@@ -332,11 +332,13 @@ def _dense_rows[
                 d * job.kt_stride_d + kbase
             ).cast[DType.float32]()
             comptime for r in range(qt):
-                logits[r] += (
-                    SIMD[DType.float32, KT_TILE](
-                        qv.unsafe_load(r * head_dim + d)
-                    )
-                    * kv
+                # fma(), not `+=`/`*`: multiply+add pairs do not contract on
+                # their own here, and an uncontracted pair is two instructions
+                # per 16 MACs instead of one.
+                logits[r] = fma(
+                    SIMD[DType.float32, KT_TILE](qv.unsafe_load(r * head_dim + d)),
+                    kv,
+                    logits[r],
                 )
             d += 1
 
@@ -388,7 +390,13 @@ def _dense_rows[
                 (t0 + j) * job.v_stride_t
             ).cast[DType.float32]()
             comptime for r in range(qt):
-                acc[r] += probs.unsafe_load(r * KT_TILE + j) * vrow
+                acc[r] = fma(
+                    SIMD[DType.float32, head_dim](
+                        probs.unsafe_load(r * KT_TILE + j)
+                    ),
+                    vrow,
+                    acc[r],
+                )
             j += 1
 
         t0 += KT_TILE
@@ -530,11 +538,10 @@ def _dense_rows_mem[
                     d * job.kt_stride_d + kbase
                 ).cast[DType.float32]()
                 comptime for r in range(qt):
-                    logits[r] += (
-                        SIMD[DType.float32, kt](
-                            qv.unsafe_load(r * head_dim + d)
-                        )
-                        * kv
+                    logits[r] = fma(
+                        SIMD[DType.float32, kt](qv.unsafe_load(r * head_dim + d)),
+                        kv,
+                        logits[r],
                     )
                 d += 1
 
@@ -590,7 +597,11 @@ def _dense_rows_mem[
                     (t0 + j) * job.v_stride_t + dci * dc
                 ).cast[DType.float32]()
                 comptime for r in range(qt):
-                    accv[r] += probs.unsafe_load(r * kt + j) * vrow
+                    accv[r] = fma(
+                        SIMD[DType.float32, dc](probs.unsafe_load(r * kt + j)),
+                        vrow,
+                        accv[r],
+                    )
                 j += 1
             comptime for r in range(qt):
                 acc.unsafe_store[width=dc](r * head_dim + dci * dc, accv[r])
@@ -755,7 +766,13 @@ def _dense_rows_dot[
                 (t0 + j) * job.v_stride_t
             ).cast[DType.float32]()
             comptime for r in range(qt):
-                acc[r] += probs.unsafe_load(r * KT_TILE + j) * vrow
+                acc[r] = fma(
+                    SIMD[DType.float32, head_dim](
+                        probs.unsafe_load(r * KT_TILE + j)
+                    ),
+                    vrow,
+                    acc[r],
+                )
             j += 1
 
         t0 += KT_TILE
