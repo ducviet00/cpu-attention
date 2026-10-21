@@ -297,6 +297,47 @@ vdpbf16ps` (72 here) or `grep -c bfdot` (5664 on Graviton).
 - Prefer `stack_allocation` or torch tensors over `List` for buffers a kernel
   reads through raw pointers; the tests do that.
 
+## 6b. Mojo std-lib inventory (what the kernels use, what to reach for)
+
+Both kernels are already written on stdlib primitives rather than hand-rolled
+ones; this is the list, so nobody re-implements them:
+
+| need | stdlib |
+|---|---|
+| vector width, ISA detection | `simd_width_of[DType.float32]()`, `CompilationTarget.is_x86()/has_neon()/_has_feature["avx512bf16"|"bf16"]()` |
+| buffers a pointer-based kernel reads | `stack_allocation[N, dtype]()` (`std.memory`) |
+| typed pointer arithmetic | `MutPointer[T, MutUntrackedOrigin](unsafe_from_address=...)`, `.unsafe_offset`, `.unsafe_load[width=N](off)`, `.unsafe_store[width=N](off, v)` |
+| lane index vector for masks | `iota[DType.int32, N](start)` (`std.math`) |
+| per-lane compare + blend | `.lt/.le/.gt/.ge/.eq/.ne` then `mask.select(a, b)` (SIMD ops are *reducing*, so the mask form is required) |
+| horizontal max/sum | `SIMD.reduce_max()`, `SIMD.reduce_add()` |
+| pack (lo,hi) pairs | `SIMD.interleave` (this is how the bf16 broadcast pair operand is built) |
+| transcendental | `exp` (`std.math`) — already lowers to a vector polynomial (`vrndscaleps`/`vscalefps` + FMAs) |
+| ceil in tile math | `std.math.ceildiv` (`-(-a // b)` only remains in Python, where it is cheaper than importing) |
+| thread dispatch | `external_call["GOMP_parallel"/"omp_get_*"]` (`std.ffi`) on torch's pool |
+| ISA intrinsics | `llvm_intrinsic[name, RetType, has_side_effect=False]` (`std.sys`) — **always pass `has_side_effect=False`**, or the calls are ordered and the phase runs ~4x slower |
+
+Verified while reviewing the ARM work: **`bfmmla` is reachable from Mojo**
+
+```mojo
+from std.sys import llvm_intrinsic
+def bfmmla(a: SIMD[DType.float32, 4], x: SIMD[DType.bfloat16, 8],
+           y: SIMD[DType.bfloat16, 8]) -> SIMD[DType.float32, 4]:
+    return llvm_intrinsic["llvm.aarch64.neon.bfmmla", SIMD[DType.float32, 4],
+                          has_side_effect=False](a, x, y)
+```
+`mojo build --emit asm --target-triple aarch64-unknown-linux-gnu --target-cpu
+neoverse-v3` emits `bfmmla v0.4s, v1.8h, v2.8h`. Operands: acc = 2x2 fp32 tile
+`(r0c0, r0c1, r1c0, r1c1)`, `x` = 2x4 bf16 row-major (rows = 2 queries, 4 k),
+`y` = 4x2 bf16 row-major (k-major: `(k0c0, k0c1, k1c0, k1c1, ...)`). For Q@K^T that
+means K needs a *position*-paired layout (`(k[d][t], k[d][t+1])` adjacent); for
+P@V plain row-major V already has the dim pair adjacent.
+
+What the stdlib does **not** have (do not go looking for it): a partial/tail
+load or a gather (`iota` + `select` is the idiom here, §13), a non-NaN-propagating
+float `max`/`reduce_max` (ours emits `vcmpordps` + `vmaxps` per step because our
+values are finite, but there is no cheaper entry point), and any batched
+matmul — that is what the per-ISA intrinsics are for.
+
 ## 7. Python-extension / host-side cost (measured on the Ryzen, b8/ctx256)
 
 | item | µs |
