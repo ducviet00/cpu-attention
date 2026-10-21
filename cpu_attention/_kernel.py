@@ -450,6 +450,9 @@ _CSRC = None
 
 _AMX_ENV = os.environ.get("CPU_ATTENTION_AMX", "1") != "0"
 _KT_ENV = os.environ.get("CPU_ATTENTION_KT", "0")
+# Profiling only: "pack" skips the attention loop, "attn" skips the pack (which
+# then reads a stale buffer, so the result is garbage -- timings only).
+_AMX_MODE = os.environ.get("CPU_ATTENTION_AMX_MODE", "")
 
 
 def _csrc():
@@ -507,7 +510,11 @@ def _amx_dense(q, k, v, scale: float, causal: bool):
         vs[0], vs[1], vs[2],
         os_[0], os_[1], os_[2],
         float(scale), int(bool(causal)),
-        _workers(tasks, 8), int(_KT_ENV or 0),
+        _workers(tasks, 8),
+        int(_KT_ENV or 0)
+        | (1 << 16 if _AMX_MODE == "pack" else 0)
+        | (1 << 17 if _AMX_MODE == "attn" else 0)
+        | (int(_AMX_MODE[3:], 16) << 18 if _AMX_MODE.startswith("abl") else 0),
     )
     return out if rc == 0 else None
 

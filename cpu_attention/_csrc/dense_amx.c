@@ -70,6 +70,20 @@ typedef uint16_t bf16;
 #define KEYCH 32  /* keys per QK step (4 accumulator tiles) */
 #define MAXKT 512 /* upper bound on the super-tile */
 
+/* Softmax A/B switch (build-time so both variants cost nothing at run time).
+ *
+ * MEASURED, in one process, 2 threads, medians of 5 (`scripts/prof/x86/amx_ab.py`
+ * over three builds, kt=256): 1 is the winner and 2/0 are 3-40% *slower*.
+ *   1 = bit-insert exp + one row at a time
+ *   2 = vscalefps exp + two rows in flight   (10-30% slower at short S)
+ *   0 = bit-insert exp + two rows in flight  (10-40% slower)
+ * Two rows in flight is slower because four `exp2` chains plus four sum
+ * accumulators exceed the vector register file and spill; `vscalefps` for the
+ * 2^n scale is neutral against the integer bit-insert (m2 vs m0). */
+#ifndef AMX_SM
+#define AMX_SM 1
+#endif
+
 static const float kLog2e = 1.4426950408889634f;
 static const float kNegInf = -3.4028234663852886e38f;
 
@@ -96,9 +110,16 @@ static void tile_setup(void) {
 
 /* ------------------------------------------------------------------ softmax */
 
-/* 2^x for x in [-127, 127]; exactly 0 below the subnormal boundary. */
+/* 2^x, and *exactly* +0 once x is far enough below zero.
+ *
+ * Degree-4 polynomial on [-0.5, 0.5] and `vscalefps` for the 2^n scale (one
+ * instruction, vs the four of a float-to-int + shift + bit-insert). The clamp
+ * at -150 relies on 2^-150 underflowing fp32 to +0: a fully masked tile then
+ * contributes a probability of exactly 0, which P@V needs (0 * garbage must be
+ * 0, and a bf16 denormal in an AMX tile is not free). Relative error 4e-5,
+ * two orders below the bf16 probabilities this path already rounds to. */
 static inline __m512 exp2_ps(__m512 x) {
-  x = _mm512_max_ps(x, _mm512_set1_ps(-127.0f));
+  x = _mm512_max_ps(x, _mm512_set1_ps(AMX_SM == 1 ? -127.0f : -150.0f));
   x = _mm512_min_ps(x, _mm512_set1_ps(127.0f));
   __m512 n =
       _mm512_roundscale_ps(x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
@@ -108,9 +129,13 @@ static inline __m512 exp2_ps(__m512 x) {
   p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(0.2402265069591007f));
   p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(0.6931471805599453f));
   p = _mm512_fmadd_ps(p, f, _mm512_set1_ps(1.0f));
+#if AMX_SM == 1
   __m512i e = _mm512_slli_epi32(
       _mm512_add_epi32(_mm512_cvtps_epi32(n), _mm512_set1_epi32(127)), 23);
   return _mm512_mul_ps(p, _mm512_castsi512_ps(e));
+#else
+  return _mm512_scalef_ps(p, n);
+#endif
 }
 
 /* ------------------------------------------------------- K pack (transpose) */
@@ -236,6 +261,18 @@ static void pack_v_block(const PackJob *pj, int64_t b, int64_t h, int64_t kb,
   }
 }
 
+/* One task = one (batch, kv head, 16-key block): every dim chunk of that slab.
+ * Doing all dim chunks inside a task turns the source reads into one linear run
+ * over `16 * head_dim` elements instead of `64 bytes at stride head_dim*2` per
+ * task, which measured latency-bound at short seq_k. */
+static void pack_k_slab(const PackJob *pj, int64_t b, int64_t h, int64_t kb) {
+  for (int64_t dc = 0; dc < pj->dc32; dc++) pack_k_block(pj, b, h, kb, dc);
+}
+
+static void pack_v_slab(const PackJob *pj, int64_t b, int64_t h, int64_t kb) {
+  for (int64_t dc = 0; dc < pj->dc16; dc++) pack_v_block(pj, b, h, kb, dc);
+}
+
 /* ---------------------------------------------------------------- main loop */
 
 typedef struct {
@@ -250,6 +287,7 @@ typedef struct {
   int64_t kp_bh, vp_bh;
   int64_t nqg;
   int kt;
+  int ablate; /* profiling only: 1 = no QK, 2 = no softmax, 4 = no P@V */
 } Ctx;
 
 typedef struct {
@@ -317,9 +355,14 @@ static void dense_item(const Ctx *c, Scratch *s, int64_t b, int64_t h,
   for (int64_t t0 = 0; t0 < loop_end; t0 += kt) {
     const int nk = (int)((loop_end - t0 < kt) ? (loop_end - t0) : kt);
     const int nch = (nk + KEYCH - 1) / KEYCH;
+    /* Lanes the QK actually wrote (the tile is 32 keys wide). The mask, the
+     * softmax and the P buffer only ever need these: PV reads ceil(nk/32)
+     * blocks. Running the softmax over all of `kt` instead wastes (kt-nk) lanes
+     * on every partial super-tile, which is most of them at short seq_k. */
+    const int nkp = nch * KEYCH;
 
     /* ---- Q@K^T: KEYCH keys at a time, 32 rows -> fp32 logits ---- */
-    for (int ch = 0; ch < nch; ch++) {
+    for (int ch = 0; !(c->ablate & 1) && ch < nch; ch++) {
       const int64_t k0 = t0 + ch * KEYCH;
       const int64_t kb = (k0 / 16) * c->dc32 * 512;
       _tile_zero(4);
@@ -347,17 +390,17 @@ static void dense_item(const Ctx *c, Scratch *s, int64_t b, int64_t h,
     {
       int64_t lim_min = c->causal ? (q0 + diag + 1) : seq_k;
       if (lim_min > seq_k) lim_min = seq_k;
-      if (t0 + kt > lim_min) {
+      if (t0 + nkp > lim_min) {
         for (int64_t r = 0; r < nrows; r++) {
           int64_t lim = c->causal ? (q0 + r + diag + 1) : seq_k;
           if (lim > seq_k) lim = seq_k;
           lim -= t0;
-          if (lim >= kt) continue;
+          if (lim >= nkp) continue;
           float *lg = logits + r * kt;
           if (lim <= 0) {
-            for (int j = 0; j < kt; j += 16) _mm512_storeu_ps(lg + j, ninf);
+            for (int j = 0; j < nkp; j += 16) _mm512_storeu_ps(lg + j, ninf);
           } else {
-            for (int j = (int)(lim & ~15L); j < kt; j += 16) {
+            for (int j = (int)(lim & ~15L); j < nkp; j += 16) {
               __m512i idx = _mm512_add_epi32(_mm512_set1_epi32(j), lane);
               __mmask16 keep =
                   _mm512_cmpgt_epi32_mask(_mm512_set1_epi32((int)lim), idx);
@@ -371,13 +414,13 @@ static void dense_item(const Ctx *c, Scratch *s, int64_t b, int64_t h,
     }
 
     /* ---- online softmax over the whole super-tile ------------------------ */
-    for (int rg = 0; rg < 2; rg++) {
+    for (int rg = 0; !(c->ablate & 2) && rg < 2; rg++) {
       float *lg = logits + rg * 16 * kt;
       __m512 m_old = rg ? m1 : m0;
       float rm[16];
       for (int r = 0; r < 16; r++) {
         __m512 v = _mm512_loadu_ps(lg + r * kt);
-        for (int j = 16; j < kt; j += 16)
+        for (int j = 16; j < nkp; j += 16)
           v = _mm512_max_ps(v, _mm512_loadu_ps(lg + r * kt + j));
         rm[r] = _mm512_reduce_max_ps(v);
       }
@@ -406,19 +449,70 @@ static void dense_item(const Ctx *c, Scratch *s, int64_t b, int64_t h,
       float m_sc[16];
       _mm512_storeu_ps(m_sc, m_new);
       /* exp + P in bf16 + row sum */
-      for (int r = 0; r < 16; r++) {
-        const float *lp = lg + r * kt;
-        bf16 *pp = prob + (rg * 16 + r) * kt;
-        const __m512 off = _mm512_set1_ps(-m_sc[r] * c1f);
-        __m512 sum = _mm512_setzero_ps();
-        for (int j = 0; j < kt; j += 16) {
-          __m512 e =
-              exp2_ps(_mm512_fmadd_ps(_mm512_loadu_ps(lp + j), c1v, off));
-          sum = _mm512_add_ps(sum, e);
-          _mm256_storeu_si256((__m256i *)(pp + j),
-                              (__m256i)_mm512_cvtneps_pbh(e));
+      if (!(c->ablate & 8) && AMX_SM != 1) {
+        /* Two rows in flight and two sum accumulators per row: the polynomial
+         * is a serial FMA chain, so one row at a time leaves the vector pipes
+         * idle and the `sum` add is a second serial chain. */
+        for (int r = 0; r < 16; r += 2) {
+          const float *lp0 = lg + r * kt, *lp1 = lp0 + kt;
+          bf16 *pp0 = prob + (rg * 16 + r) * kt, *pp1 = pp0 + kt;
+          const __m512 off0 = _mm512_set1_ps(-m_sc[r] * c1f);
+          const __m512 off1 = _mm512_set1_ps(-m_sc[r + 1] * c1f);
+          __m512 s0a = _mm512_setzero_ps(), s0b = _mm512_setzero_ps();
+          __m512 s1a = _mm512_setzero_ps(), s1b = _mm512_setzero_ps();
+          int j = 0;
+          for (; j + 32 <= nkp; j += 32) {
+            __m512 e00 =
+                exp2_ps(_mm512_fmadd_ps(_mm512_loadu_ps(lp0 + j), c1v, off0));
+            __m512 e10 =
+                exp2_ps(_mm512_fmadd_ps(_mm512_loadu_ps(lp1 + j), c1v, off1));
+            __m512 e01 = exp2_ps(
+                _mm512_fmadd_ps(_mm512_loadu_ps(lp0 + j + 16), c1v, off0));
+            __m512 e11 = exp2_ps(
+                _mm512_fmadd_ps(_mm512_loadu_ps(lp1 + j + 16), c1v, off1));
+            s0a = _mm512_add_ps(s0a, e00);
+            s0b = _mm512_add_ps(s0b, e01);
+            s1a = _mm512_add_ps(s1a, e10);
+            s1b = _mm512_add_ps(s1b, e11);
+            _mm256_storeu_si256((__m256i *)(pp0 + j),
+                                (__m256i)_mm512_cvtneps_pbh(e00));
+            _mm256_storeu_si256((__m256i *)(pp1 + j),
+                                (__m256i)_mm512_cvtneps_pbh(e10));
+            _mm256_storeu_si256((__m256i *)(pp0 + j + 16),
+                                (__m256i)_mm512_cvtneps_pbh(e01));
+            _mm256_storeu_si256((__m256i *)(pp1 + j + 16),
+                                (__m256i)_mm512_cvtneps_pbh(e11));
+          }
+          for (; j < nkp; j += 16) {
+            __m512 e0 =
+                exp2_ps(_mm512_fmadd_ps(_mm512_loadu_ps(lp0 + j), c1v, off0));
+            __m512 e1 =
+                exp2_ps(_mm512_fmadd_ps(_mm512_loadu_ps(lp1 + j), c1v, off1));
+            s0a = _mm512_add_ps(s0a, e0);
+            s1a = _mm512_add_ps(s1a, e1);
+            _mm256_storeu_si256((__m256i *)(pp0 + j),
+                                (__m256i)_mm512_cvtneps_pbh(e0));
+            _mm256_storeu_si256((__m256i *)(pp1 + j),
+                                (__m256i)_mm512_cvtneps_pbh(e1));
+          }
+          rm[r] = _mm512_reduce_add_ps(_mm512_add_ps(s0a, s0b));
+          rm[r + 1] = _mm512_reduce_add_ps(_mm512_add_ps(s1a, s1b));
         }
-        rm[r] = _mm512_reduce_add_ps(sum);
+      } else {
+        for (int r = 0; r < 16; r++) {
+          const float *lp = lg + r * kt;
+          bf16 *pp = prob + (rg * 16 + r) * kt;
+          const __m512 off = _mm512_set1_ps(-m_sc[r] * c1f);
+          __m512 sum = _mm512_setzero_ps();
+          for (int j = 0; j < nkp; j += 16) {
+            __m512 e =
+                exp2_ps(_mm512_fmadd_ps(_mm512_loadu_ps(lp + j), c1v, off));
+            sum = _mm512_add_ps(sum, e);
+            _mm256_storeu_si256((__m256i *)(pp + j),
+                                (__m256i)_mm512_cvtneps_pbh(e));
+          }
+          rm[r] = _mm512_reduce_add_ps(sum);
+        }
       }
       __m512 rows = _mm512_loadu_ps(rm);
       if (rg)
@@ -428,7 +522,7 @@ static void dense_item(const Ctx *c, Scratch *s, int64_t b, int64_t h,
     }
 
     /* ---- P@V over the super-tile, 2 dim chunks (4 accumulator tiles) ----- */
-    {
+    if (!(c->ablate & 4)) {
       const int nks = (nk + 31) / 32;
       for (int dc = 0; dc < D / 16; dc += 2) {
         _tile_loadd(4, (void *)(acc + dc * 16), astride);
@@ -507,12 +601,19 @@ int dense_amx_bf16(const void *q, const void *k, const void *v, void *out,
                    int64_t vsb, int64_t vst, int64_t vsh, int64_t ob,
                    int64_t ot, int64_t oh, double scale, int64_t causal,
                    int64_t nthreads, int64_t kt_in) {
+  /* mode lives in kt_in's top bits so the ctypes signature stays put:
+   * bit 16 set = skip the pack, bit 17 set = skip the attention. Profiling
+   * only (a skipped pack reads stale buffers on purpose). */
+  const int ablate = (int)((kt_in >> 18) & 63);
+  const int skip_pack = (kt_in & (1 << 16)) != 0;
+  const int skip_attn = (kt_in & (1 << 17)) != 0;
+  kt_in &= 0xFFFF;
   if (amx_init()) return 1;
   if (head_dim != 32 && head_dim != 64 && head_dim != 128) return 1;
   if (nkv <= 0 || nh % nkv) return 1;
   if (seq_q <= 0 || seq_k <= 0) return 1;
   int kt = (int)kt_in;
-  if (kt <= 0) kt = 128;
+  if (kt <= 0) kt = 256;
   if (kt > MAXKT) kt = MAXKT;
   if (kt % KEYCH) return 1;
   if (nthreads < 1) nthreads = 1;
@@ -575,9 +676,10 @@ int dense_amx_bf16(const void *q, const void *k, const void *v, void *out,
   c.vp_bh = pj.vp_bh;
   c.nqg = (seq_q + QROWS - 1) / QROWS;
   c.kt = kt;
+  c.ablate = ablate;
 
-  const int64_t nk_tasks = batch * nkv * kb16 * dc32;
-  const int64_t nv_tasks = batch * nkv * kb32 * dc16;
+  const int64_t nk_tasks = batch * nkv * kb16;
+  const int64_t nv_tasks = batch * nkv * kb32;
   const int64_t items = batch * nh * c.nqg;
   const int nthreads_i = (int)nthreads;
 
@@ -588,25 +690,21 @@ int dense_amx_bf16(const void *q, const void *k, const void *v, void *out,
     const int tid = omp_get_thread_num();
     const int nt = omp_get_num_threads();
     tile_setup();
-    for (int64_t i = tid; i < nk_tasks + nv_tasks; i += nt) {
+    for (int64_t i = tid; !skip_pack && i < nk_tasks + nv_tasks; i += nt) {
       if (i < nk_tasks) {
         int64_t t = i;
-        const int64_t dc = t % dc32;
-        t /= dc32;
         const int64_t kb = t % kb16;
         t /= kb16;
         const int64_t h = t % nkv;
         const int64_t b = t / nkv;
-        pack_k_block(&pj, b, h, kb, dc);
+        pack_k_slab(&pj, b, h, kb);
       } else {
         int64_t t = i - nk_tasks;
-        const int64_t dc = t % dc16;
-        t /= dc16;
         const int64_t kb = t % kb32;
         t /= kb32;
         const int64_t h = t % nkv;
         const int64_t b = t / nkv;
-        pack_v_block(&pj, b, h, kb, dc);
+        pack_v_slab(&pj, b, h, kb);
       }
     }
 #pragma omp barrier
@@ -617,7 +715,7 @@ int dense_amx_bf16(const void *q, const void *k, const void *v, void *out,
     sc.acc = (float *)(base + (size_t)kt * QROWS * 4 + (size_t)kt * QROWS * 2);
     sc.qpad = (bf16 *)(base + (size_t)kt * QROWS * 4 +
                        (size_t)kt * QROWS * 2 + (size_t)QROWS * head_dim * 4);
-    for (int64_t t = tid; t < items; t += nt) {
+    for (int64_t t = tid; !skip_attn && t < items; t += nt) {
       const int64_t g = t % c.nqg;
       const int64_t rest = t / c.nqg;
       const int64_t h2 = rest % nh;
