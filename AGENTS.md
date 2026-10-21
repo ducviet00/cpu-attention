@@ -610,19 +610,36 @@ default of 16 is also the C++ kernel's best point (67 vs 76 µs at block 32).
    this round — head-dim-tiled acc in L1, and KV-outer chunks — were within 1%
    of the current kernel, so a rewrite must change the *inner* GEMM, not the
    loop order or the buffers.
-4. **Dense: `bfmmla` on ARM for both phases.** `bfdot` gives 2x the fp32-lane
+4. **ARM: the softmax, not the tile.** Round 2 built four variants and reverted
+   all of them (numbers in `4c7ca5d`), which fixes the remaining 1.45x
+   precisely. Measured on the box: `bfmmla` issues at **2.0/cycle** (0.152 ns,
+   1640 GFLOP/s ceiling) and we run at 1.02 (D=64) / 1.30 (D=128) per cycle
+   while vLLM runs 1.49/1.86. A two-head-dim marginal fit gives **0.5 cycle per
+   `bfmmla`** — the ceiling — so the matmul has no headroom, and an intercept of
+   **~3.0 cycles/row-key of softmax that does not overlap it** (37% of the D=64
+   runtime). The softmax block is ~770 instructions per 16-key tile (12 per
+   row-key) against ~300 of real work; the rest is `ldr/str q,[sp]` spill and
+   remat. Do NOT retry: one row pair at a time (-11%/-9%, the duplicated K loads
+   cost more than the register relief even when they are L1 hits), logits staged
+   through L1 (-0%, LLVM SROA forwards the stores so the allocator still keeps
+   them in registers), software-pipelining the softmax into the matmul (-11%/-8%
+   plus a parity bug). qt=8 at D=64 loses too. The only untried route is a
+   Vec16-style *single-loop* softmax over a memory-resident logits buffer
+   (vLLM's actual structure, 200-300 lines, softmax only — Q@K^T, P@V and all
+   layouts stay). Expected ~1.2-1.3x, i.e. ~1.15x from vLLM rather than 1.45x.
+5. **Dense: `bfmmla` on ARM for both phases** (done, see §4b). `bfdot` gives 2x the fp32-lane
    MACs, `bfmmla` gives 4x and amortizes the loads over a 2x2 output tile -- that
    is where vLLM's 1234 GFLOP/s bf16 on Graviton comes from (`cpu_attn_neon_bfmmla.hpp`
    is the file to read). It needs V in a *position*-paired layout
    (`[seq_k/2][head_dim][2]`), i.e. a second transpose pass, plus 2x4 / 4x2
    operand staging for `llvm.aarch64.neon.bfmmla`. Expect ~2x over the current
    ARM bf16 path, which is still 3.7x behind vLLM.
-5. **GQA/MQA**: one KV page shared by `q_heads_per_kv` heads would let one task
+6. **GQA/MQA**: one KV page shared by `q_heads_per_kv` heads would let one task
    amortise the K/V loads over several query heads — and only then does AMX
    (16-row tiles) become interesting. Not needed for BART/Florence-2.
-6. ~~Own thread pool~~ **Done, differently**: not a pool of our own (no win,
+7. ~~Own thread pool~~ **Done, differently**: not a pool of our own (no win,
    §9.3) but `GOMP_parallel` on torch's pool. A hand-rolled pool cannot beat it
    because the win is *reusing* the pool that is already awake.
-7. **`partial_simd_load`** for tails instead of `iota`+`select` (cosmetic).
-8. **T5** (root `AGENTS.md`): same paged path, but its per-layer pointwise chains
+8. **`partial_simd_load`** for tails instead of `iota`+`select` (cosmetic).
+9. **T5** (root `AGENTS.md`): same paged path, but its per-layer pointwise chains
    are what the frozen compile graphs fuse, so the CPU gains would be larger.
