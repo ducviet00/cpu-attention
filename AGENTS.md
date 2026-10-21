@@ -182,12 +182,31 @@ kernel. Three fixes, in order of payoff:
    layout Python never wrote (18/41 parity checks failed).
 
 Together: 16-32% on ARM (S=1024/H=16/D=128 bf16 18.6 -> 12.6 ms; fp32 S=512
-1121 vs 1410 us). Still behind **vLLM's `bfmmla`**: their `.so` has 9436 `bfmmla`
-and 0 `bfdot`, and they get 1234 GFLOP/s bf16 / 480 fp32 against our 330 / 250.
-`bfdot` is 2x fp32 lanes; `bfmmla` is 4x, and it is a 2x2 matmul so it also
-amortizes the loads. Their fp32 is at ~100% of the NEON fp32 roofline, ours at
-~55%. Next step is §13.4: `bfmmla` for both phases, which needs a
-position-paired V layout (the dense analogue of the paged NEON V page).
+1121 vs 1410 us).
+
+Then the real fix landed: **`_dense_rows_bfmmla`**, `bfmmla` on both phases
+(Q@K^T 2 rows x 4 dims vs 2 keys x 4 dims, P@V 2 rows x 4 keys vs 2 dims x 4
+keys), so a task lives in 2x2 fp32 tiles, the logits *are* the Q@K^T
+accumulators and the softmax handles a row pair at a time. K gets a
+position-paired layout `[head_dim/4][seq/2][8]` and V a position-major one
+`[head_dim/2][seq/4][8]` (P@V contracts over keys), both packed in the one
+transpose pass for 1-2% of the call. Plus `_exp2_fast` (magic-constant rounding
++ degree-4 polynomial + exponent insert, ~10 instructions against
+`std.math.exp`'s ~22, which was **20% of the call**; the clamp at -127 makes
+masked lanes exactly 0 via exponent underflow, and one `fmaxnm` removes the
+"no visible key" special case) and `_vmax` as a single `fmaxnm`.
+Result: **2.2-3.2x**, 331 -> 853 GFLOP/s (D=64) and 348 -> 1093 (D=128); bf16
+now beats SDPA at every D=128 size and up to S=1024 at D=64.
+
+Still open, measured, not guessed: we are **1.44-1.8x behind vLLM** (and 5-13%
+behind SDPA at D=64/S>=2048). Their `.so` runs 2 `bfmmla`/cycle where we run
+1.2-1.35, and they issue ~16 instructions per row-key against our ~21 at IPC
+3.7 vs 2.6. About 300 instructions per 16-key tile are **spill traffic**:
+`qt/2 * sub/2` 2x2 tiles plus the softmax working set exactly fill the
+32-register file, and the static asm still shows `str/ldr q, [sp, ...]` around
+every tile. The lever is a register-lean (vLLM-style) softmax with the logits in
+L1 and one row pair live at a time — §13.4. fp32 on ARM has no matrix-multiply
+instruction, so it stays at ~250 GFLOP/s against vLLM's 480 and needs §13.3.
 
 Also: the ARM build needs **libgomp linked into the extension**. Leaving `omp_*`
 undefined for load time works on x86 because torch brings a global copy, but on

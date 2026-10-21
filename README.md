@@ -336,31 +336,35 @@ fp32, the low end again `H=16 D=128`.
 
 ### On Graviton 5 (Neoverse-V3, 8 cores)
 
-The same table on a `c7g`-class ARM box, causal, interleaved against SDPA and
-against vLLM's `csrc/cpu` NEON kernel (built from upstream, `bfmmla` path) —
-ours / vLLM / SDPA in µs:
+The dense kernel was first tuned on AVX-512 and it showed on ARM. bf16 now runs
+both phases on `bfmmla` (the 2x2 bf16 matrix-multiply, which vLLM's NEON kernel
+uses and which `bfdot` does not reach): Q@K^T as 2 rows x 4 dims against 2 keys x
+4 dims, P@V as 2 rows x 4 keys against 2 dims x 4 keys, so the logits *are* the
+Q@K^T accumulators and the softmax runs a row pair at a time. K gets a
+position-paired layout and V a position-major one, both built in the same
+transpose pass; the softmax uses a magic-constant `exp2` (~10 instructions
+instead of `std.math.exp`'s ~22, which was 20% of the call).
 
-| case | bf16 | fp32 |
-|---|---|---|
-| S=512 H=8 D=64 | 858 / 240 / 557 | 1121 / 605 / 1750 |
-| S=1024 H=8 D=64 | 3282 / 915 / 1468 | 4321 / 2261 / 4654 |
-| S=2048 H=8 D=64 | 13063 / 3482 / 6012 | 16934 / 8874 / 14742 |
-| S=1024 H=16 D=128 | 12636 / 2851 / 6340 | 16999 / 9433 / 14629 |
-| S=2048 H=16 D=128 | 49320 / 11051 / 17094 | 71521 / 36312 / 46331 |
+Causal, bf16, ours before -> after, against vLLM's `csrc/cpu` NEON kernel and
+torch SDPA (same session, interleaved):
 
-So on ARM the dense kernel is **0.35-0.65x SDPA on bf16 and 0.65-1.56x on fp32**,
-and 2-4x behind vLLM: 330 vs 1234 GFLOP/s bf16, 250 vs 480 fp32. Two reasons,
-both measured:
+| case | before | after | vLLM | SDPA |
+|---|---:|---:|---:|---:|
+| S=512 H=8 D=64 | 857 | **390** | 236 | 542 |
+| S=1024 H=8 D=64 | 3277 | **1376** | 911 | 1451 |
+| S=2048 H=8 D=64 | 12972 | **5038** | 3417 | 4719 |
+| S=4096 H=8 D=64 | 51467 | **19901** | 13691 | 17397 |
+| S=256 H=16 D=128 | 858 | **386** | 217 | 487 |
+| S=1024 H=16 D=128 | 12824 | **4164** | 2868 | 4829 |
+| S=2048 H=16 D=128 | 49432 | **15715** | 10931 | 17027 |
+| S=512 H=32 D=128 | 6687 | **2371** | 1501 | 3722 |
 
-* NEON vectors are 4 fp32 lanes, not 16, so every fp32-phase instruction buys a
-  quarter of the work it does on AVX-512. Tying the key tile to the lane width
-  (`KT_TILE = 4 * LANES`: 64 keys on x86, 16 on NEON), keeping the accumulator in
-  L1 on ARM (`dc = 2 * LANES`) and running bf16 Q@K^T on `bfdot` there too was
-  worth **16-32%** (S=1024/H=16/D=128: 18.6 -> 12.6 ms bf16);
-* P@V is still fp32 on ARM, while vLLM's NEON kernel runs **`bfmmla`** for both
-  phases (9436 `bfmmla` / 0 `bfdot` in their `.so`), i.e. 2x the MACs per
-  instruction over `bfdot` and 4x over fp32 lanes. That, plus a position-paired V
-  layout for a bf16 P@V, is the next step (`AGENTS.md` §13.4).
+That is 2.2-3.2x, and 331 -> 853 GFLOP/s at D=64 / 348 -> 1093 at D=128 (both
+S=2048): **bf16 now beats SDPA at every D=128 size (1.12-1.57x) and up to
+S=1024 at D=64, but is still 1.44-1.8x behind vLLM** and 5-13% behind SDPA at
+D=64/S>=2048. fp32 on ARM is unchanged by this (209-255 GFLOP/s) — there is no
+matrix-multiply instruction for it, so that path needs the same GEMM tiling as
+x86 (`AGENTS.md` §13.3-13.4).
 
 **Read these as bands, not points.** This laptop throttles to ~2.0 GHz under
 sustained AVX-512 (and a second session on the box makes it worse), and the
