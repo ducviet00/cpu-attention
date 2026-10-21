@@ -1219,14 +1219,27 @@ def _dense_rows_bfmmla[
                         )
 
 
-comptime TILE_KS = 64
-"""Keys per tile in ``_dense_rows_tile``: the whole tile's logits live in L1.
+comptime TILE_KS = 128
+"""Keys per tile in ``_dense_rows_tile`` (bf16): the whole tile's logits live in L1.
 
 This is the vLLM structure (one QK pass over a key tile, one straight-line
 softmax over the whole tile, then P@V over it) as opposed to v1's online-softmax
 chain, which re-derives the max and rescales the accumulator every 16 keys. A
 tile has to be a multiple of 64 because the K scratch is padded to 64 keys and
 the QK pass reads whole sub-blocks.
+
+Measured at S=2048 H=8 D=64 bf16, cycles/row-key: 64 keys 5.86, **128 keys
+5.33**, 256 keys 5.66 -- the per-tile P@V accumulator round trip and the tile
+epilogue amortise up to 128, and past that the two logit buffers (16 KB at 256)
+start competing with the K/V streams for L1.
+"""
+
+comptime TILE_KS_F32 = 256
+"""Keys per tile in ``_dense_rows_tile_f32``: 256, not 128.
+
+Same measurement, fp32 D=64: 64 keys 14.16, 128 keys 14.07, **256 keys 13.68**.
+The logit buffer is 4 bytes per element here, so 256 keys is 8 KB per buffer --
+the same footprint bf16 gets at 128.
 """
 
 comptime KT_PAIR_STRIDE = (KS_STRIDE // 2) * 8
@@ -2423,7 +2436,7 @@ def _dense_arm_rows[
             job, batch, head, kv_head, q0
         )
     else:
-        _dense_rows_tile_f32[head_dim, qt, TILE_KS, 8, 8](
+        _dense_rows_tile_f32[head_dim, qt, TILE_KS_F32, 8, 8](
             job, batch, head, kv_head, q0
         )
 
