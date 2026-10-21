@@ -23,6 +23,11 @@ SHAPES = [
     (1, 300, 300, 8, 8, 64),  # several 64-key tiles
     (1, 17, 301, 4, 4, 64),  # short query against a long cache
     (1, 257, 257, 8, 2, 64),  # GQA + odd length
+    # head_dim 128 with seq_k >= 1024: 8 rows x 128 dims is the only shape that
+    # leaves the register kernel for the L1-accumulator one (`_dense_rows_mem`),
+    # and 1088 = 17 x 64 exercises a partial last K^T block.
+    (1, 1088, 1088, 2, 2, 128),
+    (1, 1100, 1030, 2, 1, 128),  # GQA, seq_q != seq_k, both non-multiples
 ]
 
 

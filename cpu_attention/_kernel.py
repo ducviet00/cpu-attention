@@ -226,8 +226,37 @@ def _paged(
     )
 
 
-_TRANSPOSE = None
+_LLC = None
 
+
+def _llc_bytes() -> int:
+    """Last-level cache size in bytes, from sysfs (32 MiB if unknown).
+
+    Only used to decide whether a dense V is worth copying into a per-head
+    contiguous slab: the copy pays when V no longer fits, and the P@V sweep is
+    the only reader.
+    """
+    global _LLC
+    if _LLC is None:
+        size = 0
+        try:
+            for idx in (3, 2, 1, 0):
+                with open(f"/sys/devices/system/cpu/cpu0/cache/index{idx}/size") as f:
+                    text = f.read().strip()
+                mult = 1
+                if text.endswith("K"):
+                    mult, text = 1024, text[:-1]
+                elif text.endswith("M"):
+                    mult, text = 1024 * 1024, text[:-1]
+                size = int(text) * mult
+                break
+        except (OSError, ValueError):
+            size = 0
+        _LLC = size or (32 << 20)
+    return _LLC
+
+
+_TRANSPOSE = None
 
 def _transpose_attention():
     """Return the extension's K-transpose entry point, bound once."""
@@ -377,6 +406,25 @@ def _dense(q, k, v, scale: float, causal: bool):
     # needs V repacked too (its P@V contracts over keys). Padded to the key tile
     # (64) so the last tile never reads past the buffer; the mask kills the
     # padding lanes.
+    #
+    # V gets a plain contiguous copy per (batch, kv head) when it no longer fits
+    # in the LLC, because the P@V sweep reads one head's V rows once per key and
+    # a dense V puts consecutive tokens `heads * head_dim` apart -- 8 KB at 16
+    # heads x 128 dims, a stride the hardware prefetcher cannot follow. vLLM's
+    # paged cache hands its P@V sweep that layout for free
+    # (`[block][head][block_size][head_dim]`: 512 B per token); a dense call has
+    # to pay one linear copy (33 MB at 40-70 GB/s, 1-2% of the call). Measured
+    # on the Ryzen, interleaved, bit-identical output (`max|diff| 0`):
+    #
+    #   S=4096 H=16 D=128 fp32 (V 33.5 MB): 1.90x
+    #   S=2048 H=16 D=128 fp32 (V 16.8 MB): 1.04x
+    #   S=4096 H= 8 D= 64 fp32 (V  8.4 MB): 0.99x
+    #   S=4096 H=16 D=128 bf16 (V 16.8 MB): 0.94x
+    #
+    # so it is gated on fp32 (whose P@V is V-bandwidth-bound; bf16 spends its
+    # P@V instructions widening V instead) and on V being at least half the LLC.
+    vpack = (v.dtype == torch.float32
+             and v.numel() * v.element_size() * 2 >= _llc_bytes())
     seq_k_pad = -(-seq_k // 64) * 64
     if bfmmla:
         mode = 2
@@ -390,11 +438,13 @@ def _dense(q, k, v, scale: float, causal: bool):
         mode = 1
         kt = torch.empty((batch, num_kv_heads, head_dim // 2, seq_k_pad, 2),
                          dtype=k.dtype)
-        vt = None
+        vt = (torch.empty((batch, num_kv_heads, seq_k, head_dim), dtype=v.dtype)
+              if vpack else None)
     else:
         mode = 0
         kt = torch.empty((batch, num_kv_heads, head_dim, seq_k_pad), dtype=k.dtype)
-        vt = None
+        vt = (torch.empty((batch, num_kv_heads, seq_k, head_dim), dtype=v.dtype)
+              if vpack else None)
     _transpose_attention()(
         k.data_ptr(),
         kt.data_ptr(),
