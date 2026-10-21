@@ -512,40 +512,48 @@ i.e. attention 29.8-49.6 + interference +39.2 against 90.7 + 25.9.
    interleaved A/B inside one process is trustworthy (`/tmp`-style script: run
    variant A, B, A, B... and take per-variant medians); `tests/bench_dense.py`
    blocks per variant and is therefore a coarse number only.
-10. **Nothing about the dense kernel's blocking matters**, and the *reason* is
-   not what it looks like. Drift-controlled A/B: `qt` = 2/4/6/8 sits within 1% at
-   head_dim 128, the KV-outer loop order (one (batch, head) per work item,
-   L2-sized key chunks, `acc`/`m`/`l` in memory) is within 1% (+5-9% at head_dim
-   64), a head-dim-tiled L1 accumulator is within 1%, and a hand-written
-   register-tiled GEMM (`_dense_rows_gemm`, explicit `fma`, logits and
-   probabilities in registers, pointer-bumped K/V) was **1.63x slower at fp32
-   head_dim 64 and 1.03-1.17x slower at 128**.
+10. **Profiled properly, the dense kernel is *stall*-bound on the servers, and
+   the lever is rows-per-K/V-sweep.** Two independent profiles
+   (`PROFILE_X86.md`, `PROFILE_ARM.md`) with different tools agree, and both
+   falsified the theories in this file:
 
-   That kills the obvious theory, which this file used to state: "we issue ~4
-   instructions per 2 FMAs, a GEMM micro-tile issues 1 load per 8, so build a
-   GEMM tile". It is wrong on both halves.
+   * x86 (`perf stat`, hardware counters): we retire **19.07 instructions per
+     row-key against vLLM's 18.67 — a wash** — yet take **260 M cycles where they
+     take 109 M, IPC 1.23 vs 2.87**. The separating counters are
+     `l2_rqsts.demand_data_rd_miss/loads` **5.97% vs 0.07%**,
+     `l1d.replacement/loads` 42% vs 21%, `exe_activity.bound_on_loads/cycles`
+     **48% vs 15%**. At S=512 (128 KB of K^T, cache-resident) we are 1.28x behind
+     with 0.42% misses; at S=2048, 2.25x with 5.97%. `llvm-mca` puts our Q@K^T
+     loop's port floor at 1.0 FMA/cycle (6 zmm loads per 8 FMAs) and we run 0.42.
+   * ARM: the `bfmmla` floor is 4.0 cycles/row-key (8 `bfmmla`/row-key at the
+     measured 2.0/cycle ceiling); we measure 7.76 and vLLM 5.40, so **100% of the
+     2.36-cycle gap is non-matmul cycles** — 18 instructions/row-key of which 8
+     are `bfmmla`, 21-26% of the super-tile loop is `[sp]` spill, and 0.63 loads
+     per `bfmmla`. The operand port does not bind; what is missing is **reuse
+     across rows**: vLLM's K/V panel feeds 8-16 rows, ours 4.
 
-   * *Loads were never the constraint.* `qt` **is** the FMA-per-load ratio of
-     P@V (one V vector feeds `qt` FMAs), and sweeping it 2 -> 8 changes nothing,
-     so the load ports are not binding. Per d-iteration the Q@K^T loop already
-     runs ~10 loads against 16 `vfmadd` in 16 cycles: the FMA port is saturated
-     at ~1 zmm FMA/cycle and the loads use a quarter of their capacity. There is
-     nothing for a tile to win.
-   * *What costs is instruction count in the softmax and dependency latency.*
-     `std.math.exp` was **22 instructions per vector** (58% of the worker's
-     kernel, ~17% of a tile in ours); `_vexp` at ~10 is worth +18% on x86 bf16
-     head_dim 128. On ARM the `bfmmla` pipe runs at **1.02-1.30/cycle against a
-     measured ceiling of 2.0** (0.152 ns/instr, marginal fit **0.5 cycle per
-     `bfmmla`** = exactly the ceiling), and the whole deficit is a **~3.0
-     cycles/row-key softmax that does not overlap the matmul** (37% of the D=64
-     runtime, 12 instructions/row-key against 5 of real work, ~60% of it
-     `ldr/str q,[sp]` spill and remat). x86 agrees: phase split at D=128 is
-     Q@K^T 31% / softmax+P@V 69%.
+   Consequences, measured: `CPU_ATTENTION_QT=8` is **1.20-1.34x** on x86 fp32
+   (L2 miss 6.34 -> 2.62%) at 2048:8:64, 1024:16:128 and 4096:8:128; on ARM
+   `qt=2` is 0.74-0.80x and **fp32 `qt=6` is a free 1.09-1.11x** at every long S.
+   `qt=8` does *not* transplant to ARM because `qt > 4` flips the tile to
+   `[BKS, 4, 8]` (half the key tile, double the row pairs) and blows the register
+   file — that is a config coupling, not a row-count limit.
 
-   Corollary that bit twice: **adding loads does hurt** (ARM "one row pair at a
-   time" duplicates K loads -> -11%), while *removing* them (GEMM tile,
-   L1-staged logits) buys nothing. So: the target is fewer instructions and
-   better overlap in the softmax, not a different tiling.
+   Why the old "blocking does not matter" note was wrong: it was measured on the
+   **laptop**, 8 threads, 32 MB L3 and a private 1 MB L2 per core, where K/V
+   traffic per row was not the binding term. On a 4-physical-core server slice
+   with 2 MB L2 it is. Both regimes are real; the tuning must be per box, and
+   `CPU_ATTENTION_QT` exists for exactly that.
+
+   Also falsified, keep them dead: the L2-sized-tile theory (per-tile fixed cost
+   is 0.47 of 7.76 cycles/row-key at D=64; a 1024-key tile buys **5.7%**, and
+   ≤1.18x even if driven to zero), mask-by-range (~1%), the −8 rescale threshold
+   (~4%), probabilities-aliasing (~3%), store-forwarding stalls (~1%,
+   `ld_blocks.store_forward`), spills in the Q@K^T/P@V loops (none outside the
+   23% softmax block), KV-split for long S (8192 tasks are already balanced),
+   and "short S is our fixed cost" — charged fairly, **we are 1.32x faster than
+   vLLM at S=128** because their `reshape_and_cache` costs more than our
+   transpose, and the GOMP pool is a 2.5x win, not a cost.
 
 11. **Dense kernel (laptop, 8 threads, causal, `tests/bench_dense.py`)**: bf16 is
    1.26-2.5× torch SDPA, fp32 1.0-2.0× — except `H=16/D=128` at S=1024 (0.83×,
