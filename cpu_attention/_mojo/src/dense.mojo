@@ -259,6 +259,45 @@ def _vexp[
 
 
 @inline(.always)
+def _exp2_g[
+    width: Int
+](y: SIMD[DType.float32, width]) -> SIMD[DType.float32, width]:
+    """Width-generic ``2^y`` for ``y <= 0``: magic-constant rounding + degree-4
+    minimax + exponent insert, ~13 instructions.
+
+    ``_exp2_fast`` is the 4-lane version and uses ``roundeven``; this one exists
+    because the fp32 tile kernel works in ``LANES``-wide vectors and the
+    intrinsic's name carries the width. Degree 5 (7.5e-8 relative) because the
+    probability error is amplified ~40x into the output: degree 4 (2.6e-6)
+    measured 1.1e-4 against the 2e-4 tolerance, degree 3 would fail it.
+    """
+    comptime MAGIC = 12582912.0
+    var yc = max(y, SIMD[DType.float32, width](-127.0))
+    var n = (yc + SIMD[DType.float32, width](MAGIC)) - SIMD[DType.float32, width](
+        MAGIC
+    )
+    var f = yc - n
+    var p = SIMD[DType.float32, width](1.3276673810e-3)
+    p = p * f + SIMD[DType.float32, width](9.6755714487e-3)
+    p = p * f + SIMD[DType.float32, width](5.5507129206e-2)
+    p = p * f + SIMD[DType.float32, width](2.4022119177e-1)
+    p = p * f + SIMD[DType.float32, width](6.9314696713e-1)
+    p = p * f + SIMD[DType.float32, width](1.0000000718e0)
+    var ki = n.cast[DType.int32]()
+    var sbits = (ki + SIMD[DType.int32, width](127)) << SIMD[
+        DType.int32, width
+    ](23)
+    return p * bitcast[DType.float32, width](sbits)
+
+
+@inline(.always)
+def _exp2f(x: Scalar[DType.float32]) -> Scalar[DType.float32]:
+    """Scalar ``2^x`` through the same polynomial (the online-softmax rescale).
+    """
+    return _exp2_g[1](SIMD[DType.float32, 1](x))[0]
+
+
+@inline(.always)
 def _vexp_f(x: Scalar[DType.float32]) -> Scalar[DType.float32]:
     """Scalar ``exp`` through the same polynomial (the online-softmax rescale).
     """
@@ -819,8 +858,9 @@ def _exp2_fast(y: SIMD[DType.float32, 4]) -> SIMD[DType.float32, 4]:
         "llvm.roundeven.v4f32", SIMD[DType.float32, 4], has_side_effect=False
     ](yc)
     var f = yc - n
-    # Degree-3 minimax on [-0.5, 0.5]: relative error 7.5e-5, two orders below
-    # the bf16 probabilities this path rounds to.
+    # Degree-3 minimax on [-0.5, 0.5]: 7.5e-5 relative. Degree 2 (1.7e-3) is
+    # only 1% faster and doubles the output error (7.8e-3 -> 1.6e-2 against a
+    # 3e-2 tolerance), so it is not worth the margin.
     var p = SIMD[DType.float32, 4](5.5172628285e-2)
     p = p * f + SIMD[DType.float32, 4](2.4261366164e-1)
     p = p * f + SIMD[DType.float32, 4](6.9326095397e-1)
@@ -1123,10 +1163,12 @@ def _dense_rows_bfmmla[
                 var ap = Array[SIMD[DType.bfloat16, 8], RP](uninitialized=True)
                 comptime for rp in range(RP):
                     ap[rp] = probs.unsafe_load[width=8]((kg * RP + rp) * 8)
+                # One pointer bump per key group, then every dim pair is a
+                # compile-time offset off it: taking the stride inside the d loop
+                # turned each of the `dcp` loads into a `madd`.
+                var vp = vbase.unsafe_offset(kg * job.v_stride_t)
                 comptime for d in range(dcp):
-                    var vv = vbase.unsafe_load[width=8](
-                        kg * job.v_stride_t + d * 8
-                    )
+                    var vv = vp.unsafe_load[width=8](d * 8)
                     comptime for rp in range(RP):
                         accv[rp * dcp + d] = _bfmmla(
                             accv[rp * dcp + d], ap[rp], vv
@@ -1177,14 +1219,27 @@ def _dense_rows_bfmmla[
                         )
 
 
-comptime TILE_KS = 64
-"""Keys per tile in ``_dense_rows_tile``: the whole tile's logits live in L1.
+comptime TILE_KS = 128
+"""Keys per tile in ``_dense_rows_tile`` (bf16): the whole tile's logits live in L1.
 
 This is the vLLM structure (one QK pass over a key tile, one straight-line
 softmax over the whole tile, then P@V over it) as opposed to v1's online-softmax
 chain, which re-derives the max and rescales the accumulator every 16 keys. A
 tile has to be a multiple of 64 because the K scratch is padded to 64 keys and
 the QK pass reads whole sub-blocks.
+
+Measured at S=2048 H=8 D=64 bf16, cycles/row-key: 64 keys 5.86, **128 keys
+5.33**, 256 keys 5.66 -- the per-tile P@V accumulator round trip and the tile
+epilogue amortise up to 128, and past that the two logit buffers (16 KB at 256)
+start competing with the K/V streams for L1.
+"""
+
+comptime TILE_KS_F32 = 256
+"""Keys per tile in ``_dense_rows_tile_f32``: 256, not 128.
+
+Same measurement, fp32 D=64: 64 keys 14.16, 128 keys 14.07, **256 keys 13.68**.
+The logit buffer is 4 bytes per element here, so 256 keys is 8 KB per buffer --
+the same footprint bf16 gets at 128.
 """
 
 comptime KT_PAIR_STRIDE = (KS_STRIDE // 2) * 8
@@ -1410,7 +1465,12 @@ def _dense_rows_tile[
             var alpha = SIMD[DType.float32, 4](1.0)
             if has:
                 m_new = _vmax(m_v[rp], mt[rp])
-                alpha = _exp2_fast((m_v[rp] - m_new) * c1)
+                # Degree-5 exp2, four lanes: an error in `alpha` does not cancel
+                # between the accumulator and the row sum (the terms added
+                # afterwards are not scaled), so it accumulates over tiles -- and
+                # the two rows of the pair have their own max, so this has to stay
+                # a vector.
+                alpha = _exp2_g[4]((m_v[rp] - m_new) * c1)
                 m_v[rp] = m_new
                 # The accumulator (and the row sum) are relative to the old max.
                 if s_v[rp].reduce_max() > Scalar[DType.float32](0.0):
@@ -1607,6 +1667,11 @@ def _dense_rows_tile_f32[
 
     # Q transposed to [head_dim][qt], scale folded in: one 4-lane load then feeds
     # four rows with a lane-indexed fma.
+    # `scale * log2(e)` folded into Q, so every exponential below is a bare
+    # exp2 with no per-element multiply.
+    var c1 = Scalar[DType.float32](job.scale) * Scalar[DType.float32](
+        1.4426950408889634
+    )
     var q_t = stack_allocation[head_dim * qt, DType.float32]()
     var rr = 0
     while rr < qt:
@@ -1614,7 +1679,7 @@ def _dense_rows_tile_f32[
             var src = q_base.unsafe_offset((q0 + rr) * job.q_stride_t)
             var d = 0
             while d < head_dim:
-                var v = src.unsafe_load[width=LANES](d) * job.scale
+                var v = src.unsafe_load[width=LANES](d) * c1
                 comptime for i in range(LANES):
                     q_t.unsafe_store((d + i) * qt + rr, v[i])
                 d += LANES
@@ -1660,15 +1725,15 @@ def _dense_rows_tile_f32[
                 accs[i] = zero
             var d = 0
             while d < head_dim:
+                var kp = kt_sub.unsafe_offset(d * KS_STRIDE)
                 var kv = Array[SIMD[DType.float32, LANES], KV](
                     uninitialized=True
                 )
                 comptime for v in range(KV):
-                    kv[v] = kt_sub.unsafe_load[width=LANES](
-                        d * KS_STRIDE + v * LANES
-                    )
+                    kv[v] = kp.unsafe_load[width=LANES](v * LANES)
+                var qp = q_t.unsafe_offset(d * qt)
                 comptime for h in range(qt // LANES):
-                    var qv = q_t.unsafe_load[width=LANES](d * qt + h * LANES)
+                    var qv = qp.unsafe_load[width=LANES](h * LANES)
                     comptime for i in range(LANES):
                         comptime for v in range(KV):
                             accs[(h * LANES + i) * KV + v] += (
@@ -1716,10 +1781,10 @@ def _dense_rows_tile_f32[
             var has = m_cand > Scalar[DType.float32](NEG_INF)
             if has:
                 m_new = max(m_new, m_cand)
-                alpha = _vexp_f(Scalar[DType.float32](row_max[r] - m_new))
+                alpha = _exp2f(Scalar[DType.float32](row_max[r] - m_new))
                 row_max[r] = m_new
-            # `q_t` already carries `scale`, so the logits are final: the exp
-            # argument is logit - max, one fadd instead of a second scaling.
+            # `q_t` carries `scale * log2(e)`, so the logits are already log2
+            # units: the exp argument is logit - max, one fadd.
             var off = Scalar[DType.float32](0.0)
             if m_new > Scalar[DType.float32](NEG_INF):
                 off = -m_new
@@ -1745,7 +1810,7 @@ def _dense_rows_tile_f32[
             # logits past `jn` are NEG_INF, so exp of them is exactly 0).
             var kend = min(ks, (jn + 3) // 4 * 4)
             while k < kend:
-                var p = _vexp[LANES](
+                var p = _exp2_g[LANES](
                     logits.unsafe_load[width=LANES](r * ks + k)
                     + SIMD[DType.float32, LANES](off)
                 )
@@ -1773,21 +1838,24 @@ def _dense_rows_tile_f32[
                 var pv = Array[SIMD[DType.float32, LANES], qt](
                     uninitialized=True
                 )
+                # One base per key group: `r * ks` is then a compile-time offset,
+                # instead of an address computation per row.
+                var pp = probs.unsafe_offset(kg * 4)
                 comptime for r in range(qt):
-                    pv[r] = probs.unsafe_load[width=LANES](r * ks + kg * 4)
+                    pv[r] = pp.unsafe_load[width=LANES](r * ks)
                 # The four keys of the group are the four *lanes* of the
                 # probability vector, so this has to be comptime: a runtime
                 # lane index would spill the vector to the stack.
+                var vg = v_base.unsafe_offset(
+                    (t0 + kg * 4) * job.v_stride_t + c * dc
+                )
                 comptime for kgi in range(4):
                     var vv = Array[SIMD[DType.float32, LANES], DV](
                         uninitialized=True
                     )
                     comptime for v in range(DV):
-                        vv[v] = v_base.unsafe_load[width=LANES](
-                            (t0 + kg * 4 + kgi) * job.v_stride_t
-                            + c * dc
-                            + v * LANES
-                        )
+                        vv[v] = vg.unsafe_load[width=LANES](v * LANES)
+                    vg = vg.unsafe_offset(job.v_stride_t)
                     comptime for r in range(qt):
                         comptime for v in range(DV):
                             accv[r * DV + v] += vv[v] * SIMD[DType.float32, LANES](
@@ -2368,7 +2436,7 @@ def _dense_arm_rows[
             job, batch, head, kv_head, q0
         )
     else:
-        _dense_rows_tile_f32[head_dim, qt, TILE_KS, 8, 8](
+        _dense_rows_tile_f32[head_dim, qt, TILE_KS_F32, 8, 8](
             job, batch, head, kv_head, q0
         )
 
@@ -2574,5 +2642,208 @@ def run_dense(job: DenseJob, dtype_code: Int, num_workers: Int, qt: Int) raises:
         _run_dtype[DType.float32](job, num_workers, qt)
     elif dtype_code == 1:
         _run_dtype[DType.bfloat16](job, num_workers, qt)
+    else:
+        raise Error("cpu_attention dense: unsupported dtype")
+
+
+struct FusedDispatch(ImplicitlyCopyable, Movable):
+    """One ``GOMP_parallel`` region that packs K/V and then runs attention.
+
+    The two phases were two regions (``dense_transpose`` then
+    ``dense_attention``). Each fork-join costs a pool wake plus a barrier, and at
+    S=128 ``gomp_barrier_wait_end`` was 14% of the process by ``perf`` -- more
+    than the kernel's own hot loop at the small shapes. One region, one barrier,
+    with ``GOMP_barrier`` between the phases.
+    """
+
+    var tjob: TransposeJob
+    var djob: DenseJob
+    var t_fn: TransposeTaskFn
+    var d_fn: DenseTaskFn
+    var t_items: Int
+    var d_items: Int
+
+    def __init__(
+        out self,
+        tjob: TransposeJob,
+        djob: DenseJob,
+        t_fn: TransposeTaskFn,
+        d_fn: DenseTaskFn,
+        t_items: Int,
+        d_items: Int,
+    ):
+        self.tjob = tjob
+        self.djob = djob
+        self.t_fn = t_fn
+        self.d_fn = d_fn
+        self.t_items = t_items
+        self.d_items = d_items
+
+
+@export
+def _gomp_worker_fused(data: Int) abi("C"):
+    var st = MutPointer[FusedDispatch, MutUntrackedOrigin](
+        unsafe_from_address=data
+    )
+    var state = st[]
+    var threads = Int(external_call["omp_get_num_threads", Int32]())
+    var tid = Int(external_call["omp_get_thread_num", Int32]())
+    var t = tid
+    while t < state.t_items:
+        state.t_fn(state.tjob, t)
+        t += threads
+    if threads > 1:
+        # The attention phase reads what the pack wrote, so the threads have to
+        # meet here. Inside a GOMP region this is the `#pragma omp barrier` ABI.
+        external_call["GOMP_barrier", NoneType]()
+    var task = tid
+    while task < state.d_items:
+        state.d_fn(state.djob, task)
+        task += threads
+
+
+def _dense_items[dtype: DType, qt: Int](job: DenseJob) -> Int:
+    """Work items the attention phase will run (half as many when paired)."""
+    var qgroups = (job.seq_q + qt - 1) // qt
+    comptime paired = (
+        LANES < 16
+        and qt > 4
+        and (dtype == DType.float32 or (dtype == DType.bfloat16 and BFMMLA))
+    )
+    comptime if paired:
+        qgroups = (qgroups + 1) // 2
+    return job.batch * job.num_heads * qgroups
+
+
+def _dense_fused[
+    dtype: DType, head_dim: Int, qt: Int
+](
+    tjob: TransposeJob,
+    djob: DenseJob,
+    mode: Int,
+    num_workers: Int,
+    dtype_code_t: Int,
+):
+    """Pack K/V and run the attention in one OpenMP region.
+
+    ``dtype_code_t`` is the pack's dtype (the dense phase is dispatched on
+    ``dtype``, and the two are the same tensor dtype in practice, but the pack's
+    scratch has its own code path).
+    """
+    comptime T0 = _transpose_task[dtype, head_dim, 0]
+    comptime T1 = _transpose_task[dtype, head_dim, 1]
+    comptime T2 = _transpose_task[dtype, head_dim, 2]
+    var t_fn: TransposeTaskFn = T2
+    if mode == 0:
+        t_fn = T0
+    elif mode == 1:
+        t_fn = T1
+    comptime paired = (
+        LANES < 16
+        and qt > 4
+        and (dtype == DType.float32 or (dtype == DType.bfloat16 and BFMMLA))
+    )
+    comptime D1 = _dense_task[dtype, head_dim, qt]
+    comptime D2 = _dense_task_pair[dtype, head_dim, qt]
+    var d_fn: DenseTaskFn = D1
+    comptime if paired:
+        d_fn = D2
+    var t_items = tjob.batch * tjob.num_kv_heads
+    var d_items = _dense_items[dtype, qt](djob)
+    if d_items == 0:
+        return
+    var workers = min(num_workers, max(t_items, d_items))
+    if workers <= 1:
+        for i in range(t_items):
+            t_fn(tjob, i)
+        for i in range(d_items):
+            d_fn(djob, i)
+        return
+    var state = stack_allocation[1, FusedDispatch]()
+    state[] = FusedDispatch(tjob, djob, t_fn, d_fn, t_items, d_items)
+    comptime entry = _gomp_worker_fused
+    external_call["GOMP_parallel", NoneType](
+        entry, Int(state), Int32(workers), Int32(0)
+    )
+
+
+def _fused_shape[
+    dtype: DType, head_dim: Int
+](
+    tjob: TransposeJob,
+    djob: DenseJob,
+    mode: Int,
+    qt: Int,
+    num_workers: Int,
+    dtype_code_t: Int,
+) raises:
+    if qt == 2:
+        _dense_fused[dtype, head_dim, 2](
+            tjob, djob, mode, num_workers, dtype_code_t
+        )
+    elif qt == 4:
+        _dense_fused[dtype, head_dim, 4](
+            tjob, djob, mode, num_workers, dtype_code_t
+        )
+    elif qt == 6:
+        _dense_fused[dtype, head_dim, 6](
+            tjob, djob, mode, num_workers, dtype_code_t
+        )
+    elif qt == 8:
+        _dense_fused[dtype, head_dim, 8](
+            tjob, djob, mode, num_workers, dtype_code_t
+        )
+    elif qt == 10:
+        # The x86 fp32 row count (`_kernel._qt_for`); no ARM path selects it.
+        _dense_fused[dtype, head_dim, 10](
+            tjob, djob, mode, num_workers, dtype_code_t
+        )
+    elif qt == 12:
+        _dense_fused[dtype, head_dim, 12](
+            tjob, djob, mode, num_workers, dtype_code_t
+        )
+    else:
+        raise Error("cpu_attention dense: qt must be 2, 4, 6, 8, 10 or 12")
+
+
+def _fused_dtype[
+    dtype: DType
+](
+    tjob: TransposeJob,
+    djob: DenseJob,
+    mode: Int,
+    qt: Int,
+    num_workers: Int,
+    dtype_code_t: Int,
+) raises:
+    if djob.head_dim == 32:
+        _fused_shape[dtype, 32](tjob, djob, mode, qt, num_workers, dtype_code_t)
+    elif djob.head_dim == 64:
+        _fused_shape[dtype, 64](tjob, djob, mode, qt, num_workers, dtype_code_t)
+    elif djob.head_dim == 128:
+        _fused_shape[dtype, 128](
+            tjob, djob, mode, qt, num_workers, dtype_code_t
+        )
+    else:
+        raise Error("cpu_attention dense: unsupported head_dim")
+
+
+def run_dense_fused(
+    tjob: TransposeJob,
+    djob: DenseJob,
+    dtype_code: Int,
+    mode: Int,
+    qt: Int,
+    num_workers: Int,
+) raises:
+    """One region for the K/V pack and the attention (see ``FusedDispatch``)."""
+    if dtype_code == 0:
+        _fused_dtype[DType.float32](
+            tjob, djob, mode, qt, num_workers, dtype_code
+        )
+    elif dtype_code == 1:
+        _fused_dtype[DType.bfloat16](
+            tjob, djob, mode, qt, num_workers, dtype_code
+        )
     else:
         raise Error("cpu_attention dense: unsupported dtype")

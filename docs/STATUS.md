@@ -34,11 +34,26 @@ does not contain, and at S=128 the whole call is 60 us.
 
 | | beats SDPA | beats vLLM |
 |---|---|---|
-| NEON reference | **22 / 22** | 1 / 22 |
+| NEON reference | **22 / 22** | 4 / 22 |
 
-fp32 is 0.35-0.94 of SDPA and 0.94-1.18 of vLLM; bf16 0.50-0.88 of SDPA and
-1.06-1.42 of vLLM. Twelve of the 22 rows are within 15% of the vLLM line and
-the campaign's first row has crossed it.
+| shape | bf16 o/sdpa | bf16 o/vllm | fp32 o/sdpa | fp32 o/vllm |
+|---|---:|---:|---:|---:|
+| S=128  H=8  D=64  | 0.64 | 1.40 | 0.35 | 1.09 |
+| S=512  H=8  D=64  | 0.50 | 1.17 | 0.35 | 1.05 |
+| S=1024 H=8  D=64  | 0.66 | 1.05 | 0.50 | 1.03 |
+| S=2048 H=8  D=64  | 0.77 | 1.06 | 0.63 | 1.01 |
+| S=4096 H=8  D=64  | 0.83 | 1.08 | 0.74 | 1.05 |
+| S=256  H=16 D=128 | 0.55 | 1.26 | 0.46 | 0.95 |
+| S=1024 H=16 D=128 | 0.67 | 1.12 | 0.60 | 0.90 |
+| S=2048 H=16 D=128 | 0.77 | 1.13 | 0.75 | 0.97 |
+| S=4096 H=16 D=128 | 0.85 | 1.14 | 0.91 | 1.03 |
+| S=512  H=32 D=128 | 0.49 | 1.21 | 0.44 | 0.99 |
+| S=1024 H=8  D=32  | 0.65 | 1.03 | 0.48 | 1.02 |
+
+Every row is at or below 1.40 of vLLM's kernel, sixteen of 22 are within 15%,
+and the first four have crossed. The kernel is now at vLLM's instruction count
+for bf16 (20.99 vs 20.88 per row-key) and behind on IPC (3.62 vs 4.07), against
+measured ceilings of 4.0 (bf16) and 9.4 (fp32) cycles per row-key.
 
 ### Where the remaining work is
 

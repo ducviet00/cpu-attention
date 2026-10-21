@@ -14,6 +14,7 @@ from attention import Job, run
 from dense import (
     DenseJob,
     TransposeJob,
+    run_dense_fused,
     has_bf16_dot,
     has_bfmmla,
     lane_width,
@@ -215,12 +216,120 @@ def dense_amx_attention(
     run_dense_amx(pack, job, num_workers=Int(py=num_workers), kt=Int(py=kt))
 
 
+def dense_forward(
+    k: PythonObject,
+    kt: PythonObject,
+    v: PythonObject,
+    vt: PythonObject,
+    vk: PythonObject,
+    batch: PythonObject,
+    num_kv_heads: PythonObject,
+    seq_k: PythonObject,
+    head_dim: PythonObject,
+    k_stride_b: PythonObject,
+    k_stride_t: PythonObject,
+    k_stride_h: PythonObject,
+    vt_stride_bh: PythonObject,
+    vt_stride_d: PythonObject,
+    vs_b: PythonObject,
+    vs_t: PythonObject,
+    vs_h: PythonObject,
+    q: PythonObject,
+    dst: PythonObject,
+    seq_q: PythonObject,
+    num_heads: PythonObject,
+    q_stride_b: PythonObject,
+    q_stride_t: PythonObject,
+    q_stride_h: PythonObject,
+    v_stride_b: PythonObject,
+    v_stride_t: PythonObject,
+    v_stride_h: PythonObject,
+    o_stride_b: PythonObject,
+    o_stride_t: PythonObject,
+    o_stride_h: PythonObject,
+    scale: PythonObject,
+    causal: PythonObject,
+    dtype: PythonObject,
+    mode: PythonObject,
+    kt_stride_bh: PythonObject,
+    kt_stride_d: PythonObject,
+    kt_stride_t: PythonObject,
+    kt_blk: PythonObject,
+    qt: PythonObject,
+    num_workers: PythonObject,
+) raises:
+    """Pack K/V and run dense attention in one OpenMP region.
+
+    Same work as ``dense_transpose`` followed by ``dense_attention``, but one
+    fork-join with a ``GOMP_barrier`` between the phases instead of two. ``kt``
+    and ``vt`` are the pack's destinations and the kernel's operands; the pack's
+    V source strides and the kernel's *packed* V strides are separate arguments
+    because they are different tensors.
+    """
+    var tjob = TransposeJob()
+    tjob.k = Int(py=k)
+    tjob.kt = Int(py=kt)
+    tjob.v = Int(py=v)
+    tjob.vt = Int(py=vt)
+    tjob.batch = Int(py=batch)
+    tjob.num_kv_heads = Int(py=num_kv_heads)
+    tjob.seq_k = Int(py=seq_k)
+    tjob.head_dim = Int(py=head_dim)
+    tjob.k_stride_b = Int(py=k_stride_b)
+    tjob.k_stride_t = Int(py=k_stride_t)
+    tjob.k_stride_h = Int(py=k_stride_h)
+    tjob.kt_stride_bh = Int(py=kt_stride_bh)
+    tjob.kt_stride_d = Int(py=kt_stride_d)
+    tjob.kt_blk = Int(py=kt_blk)
+    tjob.v_stride_b = Int(py=vs_b)
+    tjob.v_stride_t = Int(py=vs_t)
+    tjob.v_stride_h = Int(py=vs_h)
+    tjob.vt_stride_bh = Int(py=vt_stride_bh)
+    tjob.vt_stride_d = Int(py=vt_stride_d)
+
+    var job = DenseJob()
+    job.q = Int(py=q)
+    job.kt = Int(py=kt)
+    job.v = Int(py=vk)
+    job.dst = Int(py=dst)
+    job.batch = Int(py=batch)
+    job.seq_q = Int(py=seq_q)
+    job.seq_k = Int(py=seq_k)
+    job.num_heads = Int(py=num_heads)
+    job.num_kv_heads = Int(py=num_kv_heads)
+    job.head_dim = Int(py=head_dim)
+    job.q_stride_b = Int(py=q_stride_b)
+    job.q_stride_t = Int(py=q_stride_t)
+    job.q_stride_h = Int(py=q_stride_h)
+    job.kt_stride_bh = Int(py=kt_stride_bh)
+    job.kt_stride_d = Int(py=kt_stride_d)
+    job.kt_stride_t = Int(py=kt_stride_t)
+    job.kt_blk = Int(py=kt_blk)
+    job.v_stride_b = Int(py=v_stride_b)
+    job.v_stride_t = Int(py=v_stride_t)
+    job.v_stride_h = Int(py=v_stride_h)
+    job.o_stride_b = Int(py=o_stride_b)
+    job.o_stride_t = Int(py=o_stride_t)
+    job.o_stride_h = Int(py=o_stride_h)
+    job.scale = Float32(Float64(py=scale))
+    job.causal = Bool(causal)
+    run_dense_fused(
+        tjob,
+        job,
+        dtype_code=Int(py=dtype),
+        mode=Int(py=mode),
+        qt=Int(py=qt),
+        num_workers=Int(py=num_workers),
+    )
+
+
 @export
 def PyInit__C() abi("C") -> PythonObject:
     try:
         var m = PythonModuleBuilder("_C")
         m.def_function[attention]("attention")
         m.def_function[dense_attention]("dense_attention")
+        m.def_function[dense_forward]("dense_forward")
         m.def_function[dense_transpose]("dense_transpose")
         m.def_function[dense_bf16_dot]("dense_bf16_dot")
         m.def_function[dense_bfmmla]("dense_bfmmla")

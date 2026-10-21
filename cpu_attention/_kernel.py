@@ -267,6 +267,20 @@ def _transpose_attention():
     return _TRANSPOSE
 
 
+_FORWARD = None
+
+
+def _forward():
+    """Return the extension's fused pack+attention entry point, bound once."""
+    global _FORWARD
+    if _FORWARD is None:
+        _FORWARD = require().dense_forward
+    return _FORWARD
+
+
+_FUSE = not os.environ.get("CPU_ATTENTION_NO_FUSE")
+
+
 _DENSE = None
 
 
@@ -638,37 +652,11 @@ def _dense(q, k, v, scale: float, causal: bool):
                               kt_blk), k.dtype)
         vt = (_scratch("vt0", (batch, num_kv_heads, seq_k, head_dim), v.dtype)
               if vpack else None)
-    _transpose_attention()(
-        k.data_ptr(),
-        kt.data_ptr(),
-        v.data_ptr() if vt is not None else 0,
-        vt.data_ptr() if vt is not None else 0,
-        batch,
-        num_kv_heads,
-        seq_k,
-        head_dim,
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        kt.stride(1),
-        (kt.stride(3) if mode == 0 else
-         (kt.stride(3) if mode == 1 else kt.stride(3))),
-        kt_blk,
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        vt.stride(1) if vt is not None else 0,
-        vt.stride(2) if vt is not None else 0,
-        _DTYPE_CODES[k.dtype],
-        mode,
-        # The pack is one task per (batch, kv head) and each task does
-        # `seq_k` strided row copies, so "pages" has to count tokens, not
-        # 64-token blocks: at 8 heads the old `seq_k // 64` kept the pack
-        # single-threaded up to seq_k 512, where it costs 23.7 us of a 71 us
-        # call at S=128 (8 workers: 5.5 us).
-        _workers(batch * num_kv_heads, seq_k // 8),
-    )
-
+    # The pack's strides: `kt_blk` keys per contiguous K^T block, and the V
+    # scratch's per-head base and per-key-group stride.
+    kt_bh, kt_d = kt.stride(1), kt.stride(3)
+    vt_bh = vt.stride(1) if vt is not None else 0
+    vt_d = vt.stride(2) if vt is not None else 0
     out = torch.empty_like(q, memory_format=torch.contiguous_format)
     qb, qtok, qh = q.stride(0), q.stride(1), q.stride(2)
     # In mode 2 the kernel reads the packed V (one row per head dim *pair*, one
@@ -693,6 +681,80 @@ def _dense(q, k, v, scale: float, causal: bool):
         ktd = kt.stride(3)                      # dim stride within a block
         ktt = kt.stride(4) if mode == 1 else 1  # token stride inside a block
     tasks = batch * num_heads * (-(-seq_q // qt))
+    workers = _workers(tasks, 8)
+    if _FUSE:
+        # One OpenMP region for the pack and the attention, with a barrier
+        # between them: two fork-joins cost two pool wakes, and at S=128 the
+        # barrier was 14% of the process by perf. `CPU_ATTENTION_NO_FUSE=1`
+        # restores the two-call form, which is what `tests/bench_phases.py`
+        # instruments to split pack from kernel.
+        _forward()(
+            k.data_ptr(),
+            kt.data_ptr(),
+            v.data_ptr(),
+            vt.data_ptr() if vt is not None else 0,
+            v_ptr,
+            batch,
+            num_kv_heads,
+            seq_k,
+            head_dim,
+            k.stride(0),
+            k.stride(1),
+            k.stride(2),
+            vt_bh,
+            vt_d,
+            v.stride(0),
+            v.stride(1),
+            v.stride(2),
+            q.data_ptr(),
+            out.data_ptr(),
+            seq_q,
+            num_heads,
+            qb,
+            qtok,
+            qh,
+            vb,
+            vtok,
+            vh,
+            ob,
+            otok,
+            oh,
+            scale,
+            causal,
+            _DTYPE_CODES[q.dtype],
+            mode,
+            ktb,
+            ktd,
+            ktt,
+            kt_blk,
+            qt,
+            workers,
+        )
+        return out
+    _transpose_attention()(
+        k.data_ptr(),
+        kt.data_ptr(),
+        v.data_ptr() if vt is not None else 0,
+        vt.data_ptr() if vt is not None else 0,
+        batch,
+        num_kv_heads,
+        seq_k,
+        head_dim,
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        kt_bh,
+        kt_d,
+        kt_blk,
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        vt_bh,
+        vt_d,
+        _DTYPE_CODES[k.dtype],
+        mode,
+        _workers(batch * num_kv_heads, seq_k // 8),
+    )
     _dense_attention()(
         q.data_ptr(),
         kt.data_ptr(),
@@ -721,6 +783,6 @@ def _dense(q, k, v, scale: float, causal: bool):
         causal,
         _DTYPE_CODES[q.dtype],
         qt,
-        _workers(tasks, 8),
+        workers,
     )
     return out
