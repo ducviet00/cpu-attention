@@ -1718,12 +1718,15 @@ def _dense_task[dtype: DType, head_dim: Int, qt: Int](job: DenseJob, task: Int):
             )
     elif dtype == DType.bfloat16 and BF16_DOT:
         _dense_rows_dot[dtype, head_dim, qt](job, batch, head, kv_head, q0)
-    elif qt * head_dim > 512:
-        # acc (qt * head_dim / LANES zmm) + logits (qt * KT_TILE / LANES) no
-        # longer fit in 32 registers: keep acc in L1 and tile the head dim.
-        # The threshold is 512 rather than 384 because the register kernel is 6%
-        # faster at 8 rows x 64 dims where both are legal (measured, and it is
-        # only unusable above 512).
+    elif qt * head_dim >= 512:
+        # acc (qt * head_dim / LANES zmm) + logits (qt * KT_TILE / LANES) do
+        # not fit in 32 registers: keep acc in L1 and tile the head dim.
+        # The threshold is `>=`, not `>`: 8 rows x 64 dims is exactly 512 floats
+        # of accumulator *plus* 8 x KT_TILE/16 = 32 zmm of logits, i.e. 64 zmm
+        # of live state, so it spills in the register kernel. Measured on the
+        # Ryzen, interleaved, medians of 5: 1.05-1.10x for the L1-accumulator
+        # kernel at 1024/2048/4096 x 8 x 64 fp32, and with qt=6 instead of 8 on
+        # top of that (CPU_ATTENTION_QT=6) the same shapes gain 1.19-1.22x.
         _dense_rows_mem[dtype, head_dim, qt, 32, 32, False](
             job, batch, head, kv_head, q0
         )
