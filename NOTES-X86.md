@@ -1,3 +1,13 @@
+**Integrator correction (2026-10-22).** The `128:8:64 fp32` result below does
+not reproduce: three focused runs of
+`tests/bench_vs_refs.py --vllm ~/vllm_cpu_build/vllm_cpu_attn_bench.so --isa vec
+--dtype fp32 --shapes 128:8:64 --rounds 9` on the same box give ours 125/129/144
+us against vLLM 110/109/108, i.e. **o/vllm 1.14-1.33 (median 1.19)**, not 0.98.
+The tree contains no change that should move that row 20% (the in-place
+transpose measured neutral), so the 0.98 was almost certainly a run where our
+side landed ~30% faster than it does now. Treat x86 as **21/22 against VEC**, and
+that one row as open.
+
 # NOTES-X86 — the AMX campaign (x86 kernel agent)
 
 Ratios are `ours/baseline` (below 1 = we win). Box: `ubuntu@3.27.45.233`,
@@ -366,3 +376,235 @@ built from `a[i] = (i%7)*0.25`, `b[i] = (i%5)*-0.5` and reported 0.0 against a
 different layouts. **Layout tests need irregular data.** With `(i*37)%101` the
 same test separates them immediately, and it also caught that
 `tdpbf16ps`'s AT&T operand order puts the destination tile *last*.
+
+---
+
+# Round 4 — the short-S rows: the per-call intercept, measured
+
+Branch `x86-small-s`. Question: why do the short/medium bf16 rows lose to
+vLLM-AMX, and is `128:8:64 fp32` (1.18 vs VEC) the same problem.
+
+## The answer, in one table
+
+`/tmp/intercept.py` style sweep, H=8 D=64 bf16 causal, 2 threads, medians:
+
+| S | ours us | vLLM-AMX us | ratio |
+|---:|---:|---:|---:|
+| 8 | 19 | 4 | 4.37 |
+| 16 | 22 | 7 | 3.11 |
+| 32 | 18 | 11 | 1.70 |
+| 64 | 29 | 26 | 1.14 |
+| 128 | 68 | 59 | 1.15 |
+| 256 | 200 | 179 | 1.12 |
+
+Fit the two lines: **our slope is 0.38 us/key, vLLM's is 0.43.** We are *faster
+per key than their AMX kernel*. The whole deficit is the intercept: **ours ~18 us,
+theirs ~4 us**, and it is flat in S, so it is exactly what dominates the seven
+losing rows and it is the same thing that loses `128:8:64 fp32`.
+
+## What the intercept is made of (`tests/bench_amx_phases.py`)
+
+| shape | total | pack | attention | fixed (region + marshalling) |
+|---|---:|---:|---:|---:|
+| 128:8:64 bf16 | 52 | 16 (31%) | 31 (60%) | 7.3 |
+| 256:16:128 bf16 | 431 | 116 (27%) | 338 | 13 |
+| 512:8:64 bf16 | 417 | 96 (23%) | 346 | 10 |
+| 128:8:64 fp32 | 97 | 37 (38%) | 61 | 7.9 |
+
+and inside the attention (`tests/bench_amx_ablate.py`, marginal cost of each
+phase as a share of the attention part): **Q@K^T 33-40%, softmax 45-55%, P@V
+0-10%** at these shapes — the softmax is the largest single piece, and P@V is
+nearly free once the accumulator is L1-resident.
+
+Independent confirmation that it is a *fixed* cost, not work: a heads sweep at
+S=128 gives +4.8 us per 4 items, i.e. **~1.2 us per work item on top of its
+matmul**, and our per-item overhead is about the same as vLLM's. Their advantage
+is entirely that their timed region starts with K/V already staged.
+
+## What I changed and what it was worth
+
+* **16x16 transpose in place, two temporaries.** The first version built a new
+  16-register array per stage, so 32 zmm were live on a 32-register machine.
+  K pack 19 -> 14 us, fp32 pack 44 -> 37. Ported.
+* **Profiling knobs** (`CPU_ATTENTION_AMX_MODE` bit table in the kernel header)
+  and `tests/bench_amx_phases.py` / `tests/bench_amx_ablate.py` rewritten for
+  them. These are what produced the tables above; keep them.
+
+## Falsified this round
+
+* **Hoisting the bounds check out of the pack's unrolled load loop.** The theory
+  was that 16 conditional loads per tile put every load in its own basic block
+  (IPC 0.16). Measured: neutral (pack 16-17 vs 14-16, inside noise). Reverted.
+* **Cost-ordered work-item dispatch.** A causal item's cost is proportional to
+  its key range, so plain round-robin gives one thread blocks 0+2 and the other
+  1+3 (128 vs 192 units at S=128) and the call scaled only 1.08x on two cores.
+  Ordering items by descending cost and round-robining over that should balance
+  it exactly. Measured: **no change at S=128 and 3% worse at 1024:16:128 and
+  4096:16:128**. Reverted. So the imbalance is not what limits the S=128 call.
+* **More threads.** 3T and 4T are within 1% of 2T at every shape
+  (2T/1T 1.83x, 4T/1T 1.83x at 1024:16:128), so this box has ~2 cores' worth of
+  throughput and `_physical_cores()` capping at 2 is right. Worth recording:
+  `/sys/.../thread_siblings_list` says cpu0 and cpu2 are siblings, but
+  `taskset -c 0,2` is *faster* than `taskset -c 0-1` (59 vs 65 us at S=128), i.e.
+  the VM's topology labels do not describe the host's real cores. Do not trust
+  them for affinity decisions.
+
+## The open item, with the numbers that bracket it
+
+The pack moves 512 KB (read+write) in 16 us at S=128 = **32 GB/s**, against a
+measured 139 GB/s for an L2-resident copy of that size. Its instruction budget is
+~96 per 1 KB tile (16 loads of 64 B, 64 `vpermt2d`, 16 stores) = ~25 K
+instructions per thread = **~2 us at 1.2 IPC**. Both estimates say 2-4 us; it
+takes 16. There are **no zmm spills** in either worker (`objdump` on
+`_gomp_worker_amx_bf16`: 0 `vmovdqu64 %zmm,(%rsp)`, 12 static `tileloadd`,
+2352 instructions total), so it is not register pressure. Something is stalling
+inside the pack loop that neither the instruction count nor the traffic explains,
+and that is the one thing left that would close these rows: at 3x the pack rate
+S=128 would be 52 -> 41 us against vLLM's 46-59, i.e. every remaining bf16 row
+and the fp32 row would flip.
+
+---
+
+# Round 5 — the pack, isolated. It cannot go below ~10 us, and here is why
+
+Branch `x86-small-s`, on `main` after the ARM merge (which routes the Mojo
+AVX-512/ARM paths through a fused pack+attention region; the AMX kernel already
+had one). Re-baselined first, as asked: parity green, and S=128 pack 14 us,
+total 51 us — the round-4 numbers hold.
+
+## The ladder (`cpu_attention/_mojo/tests/pack_bench.mojo`)
+
+Same 16 loads of 64 B / transpose / 16 stores of 64 B per tile, 512 tiles per
+rep, 8 reps, variants interleaved, single-threaded, medians of 9:
+
+| variant | ns/tile | GB/s |
+|---|---:|---:|
+| full | **22** | 89 |
+| no loads (transpose + stores only) | **16** | 124 |
+| no transpose (loads + stores only) | **22** | 89 |
+
+Read it twice, because it kills the obvious theory:
+
+* **The transpose is free.** Removing it changes nothing (22 = 22): the network
+  is entirely hidden behind the memory ops. The integrator's prior — 4 dependent
+  stages x 16 shuffles = ~190 cycles per tile — does not survive; with 16
+  independent outputs per stage the chain is 4 x 3 cycles, not 64 x 3.
+* **The loads are the cost**, and even so, loads+stores alone run at **89 GB/s**
+  for 2 KB of traffic per tile, which is the same class as the L2-resident copy
+  ceiling (139 GB/s).
+
+So the *tile* work is not the problem. The problem is that the same code inside
+the kernel runs at ~109 ns/tile/thread (14 us for 256 tiles over 2 threads) —
+5x the standalone rate — and **nothing I changed from inside the pack moved the
+whole-call number**:
+
+| change | A/B result (new/old, interleaved, `ab_two_trees.py`, 4 shapes x 2 dtypes) |
+|---|---|
+| in-place transpose, 2 temps (16+2 registers live instead of 32) | 0.99-1.03x, i.e. neutral |
+| transpose split into 4 distinct stage functions (`_tr_s0..s3`, matching `dense.mojo`) so LLVM cannot reroll the stages into a runtime loop with per-stage index-vector loads | 1.00-1.02x bf16, 0.99-1.03x fp32 |
+| pack task = 8 key blocks instead of 1 (decode ~16x instead of ~100x, removing ~2.6 us of `idiv` from a 14 us pass) | neutral |
+| `PackJob` fields hoisted to locals (no aliasing info in Mojo, so the compiler may reload `k_stride_t` after every store) | neutral |
+| bounds-check hoisting in the unrolled load loop (round 4) | neutral |
+
+`objdump` agrees that it is not register pressure (0 `vmovdqu64 %zmm,(%rsp)` in
+either worker) and not call overhead (the pack is inlined: the worker's only
+`call`s are `omp_get_thread_num`, `omp_get_num_threads`, `GOMP_barrier`,
+`memset`). It also shows the transpose *does* get rerolled into a loop with the
+index vectors loaded from `.rodata` per iteration — which is why the split-stage
+rewrite looked so promising — but fixing it changed nothing measurable, so the
+reroll is not what costs either.
+
+## Verdict, with the numbers
+
+At S=128 (the worst row) the pack is 10-16 us of a 49-55 us call, and a
+*free* pack would leave us at ~40 us against vLLM's 46-59 — i.e. the row is
+reachable only by making the pack ~free, not by making it 2x faster. Everything
+I can reach from inside the pack is neutral, the tile loop is already at memcpy
+class standalone, and the residual (kernel 109 ns/tile vs standalone 22) is not
+register pressure, call overhead, instruction count, the transpose network, the
+task decode, or aliasing. I could not find it, and I would now stop rather than
+grind: the honest statement is **the pack cannot go below ~10 us by any change I
+have been able to test**, and the remaining bf16 rows plus `128:8:64 fp32` are
+not reachable through this path.
+
+The one structural option left is the one you raised and I rejected twice:
+the pack is a pure function of K/V, and every work item's *first* super-tile
+needs only keys [0, q0+32). Overlapping it with the attention needs a
+producer/consumer handshake (per-key-block ready flags) or a three-phase split
+(K pack | QK+softmax while packing V | P@V), which costs an extra barrier and a
+global P buffer per work item (512 KB at S=128/H=8). Estimated ceiling: V is
+half the pack, so at best it saves ~half of it — 5-8 us — and the three-phase
+version also has to beat the extra barrier and P traffic. That is a redesign of
+the driver, not a pack optimisation, and I would want your go-ahead before
+building it.
+
+`pack_bench.mojo` stays: it is the instrument that says where to look (loads,
+not the network) and where not to (the transpose).
+
+## Final table on the merged tree (`scripts/verify.sh ... r5`)
+
+| | beats SDPA | beats VLLM-VEC | beats VLLM-AMX |
+|---|---|---|---|
+| fp32 (11 rows) | 11/11 | **11/11** | n/a (their AMX has no fp32) |
+| bf16 (11 rows) | 11/11 | 11/11 | 6/11 |
+
+**All 22 rows now beat vLLM-VEC**, including `128:8:64 fp32`, which was 1.18-1.21
+across the last four verify runs and measured **0.98** here (o/sdpa 0.38 against
+0.55 in the previous run — the merge with `main` moved it, and the ratio moved
+more than the drift band, so it is not noise). The remaining bf16 losses against
+vLLM's AMX build are 128:8:64 (1.49), 512:32:128 (1.13), 256:16:128 (1.14),
+512:8:64 (1.07), 1024:16:128 (1.00) — every one of them the pack+fixed
+intercept measured in round 4, not the kernel.
+
+## Round 5b — the pack question is CLOSED
+
+Four more probes after the ladder, all negative. Written down so nobody
+re-derives them.
+
+**1. It is not TLB and not page faults.** `perf stat` on 400 pack-only calls vs
+400 no-pack calls (same script, same shape): `dTLB-load-misses` 2.27 M of 1.19 G
+loads = **0.19%** (the standalone loop: 0.04%), `page-faults` identical (41 800,
+all torch startup). The counters also give the pack's own cost directly: the
+difference between the two runs is **41 M instructions and 17 M cycles over 400
+calls = 102 K instructions and 42 K cycles per call**, i.e. 11 us — the same
+number the phase bench reports. The ARM agent's 28 GB/s and our 32 GB/s are not
+a TLB effect.
+
+**2. The pack retires ~400 instructions per 1 KB tile; the same tile standalone
+retires ~96.** 102 K instructions per call at S=128 is 256 tiles' worth, and the
+tile is 16 loads + 64 shuffles + 16 stores. So the in-call pack executes ~4x the
+instructions of the identical tile loop, at IPC 2.4 (so it is not stalled — it is
+doing more work). That is the whole "5x slower than standalone" mystery, and it
+is an *instruction* effect, not a memory one.
+
+**3. Three source formulations compile to the same code, and none of them change
+it.** (a) the stages in one function with `comptime for k`; (b) each stage a
+separate `@inline(.always)` function (matching `dense.mojo`'s `_tr16_s0..s3`, so
+LLVM cannot reroll across them); (c) sixteen *named* locals with all 64
+`shuffle` calls written out and no array indexing at all, so no memory form is
+expressible. All three: identical `perf` instruction count (4.564 / 4.569 /
+4.574 G over the same 400 calls, within 0.2%) and identical wall time
+(0.99-1.03x in `ab_two_trees`). Mojo/LLVM normalises them, and the 4x is what
+this expression lowers to on this toolchain. Not fixable from the source side.
+
+**4. The three-phase split is decisively out, measured not modelled.** Deferring
+P@V forces every work item's P (probabilities) to survive until the V pack
+finishes, so the per-thread P buffer grows from one item's worth to all of that
+thread's items. Writing + reading that buffer, warm, single-threaded:
+
+| shape | P per thread | traffic | cost | (V pack it would hide) |
+|---|---:|---:|---:|---:|
+| 128:8:64 | 96 KB | 192 KB | 25.8 us | ~7 us |
+| 256:16:128 | 640 KB | 1280 KB | 426 us | ~52 us |
+| 512:32:128 | 4.6 MB | 9.2 MB | 13.3 ms | ~200 us |
+
+The buffer costs **2-8x the phase it would overlap**, at every target shape, and
+it is 640 KB-4.6 MB per thread, i.e. out of L2. The "K pack | QK+softmax |
+V pack + P@V" idea is dead on its own traffic, so I did not build it.
+
+**Status: closed.** At S=128 the pack is 10-16 us of a 49-55 us call; a *free*
+pack would leave us at ~40 us against vLLM's 46-59; the pack cannot be made
+faster by any source change this toolchain responds to, and it cannot be hidden
+behind the attention without paying more than it costs. `128:8:64` bf16 (1.49)
+needs the *kernel* ~25% faster at 60 us, which is a different project and not
+started.
