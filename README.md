@@ -311,28 +311,33 @@ overrides `qt` for experiments.
 
 ### Against torch SDPA
 
-Ryzen 7 7840H, 8 threads, causal, `tests/bench_dense.py`, two runs (median of a
-150 ms budget per cell; the spread between runs is < 6%). Ratio `sdpa / ours`,
-so > 1 is faster, and it includes the K transpose + allocation each call:
+Ryzen 7 7840H, 8 threads, causal, interleaved per shape (`tests/bench_vs_refs.py`).
+Measured at **1.94 GHz** (the box throttles; the ratios are what matter, absolute
+GFLOP/s would be ~2.4x higher unthrottled):
 
-| case | bf16 | fp32 |
-|---|---:|---:|
-| S=128 H=8 D=64 | 1.27-1.37 | 0.93-1.03 |
-| S=512 H=8 D=64 | 2.51-2.53 | 1.95-1.98 |
-| S=1024 H=8 D=64 | 2.05-2.07 | 1.49 |
-| S=2048 H=8 D=64 | 1.83-1.86 | 1.30-1.33 |
-| S=4096 H=8 D=64 | 1.66-1.70 | 1.03-1.05 |
-| S=256 H=16 D=128 | 1.43-1.44 | 1.43-1.45 |
-| S=1024 H=16 D=128 | 1.41-1.43 | 0.83-0.86 |
-| S=2048 H=16 D=128 | 1.25-1.26 | 0.94-1.01 |
-| S=512 H=32 D=128 | 1.58-1.67 | 1.34-1.44 |
-| S=1024 H=8 D=32 | 1.79-1.81 | 1.54-1.56 |
-| B=2 S=1024 H=8 D=64 | 2.15-2.16 | 1.49-1.51 |
-| GQA H=16/Hk=4 S=512 D=64 | 2.52-2.53 | 1.95-2.04 |
+| case | ours | SDPA | ratio | GFLOP/s |
+|---|---:|---:|---:|---:|
+| S=128 H=8 D=64 bf16 | 42 µs | 76 | **1.79x** | |
+| S=512 H=8 D=64 bf16 | 283 | 1 341 | **4.74x** | 948 |
+| S=2048 H=8 D=64 bf16 | 4 509 | 7 705 | **1.71x** | 953 |
+| S=1024 H=16 D=128 bf16 | 6 925 | 9 225 | **1.33x** | 620 |
+| S=2048 H=16 D=128 bf16 | 29 004 | 31 460 | **1.08x** | 592 |
+| S=4096 H=16 D=128 bf16 | 107 664 | 116 641 | **1.08x** | 638 |
+| S=128 H=8 D=64 fp32 | 57 | 87 | **1.54x** | |
+| S=512 H=8 D=64 fp32 | 668 | 1 280 | **1.92x** | 402 |
+| S=2048 H=8 D=64 fp32 | 6 388 | 7 333 | **1.15x** | 672 |
+| S=1024 H=16 D=128 fp32 | 9 247 | 8 747 | 0.95x | 464 |
+| S=2048 H=16 D=128 fp32 | 27 723 | 30 660 | **1.11x** | 620 |
+| S=4096 H=16 D=128 fp32 | 95 149 | 118 209 | **1.24x** | 722 |
 
-Non-causal (the encoder case) is the same story with a smaller margin, because
-every query block sweeps the whole key range: 1.0-1.55x on bf16 and 0.6-1.2x on
-fp32, the low end again `H=16 D=128`.
+11 of 12 beat SDPA; the exception is `S=1024/D=128` fp32 at 0.95x. The two
+biggest single moves were **per-head-contiguous K and V** (vLLM's page layout;
+our dense call was reading V tokens 8 KB apart and K^T dims `seq_k` apart):
+`S=4096/H=16/D=128` fp32 went **0.61x -> 1.24x** (2.0x), and **workers-per-pack**
+sizing (the K/V pack ran single-threaded below S=512): S=512 bf16 **4.7x**.
+
+Against vLLM on this box we are ahead on bf16 at D=64 and ~1.2-1.3x behind on the
+rest; see `AGENTS.md` §9 for what binds (the softmax block) and what is left.
 
 ### On Graviton 5 (Neoverse-V3, 8 cores)
 
