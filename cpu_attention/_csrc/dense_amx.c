@@ -58,6 +58,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -589,6 +590,10 @@ typedef struct {
 } Buf;
 
 static Buf g_pack_k, g_pack_v, g_thread;
+/* ctypes releases the GIL around the call, so two Python threads can be inside
+ * this function at once. The packed K/V and the per-thread scratch are shared,
+ * so serialise the call: the cost is a futex-free uncontended lock. */
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void *grow(Buf *b, size_t need) {
   if (b->cap < need) {
@@ -630,6 +635,7 @@ int dense_amx_bf16(const void *q, const void *k, const void *v, void *out,
   if (kt % KEYCH) return 1;
   if (nthreads < 1) nthreads = 1;
 
+  pthread_mutex_lock(&g_lock);
   const int64_t kb32 = (seq_k + 31) / 32;
   const int64_t kb16 = kb32 * 2;
   const int64_t dc32 = head_dim / 32, dc16 = head_dim / 16;
@@ -641,7 +647,10 @@ int dense_amx_bf16(const void *q, const void *k, const void *v, void *out,
       (size_t)kt * QROWS * 4 + (size_t)kt * QROWS * 2 +
       (size_t)QROWS * head_dim * 4 + (size_t)QROWS * head_dim * 2 + 128;
   Scratch *scr = (Scratch *)grow(&g_thread, per_thread * (size_t)nthreads);
-  if (!kp || !vp || !scr) return 1;
+  if (!kp || !vp || !scr) {
+    pthread_mutex_unlock(&g_lock);
+    return 1;
+  }
   char *sp = (char *)scr;
 
   PackJob pj;
@@ -735,6 +744,7 @@ int dense_amx_bf16(const void *q, const void *k, const void *v, void *out,
       dense_item(&c, &sc, b2, h2, g * QROWS);
     }
   }
+  pthread_mutex_unlock(&g_lock);
   return 0;
 }
 

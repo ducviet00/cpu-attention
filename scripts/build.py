@@ -37,8 +37,10 @@ C_FLAGS = [
 
 def build_c() -> None:
     """gcc-build the C kernels; silently skipped off x86_64."""
-    if platform.machine() not in ("x86_64", "AMD64"):
-        print("skip the C kernels: x86_64 only")
+    if not sys.platform.startswith("linux") or platform.machine() not in (
+        "x86_64", "AMD64",
+    ):
+        print("skip the C kernels: linux x86_64 only")
         return
     cc = os.environ.get("CC", "gcc")
     if shutil.which(cc) is None:
