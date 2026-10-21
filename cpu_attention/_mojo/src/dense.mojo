@@ -1426,9 +1426,12 @@ def _dense_task[dtype: DType, head_dim: Int, qt: Int](job: DenseJob, task: Int):
             )
     elif dtype == DType.bfloat16 and BF16_DOT:
         _dense_rows_dot[dtype, head_dim, qt](job, batch, head, kv_head, q0)
-    elif qt * head_dim > 384:
+    elif qt * head_dim > 512:
         # acc (qt * head_dim / LANES zmm) + logits (qt * KT_TILE / LANES) no
         # longer fit in 32 registers: keep acc in L1 and tile the head dim.
+        # The threshold is 512 rather than 384 because the register kernel is 6%
+        # faster at 8 rows x 64 dims where both are legal (measured, and it is
+        # only unusable above 512).
         _dense_rows_mem[dtype, head_dim, qt, 32, 32, False](
             job, batch, head, kv_head, q0
         )

@@ -554,6 +554,16 @@ i.e. attention 29.8-49.6 + interference +39.2 against 90.7 + 25.9.
    Consequences, measured: `CPU_ATTENTION_QT=8` is **1.20-1.34x** on x86 fp32
    (L2 miss 6.34 -> 2.62%) at 2048:8:64, 1024:16:128 and 4096:8:128; on ARM
    `qt=2` is 0.74-0.80x and **fp32 `qt=6` is a free 1.09-1.11x** at every long S.
+   The shipped rule (`_kernel._qt_for`) is a per-(ISA, dtype, head_dim, seq_k)
+   table: x86 fp32 `qt=8` for head_dim 64/128 and 4 at 32; x86 bf16 8 at 128 and
+   4 at 64 (8 rows x 64 dims = 32 zmm of accumulator, the spills eat the gain);
+   ARM fp32 6 at <=64 / 2 at 128; ARM bf16 4 (D=64) / 8 (D=128). The register
+   kernel's threshold moved 384 -> 512 so 8 rows x 64 dims stays on it (6% faster
+   than the L1-acc kernel where both are legal). **In-process A/B on the Ryzen
+   measures qt 4 vs 8 as 1.00x at every shape**, i.e. this is a server-only win
+   (4 physical cores); the laptop number moves 20-30% between runs on that box
+   and cannot settle it.
+
    `qt=8` does *not* transplant to ARM because `qt > 4` flips the tile to
    `[BKS, 4, 8]` (half the key tile, double the row pairs) and blows the register
    file — that is a config coupling, not a row-count limit.

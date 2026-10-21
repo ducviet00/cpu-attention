@@ -346,7 +346,19 @@ def _qt_for(
         if head_dim <= 64:
             return 6 if seq_k >= 1024 else 4
         return 2
-    return _QT
+    # x86. Measured on m8i (4 physical cores), 1/4/8 threads, interleaved:
+    # qt=8 is 1.19x at head_dim 64 fp32 and 1.14x at 128, and the row effect is
+    # 1.18-1.19x no matter which kernel runs (register 1.19x, L1-accumulator
+    # 1.18x), so this is the rows, not the kernel. bf16 D=64 is the exception:
+    # 8 rows x 64 dims of accumulator is 32 zmm, and the spill instructions eat
+    # more than the wider sweep gains (a wash). head_dim 32 gains nothing (0.94x).
+    if seq_k < 1024:
+        return 4
+    if head_dim == 32:
+        return 4
+    if is_bf16:
+        return 8 if head_dim >= 128 else 4
+    return 8
 
 
 def _dense(q, k, v, scale: float, causal: bool):
