@@ -1147,6 +1147,102 @@ comptime TBLK = 16
 destination is written a cache line at a time instead of 4 bytes at a time (which
 is what ``torch.permute(...).contiguous()`` does here -- 5-15 GB/s)."""
 
+comptime WIDE_TP = LANES >= 16
+"""Whether the transpose runs as 16x16 register tiles (AVX-512) or through L1.
+
+Both variants move the same bytes; they differ in what the *source* read costs.
+Gathering one head dim of 16 tokens is 16 scalar loads ``head_dim * sizeof(T)``
+apart, i.e. 16 different cache lines, and the old loop did that once per head
+dim -- so every source line was re-read ``head_dim`` times and the pass moved
+``head_dim`` times the tensor through L2/L3 (at head_dim 128 / S=512 / H=32 that
+measured 1.0 ms for 16.8 MB, 16 GB/s). The register form loads whole 64-byte
+rows once and permutes them into columns, so DRAM traffic is one read plus one
+write and the instruction count drops from 17 per 64-byte store to 6."""
+
+
+@inline(.always)
+def _tr16_s0[dt: DType](
+    m: Array[SIMD[dt, 16], 16]
+) -> Array[SIMD[dt, 16], 16]:
+    """16x16 transpose, stage 0 of 4: swap row bit 0 with lane bit 0.
+
+    Stage ``k`` swaps bit ``k`` of the row index with bit ``k`` of the lane
+    index; the product of the four stages is the transpose. Each stage is one
+    ``shuffle[mask](a, b)`` per output row (a permute of the 32-lane
+    concatenation of the two source rows), i.e. 64 permutes per 1 KB tile.
+    """
+    var o = Array[SIMD[dt, 16], 16](uninitialized=True)
+    comptime for i in range(8):
+        var a = m[2 * i]
+        var b = m[2 * i + 1]
+        o[2 * i] = a.shuffle[
+            0, 16, 2, 18, 4, 20, 6, 22, 8, 24, 10, 26, 12, 28, 14, 30
+        ](b)
+        o[2 * i + 1] = a.shuffle[
+            1, 17, 3, 19, 5, 21, 7, 23, 9, 25, 11, 27, 13, 29, 15, 31
+        ](b)
+    return o.copy()
+
+
+@inline(.always)
+def _tr16_s1[dt: DType](
+    m: Array[SIMD[dt, 16], 16]
+) -> Array[SIMD[dt, 16], 16]:
+    """16x16 transpose, stage 1: swap row bit 1 with lane bit 1."""
+    var o = Array[SIMD[dt, 16], 16](uninitialized=True)
+    comptime for i in range(16):
+        comptime if (i >> 1) & 1 == 0:
+            comptime b = i | 2
+            o[i] = m[i].shuffle[
+                0, 1, 16, 17, 4, 5, 20, 21, 8, 9, 24, 25, 12, 13, 28, 29
+            ](m[b])
+            o[b] = m[i].shuffle[
+                2, 3, 18, 19, 6, 7, 22, 23, 10, 11, 26, 27, 14, 15, 30, 31
+            ](m[b])
+    return o.copy()
+
+
+@inline(.always)
+def _tr16_s2[dt: DType](
+    m: Array[SIMD[dt, 16], 16]
+) -> Array[SIMD[dt, 16], 16]:
+    """16x16 transpose, stage 2: swap row bit 2 with lane bit 2."""
+    var o = Array[SIMD[dt, 16], 16](uninitialized=True)
+    comptime for i in range(16):
+        comptime if (i >> 2) & 1 == 0:
+            comptime b = i | 4
+            o[i] = m[i].shuffle[
+                0, 1, 2, 3, 16, 17, 18, 19, 8, 9, 10, 11, 24, 25, 26, 27
+            ](m[b])
+            o[b] = m[i].shuffle[
+                4, 5, 6, 7, 20, 21, 22, 23, 12, 13, 14, 15, 28, 29, 30, 31
+            ](m[b])
+    return o.copy()
+
+
+@inline(.always)
+def _tr16_s3[dt: DType](
+    m: Array[SIMD[dt, 16], 16]
+) -> Array[SIMD[dt, 16], 16]:
+    """16x16 transpose, stage 3: swap row bit 3 with lane bit 3."""
+    var o = Array[SIMD[dt, 16], 16](uninitialized=True)
+    comptime for i in range(8):
+        var a = m[i]
+        var b = m[i + 8]
+        o[i] = a.shuffle[
+            0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23
+        ](b)
+        o[i + 8] = a.shuffle[
+            8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31
+        ](b)
+    return o.copy()
+
+
+@inline(.always)
+def _tr16[dt: DType](m: Array[SIMD[dt, 16], 16]) -> Array[SIMD[dt, 16], 16]:
+    """Transpose a 16x16 tile held in registers (rows in, rows out)."""
+    return _tr16_s3(_tr16_s2(_tr16_s1(_tr16_s0(m))))
+
 
 struct TransposeJob(Copyable, ImplicitlyCopyable, Movable):
     """K -> K^T (the Q@K^T sweep's layout) and V -> the P@V operand layout.
@@ -1221,35 +1317,100 @@ def _transpose_head[
     while t0 < job.seq_k:
         var n = min(TBLK, job.seq_k - t0)
         comptime if mode == 0:
-            comptime for d in range(head_dim):
-                var v = SIMD[DType.float32, TBLK](0.0)
+            comptime if WIDE_TP:
+                # 16 tokens x 16 head dims per register tile: whole rows in,
+                # whole columns out, so the source is read once (see WIDE_TP).
+                var d0 = 0
+                while d0 < head_dim:
+                    var rows = Array[SIMD[dtype, 16], 16](uninitialized=True)
+                    comptime for i in range(TBLK):
+                        if i < n:
+                            rows[i] = src.unsafe_load[width=16](
+                                (t0 + i) * job.k_stride_t + d0
+                            )
+                        else:
+                            rows[i] = SIMD[dtype, 16](Scalar[dtype](0))
+                    var cols = _tr16[dtype](rows)
+                    comptime for d in range(16):
+                        dst.unsafe_store[width=16](
+                            (t0 // job.kt_blk) * (head_dim * job.kt_blk)
+                            + (d0 + d) * job.kt_stride_d
+                            + t0 % job.kt_blk,
+                            cols[d],
+                        )
+                    d0 += 16
+            else:
+                # Lanes narrower than the tile: stage 16 whole rows in L1, then
+                # gather each column out of it. Every source line is read once
+                # (the old form re-read it once per head dim) and the gathers
+                # are L1 hits.
+                var tile = stack_allocation[TBLK * head_dim, dtype]()
                 comptime for i in range(TBLK):
                     if i < n:
-                        v[i] = Scalar[DType.float32](
-                            src.unsafe_load((t0 + i) * job.k_stride_t + d)
+                        tile.unsafe_store[width=head_dim](
+                            i * head_dim,
+                            src.unsafe_load[width=head_dim](
+                                (t0 + i) * job.k_stride_t
+                            ),
                         )
-                dst.unsafe_store[width=TBLK](
-                    (t0 // job.kt_blk) * (head_dim * job.kt_blk)
-                    + d * job.kt_stride_d
-                    + t0 % job.kt_blk,
-                    v.cast[dtype](),
-                )
+                comptime for d in range(head_dim):
+                    var v = SIMD[dtype, TBLK](Scalar[dtype](0))
+                    comptime for i in range(TBLK):
+                        v[i] = tile.unsafe_load(i * head_dim + d)
+                    dst.unsafe_store[width=TBLK](
+                        (t0 // job.kt_blk) * (head_dim * job.kt_blk)
+                        + d * job.kt_stride_d
+                        + t0 % job.kt_blk,
+                        v,
+                    )
         elif mode == 1:
-            comptime for d2 in range(head_dim // 2):
-                var v = SIMD[dtype, 2 * TBLK](0.0)
-                comptime for i in range(TBLK):
-                    if i < n:
-                        var row = src.unsafe_offset(
-                            (t0 + i) * job.k_stride_t + 2 * d2
+            comptime if WIDE_TP:
+                # Same tile, but the element is a head-dim *pair* (two adjacent
+                # bf16), so one 16-lane register is a 64-byte run of a token.
+                # The pairs are addressed as int32, since a 16-lane bitcast of a
+                # 32-lane bf16 value is not a thing this compiler accepts.
+                var src32 = _ptr[Int32](Int(src))
+                var dst32 = _ptr[Int32](Int(dst))
+                var d0 = 0
+                while d0 < head_dim // 2:
+                    var rows = Array[SIMD[DType.int32, 16], 16](
+                        uninitialized=True
+                    )
+                    comptime for i in range(TBLK):
+                        if i < n:
+                            rows[i] = src32.unsafe_load[width=16](
+                                ((t0 + i) * job.k_stride_t) // 2 + d0
+                            )
+                        else:
+                            rows[i] = SIMD[DType.int32, 16](0)
+                    var cols = _tr16[DType.int32](rows)
+                    comptime for d in range(16):
+                        dst32.unsafe_store[width=16](
+                            (
+                                (t0 // job.kt_blk) * (head_dim * job.kt_blk)
+                                + (d0 + d) * job.kt_stride_d
+                                + (t0 % job.kt_blk) * 2
+                            )
+                            // 2,
+                            cols[d],
                         )
-                        v[2 * i] = row.unsafe_load(0)
-                        v[2 * i + 1] = row.unsafe_load(1)
-                dst.unsafe_store[width=2 * TBLK](
-                    (t0 // job.kt_blk) * (head_dim * job.kt_blk)
-                    + d2 * job.kt_stride_d
-                    + (t0 % job.kt_blk) * 2,
-                    v,
-                )
+                    d0 += 16
+            else:
+                comptime for d2 in range(head_dim // 2):
+                    var v = SIMD[dtype, 2 * TBLK](0.0)
+                    comptime for i in range(TBLK):
+                        if i < n:
+                            var row = src.unsafe_offset(
+                                (t0 + i) * job.k_stride_t + 2 * d2
+                            )
+                            v[2 * i] = row.unsafe_load(0)
+                            v[2 * i + 1] = row.unsafe_load(1)
+                    dst.unsafe_store[width=2 * TBLK](
+                        (t0 // job.kt_blk) * (head_dim * job.kt_blk)
+                        + d2 * job.kt_stride_d
+                        + (t0 % job.kt_blk) * 2,
+                        v,
+                    )
         else:
             # 16 tokens = 8 key pairs = 64 bf16 per head-dim group: one 128-byte
             # store, 4 head dims of one key per 8-byte load.
