@@ -433,14 +433,11 @@ def _qt_for(
     if lanes < 16:
         # fp32 v2 (tile logits in L1) wants 8 rows at every head dim: rows are
         # what the K/V read is amortised over and the register file no longer
-        # caps them. ``CPU_ATTENTION_QT=4`` selects the old online-softmax path.
+        # caps them. ``CPU_ATTENTION_QT=4`` selects the old online-softmax path,
+        # which wanted 6 (measured 1.09-1.11x over 4 at D<=64, 1.42-1.73x at
+        # D=128 back when the accumulator lived in L1 and rows cost kt + dc
+        # registers -- kept here only as history).
         return 8
-        if head_dim <= 64:
-            return 6 if seq_k >= 1024 else 4
-        # head_dim 128 takes the same 6 (1.42-1.73x over the old qt=2); the
-        # "32 registers per row" argument does not apply because this kernel keeps
-        # the accumulator in L1, so a row costs kt + dc registers.
-        return 6
     # x86. Measured on m8i (4 physical cores), 1/4/8 threads, interleaved:
     # qt=8 is 1.19x at head_dim 64 fp32 and 1.14x at 128, and the row effect is
     # 1.18-1.19x no matter which kernel runs (register 1.19x, L1-accumulator
