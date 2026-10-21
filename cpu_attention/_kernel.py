@@ -226,8 +226,37 @@ def _paged(
     )
 
 
-_TRANSPOSE = None
+_LLC = None
 
+
+def _llc_bytes() -> int:
+    """Last-level cache size in bytes, from sysfs (32 MiB if unknown).
+
+    Only used to decide whether a dense V is worth copying into a per-head
+    contiguous slab: the copy pays when V no longer fits, and the P@V sweep is
+    the only reader.
+    """
+    global _LLC
+    if _LLC is None:
+        size = 0
+        try:
+            for idx in (3, 2, 1, 0):
+                with open(f"/sys/devices/system/cpu/cpu0/cache/index{idx}/size") as f:
+                    text = f.read().strip()
+                mult = 1
+                if text.endswith("K"):
+                    mult, text = 1024, text[:-1]
+                elif text.endswith("M"):
+                    mult, text = 1024 * 1024, text[:-1]
+                size = int(text) * mult
+                break
+        except (OSError, ValueError):
+            size = 0
+        _LLC = size or (32 << 20)
+    return _LLC
+
+
+_TRANSPOSE = None
 
 def _transpose_attention():
     """Return the extension's K-transpose entry point, bound once."""
@@ -388,7 +417,33 @@ def _dense(q, k, v, scale: float, causal: bool):
     # needs V repacked too (its P@V contracts over keys). Padded to the key tile
     # (64) so the last tile never reads past the buffer; the mask kills the
     # padding lanes.
+    #
+    # V gets a plain contiguous copy per (batch, kv head) when it no longer fits
+    # in the LLC, because the P@V sweep reads one head's V rows once per key and
+    # a dense V puts consecutive tokens `heads * head_dim` apart -- 8 KB at 16
+    # heads x 128 dims, a stride the hardware prefetcher cannot follow. vLLM's
+    # paged cache hands its P@V sweep that layout for free
+    # (`[block][head][block_size][head_dim]`: 512 B per token); a dense call has
+    # to pay one linear copy (33 MB at 40-70 GB/s, 1-2% of the call). Measured
+    # on the Ryzen, interleaved, bit-identical output (`max|diff| 0`):
+    #
+    #   S=4096 H=16 D=128 fp32 (V 33.5 MB): 1.90x
+    #   S=2048 H=16 D=128 fp32 (V 16.8 MB): 1.04x
+    #   S=4096 H= 8 D= 64 fp32 (V  8.4 MB): 0.99x
+    #   S=4096 H=16 D=128 bf16 (V 16.8 MB): 0.94x
+    #
+    # so it is gated on fp32 (whose P@V is V-bandwidth-bound; bf16 spends its
+    # P@V instructions widening V instead) and on V being at least half the LLC.
+    vpack = (v.dtype == torch.float32
+             and v.numel() * v.element_size() * 2 >= _llc_bytes())
     seq_k_pad = -(-seq_k // 64) * 64
+    # K^T is blocked every `kt_blk` keys so one Q@K^T tile is a single linear run
+    # (`[tile][dim][kt_blk]`) instead of `head_dim` rows `kt_blk * elt` apart --
+    # 16 KB at seq_k 4096. Same reason as the V copy below, and the same
+    # measurement: handed the blocked layout, S=4096/H=16/D=128 fp32 gains
+    # 1.2-1.4x over the plain `[head_dim, seq_k]` transpose. `seq_k_pad` (i.e. no
+    # blocking) keeps the 4-lane/ARM layouts byte-identical to before.
+    kt_blk = 4 * _lanes() if _lanes() >= 16 and not bfmmla else seq_k_pad
     if bfmmla:
         mode = 2
         kt = torch.empty(
@@ -399,13 +454,20 @@ def _dense(q, k, v, scale: float, causal: bool):
         )
     elif k.dtype == torch.bfloat16 and _bf16_dot():
         mode = 1
-        kt = torch.empty((batch, num_kv_heads, head_dim // 2, seq_k_pad, 2),
-                         dtype=k.dtype)
-        vt = None
+        kt = torch.empty(
+            (batch, num_kv_heads, head_dim // 2, seq_k_pad // kt_blk, kt_blk, 2),
+            dtype=k.dtype,
+        )
+        vt = (torch.empty((batch, num_kv_heads, seq_k, head_dim), dtype=v.dtype)
+              if vpack else None)
     else:
         mode = 0
-        kt = torch.empty((batch, num_kv_heads, head_dim, seq_k_pad), dtype=k.dtype)
-        vt = None
+        kt = torch.empty(
+            (batch, num_kv_heads, seq_k_pad // kt_blk, head_dim, kt_blk),
+            dtype=k.dtype,
+        )
+        vt = (torch.empty((batch, num_kv_heads, seq_k, head_dim), dtype=v.dtype)
+              if vpack else None)
     _transpose_attention()(
         k.data_ptr(),
         kt.data_ptr(),
@@ -419,7 +481,8 @@ def _dense(q, k, v, scale: float, causal: bool):
         k.stride(1),
         k.stride(2),
         kt.stride(1),
-        kt.stride(2),
+        kt.stride(3) if mode == 0 else (kt.stride(3) if mode == 1 else kt.stride(2)),
+        kt_blk,
         v.stride(0),
         v.stride(1),
         v.stride(2),
@@ -446,7 +509,12 @@ def _dense(q, k, v, scale: float, causal: bool):
         vb, vtok, vh = v.stride(0), v.stride(1), v.stride(2)
         v_ptr = v.data_ptr()
     ob, otok, oh = out.stride(0), out.stride(1), out.stride(2)
-    ktb, ktd, ktt = kt.stride(1), kt.stride(2), kt.stride(3)
+    ktb = kt.stride(1)
+    if mode == 2:
+        ktd, ktt = kt.stride(2), kt.stride(3)   # bfmmla: its own packing
+    else:
+        ktd = kt.stride(3)                      # dim stride within a block
+        ktt = kt.stride(4) if mode == 1 else 1  # token stride inside a block
     tasks = batch * num_heads * (-(-seq_q // qt))
     _dense_attention()(
         q.data_ptr(),
@@ -465,6 +533,7 @@ def _dense(q, k, v, scale: float, causal: bool):
         ktb,
         ktd,
         ktt,
+        kt_blk,
         vb,
         vtok,
         vh,

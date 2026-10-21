@@ -36,6 +36,7 @@ def dense_transpose(
     k_stride_h: PythonObject,
     kt_stride_bh: PythonObject,
     kt_stride_d: PythonObject,
+    kt_blk: PythonObject,
     v_stride_b: PythonObject,
     v_stride_t: PythonObject,
     v_stride_h: PythonObject,
@@ -60,6 +61,7 @@ def dense_transpose(
     job.k_stride_h = Int(py=k_stride_h)
     job.kt_stride_bh = Int(py=kt_stride_bh)
     job.kt_stride_d = Int(py=kt_stride_d)
+    job.kt_blk = Int(py=kt_blk)
     job.v_stride_b = Int(py=v_stride_b)
     job.v_stride_t = Int(py=v_stride_t)
     job.v_stride_h = Int(py=v_stride_h)
@@ -183,6 +185,7 @@ def dense_attention(
     kt_stride_bh: PythonObject,
     kt_stride_d: PythonObject,
     kt_stride_t: PythonObject,
+    kt_blk: PythonObject,
     v_stride_b: PythonObject,
     v_stride_t: PythonObject,
     v_stride_h: PythonObject,
@@ -217,6 +220,7 @@ def dense_attention(
     job.kt_stride_bh = Int(py=kt_stride_bh)
     job.kt_stride_d = Int(py=kt_stride_d)
     job.kt_stride_t = Int(py=kt_stride_t)
+    job.kt_blk = Int(py=kt_blk)
     job.v_stride_b = Int(py=v_stride_b)
     job.v_stride_t = Int(py=v_stride_t)
     job.v_stride_h = Int(py=v_stride_h)

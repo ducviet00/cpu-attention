@@ -139,6 +139,10 @@ struct DenseJob(Copyable, ImplicitlyCopyable, Movable):
     var kt_stride_bh: Int
     var kt_stride_d: Int
     var kt_stride_t: Int
+    # Keys per contiguous K^T block: the transposed K is `[tile][dim][kt_blk]`,
+    # so one Q@K^T tile is one linear run instead of `head_dim` rows
+    # `kt_blk * sizeof(T)` apart. Set to `seq_k_pad` for the unblocked layout.
+    var kt_blk: Int
     var v_stride_b: Int
     var v_stride_t: Int
     var v_stride_h: Int
@@ -165,6 +169,7 @@ struct DenseJob(Copyable, ImplicitlyCopyable, Movable):
         self.kt_stride_bh = 0
         self.kt_stride_d = 0
         self.kt_stride_t = 0
+        self.kt_blk = 0
         self.v_stride_b = 0
         self.v_stride_t = 0
         self.v_stride_h = 0
@@ -311,6 +316,10 @@ def _dense_rows[
 
     var t0 = 0
     while t0 < loop_end:
+        # Offset of this tile inside the (possibly blocked) K^T.
+        var kbase = (t0 // job.kt_blk) * (head_dim * job.kt_blk) + (
+            t0 % job.kt_blk
+        ) * job.kt_stride_t
         var logits = Array[SIMD[DType.float32, KT_TILE], qt](uninitialized=True)
         comptime for r in range(qt):
             logits[r] = SIMD[DType.float32, KT_TILE](0.0)
@@ -320,7 +329,7 @@ def _dense_rows[
         var d = 0
         while d < head_dim:
             var kv = kt_base.unsafe_load[width=KT_TILE](
-                d * job.kt_stride_d + t0 * job.kt_stride_t
+                d * job.kt_stride_d + kbase
             ).cast[DType.float32]()
             comptime for r in range(qt):
                 logits[r] += (
@@ -477,6 +486,10 @@ def _dense_rows_mem[
 
     var t0 = 0
     while t0 < loop_end:
+        # Offset of this tile inside the (possibly blocked) K^T.
+        var kbase = (t0 // job.kt_blk) * (head_dim * job.kt_blk) + (
+            t0 % job.kt_blk
+        ) * job.kt_stride_t
         var logits = Array[SIMD[DType.float32, kt], qt](uninitialized=True)
         comptime if pairs:
             comptime NV = kt // LANES
@@ -497,7 +510,7 @@ def _dense_rows_mem[
                             a,
                             kt_base.unsafe_load[width=OPN](
                                 dp * job.kt_stride_d
-                                + t0 * job.kt_stride_t
+                                + kbase
                                 + v * OPN
                             ),
                         )
@@ -514,7 +527,7 @@ def _dense_rows_mem[
             var d = 0
             while d < head_dim:
                 var kv = kt_base.unsafe_load[width=kt](
-                    d * job.kt_stride_d + t0 * job.kt_stride_t
+                    d * job.kt_stride_d + kbase
                 ).cast[DType.float32]()
                 comptime for r in range(qt):
                     logits[r] += (
@@ -663,6 +676,10 @@ def _dense_rows_dot[
 
     var t0 = 0
     while t0 < loop_end:
+        # Offset of this tile inside the (possibly blocked) K^T.
+        var kbase = (t0 // job.kt_blk) * (head_dim * job.kt_blk) + (
+            t0 % job.kt_blk
+        ) * job.kt_stride_t
         var accs = Array[SIMD[DType.float32, LANES], qt * NV](
             uninitialized=True
         )
@@ -680,7 +697,7 @@ def _dense_rows_dot[
                         a,
                         kt_base.unsafe_load[width=OPN](
                             dp * job.kt_stride_d
-                            + t0 * job.kt_stride_t
+                            + kbase
                             + v * OPN
                         ),
                     )
@@ -1152,6 +1169,7 @@ struct TransposeJob(Copyable, ImplicitlyCopyable, Movable):
     var k_stride_h: Int
     var kt_stride_bh: Int
     var kt_stride_d: Int
+    var kt_blk: Int
     var v_stride_b: Int
     var v_stride_t: Int
     var v_stride_h: Int
@@ -1172,6 +1190,7 @@ struct TransposeJob(Copyable, ImplicitlyCopyable, Movable):
         self.k_stride_h = 0
         self.kt_stride_bh = 0
         self.kt_stride_d = 0
+        self.kt_blk = 0
         self.v_stride_b = 0
         self.v_stride_t = 0
         self.v_stride_h = 0
@@ -1210,7 +1229,10 @@ def _transpose_head[
                             src.unsafe_load((t0 + i) * job.k_stride_t + d)
                         )
                 dst.unsafe_store[width=TBLK](
-                    d * job.kt_stride_d + t0, v.cast[dtype]()
+                    (t0 // job.kt_blk) * (head_dim * job.kt_blk)
+                    + d * job.kt_stride_d
+                    + t0 % job.kt_blk,
+                    v.cast[dtype](),
                 )
         elif mode == 1:
             comptime for d2 in range(head_dim // 2):
@@ -1223,7 +1245,10 @@ def _transpose_head[
                         v[2 * i] = row.unsafe_load(0)
                         v[2 * i + 1] = row.unsafe_load(1)
                 dst.unsafe_store[width=2 * TBLK](
-                    d2 * job.kt_stride_d + t0 * 2, v
+                    (t0 // job.kt_blk) * (head_dim * job.kt_blk)
+                    + d2 * job.kt_stride_d
+                    + (t0 % job.kt_blk) * 2,
+                    v,
                 )
         else:
             # 16 tokens = 8 key pairs = 64 bf16 per head-dim group: one 128-byte
@@ -1240,6 +1265,47 @@ def _transpose_head[
                 dst.unsafe_store[width=4 * TBLK](
                     g * job.kt_stride_d + t0 * 4, v
                 )
+        t0 += TBLK
+
+
+@inline(.always)
+def _vcopy_head[
+    dtype: DType, head_dim: Int
+](job: TransposeJob, batch: Int, head: Int):
+    """Copy one (batch, kv head) of V so its tokens are contiguous.
+
+    V arrives as ``[batch, seq_k, heads, head_dim]``, i.e. one head's V rows are
+    ``heads * head_dim`` elements apart -- 8 KB at 16 heads x head_dim 128 fp32.
+    The P@V sweep walks those rows once per key per d-chunk, so on a 33 MB V that
+    stride is what the prefetcher cannot follow: measured on the Ryzen,
+    ``S=4096 H=16 D=128`` fp32 runs **1.95x** faster when the same values are
+    handed over head-major (16.8 MB: 1.14x; head_dim 64 or bf16, where V fits in
+    cache: 1.0x). vLLM gets this layout for free from its paged cache
+    (``[block][head][block_size][head_dim]``, 512 B per token); a dense V does
+    not, so it is packed here with the K transpose in the same fork-join.
+
+    It is a straight copy -- no transpose, no dtype change -- so the result is
+    bit-identical to reading V in place; it costs 1-2% of the call (33 MB at
+    40-70 GB/s against a 100 ms kernel).
+    """
+    var src = _ptr[Scalar[dtype]](job.v).unsafe_offset(
+        batch * job.v_stride_b + head * job.v_stride_h
+    )
+    var dst = _ptr[Scalar[dtype]](job.vt).unsafe_offset(
+        (batch * job.num_kv_heads + head) * job.vt_stride_bh
+    )
+    var t0 = 0
+    while t0 < job.seq_k:
+        var n = min(TBLK, job.seq_k - t0)
+        comptime for i in range(TBLK):
+            if i < n:
+                dst.unsafe_store[width=head_dim](
+                    i * head_dim,
+                    src.unsafe_load[width=head_dim](
+                        (t0 + i) * job.v_stride_t
+                    ),
+                )
+        dst = dst.unsafe_offset(TBLK * head_dim)
         t0 += TBLK
 
 
@@ -1321,6 +1387,12 @@ def _transpose_task[
         # The bfmmla path needs V position-major too; pack both in one pass so
         # the call pays a single fork-join.
         _vpack_head[dtype, head_dim](job, batch, head)
+    else:
+        # Every other path reads V with `_vcopy_head`'s contiguous layout, when
+        # the Python side decided the copy pays (`vt == 0` otherwise: same
+        # `v_stride_t` the caller handed us, read in place).
+        if job.vt != 0:
+            _vcopy_head[dtype, head_dim](job, batch, head)
 
 
 def _transpose_dispatch[
