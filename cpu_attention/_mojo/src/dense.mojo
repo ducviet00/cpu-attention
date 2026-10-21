@@ -186,6 +186,24 @@ def _ptr[T: AnyType](address: Int) -> MutPointer[T, MutUntrackedOrigin]:
 
 
 @inline(.always)
+def fold_quarters[
+    n: Int
+](p: SIMD[DType.float32, n]) -> SIMD[DType.float32, LANES]:
+    """Sum a tile-wide probability vector into one vector of ``LANES`` lanes.
+
+    ``row_sum`` only needs the total, so the per-tile horizontal reduce can be
+    replaced by ``n / LANES - 1`` vector adds here plus a single horizontal
+    reduce per row at the end of the call. With ``n = 64`` that is 3 adds against
+    a 4-step dependent tree, and it removes the tile-to-tile serialisation.
+    """
+    var acc = SIMD[DType.float32, LANES](0.0)
+    comptime for i in range(n // LANES):
+        comptime for l in range(LANES):
+            acc[l] += p[i * LANES + l]
+    return acc
+
+
+@inline(.always)
 def _bf16_dot[
     dtype: DType
 ](
@@ -302,10 +320,14 @@ def _dense_rows[
     var acc = Array[SIMD[DType.float32, head_dim], qt](uninitialized=True)
     var row_max = Array[Float32, qt](uninitialized=True)
     var row_sum = Array[Float32, qt](uninitialized=True)
+    # Per-row sum of the tile probabilities, folded to one vector per row so the
+    # horizontal reduce happens once per row per call rather than per tile.
+    var sumv = Array[SIMD[DType.float32, LANES], qt](uninitialized=True)
     comptime for r in range(qt):
         acc[r] = SIMD[DType.float32, head_dim](0.0)
         row_max[r] = Scalar[DType.float32](NEG_INF)
         row_sum[r] = Scalar[DType.float32](0.0)
+        sumv[r] = SIMD[DType.float32, LANES](0.0)
 
     var probs = stack_allocation[qt * KT_TILE, DType.float32]()
 
@@ -360,22 +382,40 @@ def _dense_rows[
                 )
 
         # Online softmax for the block, then P@V.
+        #
+        # Two things are deferred out of the inner loop because the horizontal
+        # reduce is the only *serial* dependency in the tile (a 16-lane tree is
+        # ~4 dependent steps, and the reorder buffer cannot span two tiles):
+        #
+        #  * the row *sum* accumulates into a per-row vector (`sumv`) and is
+        #    reduced once per row at the end, instead of once per tile;
+        #  * the running max only moves when the tile max exceeds it by more than
+        #    FA4's threshold of 8 (`cpu_attn_impl.hpp:1468`), so the rescale --
+        #    and its dependency on exp() -- fires rarely. Drift is bounded by 8,
+        #    far below the e^88 overflow point, and a rescale is exact.
         comptime for r in range(qt):
             var m_old = row_max[r]
             var m_new = max(
                 m_old, Scalar[DType.float32](logits[r].reduce_max())
             )
-            var alpha = Scalar[DType.float32](0.0)
-            if m_new > Scalar[DType.float32](NEG_INF):
-                alpha = _vexp_f(m_old - m_new)
+            var threshold = m_old + Scalar[DType.float32](8.0)
+            if m_old == Scalar[DType.float32](NEG_INF):
+                threshold = m_old
+            if m_new > threshold:
+                var alpha = _vexp_f(m_old - m_new)
+                row_max[r] = m_new
+                sumv[r] = sumv[r] * alpha
+                acc[r] = acc[r] * alpha
+            else:
+                # Keep the stale max: exp() is then up to e^8 larger, which is
+                # exact (the final divide removes the offset) and bounded.
+                m_new = m_old
+            # A row whose keys are all masked keeps m = -inf, and
+            # -inf - -inf is NaN: keep the guard that used to live here.
             var p = SIMD[DType.float32, KT_TILE](0.0)
             if m_new > Scalar[DType.float32](NEG_INF):
                 p = _vexp[KT_TILE](logits[r] - m_new)
-            row_sum[r] = row_sum[r] * alpha + Scalar[DType.float32](
-                p.reduce_add()
-            )
-            row_max[r] = m_new
-            acc[r] = acc[r] * alpha
+            sumv[r] = sumv[r] + fold_quarters(p)
             probs.unsafe_store[width=KT_TILE](r * KT_TILE, p)
 
         # Only the keys that exist: a short last tile has KT_TILE - jn masked
@@ -393,6 +433,8 @@ def _dense_rows[
 
         t0 += KT_TILE
 
+    comptime for r in range(qt):
+        row_sum[r] = Scalar[DType.float32](sumv[r].reduce_add())
     comptime for r in range(qt):
         if r < nrows:
             var out = o_base.unsafe_offset((q0 + r) * job.o_stride_t)
