@@ -5,9 +5,10 @@ The bf16 path for x86 CPUs that have AMX (`amx-tile` + `amx-bf16`): one
 flops/cycle against AVX-512 `vdpbf16ps`'s 32 -- the difference between being
 1.7-6.8x behind torch SDPA on a Xeon and being 1.4-2.4x ahead of it.
 
-This mirrors `cpu_attention/_csrc/dense_amx.c`, which stays in the tree as the
-reference until this one has been A/B'd on hardware: same layouts, same tile
-geometry, so a difference in output is a bug here.
+This started as a structural port of a gcc-built C kernel that lived in
+`cpu_attention/_csrc/`; it was A/B'd against it on the Xeon and measured
+identical (0.97-1.03x on every shape, both dtypes), so the C version is gone --
+one build artifact, no ctypes, no second language.
 
 ## Structure
 
@@ -44,7 +45,8 @@ holds `B[2r + (t & 1)][t >> 1]`. So the contraction pair (two adjacent head dims
 lives *inside* a 32-bit unit and the N index is the unit: the K pack is a 16x16
 **32-bit** transpose, not a 16-bit one. V is the same shape with the pair being
 two adjacent *keys* of one output dim. Recovered by single-bit probes in the C
-version (`dense_amx_pack_selftest`); vLLM's `reshape_and_cache` says the same
+version (`tests/amx_smoke.mojo` on a 16x16x32 GEMM, and single-bit probes in the
+C version before it was retired); vLLM's `reshape_and_cache` says the same
 ("head elements packed as quadwords").
 
 ## Numerics
@@ -112,6 +114,20 @@ def _ptr[T: AnyType](address: Int) -> MutPointer[T, MutUntrackedOrigin]:
 
 
 @inline(.always)
+def _ea(base: Int, elem: Int, esize: Int) -> Int:
+    """Byte address of element ``elem`` of an ``esize``-byte type at ``base``.
+
+    Mojo has no typed pointers, so every offset has to be scaled explicitly --
+    and mixing the two conventions is silent: half of this file's first version
+    added element offsets to a byte address, which is right only for offset 0
+    (single batch, first head, first key block) and produced NaNs and a 2x in
+    P@V everywhere else. Every address in this file now goes through _ea or is
+    already a byte quantity, and `_EA_CHECK` below keeps it that way.
+    """
+    return base + elem * esize
+
+
+@inline(.always)
 def _exp2(x: SIMD[DType.float32, 16]) -> SIMD[DType.float32, 16]:
     """2**x, and exactly +0 once x is far enough below zero.
 
@@ -133,6 +149,42 @@ def _exp2(x: SIMD[DType.float32, 16]) -> SIMD[DType.float32, 16]:
     var ni = n.cast[DType.int32]()
     var bits = (ni + SIMD[DType.int32, 16](127)) << SIMD[DType.int32, 16](23)
     return p * bitcast[DType.float32, 16](bits)
+
+
+# --------------------------------------------------- fp32 -> bf16 hi/lo split
+
+# fp32 has no AMX instruction, so the same kernel runs fp32 by splitting every
+# operand into two bf16 halves and keeping three terms of each product:
+#
+#     x = hi + lo,  hi = bf16(x),  lo = bf16(x - hi)      (|lo| <= 2^-8 |x|)
+#     x*y ~= hi_x*hi_y + hi_x*lo_y + lo_x*hi_y             (drops lo*lo, 2^-16)
+#
+# Products are exact and the accumulation is fp32, so the result is fp32-accurate
+# at 3x the tile ops -- against AMX's ~11x instruction advantage over AVX-512
+# fp32 FMA. Both phases need it (either one alone in plain bf16 is 1e-2);
+# measured 5.5-7.6e-5 max|diff| against SDPA on every benchmark shape, gate 2e-4.
+
+
+@inline(.always)
+def _hi(x: SIMD[DType.float32, 16]) -> SIMD[DType.bfloat16, 16]:
+    """The bf16 half of an fp32 vector (round to nearest even)."""
+    return x.cast[DType.bfloat16]()
+
+
+@inline(.always)
+def _lo(
+    x: SIMD[DType.float32, 16], hi: SIMD[DType.bfloat16, 16]
+) -> SIMD[DType.bfloat16, 16]:
+    """The remainder, as bf16: `bf16(x - fp32(bf16(x)))`."""
+    return (x - hi.cast[DType.float32]()).cast[DType.bfloat16]()
+
+
+@inline(.always)
+def _row32(
+    lo: SIMD[DType.bfloat16, 16], hi: SIMD[DType.bfloat16, 16]
+) -> SIMD[DType.int32, 16]:
+    """Join two 16-bf16 halves into the 16x 32-bit units a tile row wants."""
+    return bitcast[DType.int32, 16](lo.join(hi))
 
 
 # --------------------------------------------------------------------- pack
@@ -355,7 +407,9 @@ struct PackJob(Copyable, ImplicitlyCopyable, Movable):
 
 
 @inline(.always)
-def _pack_k_block(
+def _pack_k_block[
+    fp32: Bool
+](
     job: PackJob, batch: Int, head: Int, kb: Int, dc: Int
 ) -> None:
     """One 1 KB QK B tile: 16 keys x 16 head-dim pairs, transposed.
@@ -365,34 +419,64 @@ def _pack_k_block(
     the 16 keys as the N index. Keys past `seq_k` are zero, and V is zero there
     too, so a stale probability cannot inject a NaN through a padded key.
     """
-    var src = _ptr[BFloat16](
-        job.k + batch * job.k_stride_b + head * job.k_stride_h
-    )
+    comptime stride = 1024 if fp32 else 512
     var dst32 = _ptr[Int32](
         Int(job.kp)
         + (
             (batch * job.num_kv_heads + head) * job.kp_bh
-            + (kb * job.dc32 + dc) * 512
+            + (kb * job.dc32 + dc) * stride
         )
         * 2
     )
     var k0 = kb * 16
     var d0 = dc * 32
     var rows = Array[SIMD[DType.int32, 16], 16](uninitialized=True)
-    comptime for i in range(16):
-        if k0 + i < job.seq_k:
-            rows[i] = _ptr[Int32](
-                Int(src) + ((k0 + i) * job.k_stride_t + d0) * 2
-            ).unsafe_load[width=16]()
-        else:
-            rows[i] = SIMD[DType.int32, 16](0)
-    var cols = _tp16_i32(rows)
-    comptime for i in range(16):
-        dst32.unsafe_store[width=16](i * 16, cols[i])
+    if fp32:
+        # One pass produces both slabs: hi in tiles 0..511, lo in 512..1023.
+        var srcf = _ptr[Float32](
+            _ea(Int(job.k), batch * job.k_stride_b + head * job.k_stride_h, 4)
+        )
+        var rows_lo = Array[SIMD[DType.int32, 16], 16](uninitialized=True)
+        comptime for i in range(16):
+            if k0 + i < job.seq_k:
+                var f0 = _ptr[Float32](
+                    _ea(Int(srcf), (k0 + i) * job.k_stride_t + d0, 4)
+                ).unsafe_load[width=16]()
+                var f1 = _ptr[Float32](
+                    _ea(Int(srcf), (k0 + i) * job.k_stride_t + d0 + 16, 4)
+                ).unsafe_load[width=16]()
+                var h0 = _hi(f0)
+                var h1 = _hi(f1)
+                rows[i] = _row32(h0, h1)
+                rows_lo[i] = _row32(_lo(f0, h0), _lo(f1, h1))
+            else:
+                rows[i] = SIMD[DType.int32, 16](0)
+                rows_lo[i] = SIMD[DType.int32, 16](0)
+        var cols = _tp16_i32(rows)
+        var cols_lo = _tp16_i32(rows_lo)
+        comptime for i in range(16):
+            dst32.unsafe_store[width=16](i * 16, cols[i])
+            dst32.unsafe_store[width=16](256 + i * 16, cols_lo[i])
+    else:
+        var src = _ptr[BFloat16](
+            _ea(job.k, batch * job.k_stride_b + head * job.k_stride_h, 2)
+        )
+        comptime for i in range(16):
+            if k0 + i < job.seq_k:
+                rows[i] = _ptr[Int32](
+                    _ea(Int(src), (k0 + i) * job.k_stride_t + d0, 2)
+                ).unsafe_load[width=16]()
+            else:
+                rows[i] = SIMD[DType.int32, 16](0)
+        var cols = _tp16_i32(rows)
+        comptime for i in range(16):
+            dst32.unsafe_store[width=16](i * 16, cols[i])
 
 
 @inline(.always)
-def _pack_v_block(
+def _pack_v_block[
+    fp32: Bool
+](
     job: PackJob, batch: Int, head: Int, kb: Int, dc: Int
 ) -> None:
     """One 1 KB P@V B tile: 32 keys x 16 output dims.
@@ -401,39 +485,74 @@ def _pack_v_block(
     each output dim `u` the two keys' values are interleaved as a 32-bit unit:
     one `interleave` of two 16-element key rows produces a whole tile row.
     """
-    var src = _ptr[BFloat16](
-        job.v + batch * job.v_stride_b + head * job.v_stride_h
-    )
-    var dst = _ptr[BFloat16](
-        job.vp
-        + (batch * job.num_kv_heads + head) * job.vp_bh
-        + (kb * job.dc16 + dc) * 512
-    )
     var k0 = kb * 32
     var d0 = dc * 16
-    comptime for r in range(16):
-        var ka = k0 + 2 * r
-        var a = SIMD[DType.bfloat16, 16](0)
-        var c = SIMD[DType.bfloat16, 16](0)
-        if ka < job.seq_k:
-            a = src.unsafe_load[width=16](ka * job.v_stride_t + d0)
-        if ka + 1 < job.seq_k:
-            c = src.unsafe_load[width=16]((ka + 1) * job.v_stride_t + d0)
-        dst.unsafe_store[width=32](r * 32, a.interleave(c))
+    var slab_base = _ea(
+        job.vp,
+        (batch * job.num_kv_heads + head) * job.vp_bh
+        + (kb * job.dc16 + dc) * (1024 if fp32 else 512),
+        2,
+    )
+    if fp32:
+        # hi and lo as two separate pointers: one base + a shared 512-element
+        # offset expression silently landed both stores on the same slab.
+        var hi_p = _ptr[BFloat16](slab_base)
+        var lo_p = _ptr[BFloat16](slab_base + 512 * 2)  # +512 bf16
+        var srcf = _ptr[Float32](
+            _ea(Int(job.v), batch * job.v_stride_b + head * job.v_stride_h, 4)
+        )
+        comptime for r in range(16):
+            var ka = k0 + 2 * r
+            var fa = SIMD[DType.float32, 16](0)
+            var fc = SIMD[DType.float32, 16](0)
+            if ka < job.seq_k:
+                fa = srcf.unsafe_load[width=16](ka * job.v_stride_t + d0)
+            if ka + 1 < job.seq_k:
+                fc = srcf.unsafe_load[width=16]((ka + 1) * job.v_stride_t + d0)
+            # Locals in the same scope as their use, exactly as the K pack does:
+            # assigning an outer `var` inside an `if` and then reading it in a
+            # later `_lo(...)` argument handed the *pre-assignment* value to the
+            # subtraction, so the lo slab came out equal to the hi slab (a
+            # silent 2x in P@V -- caught by comparing the packed workspace
+            # against the source, not by reading the kernel).
+            var h0 = _hi(fa)
+            var h1 = _hi(fc)
+            hi_p.unsafe_store[width=32](r * 32, h0.interleave(h1))
+            lo_p.unsafe_store[width=32](
+                r * 32, _lo(fa, h0).interleave(_lo(fc, h1))
+            )
+    else:
+        var dst = _ptr[BFloat16](slab_base)
+        var src = _ptr[BFloat16](
+            _ea(job.v, batch * job.v_stride_b + head * job.v_stride_h, 2)
+        )
+        comptime for r in range(16):
+            var ka = k0 + 2 * r
+            var a = SIMD[DType.bfloat16, 16](0)
+            var c = SIMD[DType.bfloat16, 16](0)
+            if ka < job.seq_k:
+                a = src.unsafe_load[width=16](ka * job.v_stride_t + d0)
+            if ka + 1 < job.seq_k:
+                c = src.unsafe_load[width=16]((ka + 1) * job.v_stride_t + d0)
+            dst.unsafe_store[width=32](r * 32, a.interleave(c))
 
 
 @inline(.always)
-def _pack_k_slab(job: PackJob, batch: Int, head: Int, kb: Int) -> None:
+def _pack_k_slab[
+    fp32: Bool
+](job: PackJob, batch: Int, head: Int, kb: Int) -> None:
     """One task = one 16-key block, every dim chunk: one linear read of K."""
     for dc in range(job.dc32):
-        _pack_k_block(job, batch, head, kb, dc)
+        _pack_k_block[fp32](job, batch, head, kb, dc)
 
 
 @inline(.always)
-def _pack_v_slab(job: PackJob, batch: Int, head: Int, kb: Int) -> None:
+def _pack_v_slab[
+    fp32: Bool
+](job: PackJob, batch: Int, head: Int, kb: Int) -> None:
     """One task = one 32-key block, every dim chunk: one linear read of V."""
     for dc in range(job.dc16):
-        _pack_v_block(job, batch, head, kb, dc)
+        _pack_v_block[fp32](job, batch, head, kb, dc)
 
 
 # ------------------------------------------------------------------ attention
@@ -466,6 +585,7 @@ struct AmxJob(Copyable, ImplicitlyCopyable, Movable):
     var kt: Int
     var dc32: Int
     var dc16: Int
+    var fp32: Bool
 
     def __init__(out self):
         self.q = 0
@@ -491,15 +611,20 @@ struct AmxJob(Copyable, ImplicitlyCopyable, Movable):
         self.kt = 256
         self.dc32 = 0
         self.dc16 = 0
+        self.fp32 = False
 
 
 @inline(.always)
-def _amx_dense_item(
+def _amx_dense_item[
+    fp32: Bool
+](
     job: AmxJob,
     logits: MutPointer[Float32, MutUntrackedOrigin],
     prob: MutPointer[BFloat16, MutUntrackedOrigin],
     acc: MutPointer[Float32, MutUntrackedOrigin],
     qpad: MutPointer[BFloat16, MutUntrackedOrigin],
+    qpad_lo: MutPointer[BFloat16, MutUntrackedOrigin],
+    prob_lo: MutPointer[BFloat16, MutUntrackedOrigin],
     batch: Int,
     head: Int,
     q0: Int,
@@ -516,26 +641,52 @@ def _amx_dense_item(
     if job.num_heads != job.num_kv_heads:
         kvh = head // (job.num_heads // job.num_kv_heads)
     var kbase = _ptr[BFloat16](
-        job.kp + (batch * job.num_kv_heads + kvh) * job.kp_bh
+        _ea(job.kp, (batch * job.num_kv_heads + kvh) * job.kp_bh, 2)
     )
     var vbase = _ptr[BFloat16](
-        job.vp + (batch * job.num_kv_heads + kvh) * job.vp_bh
+        _ea(job.vp, (batch * job.num_kv_heads + kvh) * job.vp_bh, 2)
     )
     var obase = _ptr[BFloat16](
-        job.dst + batch * job.o_stride_b + head * job.o_stride_h
+        _ea(job.dst, batch * job.o_stride_b + head * job.o_stride_h, 2)
     )
 
     # Q is read straight from the caller's tensor when the row block is full;
     # otherwise copy the real rows into a zero-padded slab, because a partial
     # block still computes 32 rows and the padding must not contribute.
     var qptr = _ptr[BFloat16](0)
+    var qptr_lo = _ptr[BFloat16](0)
     var qstride = 0
-    if nrows == QROWS:
+    if fp32:
+        # The A operand needs no transpose, so splitting Q is a straight
+        # conversion into a per-work-item hi/lo panel (zero padded past nrows).
+        for i in range(QROWS * D):
+            qpad.unsafe_store(i, Scalar[DType.bfloat16](0))
+            qpad_lo.unsafe_store(i, Scalar[DType.bfloat16](0))
+        for r in range(nrows):
+            var srcf = _ptr[Float32](
+                _ea(
+                    job.q,
+                    batch * job.q_stride_b
+                    + (q0 + r) * job.q_stride_t
+                    + head * job.q_stride_h,
+                    4,
+                )
+            )
+            for j in range(0, D, 16):
+                var f = srcf.unsafe_load[width=16](j)
+                var h = _hi(f)
+                qpad.unsafe_store[width=16](r * D + j, h)
+                qpad_lo.unsafe_store[width=16](r * D + j, _lo(f, h))
+        qptr = qpad
+        qptr_lo = qpad_lo
+        qstride = D * 2
+    elif nrows == QROWS:
         qptr = _ptr[BFloat16](
-            job.q
-            + batch * job.q_stride_b
-            + q0 * job.q_stride_t
-            + head * job.q_stride_h
+            _ea(
+                job.q,
+                batch * job.q_stride_b + q0 * job.q_stride_t + head * job.q_stride_h,
+                2,
+            )
         )
         qstride = job.q_stride_t * 2
     else:
@@ -543,15 +694,21 @@ def _amx_dense_item(
             qpad.unsafe_store(i, Scalar[DType.bfloat16](0))
         for r in range(nrows):
             var s = _ptr[BFloat16](
-                job.q
-                + batch * job.q_stride_b
-                + (q0 + r) * job.q_stride_t
-                + head * job.q_stride_h
+                _ea(
+                    job.q,
+                    batch * job.q_stride_b
+                    + (q0 + r) * job.q_stride_t
+                    + head * job.q_stride_h,
+                    2,
+                )
             )
             for i in range(D):
                 qpad.unsafe_store(r * D + i, s.unsafe_load(i))
         qptr = qpad
         qstride = D * 2
+
+    comptime kstride = 1024 if fp32 else 512  # bf16 per packed (hi, lo) pair
+    comptime vstride = 1024 if fp32 else 512
 
     var lstride = kt * 4
     var pstride = kt * 2
@@ -588,22 +745,41 @@ def _amx_dense_item(
         # ---- Q@K^T: KEYCH keys at a time, 32 rows, into fp32 logits ----
         for ch in range(nch):
             var k0 = t0 + ch * KEYCH
-            var kb = (k0 // 16) * job.dc32 * 512
+            # kstride, not 512: fp32 pairs a (hi, lo) slab per (key block, dim
+            # chunk), so the pitch doubles. Getting this wrong is invisible for
+            # key block 0 and wrong for every later one (it showed up only at
+            # seq_k > 32, and only in fp32).
+            var kb = (k0 // 16) * job.dc32 * kstride
             tile_zero[4]()
             tile_zero[5]()
             tile_zero[6]()
             tile_zero[7]()
             for dc in range(job.dc32):
+                var kt_hi = Int(kbase) + (kb + dc * kstride) * 2
                 tile_load[0](Int(qptr) + dc * 64, qstride)
                 tile_load[1](Int(qptr) + dc * 64 + 16 * qstride, qstride)
-                tile_load[2](Int(kbase) + (kb + dc * 512) * 2, 64)
-                tile_load[3](
-                    Int(kbase) + (kb + dc * 512 + job.dc32 * 512) * 2, 64
-                )
+                tile_load[2](kt_hi, 64)
+                tile_load[3](kt_hi + job.dc32 * kstride * 2, 64)
                 tile_dpbf16ps[4, 0, 2]()
                 tile_dpbf16ps[5, 0, 3]()
                 tile_dpbf16ps[6, 1, 2]()
                 tile_dpbf16ps[7, 1, 3]()
+                if fp32:
+                    # Q_hi@K_lo, then Q_lo@K_hi (K_hi reloads from L1).
+                    tile_load[2](kt_hi + 1024, 64)
+                    tile_load[3](kt_hi + job.dc32 * kstride * 2 + 1024, 64)
+                    tile_dpbf16ps[4, 0, 2]()
+                    tile_dpbf16ps[5, 0, 3]()
+                    tile_dpbf16ps[6, 1, 2]()
+                    tile_dpbf16ps[7, 1, 3]()
+                    tile_load[0](Int(qptr_lo) + dc * 64, qstride)
+                    tile_load[1](Int(qptr_lo) + dc * 64 + 16 * qstride, qstride)
+                    tile_load[2](kt_hi, 64)
+                    tile_load[3](kt_hi + job.dc32 * kstride * 2, 64)
+                    tile_dpbf16ps[4, 0, 2]()
+                    tile_dpbf16ps[5, 0, 3]()
+                    tile_dpbf16ps[6, 1, 2]()
+                    tile_dpbf16ps[7, 1, 3]()
             var lp = Int(logits) + ch * KEYCH * 4
             tile_store[4](lp, lstride)
             tile_store[5](lp + 64, lstride)
@@ -682,7 +858,12 @@ def _amx_dense_item(
                 for j in range(0, nkp, 16):
                     var e = _exp2(fma(lr.unsafe_load[width=16](j), c1v, off))
                     acc_s = acc_s + e
-                    pp.unsafe_store[width=16](j, e.cast[DType.bfloat16]())
+                    var h = e.cast[DType.bfloat16]()
+                    pp.unsafe_store[width=16](j, h)
+                    if fp32:
+                        prob_lo.unsafe_store[width=16](
+                            (rg * 16 + r) * kt + j, _lo(e, h)
+                        )
                 rm.unsafe_store(r, Scalar[DType.float32](acc_s.reduce_add()))
             var rows = rm.unsafe_load[width=16]()
             if rg == 1:
@@ -708,15 +889,34 @@ def _amx_dense_item(
                 tile_load[6](Int(acc) + (16 * D + dc * 16) * 4, astride)
                 tile_load[7](Int(acc) + (16 * D + (dc + 1) * 16) * 4, astride)
             for ks in range(nks):
-                var vb = ((t0 // 32) + ks) * job.dc16 * 512
+                var vb = ((t0 // 32) + ks) * job.dc16 * vstride
+                var vt_hi = Int(vbase) + (vb + dc * vstride) * 2
                 tile_load[0](Int(prob) + (ks * 32) * 2, pstride)
                 tile_load[1](Int(prob) + (16 * kt + ks * 32) * 2, pstride)
-                tile_load[2](Int(vbase) + (vb + dc * 512) * 2, 64)
-                tile_load[3](Int(vbase) + (vb + (dc + 1) * 512) * 2, 64)
+                tile_load[2](vt_hi, 64)
+                tile_load[3](vt_hi + vstride * 2, 64)
                 tile_dpbf16ps[4, 0, 2]()
                 tile_dpbf16ps[5, 0, 3]()
                 tile_dpbf16ps[6, 1, 2]()
                 tile_dpbf16ps[7, 1, 3]()
+                if fp32:
+                    # P_hi@V_lo, then P_lo@V_hi
+                    tile_load[2](vt_hi + 1024, 64)
+                    tile_load[3](vt_hi + vstride * 2 + 1024, 64)
+                    tile_dpbf16ps[4, 0, 2]()
+                    tile_dpbf16ps[5, 0, 3]()
+                    tile_dpbf16ps[6, 1, 2]()
+                    tile_dpbf16ps[7, 1, 3]()
+                    tile_load[0](Int(prob_lo) + (ks * 32) * 2, pstride)
+                    tile_load[1](
+                        Int(prob_lo) + (16 * kt + ks * 32) * 2, pstride
+                    )
+                    tile_load[2](vt_hi, 64)
+                    tile_load[3](vt_hi + vstride * 2, 64)
+                    tile_dpbf16ps[4, 0, 2]()
+                    tile_dpbf16ps[5, 0, 3]()
+                    tile_dpbf16ps[6, 1, 2]()
+                    tile_dpbf16ps[7, 1, 3]()
             tile_store[4](Int(acc) + dc * 64, astride)
             tile_store[5](Int(acc) + (dc + 1) * 64, astride)
             tile_store[6](Int(acc) + (16 * D + dc * 16) * 4, astride)
@@ -735,13 +935,36 @@ def _amx_dense_item(
         var s = sv.unsafe_load(r)
         if not (s > 0.0):
             for j in range(0, D, 16):
-                orow.unsafe_store[width=16](j, Scalar[DType.bfloat16](0))
+                if fp32:
+                    var ofrow0 = _ptr[Float32](
+                        _ea(
+                            job.dst,
+                            batch * job.o_stride_b
+                            + (q0 + r) * job.o_stride_t
+                            + head * job.o_stride_h,
+                            4,
+                        )
+                    )
+                    ofrow0.unsafe_store[width=16](j, V16(0.0))
+                else:
+                    orow.unsafe_store[width=16](j, Scalar[DType.bfloat16](0))
             continue
         var iv = V16(1.0 / s)
         for j in range(0, D, 16):
-            orow.unsafe_store[width=16](
-                j, (arow.unsafe_load[width=16](j) * iv).cast[DType.bfloat16]()
-            )
+            var o = arow.unsafe_load[width=16](j) * iv
+            if fp32:
+                var ofrow = _ptr[Float32](
+                    _ea(
+                        job.dst,
+                        batch * job.o_stride_b
+                        + (q0 + r) * job.o_stride_t
+                        + head * job.o_stride_h,
+                        4,
+                    )
+                )
+                ofrow.unsafe_store[width=16](j, o)
+            else:
+                orow.unsafe_store[width=16](j, o.cast[DType.bfloat16]())
 
 
 # ------------------------------------------------------------------- driver
@@ -765,7 +988,9 @@ struct AmxDispatch(Copyable, ImplicitlyCopyable, Movable):
 
 
 @inline(.always)
-def _amx_worker(state: AmxDispatch, tid: Int, threads: Int) -> None:
+def _amx_worker[
+    fp32: Bool
+](state: AmxDispatch, tid: Int, threads: Int) -> None:
     """One worker: pack its share, wait, then run its share of the attention."""
     var cfg = stack_allocation[64, UInt8, alignment=64]()
     tile_config_bf16(16, 64, cfg)
@@ -777,7 +1002,7 @@ def _amx_worker(state: AmxDispatch, tid: Int, threads: Int) -> None:
         if task < kinds:
             var kb = task % state.pack.kb16
             var bh = task // state.pack.kb16
-            _pack_k_slab(
+            _pack_k_slab[fp32](
                 state.pack,
                 bh // state.pack.num_kv_heads,
                 bh % state.pack.num_kv_heads,
@@ -787,7 +1012,7 @@ def _amx_worker(state: AmxDispatch, tid: Int, threads: Int) -> None:
             var t = task - kinds
             var kb = t % state.pack.kb32
             var bh = t // state.pack.kb32
-            _pack_v_slab(
+            _pack_v_slab[fp32](
                 state.pack,
                 bh // state.pack.num_kv_heads,
                 bh % state.pack.num_kv_heads,
@@ -796,14 +1021,23 @@ def _amx_worker(state: AmxDispatch, tid: Int, threads: Int) -> None:
         task += threads
     if threads > 1:
         external_call["GOMP_barrier", NoneType]()
-    var logits = stack_allocation[QROWS * MAXKT, Float32]()
-    var prob = stack_allocation[QROWS * MAXKT, BFloat16]()
-    var acc = stack_allocation[QROWS * DMAX, Float32]()
-    var qpad = stack_allocation[QROWS * DMAX, BFloat16]()
+    comptime nlo = 2 if fp32 else 1
+    # alignment=64 is not cosmetic: the tile stores/loads and every SIMD access
+    # in the softmax are 64-byte accesses, and the default alignment is the
+    # element size, so unaligned buffers split a cache line per access. The C
+    # version got it free from posix_memalign; here it has to be asked for.
+    # Measured: worth 8-15% of the whole call.
+    var logits = stack_allocation[QROWS * MAXKT, Float32, alignment=64]()
+    var prob = stack_allocation[QROWS * MAXKT * nlo, BFloat16, alignment=64]()
+    var acc = stack_allocation[QROWS * DMAX, Float32, alignment=64]()
+    var qpad = stack_allocation[QROWS * DMAX * nlo, BFloat16, alignment=64]()
     var lp = _ptr[Float32](Int(logits))
     var pp = _ptr[BFloat16](Int(prob))
     var ap = _ptr[Float32](Int(acc))
     var qp = _ptr[BFloat16](Int(qpad))
+    # The hi slab is first, the lo slab right after it (MAXKT keys / D dims).
+    var pplo = _ptr[BFloat16](Int(prob) + QROWS * MAXKT * 2)
+    var qplo = _ptr[BFloat16](Int(qpad) + QROWS * DMAX * 2)
     task = tid
     var nqg = (state.job.seq_q + QROWS - 1) // QROWS
     while task < state.items:
@@ -811,20 +1045,33 @@ def _amx_worker(state: AmxDispatch, tid: Int, threads: Int) -> None:
         var rest = task // nqg
         var head = rest % state.job.num_heads
         var batch = rest // state.job.num_heads
-        _amx_dense_item(state.job, lp, pp, ap, qp, batch, head, g * QROWS)
+        _amx_dense_item[fp32](
+            state.job, lp, pp, ap, qp, qplo, pplo, batch, head, g * QROWS
+        )
         task += threads
     tile_release()
 
 
 @export
-def _gomp_worker_amx(data: Int) abi("C"):
+def _gomp_worker_amx_bf16(data: Int) abi("C"):
     var st = MutPointer[AmxDispatch, MutUntrackedOrigin](
         unsafe_from_address=data
     )
     var state = st[]
     var threads = Int(external_call["omp_get_num_threads", Int32]())
     var tid = Int(external_call["omp_get_thread_num", Int32]())
-    _amx_worker(state, tid, threads)
+    _amx_worker[False](state, tid, threads)
+
+
+@export
+def _gomp_worker_amx_fp32(data: Int) abi("C"):
+    var st = MutPointer[AmxDispatch, MutUntrackedOrigin](
+        unsafe_from_address=data
+    )
+    var state = st[]
+    var threads = Int(external_call["omp_get_num_threads", Int32]())
+    var tid = Int(external_call["omp_get_thread_num", Int32]())
+    _amx_worker[True](state, tid, threads)
 
 
 def run_dense_amx(
@@ -839,12 +1086,21 @@ def run_dense_amx(
     var state = stack_allocation[1, AmxDispatch]()
     state[] = AmxDispatch(pack, job, pack_items, items)
     if workers <= 1:
-        _amx_worker(state[], 0, 1)
+        if job.fp32:
+            _amx_worker[True](state[], 0, 1)
+        else:
+            _amx_worker[False](state[], 0, 1)
         return
-    comptime entry = _gomp_worker_amx
-    external_call["GOMP_parallel", NoneType](
-        entry, Int(state), Int32(workers), Int32(0)
-    )
+    if job.fp32:
+        comptime entry_f = _gomp_worker_amx_fp32
+        external_call["GOMP_parallel", NoneType](
+            entry_f, Int(state), Int32(workers), Int32(0)
+        )
+    else:
+        comptime entry_b = _gomp_worker_amx_bf16
+        external_call["GOMP_parallel", NoneType](
+            entry_b, Int(state), Int32(workers), Int32(0)
+        )
 
 
 def has_amx() -> Bool:

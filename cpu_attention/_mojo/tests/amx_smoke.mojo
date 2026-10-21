@@ -26,8 +26,8 @@ def main():
     for i in range(16 * 32):
         a[i] = BFloat16(Float32((i * 37) % 101) * 0.03125 - 1.5)
         kd[i] = BFloat16(Float32((i * 53) % 97) * -0.0234375 + 1.0)
-    # The B operand's packing, measured by 512 single-bit probes in
-    # _csrc/dense_amx.c: element (tile row r, index t) is B[2r + (t & 1)][t >> 1]
+    # The B operand's packing, measured by 512 single-bit probes when this was
+    # a C kernel: element (tile row r, index t) is B[2r + (t & 1)][t >> 1]
     # -- inside one 64-byte tile row the first 16 bf16 are contraction element
     # 2r across the 16 outputs, the next 16 are 2r+1. (vLLM's
     # reshape_and_cache states the same: "head elements should be packed as
