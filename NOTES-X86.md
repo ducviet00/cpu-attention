@@ -598,3 +598,60 @@ faster by any source change this toolchain responds to, and it cannot be hidden
 behind the attention without paying more than it costs. `128:8:64` bf16 (1.49)
 needs the *kernel* ~25% faster at 60 us, which is a different project and not
 started.
+
+## Round 6 — correction on `128:8:64 fp32`, and where the per-item cost really is
+
+**The `0.98` on `128:8:64 fp32` was a contaminated run.** Re-run three times in a
+clean environment (no `CPU_ATTENTION_*` set, fresh shell, after a clean rebuild):
+
+```
+ours 129 / 123 / 165 us    vllm 107 / 108 / 169    o/vllm 1.21 / 1.14 / 0.98
+sdpa 241 / 254 / 450                                 o/sdpa 0.54 / 0.49 / 0.37
+```
+
+The third run is the one that produced 0.98, and look at what moved with it:
+**vLLM's own time went 108 -> 169 us and SDPA's 254 -> 450**, i.e. that whole
+process ran ~60-80% slow. Ours moved only 28%, so the *ratio* dropped below 1
+without us getting faster. `bench_vs_refs.py` interleaves within a process, so a
+uniform slowdown preserves ratios — this one did not, which means the
+interference was bursty enough to hit some variants' samples harder than others.
+**Conclusion: the row is 1.14-1.21, the tree has 21/22 against VEC, and I should
+have flagged a single-row run whose SDPA number had moved 77%.** Single-shape
+runs on this box have +-30% error; only the full matrix in one process is worth
+quoting.
+
+## The pack number is not an ablation artifact — but the prologue/epilogue is real
+
+New profiling bits: **128 = skip the per-item Q prologue** (the zero-padded panel
+and the Q tile loads), **256 = skip the output epilogue** (the normalise-and-
+store). Medians of 11, all modes round-robin in one process, `128:8:64` bf16:
+
+| | us |
+|---|---:|
+| full | 63.9 |
+| Q prologue | **3.1** |
+| output epilogue | **3.9** |
+| both | 4.2 |
+| pack, marginal (`full - noPack`) | **14.5** |
+| pack, isolated (`packonly - nothing`) | **14.4** |
+| nothing (region + marshalling) | 9.2 |
+
+The two pack numbers agree to 1%, so the pack measurement is clean — and it has
+to be, because bit 1 skips the *whole* item loop (`task = state.items`), so
+pack-only never runs a prologue, an epilogue or a single tile instruction. The
+hypothesis that the ablation was charging the pack for per-item work is
+falsified.
+
+What the ablation *did* find is a legitimate target the integrator predicted for
+a different reason: **the Q prologue plus the output epilogue are 7 us of a
+64 us call at S=128 (11%)**, i.e. ~0.22 us per work item, on top of the ~1.2 us
+per item of everything else. Both are worth attacking:
+* the Q prologue is 2 tile loads per (key chunk, dim chunk) and Q does not change
+  across key chunks — 16 KB of redundant L1 re-reads per item at nk=128, for
+  4 KB of Q;
+* the epilogue is 12 instructions per 16 output elements and measures ~5x that,
+  the same unexplained factor as the pack (see round 5).
+
+Caveat for whoever uses bit 128: with the Q prologue skipped the kernel reads an
+uninitialised panel, and **fp32 then segfaults** (garbage logits reach a path that
+indexes past a buffer). bf16 survives. Use bit 128 for bf16 timings only.

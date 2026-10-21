@@ -477,8 +477,10 @@ struct AmxJob(Copyable, ImplicitlyCopyable, Movable):
     var fp32: Bool
     var mode: Int
     """Profiling only (CPU_ATTENTION_AMX_MODE): bit 0 skips the pack, bit 1 the
-    attention, bit 2 the V pack, bit 3 the K pack, bits 4/5/6 the Q@K^T, softmax
-    and P@V phases. Results are garbage whenever a bit is set."""
+    whole attention loop, bit 2 the V pack, bit 3 the K pack, bits 4/5/6 the
+    Q@K^T, softmax and P@V phases, bit 7 the per-item Q prologue (the Q tile
+    loads and the zero-padded panel), bit 8 the per-item output epilogue.
+    Results are garbage whenever a bit is set."""
 
     def __init__(out self):
         self.q = 0
@@ -550,7 +552,12 @@ def _amx_dense_item[
     var qptr = _ptr[BFloat16](0)
     var qptr_lo = _ptr[BFloat16](0)
     var qstride = 0
-    if fp32:
+    if (job.mode & 128) != 0:
+        # profiling: skip the Q prologue (panel build); the pointers stay valid
+        # so the tile loads below read whatever is there.
+        qptr = qpad
+        qstride = D * 2
+    elif fp32:
         # The A operand needs no transpose, so splitting Q is a straight
         # conversion into a per-work-item hi/lo panel (zero padded past nrows).
         for i in range(QROWS * D):
@@ -650,8 +657,9 @@ def _amx_dense_item[
             tile_zero[7]()
             for dc in range(job.dc32):
                 var kt_hi = Int(kbase) + (kb + dc * kstride) * 2
-                tile_load[0](Int(qptr) + dc * 64, qstride)
-                tile_load[1](Int(qptr) + dc * 64 + 16 * qstride, qstride)
+                if (job.mode & 128) == 0:
+                    tile_load[0](Int(qptr) + dc * 64, qstride)
+                    tile_load[1](Int(qptr) + dc * 64 + 16 * qstride, qstride)
                 tile_load[2](kt_hi, 64)
                 tile_load[3](kt_hi + job.dc32 * kstride * 2, 64)
                 tile_dpbf16ps[4, 0, 2]()
@@ -823,6 +831,8 @@ def _amx_dense_item[
     var sv = stack_allocation[32, Float32]()
     sv.unsafe_store[width=16](0, s0)
     sv.unsafe_store[width=16](16, s1)
+    if (job.mode & 256) != 0:
+        return  # profiling: skip the output epilogue
     for r in range(nrows):
         var orow = obase.unsafe_offset((q0 + r) * job.o_stride_t)
         var arow = acc.unsafe_offset(r * D)
