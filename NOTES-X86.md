@@ -608,3 +608,141 @@ faster by any source change this toolchain responds to, and it cannot be hidden
 behind the attention without paying more than it costs. `128:8:64` bf16 (1.49)
 needs the *kernel* ~25% faster at 60 us, which is a different project and not
 started.
+
+## Round 6 — correction on `128:8:64 fp32`, and where the per-item cost really is
+
+**The `0.98` on `128:8:64 fp32` was a contaminated run.** Re-run three times in a
+clean environment (no `CPU_ATTENTION_*` set, fresh shell, after a clean rebuild):
+
+```
+ours 129 / 123 / 165 us    vllm 107 / 108 / 169    o/vllm 1.21 / 1.14 / 0.98
+sdpa 241 / 254 / 450                                 o/sdpa 0.54 / 0.49 / 0.37
+```
+
+The third run is the one that produced 0.98, and look at what moved with it:
+**vLLM's own time went 108 -> 169 us and SDPA's 254 -> 450**, i.e. that whole
+process ran ~60-80% slow. Ours moved only 28%, so the *ratio* dropped below 1
+without us getting faster. `bench_vs_refs.py` interleaves within a process, so a
+uniform slowdown preserves ratios — this one did not, which means the
+interference was bursty enough to hit some variants' samples harder than others.
+**Conclusion: the row is 1.14-1.21, the tree has 21/22 against VEC, and I should
+have flagged a single-row run whose SDPA number had moved 77%.** Single-shape
+runs on this box have +-30% error; only the full matrix in one process is worth
+quoting.
+
+## The pack number is not an ablation artifact — but the prologue/epilogue is real
+
+New profiling bits: **128 = skip the per-item Q prologue** (the zero-padded panel
+and the Q tile loads), **256 = skip the output epilogue** (the normalise-and-
+store). Medians of 11, all modes round-robin in one process, `128:8:64` bf16:
+
+| | us |
+|---|---:|
+| full | 63.9 |
+| Q prologue | **3.1** |
+| output epilogue | **3.9** |
+| both | 4.2 |
+| pack, marginal (`full - noPack`) | **14.5** |
+| pack, isolated (`packonly - nothing`) | **14.4** |
+| nothing (region + marshalling) | 9.2 |
+
+The two pack numbers agree to 1%, so the pack measurement is clean — and it has
+to be, because bit 1 skips the *whole* item loop (`task = state.items`), so
+pack-only never runs a prologue, an epilogue or a single tile instruction. The
+hypothesis that the ablation was charging the pack for per-item work is
+falsified.
+
+What the ablation *did* find is a legitimate target the integrator predicted for
+a different reason: **the Q prologue plus the output epilogue are 7 us of a
+64 us call at S=128 (11%)**, i.e. ~0.22 us per work item, on top of the ~1.2 us
+per item of everything else. Both are worth attacking:
+* the Q prologue is 2 tile loads per (key chunk, dim chunk) and Q does not change
+  across key chunks — 16 KB of redundant L1 re-reads per item at nk=128, for
+  4 KB of Q;
+* the epilogue is 12 instructions per 16 output elements and measures ~5x that,
+  the same unexplained factor as the pack (see round 5).
+
+Caveat for whoever uses bit 128: with the Q prologue skipped the kernel reads an
+uninitialised panel, and **fp32 then segfaults** (garbage logits reach a path that
+indexes past a buffer). bf16 survives. Use bit 128 for bf16 timings only.
+
+## Round 6b — the clock is NOT downclocked, and my "4x instructions" claim is retracted
+
+**Clock, measured with `perf stat -e cycles` over a 20-iteration run minus the
+same script at 0 iterations (single-threaded, 2048:8:64):**
+
+| workload | cycles/second |
+|---|---:|
+| full AMX attention (bf16) | **3.80 GHz** |
+| AVX-512 Mojo attention | 3.67 GHz |
+| scalar burn loop | 3.90 GHz |
+
+**There is no AMX downclock on this box.** So the round-6 caveat — "half of every
+5x gap I quoted may be frequency" — is **wrong and retracted**: the clock is the
+same under AMX, AVX-512 and scalar code, and the gaps are real work.
+
+**And the "~400 instructions per tile against ~96 standalone" figure does not
+survive.** It came from a `perf stat -e instructions` difference between
+pack-only and no-pack runs, and that difference is **0.9-3% of a 4.5 G-instruction
+process**, i.e. inside the process-to-process startup variance of torch itself.
+Trying to split it further (K-only vs V-only vs both, 400 calls each) gives
+incoherent numbers — K alone +140 M, V alone +145 M, both +152 M — which is the
+signature of noise, not of an accounting. **Retracted.** What is solid:
+
+* the pack costs **10-16 us** at S=128 by two independent methods that agree to
+  1% (marginal `full - noPack` = 14.5 us, isolated `packonly` = 14.4 us, and
+  pack-only skips the whole item loop so it cannot be contaminated);
+* the same tile work standalone runs at **22 ns/tile, 89 GB/s**, with the
+  transpose free (round 5);
+* the debut of the 5x: unexplained and now *not* frequency and *not* evidenced
+  by instruction count. Anyone re-opening this needs the two-point perf method
+  (100 vs 900 iterations, subtract) rather than the single-run difference.
+
+**Epilogue is not a divide artefact.** `objdump`: the bf16 worker contains
+exactly one `vdiv*` (one scalar reciprocal per row, as written) and the whole
+`.so` has zero `vdivps`. So the 3.9 us epilogue is not a vector divide.
+
+**The Q prologue cannot be hoisted with 8 tiles.** The A operand needs 4 tiles
+for D=64 (2 row groups x 2 dim chunks), the B operand 2 and the C tiles 4: that
+is 10. Hoisting Q out of the key-chunk loop would need the whole Q panel live in
+tiles across chunks, which does not fit; the alternatives are 16-key chunks
+(2 C tiles, worse softmax) or D=32 only. Recorded so it is not attempted again.
+
+## Round 7 — the pack is COLD-READ-BOUND. Question closed for real.
+
+The standalone bench re-runs the same tiles, so K/V stay in L1/L2 — but in the
+real matrix our call is interleaved with SDPA and vLLM, whose own traffic pushes
+K/V out, and in a real model the previous layer does the same. So the pack may be
+paying cold reads. `tests/bench_amx_phases.py --flush <MB>` now evicts between
+timed calls (this box reports **480 MB of L3**, so a useful flush is several
+hundred MB), and the same in-call phases re-measured (2 threads, medians of 15):
+
+| S=128 H=8 D=64 | hot | flushed (600 MB) | cold minus the `nothing` baseline |
+|---|---:|---:|---:|
+| nothing (region + marshalling) | 8.8 | 97.1 | — |
+| pack only | 12.6 | 122.4 | **3.8 hot -> 25.3 cold (6.7x)** |
+| full | 61.8 | 169.7 | 53.0 hot -> 72.6 cold (+37%) |
+
+| S=256 H=16 D=128 | hot | flushed | net pack |
+|---|---:|---:|---:|
+| nothing | 8.5 | 96.6 | — |
+| pack only | 64.3 | 228.5 | 55.8 -> 131.9 (2.4x) |
+| full | 428.9 | 580.6 | 420 -> 484 (+15%) |
+
+**The pack is cold-read-bound, and that is the whole 5x.** The standalone 22 ns/tile
+is a *hot* number (L2-resident source and destination); the same work on cold data
+costs 6.7x more at S=128, and nothing about it is instruction count, the transpose
+network, or the clock (round 6b: 3.8 GHz sustained, no downclock). It is
+irreducible in the two-pass structure: **we must read K and V once from outside
+cache, and a two-pass kernel pays one extra cold read+write of the packed copy
+that a fused one-pass kernel would not.**
+
+That closes the bf16 short-S pack thread for good, and it is the honest reason the
+five bf16 rows against vLLM-AMX sit at 1.0-1.15: their timed region starts with
+K/V already staged, ours starts cold. The only version that would change it is the
+one-pass design (read K directly into tiles for QK by swapping the A/B operands
+and packing only V, at S <= 256) — a different kernel, not a pack fix, and not
+started.
+
+x86 is frozen at `21/22` against the campaign's literal bar (`--isa vec`), one row
+open at ~1.15, both parity suites green.
