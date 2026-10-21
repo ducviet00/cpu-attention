@@ -383,7 +383,7 @@ def _dense_rows[
         # Only the keys that exist: a short last tile has KT_TILE - jn masked
         # lanes whose probability is exactly 0, and reading their V would walk
         # past the end of the tensor (0 * garbage is garbage, not 0).
-        var jn = min(KT_TILE, seq_k - t0)
+        var jn = min(KT_TILE, loop_end - t0)
         var j = 0
         while j < jn:
             var vrow = v_base.unsafe_load[width=head_dim](
@@ -586,7 +586,7 @@ def _dense_rows_mem[
             row_max[r] = m_new
             probs.unsafe_store[width=kt](r * kt, p)
 
-        var jn = min(kt, seq_k - t0)
+        var jn = min(kt, loop_end - t0)
         comptime for dci in range(head_dim // dc):
             var accv = Array[SIMD[DType.float32, dc], qt](uninitialized=True)
             comptime for r in range(qt):
@@ -759,7 +759,7 @@ def _dense_rows_dot[
         # Only the keys that exist: a short last tile has KT_TILE - jn masked
         # lanes whose probability is exactly 0, and reading their V would walk
         # past the end of the tensor (0 * garbage is garbage, not 0).
-        var jn = min(KT_TILE, seq_k - t0)
+        var jn = min(KT_TILE, loop_end - t0)
         var j = 0
         while j < jn:
             var vrow = v_base.unsafe_load[width=head_dim](
@@ -1717,7 +1717,17 @@ def _dense_task[dtype: DType, head_dim: Int, qt: Int](job: DenseJob, task: Int):
                 job, batch, head, kv_head, q0
             )
     elif dtype == DType.bfloat16 and BF16_DOT:
-        _dense_rows_dot[dtype, head_dim, qt](job, batch, head, kv_head, q0)
+        comptime if head_dim >= 128:
+            # head_dim 128 x qt rows of bf16 dot accumulator is 8 zmm per row,
+            # so `_dense_rows_dot`'s register accumulator is 64 zmm at qt = 8 and
+            # spills. The L1-accumulator variant with the same dot instruction
+            # measured 1.24-1.28x over it at 256/1024/4096 x 16 x 128 on the
+            # Ryzen, interleaved, medians of 5.
+            _dense_rows_mem[dtype, head_dim, qt, 32, 32, True](
+                job, batch, head, kv_head, q0
+            )
+        else:
+            _dense_rows_dot[dtype, head_dim, qt](job, batch, head, kv_head, q0)
     elif qt * head_dim >= 512:
         # acc (qt * head_dim / LANES zmm) + logits (qt * KT_TILE / LANES) do
         # not fit in 32 registers: keep acc in L1 and tile the head dim.
