@@ -203,3 +203,87 @@ worse than 6), **head_dim 128 → qt=10** (1.20-1.48x over qt=8, 1.48-1.58x over
 qt=4), with qt=8 the pick at 512:32:128. Every arm parity-checked (d ≤ 2.5e-6).
 The old `_qt_for` returned 8 for x86 fp32 at S≥1024, which is 1.10x off at
 head_dim 64 and 1.2-1.5x off at head_dim 128.
+
+---
+
+# Round 2 — fp32 on AMX (3-term bf16 hi/lo)
+
+Branch `x86-amx-fp32` off `main` (f10f05e). fp32 has no AMX instruction and never
+will, so each operand is split into two bf16 halves and every product keeps
+three terms:
+
+    x = hi + lo,  hi = bf16(x),  lo = bf16(x - hi)      (|lo| <= 2^-8 |x|)
+    x*y ~= hi_x*hi_y + hi_x*lo_y + lo_x*hi_y             (drops lo*lo, 2^-16)
+
+That is 3x the tile ops for fp32-accurate arithmetic (products exact, fp32
+accumulate) against AMX's ~11x instruction advantage over AVX-512 fp32 FMA.
+
+Implementation notes worth keeping:
+- one entry point (`dense_amx_run`) with an `fp32` flag; bf16 and fp32 are the
+  same kernel with two extra tile ops per k-block. `dense_amx_bf16` /
+  `dense_amx_fp32` are thin wrappers, so the ctypes signature never changed.
+- the packs emit an (hi, lo) slab **pair** per (key block, dim chunk), so packed
+  K/V bytes equal the fp32 source bytes and the stride math is one constant
+  (`kstride = fp32 ? 1024 : 512` bf16 per pair).
+- Q needs no transpose (the A operand is `[row][dim]`), so splitting it is a
+  straight conversion into a per-work-item hi/lo panel. That is 16 KB of traffic
+  per work item at head_dim 128 -- visible, but 1/8 of the K traffic.
+- the exp loop also writes P lo (`bf16(e - hi)`), which is what makes P@V
+  accurate; without it P's 4e-3 relative error dominates at 1e-2.
+- **one bug cost an hour**: the QK key-block base offset still used the bf16
+  slab stride (512) instead of the pair stride, which reads the wrong K block.
+  Everything passed parity except fp32, at ~1.0 max|diff| (a layout bug, not a
+  precision bug). If fp32 parity ever shows O(1) errors, check strides before
+  arithmetic.
+
+Measured error (real kernel, 3 runs x 8 shapes x both causal modes, worst of
+each run): **5.5e-5, 5.7e-5, 6.6e-5** against the 2e-4 gate; the single worst
+observation over all runs is 7.6e-5 (512:32:128 causal). Grows with seq and
+head_dim, flat in the seed, and non-causal is 5x better than causal (masked
+logits at -3e38 push more of the weight into the exponent tail).
+
+## Round 2 table (fp32, 2 threads, causal, medians of 5, interleaved)
+
+| shape | before (o/sdpa, o/vllm) | after | o/sdpa | o/vllm (VEC) | GFLOP/s |
+|---|---|---|---|---|---|
+| 128:8:64 | 168us 0.68 / 1.69 | **121** | 0.49 | 1.22 | 138 |
+| 512:8:64 | 1546us 0.59 / 1.51 | **768** | 0.30 | 0.75 | 350 |
+| 1024:8:64 | 7473us 1.19 / 2.05 | **2236** | 0.39 | 0.62 | 480 |
+| 2048:8:64 | 26700us 1.40 / 1.94 | **7673** | 0.38 | 0.56 | 560 |
+| 4096:8:64 | 107451us 1.60 / 1.97 | **28691** | 0.41 | 0.52 | 599 |
+| 256:16:128 | 1974us 0.96 / 1.79 | **979** | 0.46 | 0.88 | 274 |
+| 1024:16:128 | 27104us 1.39 / 2.01 | **7701** | 0.39 | 0.57 | 558 |
+| 2048:16:128 | 112937us 1.75 / 2.11 | **26860** | 0.41 | 0.50 | 640 |
+| 4096:16:128 | 413541us 1.76 / 2.01 | **114024** | 0.47 | 0.55 | 603 |
+| 512:32:128 | 15315us 0.95 / 2.05 | **5219** | 0.32 | 0.70 | 411 |
+| 1024:8:32 | 2582us 0.71 / 1.19 | **1588** | 0.44 | 0.72 | 338 |
+
+274-640 GFLOP/s against VLLM VEC fp32's 150-290 (its own best fp32). 10 of 11
+rows beat vLLM's fp32 kernel; the exception is 128:8:64 at 1.22x, the same
+short-S pack/marginal-cost row bf16 loses.
+
+## The pack is at the memory ceiling on this box, not 5x off it
+
+The integrator's estimate (13 GB/s, "should be 4-5 us") was measured against a
+60+ GB/s Mojo pack on the Ryzen (8 cores). On this box with 2 threads:
+- a warm 32 MB memcpy is **38.7 GB/s**; a warm 1 MB copy is 139 GB/s
+  (`/tmp/bw.c`, 2 threads, second rep);
+- our pack moves 16 MB of traffic in 475 us at 1024:16:128 = **34 GB/s**, i.e.
+  88% of the 2-thread memcpy rate;
+- at S=128 it is **10 us marginal** for 512 KB = 51 GB/s.
+
+Two corrections to how it is measured, both now fixed in
+`tests/bench_amx_phases.py`:
+- the pack-only arm pays the fork-join + barrier with no attention work behind
+  it, so it reads 2x high (20 us vs 10 us marginal at S=128). Report
+  `full - kernel`;
+- a round-robin task assignment was measured *slower* in that arm (20 us) than
+  1 thread (14 us); I tried a blocked range instead and the marginal cost got
+  worse (full 53 -> 53 with pack 24 -> and 3697 vs 3552 at 1024:16:128), so the
+  round-robin is back. The apparent "no scaling" was the barrier, not the pack.
+
+A 16x16 transpose rewrite (4 stages of `vpermt2d`, 64 permutes, 16 live
+registers -- dense.mojo's formulation, replacing my unpack/permute2x128 version
+with two stack arrays) changed nothing measurable: the pack is memory-bound, not
+instruction-bound. It stays because it is smaller and has no stack traffic, and
+`dense_amx_pack_selftest` now verifies both formulations agree.

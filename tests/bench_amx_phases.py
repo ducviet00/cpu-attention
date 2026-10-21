@@ -64,10 +64,14 @@ def main() -> int:
         variants["sdpa"] = lambda: sdpa(q, k, v, True)
         m = bench(variants, args.rounds)
         K._AMX_MODE = ""
+        # The pack-only arm pays the fork-join and the barrier for nothing, so
+        # it overstates the pack's share: the marginal cost inside a real call
+        # is full - kernel.
+        marg = m["full"] - m["kernel"]
         print(f"  S={seq:5d} H={heads:2d} D={dim:3d}: full={m['full']:8.0f} "
-              f"pack={m['pack']:7.0f} ({100*m['pack']/m['full']:4.1f}%) "
+              f"pack_marginal={marg:7.0f} ({100*marg/m['full']:4.1f}%) "
+              f"[pack-only {m['pack']:6.0f}] "
               f"kernel={m['kernel']:8.0f} "
-              f"sum-check={m['pack']+m['kernel']-m['full']:6.0f} "
               f"sdpa={m['sdpa']:8.0f}  o/sdpa {m['full']/m['sdpa']:4.2f}")
     return 0
 
