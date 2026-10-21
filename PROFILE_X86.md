@@ -520,3 +520,230 @@ objdump -d --line-numbers /tmp/C_dbg.so | $P scripts/prof/x86/asm_count.py \
 | store-forwarding / spills / dependency chains are <2 % | **high** | each counted |
 | bf16 on this box cannot reach AMX-backed SDPA | **high** | 2.71 FMA/cyc at 0.43 in/FMA vs a 32-MAC instruction |
 | KV split would not fix S=4096 | **medium-high** | parallelism is already 8 192 tasks; the locality argument favours in-task tiling |
+
+---
+
+# Round 2 — the confound closed, two hypotheses killed, one retraction
+
+New box (`i-013035a8618efeb56`, same type: 4 physical cores, 2 MB L2/core, ~3.8 GHz).
+Same protocol unless stated. Nothing above has been edited; the claims this round
+falsified are marked **RETRACTED** here rather than rewritten.
+
+## R2.1 The `qt` confound: **the rows carry the win, the kernel swap is a 6 % loss**
+
+`CPU_ATTENTION_QT=8` at head_dim 64 does not only add rows: the dispatch rule
+`qt * head_dim > 384` routes it from `_dense_rows` (register accumulator) to
+`_dense_rows_mem` (L1 accumulator). To separate the two factors I built two
+private `.so`s from copies of the tree (sources untouched in the repo):
+
+* `/tmp/src_mem/dense.mojo` — threshold `> 96`  → **mem kernel at any qt**
+* `/tmp/src_reg/dense.mojo` — threshold `> 1000000` → **register kernel at any qt**
+
+and ran the 2×2 at **2048:8:64 fp32**, one process per cell, `CPU_ATTENTION_LIB`
+pointing at the cell's build:
+
+| | qt=4 | qt=8 | row effect |
+|---|---:|---:|---:|
+| register kernel (`_dense_rows`) | 66 057 µs | **55 456 µs** | **1.19×** |
+| mem kernel (`_dense_rows_mem`) | 69 929 µs | 59 086 µs | **1.18×** |
+| kernel effect | 0.94× | 0.94× | |
+
+**Verdict: rows are worth 1.18–1.19× on their own, and the L1-accumulator kernel
+is consistently 6 % *slower* when the register kernel is also available.** So the
+recommendation stands as "raise `qt`", not "port the mem path to qt=4", and the
+default build's `reg@qt8` (55.5 ms here, `std` 57.6 ms in the sweep) is the best
+cell. Cross-check: `std@qt4` = 66.1 in the sweep vs `reg@qt4` = 66.06 here —
+the two builds are the same binary for that cell, so the harness is not the
+variable.
+
+Consequence worth recording: `AGENTS.md` §4a says the no-spill mem path is
+"within 1 %" of the register version. That is only true where the register
+version is unusable (qt≥4 at D=128); where both are legal the register kernel
+wins by 6 %.
+
+## R2.2 Two address-pattern probes: the traffic/miss hypothesis is **RETRACTED**
+
+I claimed (§3, §5 #2, §5 #3) that the gap was data supply, with the L2 demand-miss
+rate as the causal counter, and proposed block-major K as the fix. I probed both
+halves of the traffic directly, by overriding **only the strides** the kernel is
+handed — same instructions, same load count, same tile count, wrong numbers:
+
+| arm | 2048:8:64 fp32 | L2miss% | K panel | V panel |
+|---|---:|---:|---:|---:|
+| qt=4, real layout | 66 087 µs | 6.78 | 512 KB | 512 KB |
+| qt=4, `--kt-stride 512` | 65 993 µs | 6.75 | 128 KB | 512 KB |
+| qt=4, `--kt-stride 64` (L1-resident) | 65 850 µs | **6.69** | **32 KB** | 512 KB |
+| qt=4, `--v-stride 8` (V in 64 KB) | 65 319 µs | — | 512 KB | **64 KB** |
+| qt=4, **both** starved | 64 406 µs | **6.5** | **24 KB** | **64 KB** |
+| qt=8, real | 57 595 µs | 2.66 | 512 KB | 512 KB |
+| qt=8, both starved | 56 564 µs | 2.9 | 24 KB | 64 KB |
+
+**Making the entire K+V working set 88 KB — L1-resident several times over —
+changes the runtime by 1–2 % and leaves the "L2 miss rate" at 6.5 %.** Therefore:
+
+1. **block-major K is dead as a recommendation.** It cannot pay, because removing
+   50× of the K footprint pays 0.4 %. Do not touch the transpose layout (which is
+   good news: it also protects the paged kernel's page layout that already beats
+   vLLM).
+2. **the `l2_rqsts.demand_data_rd_miss` column in §3 is an artefact of this VM's
+   vPMU, not a miss count.** It reports the same *absolute* count (5.7-5.8 M/call)
+   for an 88 KB working set as for a 1 MB one, and scales only with kernel shape.
+   Strike it; it was the weakest link in the round-1 argument and it was wrong.
+   `l1d.replacement` behaves sanely (42 % → 16.4 % of loads from qt=4 to qt=8) but
+   is not causal either.
+3. the **`exe_activity.bound_on_loads`** counter is still meaningful (it counts
+   cycles waiting on load-*related* resources, including L1-hit latency): 42.2 %
+   → 33.0 % at D=64 with qt=8. It is a symptom, not a mechanism.
+
+## R2.3 What the mechanism actually is: independent work per tile
+
+With traffic eliminated as an explanation, the two head dims show *different*
+reasons for the same lever — both measured with the kernel held fixed:
+
+| shape | arm | µs | insn/call | IPC | in/pair | why it wins |
+|---|---|---:|---:|---:|---:|---|
+| 1024:16:128 fp32 | qt=4 | 73 947 | 312 M | 1.41 | 37.2 | — |
+| | qt=8 | **65 084** | 276 M (−12 %) | 1.41 | 32.9 | **fewer instructions** (Q@K^T 17 per 8 FMAs → 29 per 16) |
+| 2048:8:64 fp32 | reg qt=4 | 66 057 | 252 M | 1.31 | 15.0 | — |
+| | reg qt=8 | **55 456** | 281 M (+12 %) | **1.57** | 16.8 | **IPC**, at an instruction *penalty* |
+| 1024:16:128 bf16 | qt=4 | 68 071 | 272 M | 1.28 | 32.4 | — |
+| | qt=8 | **57 663** | 318 M (+17 %) | **1.78** | 37.9 | **IPC** (+39 %) beats +17 % insn |
+| 2048:8:64 bf16 | qt=4 | 50 268 | 209 M | 1.31 | 12.5 | — |
+| | qt=8 | 51 392 | 257 M (+23 %) | 1.74 | 15.3 | **wash** (0.98×) |
+| 1024:8:32 fp32 | qt=4 | 5 947 | — | 1.82 | 8.7 | — |
+| | qt=8 | 6 356 | — | 1.89 | 8.8 | **0.94×**, nothing to hide |
+
+Read this as: the lever is **independent work per tile** — more chains for the OOO
+window and better amortisation of the per-`d` loads/addressing — and it pays
+*only while the accumulator still fits*. It pays twice at D=128 (fewer
+instructions, and IPC is stable), pays via IPC at D=64 fp32, and is cancelled by
+spill instructions at D=64 bf16 (acc = 8×64 floats = 32 zmm) and at D=32 fp32
+(nothing is stalling: `in/pair` is already 8.7 and load-bound is 25 %).
+
+**So the per-box recommendation is not "qt=8" but a table:** fp32 qt=8 at D=64 and
+D=128 (1.19× / 1.14×), keep qt=4 at D=32 (0.94×); bf16 qt=8 at D=128 (1.18×),
+keep qt=4 at D=64 (0.98×). The repo's `_qt_for` hook (added for ARM this round)
+is the right place for it.
+
+## R2.4 Does it survive the engine's thread count? Yes, and it grows slightly
+
+`taskset -c 0-3` (4 physical cores) / `-c 0-7` (4 cores + SMT), `OMP_NUM_THREADS`
+matched, medians of 5:
+
+| shape | qt | 1 thread | 4 threads | 8 threads (SMT) | vLLM @4T |
+|---|---:|---:|---:|---:|---:|
+| 2048:8:64 fp32 | 4 | 66 057 | 18 201 | 18 952 | — |
+| | **8** | 57 595 | **15 225** | **14 859** | 7 920 |
+| 1024:16:128 fp32 | 4 | 73 947 | 22 197 | 21 926 | — |
+| | **8** | 65 084 | **16 749** | **16 667** | 7 717 |
+
+* the `qt=8` win is **1.20× at 4 and 8 threads** (D=64) and **1.33×** (D=128) —
+  it does not wash out under parallelism, as a pure-bandwidth effect would have.
+* scaling is 3.8–3.9× on 4 physical cores for both arms (94–97 % efficiency), and
+  SMT adds 0–2 %: this kernel has no spare SMT slots.
+* **the gap to vLLM is unchanged at the engine's thread count: 1.92× (D=64) and
+  2.17× (D=128) against vLLM's 7.92 / 7.72 ms.** `qt=8` is worth taking but it is
+  not the answer to the whole deficit.
+
+## R2.5 "With no traffic penalty, what would our time be?" — their IPC is real work
+
+Our best D=128 arm (qt=8, single thread) is **65.1 ms at IPC 1.41 and `in/pair`
+32.9**; vLLM is **31.6 ms at IPC 2.94 and `in/pair` 35.3**. We already retire
+*fewer* instructions per pair than they do and are still 2.06× slower, so the
+answer to "is their 2.87-2.94 IPC doing real work" is **yes, definitively** — and
+since R2.2 removes misses as the explanation for our IPC, what is left is latency
+inside the tile: a serial `reduce_max → _vexp → reduce_add → rescale` chain every
+64 (or 32) keys, which drains the pipeline because a 64-key tile is ~5 000
+instructions and the reorder buffer cannot span two tiles.
+
+Note this does **not** contradict my §5 #4 bound; it *reinterprets* it. That bound
+(≤1.18× at D=128, ≤1.06× at D=64) is on the **instruction count** of the per-tile
+fixed work. A pipeline drain costs **cycles, not instructions**, and is outside
+that bound. The ARM worker reaches the same place independently ("the residual
+3.76 cycles/row-key are spill and latency inside the 23 % softmax block").
+
+## R2.6 Cross-examination of the ARM findings
+
+**Agreed, on different evidence.** The L2-sized tile is dead: they get 5.7 % from a
+1024-key tile, I get an instruction-count bound of ≤1.18× / ≤1.06× that a bigger
+tile cannot reach because `_vexp` scales with keys. Two different methods, same
+verdict — treat it as settled.
+
+**"85 % of the ARM gap is P@V on fp32 FMA instead of `bfmmla`" — I would not sign
+it, and their own follow-up already contradicts it.** On x86 the same form of
+argument is demonstrably invalid: P@V is **54 % of our instructions** at D=64
+(§4) and we retire the **same instructions per row-key as vLLM** (19.07 vs 18.67),
+yet lose 2.3×. So "phase X is N % of the instructions" does not imply "N % of the
+gap". Their later statement — 100 % of the 2.36-cycle gap is *non*-matmul cycles —
+is the consistent one; the 85 % framing is not. **Test they can run in ten
+minutes:** fp32 vs bf16 at one fixed shape on ARM. If P@V's matmul were 85 % of the
+gap, bf16 (which routes P@V through `bfmmla`) must be ~6× faster than fp32; on x86
+the same A/B is **1.31×** (322.8 → 246.8 Mcyc at 1024:16:128) and on ARM bf16 vs
+fp32 is a similar order of magnitude, not 6×.
+
+**Where our mechanisms genuinely differ, and which I think is fundamental.** They
+say "fp32 is load-bound, not pipe-bound — 24.2 vs 13.4 cycles/row-key at an
+identical instruction set, because `qt=2` gives FMA-per-load 2 where vLLM gets 8".
+I agree with the lever and disagree with the causal chain, on measurement:
+
+* **FMA-per-load is not causal by itself.** It is a *structural* quantity that
+  sets the port floor — `llvm-mca` on our D=128 Q@K^T loop says 6 zmm loads need
+  8 cycles while 8 FMAs need 4, so the floor is **1.0 FMA/cycle** and we run 0.42
+  (§4). That floor is real and independent of memory: *a loop whose loads all hit
+  L1 still cannot exceed 1.0 FMA/cycle in this shape.* So of the two deficits —
+  2.0 → 1.0 (structure) and 1.0 → 0.42 (stalls) — the first is the load:FMA
+  ratio, exactly as they say.
+* **But the second deficit is not bytes.** R2.2 shrinks the working set 50× and
+  gains 0.4 %. So "load-bound" here means *load-latency-bound* (L1 hit latency on
+  the operand feeds, plus the serial softmax chain), not *bandwidth*- or
+  *footprint*-bound. That matters for what to build: their framing points at
+  reuse-across-rows to cut traffic; mine says the traffic cut is a side effect and
+  the thing to build is **more independent work per tile plus fewer operand loads
+  per FMA**, which is why the same lever shows up as an *instruction* win at D=128
+  and an *IPC* win at D=64.
+* **`exe_activity.bound_on_loads` sits above both.** It counts cycles where the
+  backend is blocked on a load-related resource — misses *and* L1 latency *and*
+  port conflicts — so 48 % vs 15 % is a true symptom and a useless discriminator.
+  Rank the three: **FMA-per-load (floor) > independent work per tile (how much of
+  the floor you reach) > miss rate (not causal here at all)**.
+
+## R2.7 The one experiment I would run with two more hours
+
+**Hoist the softmax out of the inner loop at `qt=8`, keeping our layouts.**
+Concretely: `_dense_rows_mem` at D=64 fp32 with `kt = 512` and a `probs` buffer
+(the vLLM structure), measured against `reg@qt8` on the same four counters
+(`instructions`, IPC, `in/pair`, `bound_on_loads`). This is the only untested
+hypothesis that survives R2.2, and it is the one both profiles converge on.
+
+*Prediction:* IPC rises from 1.57 to ≥2.0 while `in/pair` rises ≤15 % (logits and
+probs become memory traffic), for a net 1.2–1.3×.
+
+*Abandon criterion, stated before the run:* if IPC stays below ~1.8, or if
+`in/pair` rises more than 15 %, the drain hypothesis is dead — the residual is
+vLLM's 8–16-row × memory-logits structure that we cannot reach without a rewrite,
+and the right move is to ship the `qt` table from R2.3 and stop optimising the
+x86 dense kernel. **Do not start a third round on micro-tuning if that fires.**
+
+## R2.8 Round-2 data
+
+`scripts/prof/x86/data/r2_*.csv` — the `qt` A/B matrix, the K/V stride probes,
+the 2×2 cells, the thread sweep and the vLLM thread reference. The 2×2 needs the
+two patched builds; the patch is one line each:
+
+```bash
+cp -r cpu_attention/_mojo/src /tmp/src_mem && sed -i 's/qt \* head_dim > 384/qt * head_dim > 96/' /tmp/src_mem/dense.mojo
+cp -r cpu_attention/_mojo/src /tmp/src_reg && sed -i 's/qt \* head_dim > 384/qt * head_dim > 1000000/' /tmp/src_reg/dense.mojo
+mojo build /tmp/src_mem/_C.mojo -I /tmp/src_mem --emit shared-lib -o /tmp/C_mem.so -Xlinker -l:libgomp.so.1 -Xlinker -L$(dirname $(python -c 'import torch;print(torch.__file__)'))/lib
+CPU_ATTENTION_LIB=/tmp/C_mem.so python scripts/prof/x86/run_one.py --variant ours --shape 2048:8:64 --dtype fp32 --qt 4
+```
+
+## R2.9 Confidence after round 2
+
+| finding | confidence | change from round 1 |
+|---|---|---|
+| rows per tile is the lever; 1.18–1.19× measured with the kernel held fixed | **high** | was medium (confounded) → now isolated by 2×2 |
+| the L1-accumulator kernel is *not* the thing to port; it is 6 % slower when both are legal | **high** | new |
+| traffic / block-major K / the L2-miss story | **retracted** | two probes, 50× footprint change, 0.4 % effect |
+| the residual is latency + instruction structure inside the tile, not bytes | **medium-high** | replaces the miss story; consistent with both profiles |
+| `qt` recommendation is per (dtype, head_dim): fp32 8/8/4, bf16 4/8 at D=64/128 | **high** (measured), **medium** on generality | new |
+| vLLM's 2.9 IPC is real work, not a counter artefact | **high** | new, from `in/pair` 32.9 vs 35.3 |
