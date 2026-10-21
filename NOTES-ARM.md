@@ -405,46 +405,125 @@ What is still above the line, and why:
 against 88 us -- the process is still at its idle clock. Report from the second
 row on, or warm the process up.
 
-## The co-issue lever that is real but unimplemented
+## Open questions (nothing here is a knob)
 
-`scripts/prof/arm/mixed.c` measures, on this box, **8 bfmmla 3.98 cycles, 8 fp32
-fmla 2.99, and 8 bfmmla + 8 fmla 3.99** -- the fp32 work is free alongside the
-matmul, on the other two SIMD pipes. The whole softmax pass is fp32, so in
-principle it hides inside a tile's 2048 bfmmla (1024 cycles of matmul, ~4600
-issue slots, ~1800 instructions of exp).
+* **The bf16 residue is scheduling, not code.** The wrap-up below has the
+  counters, the static diff and the two failed manipulations; do not re-derive
+  it from the stall profile.
+* **fp32 D=64 is at vLLM's kernel**: 14.16 vs 13.76 cycles/row-key, 56.0 vs 51.6
+  instructions, IPC 3.93 vs 3.75. Its remaining rows are at parity and move with
+  box drift; its short-S rows are the pack.
+* **Short S is per-work-item fixed cost**, measured rather than guessed: at S=128
+  bf16 the kernel executes 56.5 instructions/row-key against 21.2 at S=2048 *at
+  the same IPC* (3.52), and the pack is 15% of the call. The two fork-joins are
+  already one GOMP region (`GOMP_barrier` in the worker), so what is left there
+  is the P@V accumulator round trip at small `jn` (2*head_dim/keys per row-key)
+  and the fact that vLLM's timed region does not contain a pack at all.
 
-A first implementation did exactly that (double-buffered logits, the exp of tile
-*i* interleaved with the Q@K^T of tile *i+1*, 2 key groups per sub-block) and was
-**5% slower**: 6.07 vs 5.79 cycles/row-key, 22.4 vs 21.2 instructions, with 80
-stack references per iteration -- the 16 Q@K^T accumulators and the exp state do
-not fit in 32 registers together. Halving the Q@K^T tile (nsq=2, 8 accumulators)
-was worse still (7.64 cycles) because the Q-panel loads double.
+## Campaign wrap-up (2026-10-22): final state, mechanisms, and everything falsified
 
-The route that has not been tried: interleave only *half* the exp (2 of the 4
-row pairs) with the Q@K^T, so the live set is 16 accumulators + ~10, and run the
-other half separately. Expected ceiling is the ~1.2 cycles/row-key the exp still
-costs, i.e. ~15-20% on bf16, which is the whole remaining bf16 D=64 gap.
+### Final numbers
 
-## Open
+`scripts/verify.sh arm64`, `ROUNDS=21`, clean rebuild from scratch, both parity
+suites green, ratios `ours/baseline` (<1 = a win), ours includes the K/V pack:
 
-* bf16 is 21.2 instructions vs vLLM's 20.9 — the remaining 18% is **IPC** (3.50
-  vs 4.07, backend stalls 1.46 vs 1.00), not instruction count.
-* fp32 is 57.2 vs 51.6 instructions. Next candidates: K^T's dim stride is a
-  compile-time 64 (`kt_blk`) but is read from the job at runtime, costing an
-  address add per dim per sub-block; and the P@V probability/`V` addressing.
-* **Short sequences are per-work-item overhead, measured**: at S=128 bf16 the
-  kernel executes 56.5 instructions/row-key against 21.2 at S=2048, at the same
-  IPC (3.52) -- so it is instruction count, not stalls. vLLM goes 20.9 -> 24.2.
-  The per-tile P@V accumulator round trip is 2*head_dim/keys per row-key (4.0 at
-  jn=8, 0.5 at jn=64), the boundary mask runs on every sub-block, and ~18% of an
-  S=128 call is still OpenMP barrier (two fork-joins per call: pack + kernel).
-  Collapsing the two GOMP regions into one (`GOMP_barrier` inside the worker) is
-  the next thing to try.
-* fp32 D=64 is now 3% behind vLLM's kernel (14.16 vs 13.76 cycles/row-key) with
-  56.0 instructions against their 51.6 and IPC 3.93 against 3.75; the remaining
-  rows above the line are 1.00-1.16.
-* bf16 D=128 P@V pays 2 panel loads/row-key because the 64 dim pairs are walked
-  in 16 chunks of 4 (`RP*dcp` = 16 registers); dcp=8 would halve it but needs 32.
-* The `-e armv8_pmuv3_0/stall_backend/` sampling profile (works on this box)
-  attributes the bf16 backend stalls to `ldp` (18%) and integer `add` (17%,
-  addresses), with bfmmla at 23% -- not to the exp.
+| | vs torch SDPA | vs vLLM `csrc/cpu` |
+|---|---|---|
+| bf16, 11 shapes | 0.48-0.85 (11/11) | 1.03-1.13 long, 1.12-1.32 short |
+| fp32, 11 shapes | 0.35-0.91 (11/11) | 0.91-1.07 (5/11) |
+
+**22/22 beat SDPA and 5/22 beat vLLM, from 17/22 and 0/22 at the start of the
+ARM campaign.** Bands are run-to-run: the box drifts ~5% and Graviton's
+1024-token rows more, so treat a row within 0.05 of 1.00 as parity.
+
+What the remainder is, by family:
+
+| family | vs vLLM | what it actually is |
+|---|---|---|
+| bf16 long (S >= 1024) | 1.03-1.13 | the scheduling residue: 4% *fewer* instructions at 6% more cycles |
+| bf16 short (S <= 512) | 1.12-1.32 | the K/V pack, 15% of an S=128 call, which vLLM's timed region does not contain |
+| fp32 | 0.91-1.07 | at parity in the kernel (14.16 vs 13.76 cycles/row-key); the rest is the pack at 0.8-1.4% |
+
+### The mechanisms that produced the wins, in order of payoff
+
+1. **vLLM's structure instead of flash-decoding's** (`_dense_rows_tile` /
+   `_dense_rows_tile_f32`): logits staged in L1 with runtime indices (so LLVM's
+   SROA cannot forward them back into registers -- the reason the previous
+   campaign's "L1 logits" probe measured 0%), one max/sum/rescale per 64-key
+   tile, 8 rows per work item, K^T blocked by key tile, V packed
+   `[key group][dim pair][8]`. bf16 7.31 -> 6.07 cycles/row-key (23.15 -> 21.24
+   instructions), fp32 18.25 -> 15.50 (72.7 -> 57.2).
+2. **`TILE_KS` = 128 (bf16) / 256 (fp32)**, the biggest knob after the structure.
+3. **Only the keys that exist**: the Q@K^T sub-block loop, the exp loop and P@V
+   all stop at the causal limit of the block's last row. 1.5x at S=128, 1.3x at
+   S=256, 1.2x at S=512.
+4. **`_exp2_fast` / `_exp2_g`**: `roundeven` + degree-3 minimax + exponent
+   insert, with `log2(e)` folded into Q on fp32. 15.14 -> 14.16 cycles/row-key
+   fp32; the polynomial had been 30% of the call (5.1 instructions/row-key).
+5. **One GOMP region for pack + attention** (`GOMP_barrier` inside the worker):
+   two fork-joins per call had been 18% of an S=128 call.
+6. Output written de-interleaved (zip1/zip2 + converts + one join).
+
+### Falsified on ARM, with the number (do not repeat)
+
+| lever | measured | why it cannot work |
+|---|---|---|
+| `TILE_KS` = 32 / adaptive tile | loses at every size, S=128 included | the causal-limit skip already bounds work by the block's limit, so a smaller tile only multiplies per-tile fixed cost |
+| fp16 softmax (`_exp2_f16`) | **-10% instructions, +1.7% time** | the conversions sit on the critical path; `fmul v.8h` is 4.0/cycle but `fcvt` is not free |
+| co-issue, all 4 row pairs | 6.07 vs 5.68 cycles/row-key (**+5%**), 22.4 vs 20.9 instructions, **80** stack refs per iteration | 16 Q@K^T accumulators plus 4 row pairs of exp state do not fit in 32 registers |
+| co-issue, 2 of 4 row pairs | **+3.7%** (5.84 cycles/row-key, 21.13 instructions, 40 stack refs, 7518 vs 7240 us at 2048:8:64) | and less interleaving is less bad, converging on the baseline: the Q@K^T body needs **3.25 IPC** (26 instructions per 16 bfmmla) on a machine sustaining ~3.5, so there are no spare *issue* slots for the exp. `mixed.c`'s 8+8-in-3.99 contains no loads, stores or address arithmetic |
+| bf16 D=128 probability panels | **0%** by ablation (6374 vs 6251-6439 us at 1024:16:128, 3523 vs ~3520 at 512:32:128, control unchanged) | the panels are L1-resident and free, and every alternative structure is register-infeasible: panels-resident needs a 16-key tile, whose P@V accumulator round trip is `DP*RP*2` = 4/row-key against 0.5 at 128 keys; halving the rows to afford `dcp=8` halves the panels and doubles the V loads |
+| int8 P@V (`i8mm`, 2x `bfmmla`) | max abs error **2.9e-2 - 4.6e-2** with a per-output-dim V scale (3.2e-2 - 4.1e-2 global) against a **3e-2** gate, where bf16 is already 1.0e-2 - 1.3e-2 | `tests/int8_pv_error.py`: it is accuracy, not speed, and it is not close. A per-key V scale would be finer but sits inside the sum and cannot be factored out afterwards |
+| K/V pack treated as a cold-read problem | **1.23x slower**, not faster, when the cache is evicted at S=128 | the pack is instruction-bound: 92% of it is hot gather work (4-byte gathers, 28 GB/s). Prefetch/layout work on it is worth 0.7-7% in the best case |
+| Python per call | F = **10.0 us/call** (3.1 extension call + 0.66 `empty_like` + ~6 Python), ~1.5% of S=128 | real but small. The integrator then took the `stride()` marshalling from 19 per call to 1 (`fa0062c`), worth 5% at S=128 |
+| pack `alignment=64` | 0% | |
+| Q@K^T loop unrolled x2 | neutral (7220 vs 7226 us) | LLVM's scheduling of the 16-bfmmla body was already fine |
+| P@V pointer hoists | 0% | |
+| `dcp=2` in P@V | 6.95 cycles, 24.35 instructions | halves the accumulator registers but doubles the panel loads |
+| more than 8 rows per work item | register wall; `nsq=2` to compensate doubles the Q-panel loads | `_qt_for` keeps 8 |
+| key-group-outer / row-pair-inner exp pass | 6.25 vs 6.22 cycles/row-key | the phase is not latency-bound |
+
+### The residue, stated as a measurement
+
+At bf16 2048:8:64, counters subtracted across 10- and 40-iteration runs (one
+process run is 99% torch import): **ours 20.10 instructions and 5.645 cycles per
+row-key (IPC 3.56); vLLM 20.96 and 5.319 (IPC 3.94).** We are 4% leaner and 6%
+slower. The inner loops are identical in shape (1.44 vs 1.47 instructions per
+`bfmmla`, both spill-free), and the only instruction class we have that they do
+not -- two constant-seed `mov`s per exp evaluation, 11% of our stalls -- is
+*cheaper* than the arithmetic that replaces it: seeding the Horner with a
+multiply instead measured **2.5% slower** at three shapes. That is the finding:
+the softmax binds on **FP-pipe slots**, not on instruction count, which is also
+why their `fast_exp_f16` is fp16 and why ours is not (fp16 conversions land on
+the same pipes: +1.7%). Their 27%-vs-22% `bfmmla` stall share is the difference
+-- they issue slightly more matmul per cycle. There is no site carrying the 0.5
+(actually 0.38) IPC.
+
+### The two routes not taken, with the evidence for each
+
+* **A from-scratch kernel shaped like theirs** (blocked GEMM micro-kernel, 8-row
+  x N-key accumulator panel, logits staged per tile). Two prototypes in the
+  previous campaign lost **20-26%**, and nothing found since weakens that. The
+  cheap version of it: port only their Q@K^T `tile_gemm` -- they reach 1.49-1.86
+  `bfmmla`/cycle where we reach 1.02-1.30 -- and keep every other part of v2.
+* **An instruction-by-instruction study of `tile_gemm`** to find the 0.38 IPC.
+  What it would have to explain is now written down above (equal instructions,
+  equal loads, their excess stalls on `bfmmla`, ours on `add`/`mov`, 0.33
+  cycles/row-key in total). Their source is
+  `~/vllm/csrc/cpu/cpu_attn_neon_bfmmla.hpp` on the box; `llvm-mca` is **not**
+  installed there. The ceiling if it succeeds is ~6% on the bf16 rows, i.e.
+  1.06 -> 1.00 -- parity, not a crossing.
+
+### For a successor: the tools and the traps
+
+`tests/bench_vs_refs.py` is the authoritative matrix (`--rounds`, `--json`);
+`tests/bench_phases.py` splits pack from kernel (sets `CPU_ATTENTION_NO_FUSE=1`);
+`scripts/prof/arm/` holds `flush.py` (eviction harness -- note it measures the
+NO_FUSE path, so fused changes are invisible there), `pk.py` (instruction
+counts; cycle deltas unreliable at small S), `analyze_asm.py` (per-loop
+histograms from an `objdump` dump), `hot.py` (per-instruction stall shares from
+`perf annotate`), `ab_qt.py`, `mixed.c`, `f16perf.c`, `one_fma.c`, `peak.c`.
+`scripts/box_sync.sh` needs `set -o pipefail` (a failed remote build used to
+report success and leave the old `.so`). Never run two measurements at once: a
+second process doubles every number and the first row of a sweep is still at
+idle clock.
