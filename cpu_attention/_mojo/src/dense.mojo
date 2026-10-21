@@ -778,10 +778,9 @@ def _dense_rows_dot[
 def _exp2_fast(y: SIMD[DType.float32, 4]) -> SIMD[DType.float32, 4]:
     """``2^y`` for ``y <= 0`` in about ten instructions, no libm.
 
-    ``y = n + f`` with ``n`` the rounded integer part (the add-and-subtract
-    magic-constant trick, so no round instruction), ``2^f`` from a degree-4
-    polynomial on ``[-0.5, 0.5]`` and ``2^n`` by adding ``n`` to the exponent
-    field of 1.0. Clamping at -127 makes the exponent field underflow to zero
+    ``y = n + f`` with ``n`` the rounded integer part (``roundeven``, one
+    instruction), ``2^f`` from a degree-3 minimax polynomial on ``[-0.5, 0.5]``
+    and ``2^n`` by adding ``n`` to the exponent field of 1.0. Clamping at -127 makes the exponent field underflow to zero
     bits, so every masked lane (``NEG_INF``) comes out as *exactly* 0 -- which
     the online softmax needs and a saturating conversion would not give.
 
@@ -796,14 +795,19 @@ def _exp2_fast(y: SIMD[DType.float32, 4]) -> SIMD[DType.float32, 4]:
     # One fmaxnm: NaN (a masked lane whose centre is +inf) and anything below
     # -127 both land on -127, whose exponent field is zero bits, so p is 0.
     var yc = _vmax(y, SIMD[DType.float32, 4](-127.0))
-    var n = (yc + SIMD[DType.float32, 4](MAGIC)) - SIMD[DType.float32, 4](MAGIC)
+    # ``roundeven`` is one instruction with 4-cycle latency; the magic-constant
+    # add/sub pair it replaces is two instructions and 8 cycles on the critical
+    # path of a chain that ablation puts at 30% of the call.
+    var n = llvm_intrinsic[
+        "llvm.roundeven.v4f32", SIMD[DType.float32, 4], has_side_effect=False
+    ](yc)
     var f = yc - n
-    var p = SIMD[DType.float32, 4](0.009618129107628477) * f + SIMD[
-        DType.float32, 4
-    ](0.05550410866482158)
-    p = p * f + SIMD[DType.float32, 4](0.2402265069591007)
-    p = p * f + SIMD[DType.float32, 4](0.6931471805599453)
-    p = p * f + SIMD[DType.float32, 4](1.0)
+    # Degree-3 minimax on [-0.5, 0.5]: relative error 7.5e-5, two orders below
+    # the bf16 probabilities this path rounds to.
+    var p = SIMD[DType.float32, 4](5.5172628285e-2)
+    p = p * f + SIMD[DType.float32, 4](2.4261366164e-1)
+    p = p * f + SIMD[DType.float32, 4](6.9326095397e-1)
+    p = p * f + SIMD[DType.float32, 4](9.9992793009e-1)
     var e = (n.cast[DType.int32]() + SIMD[DType.int32, 4](127)) << SIMD[
         DType.int32, 4
     ](23)
