@@ -644,6 +644,16 @@ i.e. attention 29.8-49.6 + interference +39.2 against 90.7 + 25.9.
    32-key softmax step alone measures **0.84x** (8 more live accumulators spill).
    That is why this is a rewrite of the row kernel rather than a knob.
 
+   **And the cheap version of that rewrite does nothing**: deferring the row-sum
+   horizontal reduce to one per row per call (a per-row vector accumulator folded
+   by `n/LANES - 1` adds per tile) plus FA4's -8 threshold on the running max
+   measured **1.00-1.01x** in a process-interleaved A/B (bf16, the untouched
+   control, 0.99-1.00x). So the `reduce_add` is not the drain either, and the
+   `nomax` ablation's 1.18-1.22x cannot be collected this way — the reduce that
+   costs is `reduce_max`, and removing it needs an overflow-safe formulation
+   (a stale max with a group-level fixup) that has not been tried. Fifth
+   softmax-restructure attempt that lost or tied; do not redo the first four.
+
 11. **Dense kernel (laptop, 8 threads, causal, `tests/bench_dense.py`)**: bf16 is
    1.26-2.5× torch SDPA, fp32 1.0-2.0× — except `H=16/D=128` at S=1024 (0.83×,
    the register wall above) and S=128 (0.93×, where the call is 80 µs and SDPA
