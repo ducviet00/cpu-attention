@@ -452,3 +452,81 @@ inside the pack loop that neither the instruction count nor the traffic explains
 and that is the one thing left that would close these rows: at 3x the pack rate
 S=128 would be 52 -> 41 us against vLLM's 46-59, i.e. every remaining bf16 row
 and the fp32 row would flip.
+
+---
+
+# Round 5 — the pack, isolated. It cannot go below ~10 us, and here is why
+
+Branch `x86-small-s`, on `main` after the ARM merge (which routes the Mojo
+AVX-512/ARM paths through a fused pack+attention region; the AMX kernel already
+had one). Re-baselined first, as asked: parity green, and S=128 pack 14 us,
+total 51 us — the round-4 numbers hold.
+
+## The ladder (`cpu_attention/_mojo/tests/pack_bench.mojo`)
+
+Same 16 loads of 64 B / transpose / 16 stores of 64 B per tile, 512 tiles per
+rep, 8 reps, variants interleaved, single-threaded, medians of 9:
+
+| variant | ns/tile | GB/s |
+|---|---:|---:|
+| full | **22** | 89 |
+| no loads (transpose + stores only) | **16** | 124 |
+| no transpose (loads + stores only) | **22** | 89 |
+
+Read it twice, because it kills the obvious theory:
+
+* **The transpose is free.** Removing it changes nothing (22 = 22): the network
+  is entirely hidden behind the memory ops. The integrator's prior — 4 dependent
+  stages x 16 shuffles = ~190 cycles per tile — does not survive; with 16
+  independent outputs per stage the chain is 4 x 3 cycles, not 64 x 3.
+* **The loads are the cost**, and even so, loads+stores alone run at **89 GB/s**
+  for 2 KB of traffic per tile, which is the same class as the L2-resident copy
+  ceiling (139 GB/s).
+
+So the *tile* work is not the problem. The problem is that the same code inside
+the kernel runs at ~109 ns/tile/thread (14 us for 256 tiles over 2 threads) —
+5x the standalone rate — and **nothing I changed from inside the pack moved the
+whole-call number**:
+
+| change | A/B result (new/old, interleaved, `ab_two_trees.py`, 4 shapes x 2 dtypes) |
+|---|---|
+| in-place transpose, 2 temps (16+2 registers live instead of 32) | 0.99-1.03x, i.e. neutral |
+| transpose split into 4 distinct stage functions (`_tr_s0..s3`, matching `dense.mojo`) so LLVM cannot reroll the stages into a runtime loop with per-stage index-vector loads | 1.00-1.02x bf16, 0.99-1.03x fp32 |
+| pack task = 8 key blocks instead of 1 (decode ~16x instead of ~100x, removing ~2.6 us of `idiv` from a 14 us pass) | neutral |
+| `PackJob` fields hoisted to locals (no aliasing info in Mojo, so the compiler may reload `k_stride_t` after every store) | neutral |
+| bounds-check hoisting in the unrolled load loop (round 4) | neutral |
+
+`objdump` agrees that it is not register pressure (0 `vmovdqu64 %zmm,(%rsp)` in
+either worker) and not call overhead (the pack is inlined: the worker's only
+`call`s are `omp_get_thread_num`, `omp_get_num_threads`, `GOMP_barrier`,
+`memset`). It also shows the transpose *does* get rerolled into a loop with the
+index vectors loaded from `.rodata` per iteration — which is why the split-stage
+rewrite looked so promising — but fixing it changed nothing measurable, so the
+reroll is not what costs either.
+
+## Verdict, with the numbers
+
+At S=128 (the worst row) the pack is 10-16 us of a 49-55 us call, and a
+*free* pack would leave us at ~40 us against vLLM's 46-59 — i.e. the row is
+reachable only by making the pack ~free, not by making it 2x faster. Everything
+I can reach from inside the pack is neutral, the tile loop is already at memcpy
+class standalone, and the residual (kernel 109 ns/tile vs standalone 22) is not
+register pressure, call overhead, instruction count, the transpose network, the
+task decode, or aliasing. I could not find it, and I would now stop rather than
+grind: the honest statement is **the pack cannot go below ~10 us by any change I
+have been able to test**, and the remaining bf16 rows plus `128:8:64 fp32` are
+not reachable through this path.
+
+The one structural option left is the one you raised and I rejected twice:
+the pack is a pure function of K/V, and every work item's *first* super-tile
+needs only keys [0, q0+32). Overlapping it with the attention needs a
+producer/consumer handshake (per-key-block ready flags) or a three-phase split
+(K pack | QK+softmax while packing V | P@V), which costs an extra barrier and a
+global P buffer per work item (512 KB at S=128/H=8). Estimated ceiling: V is
+half the pack, so at best it saves ~half of it — 5-8 us — and the three-phase
+version also has to beat the extra barrier and P traffic. That is a redesign of
+the driver, not a pack optimisation, and I would want your go-ahead before
+building it.
+
+`pack_bench.mojo` stays: it is the instrument that says where to look (loads,
+not the network) and where not to (the transpose).
