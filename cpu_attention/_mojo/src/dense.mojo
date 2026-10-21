@@ -259,6 +259,45 @@ def _vexp[
 
 
 @inline(.always)
+def _exp2_g[
+    width: Int
+](y: SIMD[DType.float32, width]) -> SIMD[DType.float32, width]:
+    """Width-generic ``2^y`` for ``y <= 0``: magic-constant rounding + degree-4
+    minimax + exponent insert, ~13 instructions.
+
+    ``_exp2_fast`` is the 4-lane version and uses ``roundeven``; this one exists
+    because the fp32 tile kernel works in ``LANES``-wide vectors and the
+    intrinsic's name carries the width. Degree 5 (7.5e-8 relative) because the
+    probability error is amplified ~40x into the output: degree 4 (2.6e-6)
+    measured 1.1e-4 against the 2e-4 tolerance, degree 3 would fail it.
+    """
+    comptime MAGIC = 12582912.0
+    var yc = max(y, SIMD[DType.float32, width](-127.0))
+    var n = (yc + SIMD[DType.float32, width](MAGIC)) - SIMD[DType.float32, width](
+        MAGIC
+    )
+    var f = yc - n
+    var p = SIMD[DType.float32, width](1.3276673810e-3)
+    p = p * f + SIMD[DType.float32, width](9.6755714487e-3)
+    p = p * f + SIMD[DType.float32, width](5.5507129206e-2)
+    p = p * f + SIMD[DType.float32, width](2.4022119177e-1)
+    p = p * f + SIMD[DType.float32, width](6.9314696713e-1)
+    p = p * f + SIMD[DType.float32, width](1.0000000718e0)
+    var ki = n.cast[DType.int32]()
+    var sbits = (ki + SIMD[DType.int32, width](127)) << SIMD[
+        DType.int32, width
+    ](23)
+    return p * bitcast[DType.float32, width](sbits)
+
+
+@inline(.always)
+def _exp2f(x: Scalar[DType.float32]) -> Scalar[DType.float32]:
+    """Scalar ``2^x`` through the same polynomial (the online-softmax rescale).
+    """
+    return _exp2_g[1](SIMD[DType.float32, 1](x))[0]
+
+
+@inline(.always)
 def _vexp_f(x: Scalar[DType.float32]) -> Scalar[DType.float32]:
     """Scalar ``exp`` through the same polynomial (the online-softmax rescale).
     """
@@ -819,8 +858,9 @@ def _exp2_fast(y: SIMD[DType.float32, 4]) -> SIMD[DType.float32, 4]:
         "llvm.roundeven.v4f32", SIMD[DType.float32, 4], has_side_effect=False
     ](yc)
     var f = yc - n
-    # Degree-3 minimax on [-0.5, 0.5]: relative error 7.5e-5, two orders below
-    # the bf16 probabilities this path rounds to.
+    # Degree-3 minimax on [-0.5, 0.5]: 7.5e-5 relative. Degree 2 (1.7e-3) is
+    # only 1% faster and doubles the output error (7.8e-3 -> 1.6e-2 against a
+    # 3e-2 tolerance), so it is not worth the margin.
     var p = SIMD[DType.float32, 4](5.5172628285e-2)
     p = p * f + SIMD[DType.float32, 4](2.4261366164e-1)
     p = p * f + SIMD[DType.float32, 4](6.9326095397e-1)
@@ -1412,7 +1452,12 @@ def _dense_rows_tile[
             var alpha = SIMD[DType.float32, 4](1.0)
             if has:
                 m_new = _vmax(m_v[rp], mt[rp])
-                alpha = _exp2_fast((m_v[rp] - m_new) * c1)
+                # Degree-5 exp2, four lanes: an error in `alpha` does not cancel
+                # between the accumulator and the row sum (the terms added
+                # afterwards are not scaled), so it accumulates over tiles -- and
+                # the two rows of the pair have their own max, so this has to stay
+                # a vector.
+                alpha = _exp2_g[4]((m_v[rp] - m_new) * c1)
                 m_v[rp] = m_new
                 # The accumulator (and the row sum) are relative to the old max.
                 if s_v[rp].reduce_max() > Scalar[DType.float32](0.0):
@@ -1609,6 +1654,11 @@ def _dense_rows_tile_f32[
 
     # Q transposed to [head_dim][qt], scale folded in: one 4-lane load then feeds
     # four rows with a lane-indexed fma.
+    # `scale * log2(e)` folded into Q, so every exponential below is a bare
+    # exp2 with no per-element multiply.
+    var c1 = Scalar[DType.float32](job.scale) * Scalar[DType.float32](
+        1.4426950408889634
+    )
     var q_t = stack_allocation[head_dim * qt, DType.float32]()
     var rr = 0
     while rr < qt:
@@ -1616,7 +1666,7 @@ def _dense_rows_tile_f32[
             var src = q_base.unsafe_offset((q0 + rr) * job.q_stride_t)
             var d = 0
             while d < head_dim:
-                var v = src.unsafe_load[width=LANES](d) * job.scale
+                var v = src.unsafe_load[width=LANES](d) * c1
                 comptime for i in range(LANES):
                     q_t.unsafe_store((d + i) * qt + rr, v[i])
                 d += LANES
@@ -1718,10 +1768,10 @@ def _dense_rows_tile_f32[
             var has = m_cand > Scalar[DType.float32](NEG_INF)
             if has:
                 m_new = max(m_new, m_cand)
-                alpha = _vexp_f(Scalar[DType.float32](row_max[r] - m_new))
+                alpha = _exp2f(Scalar[DType.float32](row_max[r] - m_new))
                 row_max[r] = m_new
-            # `q_t` already carries `scale`, so the logits are final: the exp
-            # argument is logit - max, one fadd instead of a second scaling.
+            # `q_t` carries `scale * log2(e)`, so the logits are already log2
+            # units: the exp argument is logit - max, one fadd.
             var off = Scalar[DType.float32](0.0)
             if m_new > Scalar[DType.float32](NEG_INF):
                 off = -m_new
@@ -1747,7 +1797,7 @@ def _dense_rows_tile_f32[
             # logits past `jn` are NEG_INF, so exp of them is exactly 0).
             var kend = min(ks, (jn + 3) // 4 * 4)
             while k < kend:
-                var p = _vexp[LANES](
+                var p = _exp2_g[LANES](
                     logits.unsafe_load[width=LANES](r * ks + k)
                     + SIMD[DType.float32, LANES](off)
                 )

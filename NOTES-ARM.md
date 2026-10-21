@@ -90,6 +90,26 @@ The causal-limit skip then added 1.5x/1.3x/1.2x at S=128/256/512 on both dtypes.
   now so it would work, but the expected gain (~1.5%) did not justify chasing
   the residual flakiness.
 
+## The fp32 exp rewrite, and a trap worth remembering
+
+Replacing the Cephes `_vexp` in the fp32 tile kernel with a width-generic
+`_exp2_g` (magic-constant rounding + degree-5 minimax + exponent insert, log2(e)
+folded into Q) is **15.14 -> 14.16 cycles/row-key, IPC 3.78 -> 3.93**.
+
+It first looked like it cost accuracy: the fp32 output error went 1.2e-6 ->
+1.1e-4 against a 2e-4 tolerance, and *raising the polynomial degree did nothing*
+(degree 5, 7.5e-8 relative, still 1.1e-4). The polynomial was never the problem:
+
+> **an error in the softmax `alpha` rescale does not cancel between the
+> accumulator and the row sum**, because the terms added *after* the rescale are
+> not scaled by it. It therefore accumulates over tiles (which is why the error
+> grew with seq_k and looked like a polynomial problem). `alpha` was still using
+> the degree-3 `_exp2_fast`; at degree 5 the error is back to 3.2e-6.
+
+Corollary: `alpha` must stay a **4-lane** exp in the bf16 kernel -- the two rows
+of a row pair have their own max, so collapsing it to a scalar silently gives
+row 1 row 0's rescale factor (caught by parity: 33/49).
+
 ## Dead ends (measured, do not repeat)
 
 * **`dcp=2` in P@V** (16 -> 8 accumulator registers, hoping to kill register
@@ -147,6 +167,9 @@ row on, or warm the process up.
   S=128 call is still OpenMP barrier (two fork-joins per call: pack + kernel).
   Collapsing the two GOMP regions into one (`GOMP_barrier` inside the worker) is
   the next thing to try.
+* fp32 D=64 is now 3% behind vLLM's kernel (14.16 vs 13.76 cycles/row-key) with
+  56.0 instructions against their 51.6 and IPC 3.93 against 3.75; the remaining
+  rows above the line are 1.00-1.16.
 * bf16 D=128 P@V pays 2 panel loads/row-key because the 64 dim pairs are walked
   in 16 chunks of 4 (`RP*dcp` = 16 registers); dcp=8 would halve it but needs 32.
 * The `-e armv8_pmuv3_0/stall_backend/` sampling profile (works on this box)
