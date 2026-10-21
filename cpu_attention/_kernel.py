@@ -412,7 +412,12 @@ def _dense(q, k, v, scale: float, causal: bool):
         vt.stride(2) if vt is not None else 0,
         _DTYPE_CODES[k.dtype],
         mode,
-        _workers(batch * num_kv_heads, seq_k // 64),
+        # The pack is one task per (batch, kv head) and each task does
+        # `seq_k` strided row copies, so "pages" has to count tokens, not
+        # 64-token blocks: at 8 heads the old `seq_k // 64` kept the pack
+        # single-threaded up to seq_k 512, where it costs 23.7 us of a 71 us
+        # call at S=128 (8 workers: 5.5 us).
+        _workers(batch * num_kv_heads, seq_k // 8),
     )
 
     out = torch.empty_like(q, memory_format=torch.contiguous_format)
