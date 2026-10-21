@@ -214,6 +214,51 @@ aarch64 torch's bundled `libgomp.so.1` is `RTLD_LOCAL` and `import` fails with
 `undefined symbol: omp_get_thread_num`. `scripts/build.py` now links it (same
 soname, so the loader still reuses torch's copy when it is already loaded).
 
+## 4c. What vLLM actually does (read from `csrc/cpu`, not inferred)
+
+Six things, with file:line. Only the first is structural; the rest are cheap and
+we do none of them.
+
+1. **The key tile is L2-sized, 480-1024 keys** — ours is 16 (NEON) / 64
+   (AVX-512), so we pay every per-tile fixed cost **8-64x more often**.
+   `calcu_default_tile_size` (`cpu_attn_impl.hpp:962`) is
+   `L2 / (head_dim * (8 + 2*elem) + 32)`, capped at `MaxQTileIterNum(128) *
+   MaxQHeadNumPerIteration(8)` = 1024, rounded to 32: **992 keys at D=64 fp32,
+   480 at D=128 fp32, 1024 / 640 for bf16**. One `tile_gemm<QK>` call writes the
+   whole tile's logits to a buffer, then `apply_softmax` runs **once per tile**,
+   then `tile_gemm<PV>` consumes it. The per-tile cost we repeat 16-64x per key
+   block: the row-wise `reduce_max`, `reduce_add`, the accumulator rescale, and
+   the mask.
+2. **Mask by range, not per lane** (`apply_mask`, `cpu_attn_impl.hpp:1360`):
+   the causal/window mask is contiguous, so they write `-inf` into
+   `[0, left_invalid)` and `[right_invalid, n)` with scalar stores. We do
+   `iota()` + compare + `select` over **every lane of every tile** — on NEON
+   that is 4x more often per key than on x86 and it was counted in the ~770
+   instructions/16-key-tile the ARM worker measured.
+3. **Rescale only when the max moves by more than 8**: `need_rescale =
+   (init_max - new_max) < -8.0` (`cpu_attn_impl.hpp:1468`, "same rescale
+   threshold with FA4"), and when it does not fire they do not even update the
+   running max. We rescale on *any* increase.
+4. **Probabilities alias the logits buffer** (`curr_prob_buffer =
+   reinterpret_cast<...>(logits_buffer)`, `prob_buffer_stride`,
+   `cpu_attn_impl.hpp:1318-1330`): one buffer, no copy, and P@V reads it through
+   `probability_token_store_t::store_probabilities`. We keep a separate `probs`
+   stack buffer and re-read it scalar by scalar in P@V.
+5. **Work items are packed by KV length, with KV splits and a reduce pass**
+   (`AttentionScheduler::schedule`, `cpu_attn_impl.hpp:500-700`):
+   `kv_len_per_thread = total_kv_len / thread_num`, one work item accumulates
+   *many* q-tiles until that budget is spent, a single q-tile longer than the
+   budget is split (`min_split_kv_len`, `local_split_id`) and a
+   `PartitionReduction` work item combines the partials. We have no split-KV path
+   at all, and we balance causally with round-robin instead of by measured KV
+   length. P@V is also d-chunked by `headdim_alignment = 32` with `accum_c`
+   ("accumulate onto the first iteration's output"), i.e. their accumulator
+   lives in `partial_q_buffer` and is never separately zeroed.
+6. **Their `fast_exp` is exactly our `_vexp`** (`cpu_arch_macros.h:20-60`:
+   degree-5 polynomial, exponent bit-insert, clamp at the float min/max), and on
+   aarch64 bf16 they use a cheaper `fast_exp_f16`. So the transcendental is
+   settled — do not spend more time there.
+
 ## 5. One source, two ISAs
 
 ```mojo
