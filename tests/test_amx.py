@@ -60,7 +60,10 @@ def main() -> int:
     args = ap.parse_args()
     torch.set_num_threads(args.threads or torch.get_num_threads())
     if not K.amx_available():
-        print("AMX kernel unavailable here"); return 1
+        # Not an error: every other host runs the Mojo kernel and this file has
+        # nothing to say about it (verify.sh runs every parity suite on both
+        # architectures).
+        print("AMX kernel unavailable here: skipped"); return 0
 
     shapes = [(128, 8, 64), (512, 8, 64), (1024, 8, 64), (2048, 8, 64),
               (256, 16, 128), (1024, 16, 128), (512, 32, 128), (1024, 8, 32)]

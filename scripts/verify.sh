@@ -32,6 +32,10 @@ echo "== clean build =="
 
 echo "== parity =="
 "${SSH[@]}" 'bash -lc "cd ~/cpu-attention && .venv/bin/python tests/test_dense.py 2>&1 | tail -1 && .venv/bin/python tests/test_flash_api.py 2>&1 | tail -1"'
+# The AMX kernel has its own parity harness (shape grid, both causal modes,
+# compared against SDPA *and* against the Mojo kernel) plus a byte-level pack
+# self-test; it reports "skipped" on a host without AMX.
+"${SSH[@]}" 'bash -lc "cd ~/cpu-attention && .venv/bin/python tests/test_amx.py 2>&1 | tail -2"'
 
 if [ "$ARCH" = "arm64" ]; then
   ISAS="neon"
