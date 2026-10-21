@@ -32,7 +32,8 @@ an issue-slot one.
 | # | technique | upstream | ours | verdict |
 |---|---|---|---|---|
 | 1 | 8-row x 32-key register-tiled micro-kernel, acc in registers, k-loop over head_dim | `cpu_attn_vec.hpp:37-130` | `_dense_rows` (4 rows x 64 keys) | same shape, different constant; `qt` is the knob |
-| 2 | K^T stored block-major inside a page (`[head_dim, block_size]`, `k_cache_token_group_stride = 32`) | `cpu_attn_vec.hpp:204-208`, walk `cpu_attn_impl.hpp:1222-1276` | we write `[head_dim, seq_k]` | **FALSIFIED as a cause — do not port.** It correlates with the L2 miss rate (5.97% vs 0.07%) but the correlation is not causal: overriding only the strides the kernel is handed, so that the K and V panels shrink to **88 KB total (L1-resident)** and the strided walk becomes dense, buys **1-2%** (`PROFILE_X86.md`, stride-override probe). The `l2_rqsts.demand_data_rd_miss` counter is a vPMU artefact on that box — it reports the same absolute count (5.7 M/call) for an 88 KB set as for a 1 MB one. Keeping our layout also protects the paged kernel, which already beats vLLM |
+| 2 | **per-head-contiguous K and V**: vLLM's page is `[block_size, head_dim]` per KV head, so one head's K/V is one stream (`k_cache_token_group_stride = 32`, `v_cache_token_group_stride = head_dim * 32`) | `cpu_attn_vec.hpp:202-223` | **was not**: our dense V was `[seq, heads, dim]` (tokens 8 KB apart at H=16/D=128) and K^T `[dim, seq_k]` | **PORTED, the biggest single win left: 1.9-2.0x.** V repacked per (batch, kv head) (`_vcopy_head`, a straight copy, 1-2% of the call) and K^T blocked every 64 keys (`[tile][dim][64]`). S=4096/H=16/D=128 fp32: **188 207 -> 99 116 us** on the worker's box and 93 231 us here, i.e. **0.61x -> 1.21x of SDPA**. The mechanism was isolated before implementing: handing the *same values* head-major in pure Python (no code change) was 1.95x, so it is the stride, not the copy |
+| 2b | *(the probe that "falsified" #2 was invalid — kept as a warning)* | — | — | Overriding only the strides handed to the kernel (`--kt-stride`/`--v-stride`) reads the **wrong values** out of a shrunken region, so it does not test a layout: it measured 1-2%, while the correct repack measures 1.9-2.0x. A layout change must be evaluated with the data *written* in that layout. The `l2_rqsts.demand_data_rd_miss` counter remains a vPMU artefact on that box (same absolute count for 88 KB and 1 MB) |
 | 3 | V row-major per page (`[block_size, head_dim]`), so P@V's B operand is 2 vectors of 32 contiguous dims per key | `cpu_attn_vec.hpp:216` | same (V is `[seq_k, head_dim]`) | have it |
 | 4 | P@V accumulator in memory, `accum_c` = "add onto first iteration's output" so it is never zeroed | `cpu_attn_impl.hpp:1330-1360` | `_dense_rows_mem` does the L1 acc, but zeroes it explicitly | partial |
 | 5 | P@V tiled over the head dim by `headdim_alignment = 32` | `:1330` | `dc = 2*LANES` (32 x86 / 8 NEON) | have it |
@@ -64,7 +65,9 @@ fix is to move the logits out of the register file, not to change the step.
 
 ## The short list
 
-0. **What actually binds (measured, after #2 died).** Two deficits, and neither
+0. **What actually binds, in order.** First the *layout* (#2: 1.9-2.0x, now
+   ported), then the *rows per sweep* (`qt`), then the softmax block. Everything
+   below is the state after #2 landed. Two deficits, and neither
    is bytes: (a) the **load:FMA ratio sets a hard floor** — at `qt=4/kt=32` the
    Q@K^T loop needs 6 zmm loads per 8 FMAs, so `llvm-mca` gives 1.0 FMA/cycle even
    with every load in L1, and we run 0.42; (b) the **serial softmax chain**

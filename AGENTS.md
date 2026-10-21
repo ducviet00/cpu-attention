@@ -568,7 +568,18 @@ i.e. attention 29.8-49.6 + interference +39.2 against 90.7 + 25.9.
    `[BKS, 4, 8]` (half the key tile, double the row pairs) and blows the register
    file — that is a config coupling, not a row-count limit.
 
-   **The layout/bandwidth reading of those counters is also dead** (the x86
+   **But the *layout* half of it was right, and the probe that "falsified" it was
+   invalid.** vLLM's page is per-KV-head contiguous, so one head's K and V are a
+   single stream; our dense call read V across `[seq, heads, dim]` (tokens 8 KB
+   apart) and K^T across `[dim, seq_k]`. Repacking V per (batch, kv head) plus
+   blocking the transposed K every 64 keys is **1.9-2.0x**: S=4096/H=16/D=128 fp32
+   went 188 207 -> 93 231 us, **0.61x -> 1.21x of SDPA**, and the mechanism was
+   isolated first (handing the same values head-major in pure Python, no code
+   change, was 1.95x — the stride, not the copy). The earlier "strides do not
+   matter" probe overrode only the strides the kernel is handed, i.e. it read
+   wrong values out of a shrunken region; that cannot test a layout.
+
+   **The bandwidth reading of the counters, though, is dead** (the x86
    worker retracted its own round-1 mechanism with a stride-override probe:
    starving K and V to an 88 KB, L1-resident working set buys **1-2%**, and the
    `l2_rqsts` counter turns out to be a vPMU artefact that reports the same
