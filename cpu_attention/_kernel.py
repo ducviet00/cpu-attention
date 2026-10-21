@@ -9,6 +9,7 @@ every entry point raises ``RuntimeError``.
 
 import importlib.util
 import os
+import threading
 
 import torch
 
@@ -334,8 +335,8 @@ every supported head dim and dtype on the AVX-512 boxes (2 and 8 are switchable
 through the environment).
 """
 
-_SCRATCH = {}
-"""Reusable scratch, keyed by what it is for.
+_SCRATCH = threading.local()
+"""Reusable scratch, per thread, keyed by what it is for.
 
 `torch.empty` on a multi-megabyte buffer is not free: glibc serves it with
 `mmap`, the matching `free` unmaps it, so the next call gets fresh pages and the
@@ -348,33 +349,40 @@ Holding one buffer per purpose and shape removes the fault/zero pass for
 everything except the first call. It is a workspace, not a cache of results: the
 kernel writes every byte it reads, and the buffers are never returned to the
 caller (the output tensor is still a fresh allocation, since the caller owns
-it).
+it). Per-thread, because two threads packing into one buffer would corrupt each
+other's K.
 """
 
 
 def _scratch(kind, shape, dtype):
     """A workspace tensor of ``shape``/``dtype``, reused across calls."""
+    bufs = getattr(_SCRATCH, "bufs", None)
+    if bufs is None:
+        bufs = _SCRATCH.bufs = {}
     key = (kind, shape, dtype)
-    buf = _SCRATCH.get(key)
+    buf = bufs.get(key)
     if buf is None:
         # Bound the dict: one entry per (purpose, shape, dtype) alive at a time
         # is all the engine ever needs, but a caller looping over many shapes
         # would otherwise grow it without limit.
-        if len(_SCRATCH) > 64:
-            _SCRATCH.clear()
+        if len(bufs) > 64:
+            bufs.clear()
         buf = torch.empty(shape, dtype=dtype)
-        _SCRATCH[key] = buf
+        bufs[key] = buf
     return buf
 
 
 def scratch_bytes() -> int:
-    """Bytes currently held as workspace (diagnostics / leak checks)."""
-    return sum(t.numel() * t.element_size() for t in _SCRATCH.values())
+    """Bytes this thread holds as workspace (diagnostics / leak checks)."""
+    bufs = getattr(_SCRATCH, "bufs", None) or {}
+    return sum(t.numel() * t.element_size() for t in bufs.values())
 
 
 def clear_scratch() -> None:
-    """Drop every workspace buffer (tests, or after a shape sweep)."""
-    _SCRATCH.clear()
+    """Drop this thread's workspace buffers (tests, or after a shape sweep)."""
+    bufs = getattr(_SCRATCH, "bufs", None)
+    if bufs is not None:
+        bufs.clear()
 
 
 _QT_ENV = os.environ.get("CPU_ATTENTION_QT")
