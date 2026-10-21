@@ -44,7 +44,8 @@ EOS
 fi
 
 echo "== build =="
-"${SSH[@]}" 'bash -lc "cd ~/cpu-attention && PATH=\$PWD/.venv/bin:\$PATH .venv/bin/python scripts/build.py 2>&1 | tail -2"'
+# `set -o pipefail` so a failed build is not hidden by `tail`'s exit status.
+"${SSH[@]}" 'bash -lc "set -o pipefail; cd ~/cpu-attention && PATH=\$PWD/.venv/bin:\$PATH .venv/bin/python scripts/build.py 2>&1 | tail -2"'
 
 if [ "$FULL" = "--full" ]; then
   echo "== vllm reference =="

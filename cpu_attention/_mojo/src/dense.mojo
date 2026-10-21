@@ -795,10 +795,9 @@ def _dense_rows_dot[
 def _exp2_fast(y: SIMD[DType.float32, 4]) -> SIMD[DType.float32, 4]:
     """``2^y`` for ``y <= 0`` in about ten instructions, no libm.
 
-    ``y = n + f`` with ``n`` the rounded integer part (the add-and-subtract
-    magic-constant trick, so no round instruction), ``2^f`` from a degree-4
-    polynomial on ``[-0.5, 0.5]`` and ``2^n`` by adding ``n`` to the exponent
-    field of 1.0. Clamping at -127 makes the exponent field underflow to zero
+    ``y = n + f`` with ``n`` the rounded integer part (``roundeven``, one
+    instruction), ``2^f`` from a degree-3 minimax polynomial on ``[-0.5, 0.5]``
+    and ``2^n`` by adding ``n`` to the exponent field of 1.0. Clamping at -127 makes the exponent field underflow to zero
     bits, so every masked lane (``NEG_INF``) comes out as *exactly* 0 -- which
     the online softmax needs and a saturating conversion would not give.
 
@@ -813,14 +812,19 @@ def _exp2_fast(y: SIMD[DType.float32, 4]) -> SIMD[DType.float32, 4]:
     # One fmaxnm: NaN (a masked lane whose centre is +inf) and anything below
     # -127 both land on -127, whose exponent field is zero bits, so p is 0.
     var yc = _vmax(y, SIMD[DType.float32, 4](-127.0))
-    var n = (yc + SIMD[DType.float32, 4](MAGIC)) - SIMD[DType.float32, 4](MAGIC)
+    # ``roundeven`` is one instruction with 4-cycle latency; the magic-constant
+    # add/sub pair it replaces is two instructions and 8 cycles on the critical
+    # path of a chain that ablation puts at 30% of the call.
+    var n = llvm_intrinsic[
+        "llvm.roundeven.v4f32", SIMD[DType.float32, 4], has_side_effect=False
+    ](yc)
     var f = yc - n
-    var p = SIMD[DType.float32, 4](0.009618129107628477) * f + SIMD[
-        DType.float32, 4
-    ](0.05550410866482158)
-    p = p * f + SIMD[DType.float32, 4](0.2402265069591007)
-    p = p * f + SIMD[DType.float32, 4](0.6931471805599453)
-    p = p * f + SIMD[DType.float32, 4](1.0)
+    # Degree-3 minimax on [-0.5, 0.5]: relative error 7.5e-5, two orders below
+    # the bf16 probabilities this path rounds to.
+    var p = SIMD[DType.float32, 4](5.5172628285e-2)
+    p = p * f + SIMD[DType.float32, 4](2.4261366164e-1)
+    p = p * f + SIMD[DType.float32, 4](6.9326095397e-1)
+    p = p * f + SIMD[DType.float32, 4](9.9992793009e-1)
     var e = (n.cast[DType.int32]() + SIMD[DType.int32, 4](127)) << SIMD[
         DType.int32, 4
     ](23)
@@ -910,9 +914,13 @@ def _dense_rows_bfmmla[
     )
 
     # Q A panels: one per (row pair, 4 head dims), built once per work item.
+    # ``[head-dim group][row pair][8]``: one group's four row-pair panels are
+    # then 64 contiguous bytes and load as two `ldp`s. Laid out ``[rp][g][8]``
+    # they are 128 elements apart and cost four separate loads in the innermost
+    # loop of the Q@K^T sweep.
     var q_pan = stack_allocation[RP * DG * 8, BFloat16]()
-    comptime for rp in range(RP):
-        comptime for g in range(DG):
+    comptime for g in range(DG):
+        comptime for rp in range(RP):
             var lo = SIMD[DType.bfloat16, 4](0.0)
             var hi = SIMD[DType.bfloat16, 4](0.0)
             if 2 * rp < nrows:
@@ -923,7 +931,7 @@ def _dense_rows_bfmmla[
                 hi = q_base.unsafe_offset(
                     (q0 + 2 * rp + 1) * job.q_stride_t + 4 * g
                 ).unsafe_load[width=4]()
-            q_pan.unsafe_store[width=8]((rp * DG + g) * 8, lo.join(hi))
+            q_pan.unsafe_store[width=8]((g * RP + rp) * 8, lo.join(hi))
 
     var acc = stack_allocation[RP * DP * 4, DType.float32]()
     comptime for i in range(RP * DP):
@@ -966,17 +974,24 @@ def _dense_rows_bfmmla[
             comptime for i in range(RP * NS):
                 accs[i] = SIMD[DType.float32, 4](0.0)
             # One K vector (2 key positions x 4 head dims) feeds every row pair;
-            # one Q panel feeds every key pair.
+            # one Q panel feeds every key pair. K^T is blocked by ``kt_blk``
+            # keys, so this walks one 8 KB tile linearly instead of jumping
+            # ``seq_k/2 * 16`` bytes per head-dim group (16 scattered lines per
+            # sub-block, which was a 12% branch bubble at S=2048).
+            var ktp = kt_base.unsafe_offset(
+                (tok // job.kt_blk) * (DG * job.kt_stride_d)
+                + ((tok % job.kt_blk) // 2) * 8
+            )
             var g = 0
             while g < DG:
                 comptime for rp in range(RP):
-                    var a = q_pan.unsafe_load[width=8]((rp * DG + g) * 8)
+                    var a = q_pan.unsafe_load[width=8]((g * RP + rp) * 8)
                     comptime for v in range(NS):
                         accs[rp * NS + v] = _bfmmla(
                             accs[rp * NS + v],
                             a,
-                            kt_base.unsafe_load[width=8](
-                                g * job.kt_stride_d + (half + v) * 8
+                            ktp.unsafe_load[width=8](
+                                g * job.kt_stride_d + v * 8
                             ),
                         )
                 g += 1
@@ -1100,14 +1115,17 @@ def _dense_rows_bfmmla[
                     accv[rp * dcp + d] = acc.unsafe_load[width=4](
                         (rp * DP + dc + d) * 4
                     )
+            var vbase = vt_base.unsafe_offset(
+                (t0 // 4) * job.v_stride_t + dc * 8
+            )
             var kg = 0
             while kg < kgroups:
                 var ap = Array[SIMD[DType.bfloat16, 8], RP](uninitialized=True)
                 comptime for rp in range(RP):
                     ap[rp] = probs.unsafe_load[width=8]((kg * RP + rp) * 8)
                 comptime for d in range(dcp):
-                    var vv = vt_base.unsafe_load[width=8](
-                        (dc + d) * job.v_stride_t + (t0 // 4 + kg) * 8
+                    var vv = vbase.unsafe_load[width=8](
+                        kg * job.v_stride_t + d * 8
                     )
                     comptime for rp in range(RP):
                         accv[rp * dcp + d] = _bfmmla(
@@ -1159,8 +1177,656 @@ def _dense_rows_bfmmla[
                         )
 
 
-comptime TBLK = 16
-"""Tokens transposed at a time: 16 floats / 32 bf16 is one 64-byte store, so the
+comptime TILE_KS = 64
+"""Keys per tile in ``_dense_rows_tile``: the whole tile's logits live in L1.
+
+This is the vLLM structure (one QK pass over a key tile, one straight-line
+softmax over the whole tile, then P@V over it) as opposed to v1's online-softmax
+chain, which re-derives the max and rescales the accumulator every 16 keys. A
+tile has to be a multiple of 64 because the K scratch is padded to 64 keys and
+the QK pass reads whole sub-blocks.
+"""
+
+comptime KT_PAIR_STRIDE = (KS_STRIDE // 2) * 8
+"""Elements between head-dim groups in the bf16 K^T layout
+(``[tile][dim group][key pair][8]``): 32 key pairs x 8 bf16."""
+
+comptime KS_STRIDE = 64
+"""Keys per contiguous K^T block, as a *compile-time* stride.
+
+The fp32 Q@K^T sweep reads one head dim's 64 keys per iteration; taking that
+stride from the job turned every increment into a `madd`. 64 is what
+``_kernel.kt_blk`` sets for every fast path (the x86 blocking is also 64), and
+``_dense_dispatch`` falls back to the generic kernel if it ever is not.
+"""
+
+comptime TILE_NSQ = 4
+"""Key *pairs* per QK sub-block: ``qt/2 * nsq`` fp32 accumulator registers.
+
+Four row pairs x four key pairs is 16 registers, which is what lets ``qt`` grow
+to 8 (the K read is amortised over the rows, so rows are the only lever on the
+K traffic) without the 32-register tile spilling.
+"""
+
+
+@inline(.always)
+def _dense_rows_tile[
+    head_dim: Int, qt: Int, ks: Int, dcp: Int, nsq: Int
+](job: DenseJob, batch: Int, head: Int, kv_head: Int, q0: Int):
+    """``bfmmla`` attention with the key tile's logits in L1 (ARM bf16).
+
+    Same arithmetic as ``_dense_rows_bfmmla`` and the same operands, but the
+    structure is vLLM's rather than flash-decoding's:
+
+    1. **QK**, ``nsq`` key pairs (``2*nsq`` keys) at a time, ``RP*nsq`` fp32
+       accumulators in registers, straight to a logits buffer. The running tile
+       max is folded into this pass (it is one ``fmaxnm`` per accumulator, and
+       the values are already in registers).
+    2. **one softmax over the whole tile**: a single ``m_new``/``alpha`` per row
+       per tile instead of per 16 keys, then one pass that reads each logit,
+       scales, exponentiates, accumulates the row sum and writes the bf16
+       probability panel P@V consumes.
+    3. **P@V** over the tile, ``dcp`` head-dim pairs at a time.
+
+    Why: at 16 keys per online-softmax step the row max, the row sum, the
+    accumulator rescale and the block mask are all paid 4-8x more often than
+    they need to be, and the 32-register logit tile caps the rows per work item
+    (``qt``), which is the only thing that amortises the K/V reads. Staging the
+    logits in L1 costs ~4 memory ops per row-key and buys the larger row block.
+    """
+
+    comptime RP = qt // 2  # row pairs
+    comptime DG = head_dim // 4  # Q@K^T contraction groups (4 head dims each)
+    comptime DP = head_dim // 2  # P@V output dim pairs
+    comptime NKP = ks // 2  # key pairs per tile
+    comptime NKG = ks // 4  # key groups (4 keys) per tile
+
+    var seq_k = job.seq_k
+    var nrows = min(qt, job.seq_q - q0)
+    var diag = seq_k - job.seq_q
+    var q_base = _ptr[BFloat16](job.q).unsafe_offset(
+        batch * job.q_stride_b + head * job.q_stride_h
+    )
+    var kt_base = _ptr[BFloat16](job.kt).unsafe_offset(
+        (batch * job.num_kv_heads + kv_head) * job.kt_stride_bh
+    )
+    var vt_base = _ptr[BFloat16](job.v).unsafe_offset(
+        batch * job.v_stride_b + kv_head * job.v_stride_h
+    )
+    var o_base = _ptr[BFloat16](job.dst).unsafe_offset(
+        batch * job.o_stride_b + head * job.o_stride_h
+    )
+
+    # Q A panels: [row pair][head-dim group of 4][8] -- four head dims of the
+    # even row then four of the odd row, built once per work item.
+    var q_pan = stack_allocation[RP * DG * 8, BFloat16]()
+    comptime for rp in range(RP):
+        comptime for g in range(DG):
+            var lo = SIMD[DType.bfloat16, 4](0.0)
+            var hi = SIMD[DType.bfloat16, 4](0.0)
+            if 2 * rp < nrows:
+                lo = q_base.unsafe_offset(
+                    (q0 + 2 * rp) * job.q_stride_t + 4 * g
+                ).unsafe_load[width=4]()
+            if 2 * rp + 1 < nrows:
+                hi = q_base.unsafe_offset(
+                    (q0 + 2 * rp + 1) * job.q_stride_t + 4 * g
+                ).unsafe_load[width=4]()
+            q_pan.unsafe_store[width=8]((g * RP + rp) * 8, lo.join(hi))
+
+    # Output accumulator: [row pair][dim pair][4], in L1 like v1's.
+    var acc = stack_allocation[RP * DP * 4, DType.float32]()
+    comptime for i in range(RP * DP):
+        acc.unsafe_store[width=4](i * 4, SIMD[DType.float32, 4](0.0))
+
+    # The tile's logits [key pair][row pair][4 fp32] and its bf16 probability
+    # panels [key group][row pair][8]. Runtime-indexed, so they stay in L1.
+    var logits = stack_allocation[ks * qt, DType.float32]()
+    var probs = stack_allocation[NKG * RP * 8, BFloat16]()
+
+    var m_v = Array[SIMD[DType.float32, 4], RP](uninitialized=True)
+    var s_v = Array[SIMD[DType.float32, 4], RP](uninitialized=True)
+    comptime for rp in range(RP):
+        m_v[rp] = SIMD[DType.float32, 4](NEG_INF)
+        s_v[rp] = SIMD[DType.float32, 4](0.0)
+
+    # exp(scale*x - m) = 2^(c1*x - c1*m); logits stay in raw Q@K^T units.
+    var c1 = Scalar[DType.float32](job.scale) * Scalar[DType.float32](
+        1.4426950408889634
+    )
+
+    var loop_end = seq_k
+    if job.causal:
+        loop_end = min(seq_k, q0 + nrows + diag)
+
+    var t0 = 0
+    while t0 < loop_end:
+        var kt_tile = kt_base.unsafe_offset(
+            (t0 // job.kt_blk) * (DG * job.kt_stride_d)
+            + ((t0 % job.kt_blk) // 2) * 8
+        )
+        # (recomputed per sub-block below: a tile wider than ``kt_blk`` would
+        # step out of its key-pair run into the next head-dim group.)
+        # ---- 1. Q@K^T into the logits buffer, and the tile max on the way.
+        var mt = Array[SIMD[DType.float32, 4], RP](uninitialized=True)
+        comptime for rp in range(RP):
+            mt[rp] = SIMD[DType.float32, 4](NEG_INF)
+        # Only the key sub-blocks that exist: the last row of the block sees no
+        # key past ``t0 + jn``, so everything beyond is masked to NEG_INF anyway
+        # and the whole sub-block (Q@K^T, max, exp, P@V) is wasted work. At
+        # S=128 that waste was ~1.5x of the called-for work; at S>=2048 it is
+        # noise.
+        # (Up to the *causal* limit of the block's last row, not seq_k: past
+        # ``loop_end`` every row of the block is masked anyway.)
+        var jn = min(ks, loop_end - t0)
+        var nkp = min(NKP, (jn + 2 * nsq - 1) // (2 * nsq) * nsq)
+        # K^T is blocked by ``kt_blk`` (= the tile size here), so the whole
+        # tile's K is one contiguous run and a sub-block reads it linearly.
+        var sb = 0
+        while sb < nkp:
+            var kt_sub = kt_base.unsafe_offset(
+                ((t0 + 2 * sb) // job.kt_blk) * (DG * job.kt_stride_d)
+                + (((t0 + 2 * sb) % job.kt_blk) // 2) * 8
+            )
+            var accs = Array[SIMD[DType.float32, 4], RP * nsq](
+                uninitialized=True
+            )
+            # Peel g=0 so the zero accumulator is one shared register: the
+            # obvious `accs[i] = 0` loop emitted RP*nsq separate `movi`s per
+            # sub-block.
+            var zero = SIMD[DType.float32, 4](0.0)
+            comptime for rp in range(RP):
+                var a0 = q_pan.unsafe_load[width=8]((0 * RP + rp) * 8)
+                comptime for v in range(nsq):
+                    accs[rp * nsq + v] = _bfmmla(
+                        zero,
+                        a0,
+                        kt_sub.unsafe_load[width=8](v * 8),
+                    )
+            var g = 1
+            while g < DG:
+                comptime for rp in range(RP):
+                    var a = q_pan.unsafe_load[width=8]((g * RP + rp) * 8)
+                    comptime for v in range(nsq):
+                        accs[rp * nsq + v] = _bfmmla(
+                            accs[rp * nsq + v],
+                            a,
+                            kt_sub.unsafe_load[width=8](
+                                g * KT_PAIR_STRIDE + v * 8
+                            ),
+                        )
+                g += 1
+
+            # Causal tail: kill the lanes no row may see, in the accumulators so
+            # the tile max and the exp pass both see NEG_INF (exp2 of which is
+            # exactly 0 after the clamp). Lane 0,1 are keys 2v,2v+1 of row 2rp
+            # and lanes 2,3 the same keys of row 2rp+1.
+            var tok = t0 + 2 * sb
+            var boundary = tok + 2 * nsq > seq_k
+            if job.causal:
+                boundary = tok + 2 * nsq > q0 + diag + 1
+            if boundary:
+                comptime for rp in range(RP):
+                    var l0 = Int32(seq_k)
+                    var l1 = Int32(seq_k)
+                    if job.causal:
+                        l0 = Int32(q0 + 2 * rp + diag + 1)
+                        l1 = Int32(q0 + 2 * rp + 1 + diag + 1)
+                    var lim = SIMD[DType.int32, 4](l0, l0, l1, l1)
+                    comptime for v in range(nsq):
+                        var idx = SIMD[DType.int32, 4](
+                            Int32(tok + 2 * v),
+                            Int32(tok + 2 * v + 1),
+                            Int32(tok + 2 * v),
+                            Int32(tok + 2 * v + 1),
+                        )
+                        accs[rp * nsq + v] = idx.lt(lim).select(
+                            accs[rp * nsq + v], SIMD[DType.float32, 4](NEG_INF)
+                        )
+
+            comptime for rp in range(RP):
+                var mx = accs[rp * nsq]
+                comptime for v in range(1, nsq):
+                    mx = _vmax(mx, accs[rp * nsq + v])
+                # One fmaxnm per sub-block: the pair max duplicated over each
+                # row's two key lanes, folded into the tile max.
+                mt[rp] = _vmax(mt[rp], _vmax(mx, _swap_pairs(mx)))
+                comptime for v in range(nsq):
+                    logits.unsafe_store[width=4](
+                        ((sb + v) * RP + rp) * 4, accs[rp * nsq + v]
+                    )
+            sb += nsq
+
+        # ---- 2. One softmax update for the whole tile, then exp + panels.
+        # Key groups that exist, rounded up to a multiple of two (the exp loop
+        # consumes two per iteration) and never past the sub-blocks the QK pass
+        # actually filled.
+        var nkg = min(NKG, (jn + 7) // 8 * 2)
+        comptime for rp in range(RP):
+            # Does this tile show this row pair anything at all? False only in
+            # the last tile of a block whose early rows' window ends earlier.
+            var has = mt[rp].reduce_max() > Scalar[DType.float32](NEG_INF)
+            var m_new = m_v[rp]
+            var alpha = SIMD[DType.float32, 4](1.0)
+            if has:
+                m_new = _vmax(m_v[rp], mt[rp])
+                alpha = _exp2_fast((m_v[rp] - m_new) * c1)
+                m_v[rp] = m_new
+                # The accumulator (and the row sum) are relative to the old max.
+                if s_v[rp].reduce_max() > Scalar[DType.float32](0.0):
+                    comptime for d in range(DP):
+                        acc.unsafe_store[width=4](
+                            (rp * DP + d) * 4,
+                            acc.unsafe_load[width=4]((rp * DP + d) * 4) * alpha,
+                        )
+                    s_v[rp] = s_v[rp] * alpha
+            # One scalar-vector offset per row pair, and a *runtime* kg loop:
+            # 16 unrolled copies of the polynomial produced a 4.4k-instruction
+            # tile body that spilled (the compiler interleaved the chains) and
+            # did not fit the I-cache.
+            var off = m_new * (-c1)
+            # One partial sum per key group of the two the loop consumes, folded
+            # once: a single `sumv` is a 16-long serial `fadd` chain per row pair
+            # per tile, and it showed up as 5% of the backend stalls.
+            var sumv = Array[SIMD[DType.float32, 4], 2](uninitialized=True)
+            sumv[0] = SIMD[DType.float32, 4](0.0)
+            sumv[1] = SIMD[DType.float32, 4](0.0)
+            # Nothing visible yet anywhere: the panels have to be exactly zero,
+            # because -inf * -c1 is +inf and would exponentiate to 1, not 0.
+            var blind = m_new.reduce_max() == Scalar[DType.float32](NEG_INF)
+            var kg = 0
+            if not has and blind:
+                while kg < nkg:
+                    probs.unsafe_store[width=8](
+                        (kg * RP + rp) * 8, SIMD[DType.bfloat16, 8](0.0)
+                    )
+                    kg += 1
+            else:
+                # Two key groups per iteration: the polynomial is a ~10-deep
+                # dependency chain and two of them per iteration (32 cycles of
+                # latency against ~20 instructions of work) does not fill the
+                # pipeline; four in flight does.
+                while kg < nkg:
+                    comptime for u in range(2):
+                        var p0 = _exp2_fast(
+                            logits.unsafe_load[width=4](
+                                (kg + u) * (2 * RP) * 4 + rp * 4
+                            )
+                            * c1
+                            + off
+                        )
+                        var p1 = _exp2_fast(
+                            logits.unsafe_load[width=4](
+                                ((kg + u) * 2 + 1) * RP * 4 + rp * 4
+                            )
+                            * c1
+                            + off
+                        )
+                        sumv[u] += p0 + p1
+                        # Row 0's four keys are lanes 0,1 of both exponentials
+                        # and row 1's are lanes 2,3, so a panel is two 4-lane
+                        # half-shuffles, two truncating converts and a join.
+                        # The 8-lane constructor this replaces compiled to zip2
+                        # plus a scalar lane insert (`mov v.h[7]`) per group.
+                        var z0 = SIMD[DType.float32, 4](
+                            p0[0], p0[1], p1[0], p1[1]
+                        )
+                        var z1 = SIMD[DType.float32, 4](
+                            p0[2], p0[3], p1[2], p1[3]
+                        )
+                        probs.unsafe_store[width=8](
+                            ((kg + u) * RP + rp) * 8,
+                            z0.cast[DType.bfloat16]().join(
+                                z1.cast[DType.bfloat16]()
+                            ),
+                        )
+                    kg += 2
+            var st = sumv[0] + sumv[1]
+            s_v[rp] = s_v[rp] + _swap_pairs(st) + st
+
+        # ---- 3. P@V over the tile, dcp dim pairs at a time. Only the key
+        # groups that exist (``nkg``, decided in phase 1): masked lanes are
+        # exactly 0 but their V may be past the end of the packed buffer
+        # (0 * garbage is not 0).
+        var kgroups = nkg
+        comptime for dc in range(0, DP, dcp):
+            var accv = Array[SIMD[DType.float32, 4], RP * dcp](
+                uninitialized=True
+            )
+            comptime for rp in range(RP):
+                comptime for d in range(dcp):
+                    accv[rp * dcp + d] = acc.unsafe_load[width=4](
+                        (rp * DP + dc + d) * 4
+                    )
+            var vbase = vt_base.unsafe_offset(
+                (t0 // 4) * job.v_stride_t + dc * 8
+            )
+            var kg = 0
+            while kg < kgroups:
+                var ap = Array[SIMD[DType.bfloat16, 8], RP](uninitialized=True)
+                comptime for rp in range(RP):
+                    ap[rp] = probs.unsafe_load[width=8]((kg * RP + rp) * 8)
+                comptime for d in range(dcp):
+                    var vv = vbase.unsafe_load[width=8](
+                        kg * job.v_stride_t + d * 8
+                    )
+                    comptime for rp in range(RP):
+                        accv[rp * dcp + d] = _bfmmla(
+                            accv[rp * dcp + d], ap[rp], vv
+                        )
+                kg += 1
+            comptime for rp in range(RP):
+                comptime for d in range(dcp):
+                    acc.unsafe_store[width=4](
+                        (rp * DP + dc + d) * 4, accv[rp * dcp + d]
+                    )
+
+        t0 += ks
+
+    comptime for rp in range(RP):
+        comptime for c in range(2):
+            var r = 2 * rp + c
+            if r < nrows:
+                var out = o_base.unsafe_offset((q0 + r) * job.o_stride_t)
+                var vis = seq_k > 0
+                if job.causal:
+                    vis = q0 + r + diag + 1 > 0
+                var s = s_v[rp][2 * c]
+                if vis and s > Scalar[DType.float32](0.0):
+                    var inv = SIMD[DType.float32, 4](
+                        Scalar[DType.float32](1.0) / s
+                    )
+                    comptime for d4 in range(DP // 4):
+                        var o8 = SIMD[DType.bfloat16, 8](0.0)
+                        comptime for i in range(4):
+                            var t = (
+                                acc.unsafe_load[width=4](
+                                    (rp * DP + d4 * 4 + i) * 4
+                                )
+                                * inv
+                            )
+                            o8[2 * i] = Scalar[DType.bfloat16](t[2 * c])
+                            o8[2 * i + 1] = Scalar[DType.bfloat16](t[2 * c + 1])
+                        out.unsafe_store[width=8](d4 * 8, o8)
+                else:
+                    comptime for d8 in range(DP // 4):
+                        out.unsafe_store[width=8](
+                            d8 * 8, SIMD[DType.bfloat16, 8](0.0)
+                        )
+
+
+@inline(.always)
+def _dense_rows_tile_f32[
+    head_dim: Int, qt: Int, ks: Int, kb: Int, dc: Int
+](job: DenseJob, batch: Int, head: Int, kv_head: Int, q0: Int):
+    """fp32 attention with the key tile's logits in L1 (the ARM fp32 path).
+
+    Same structure as ``_dense_rows_tile`` (which is the bf16/``bfmmla`` one) and
+    for the same reasons: the old fp32 path was ``_dense_rows_mem``, i.e. an
+    online softmax every 16 keys, and ``perf stat`` put it at **72.7
+    instructions per row-key** against vLLM's 51.6 -- the max tree, the
+    accumulator rescale, the product-buffer reload per head-dim chunk and the
+    mask were all paid 4x more often than the arithmetic needs.
+
+    fp32 has no bfmmla, so the arithmetic is 16 FMA per row-key for Q@K^T and 16
+    for P@V (four 4-lane MACs each) and the whole game is issuing as few other
+    instructions as possible: this is 46, against a hard floor of 32.
+
+    * Q is transposed to ``[head_dim][qt]`` once per work item so one 4-lane load
+      broadcasts four rows' q[d] with no scalar loads (the fma becomes
+      ``fmla vD.4s, vN.4s, vM.s[k]``).
+    * Q@K^T walks ``kb`` keys (two vectors) at a time into ``qt*kb/4`` registers.
+    * one softmax per 64-key tile: one max, one alpha, one accumulator rescale.
+    * P@V walks a 4-key group at a time and reads the probability vector of each
+      row once per (group, head-dim chunk), using the four lanes as four keys --
+      so the probabilities are never re-read as scalars, which is what the old
+      path did eight times per key.
+    """
+
+    comptime NV = head_dim // LANES  # vectors per row of the output accumulator
+    comptime KV = kb // LANES  # vectors per Q@K^T key sub-block
+    comptime DV = dc // LANES  # vectors per P@V head-dim chunk
+    comptime NKB = ks // kb  # Q@K^T sub-blocks per tile
+    comptime NCH = head_dim // dc  # P@V head-dim chunks
+
+    var seq_k = job.seq_k
+    var nrows = min(qt, job.seq_q - q0)
+    var diag = seq_k - job.seq_q
+    var q_base = _ptr[Scalar[DType.float32]](job.q).unsafe_offset(
+        batch * job.q_stride_b + head * job.q_stride_h
+    )
+    var kt_base = _ptr[Scalar[DType.float32]](job.kt).unsafe_offset(
+        (batch * job.num_kv_heads + kv_head) * job.kt_stride_bh
+    )
+    var v_base = _ptr[Scalar[DType.float32]](job.v).unsafe_offset(
+        batch * job.v_stride_b + kv_head * job.v_stride_h
+    )
+    var o_base = _ptr[Scalar[DType.float32]](job.dst).unsafe_offset(
+        batch * job.o_stride_b + head * job.o_stride_h
+    )
+
+    # Q transposed to [head_dim][qt], scale folded in: one 4-lane load then feeds
+    # four rows with a lane-indexed fma.
+    var q_t = stack_allocation[head_dim * qt, DType.float32]()
+    var rr = 0
+    while rr < qt:
+        if rr < nrows:
+            var src = q_base.unsafe_offset((q0 + rr) * job.q_stride_t)
+            var d = 0
+            while d < head_dim:
+                var v = src.unsafe_load[width=LANES](d) * job.scale
+                comptime for i in range(LANES):
+                    q_t.unsafe_store((d + i) * qt + rr, v[i])
+                d += LANES
+        rr += 1
+
+    var acc = stack_allocation[qt * head_dim, DType.float32]()
+    comptime for i in range(qt * NV):
+        acc.unsafe_store[width=LANES](i * LANES, SIMD[DType.float32, LANES](0.0))
+    var logits = stack_allocation[qt * ks, DType.float32]()
+    var probs = stack_allocation[qt * ks, DType.float32]()
+
+    var row_max = Array[Scalar[DType.float32], qt](uninitialized=True)
+    var row_sum = Array[SIMD[DType.float32, LANES], qt](uninitialized=True)
+    comptime for r in range(qt):
+        row_max[r] = Scalar[DType.float32](NEG_INF)
+        row_sum[r] = SIMD[DType.float32, LANES](0.0)
+
+    var loop_end = seq_k
+    if job.causal:
+        loop_end = min(seq_k, q0 + nrows + diag)
+
+    var t0 = 0
+    while t0 < loop_end:
+        # ---- 1. Q@K^T into the logits buffer, with the tile max on the way.
+        var mvec = Array[SIMD[DType.float32, LANES], qt](uninitialized=True)
+        comptime for r in range(qt):
+            mvec[r] = SIMD[DType.float32, LANES](NEG_INF)
+        # Up to the causal limit of the block's last row (see the bf16 kernel).
+        var jn = min(ks, loop_end - t0)
+        var nkb = min(NKB, (jn + kb - 1) // kb)
+        var sb = 0
+        while sb < nkb:
+            var ko = sb * kb
+            var kt_sub = kt_base.unsafe_offset(
+                ((t0 + ko) // job.kt_blk) * (head_dim * job.kt_blk)
+                + ((t0 + ko) % job.kt_blk)
+            )
+            var accs = Array[SIMD[DType.float32, LANES], qt * KV](
+                uninitialized=True
+            )
+            var zero = SIMD[DType.float32, LANES](0.0)
+            comptime for i in range(qt * KV):
+                accs[i] = zero
+            var d = 0
+            while d < head_dim:
+                var kv = Array[SIMD[DType.float32, LANES], KV](
+                    uninitialized=True
+                )
+                comptime for v in range(KV):
+                    kv[v] = kt_sub.unsafe_load[width=LANES](
+                        d * KS_STRIDE + v * LANES
+                    )
+                comptime for h in range(qt // LANES):
+                    var qv = q_t.unsafe_load[width=LANES](d * qt + h * LANES)
+                    comptime for i in range(LANES):
+                        comptime for v in range(KV):
+                            accs[(h * LANES + i) * KV + v] += (
+                                kv[v] * SIMD[DType.float32, LANES](qv[i])
+                            )
+                d += 1
+
+            # Causal tail: NEG_INF in the lanes no row may see (exp of it is 0).
+            var boundary = t0 + ko + kb > seq_k
+            if job.causal:
+                boundary = t0 + ko + kb > q0 + diag + 1
+            if boundary:
+                comptime for r in range(qt):
+                    var lim = Int32(seq_k)
+                    if job.causal:
+                        lim = Int32(q0 + r + diag + 1)
+                    comptime for v in range(KV):
+                        var idx = iota[DType.int32, LANES](
+                            Int32(t0 + ko + v * LANES)
+                        )
+                        accs[r * KV + v] = idx.lt(
+                            SIMD[DType.int32, LANES](lim)
+                        ).select(
+                            accs[r * KV + v], SIMD[DType.float32, LANES](NEG_INF)
+                        )
+
+            comptime for r in range(qt):
+                var mx = accs[r * KV]
+                comptime for v in range(1, KV):
+                    mx = mx.lt(accs[r * KV + v]).select(
+                        accs[r * KV + v], mx
+                    )
+                mvec[r] = mvec[r].lt(mx).select(mx, mvec[r])
+                comptime for v in range(KV):
+                    logits.unsafe_store[width=LANES](
+                        r * ks + ko + v * LANES, accs[r * KV + v]
+                    )
+            sb += 1
+
+        # ---- 2. One softmax step for the tile, then exp + the row sums.
+        comptime for r in range(qt):
+            var m_cand = mvec[r].reduce_max()
+            var m_new = row_max[r]
+            var alpha = Scalar[DType.float32](1.0)
+            var has = m_cand > Scalar[DType.float32](NEG_INF)
+            if has:
+                m_new = max(m_new, m_cand)
+                alpha = _vexp_f(Scalar[DType.float32](row_max[r] - m_new))
+                row_max[r] = m_new
+            # `q_t` already carries `scale`, so the logits are final: the exp
+            # argument is logit - max, one fadd instead of a second scaling.
+            var off = Scalar[DType.float32](0.0)
+            if m_new > Scalar[DType.float32](NEG_INF):
+                off = -m_new
+            if has:
+                if row_sum[r].reduce_max() > Scalar[DType.float32](0.0):
+                    comptime for i in range(NV):
+                        acc.unsafe_store[width=LANES](
+                            r * head_dim + i * LANES,
+                            acc.unsafe_load[width=LANES](
+                                r * head_dim + i * LANES
+                            )
+                            * SIMD[DType.float32, LANES](alpha),
+                        )
+                    row_sum[r] *= SIMD[DType.float32, LANES](alpha)
+            # Two partial sums, folded once: one accumulator is a 16-long
+            # serial `fadd` chain per row per tile (the same fix as the bf16
+            # kernel, where it was worth 8% of the whole call).
+            var sumv = Array[SIMD[DType.float32, LANES], 2](uninitialized=True)
+            sumv[0] = SIMD[DType.float32, LANES](0.0)
+            sumv[1] = SIMD[DType.float32, LANES](0.0)
+            var k = 0
+            # Only the keys that exist, rounded up to a whole 4-key group (the
+            # logits past `jn` are NEG_INF, so exp of them is exactly 0).
+            var kend = min(ks, (jn + 3) // 4 * 4)
+            while k < kend:
+                var p = _vexp[LANES](
+                    logits.unsafe_load[width=LANES](r * ks + k)
+                    + SIMD[DType.float32, LANES](off)
+                )
+                sumv[(k // LANES) % 2] += p
+                probs.unsafe_store[width=LANES](r * ks + k, p)
+                k += LANES
+            row_sum[r] += sumv[0] + sumv[1]
+
+        # ---- 3. P@V over the tile, `dc` floats of the head dim at a time, four
+        # keys at a time. Only the key groups that exist: the masked lanes'
+        # probability is exactly 0, but their V may be past the end of the
+        # tensor and 0 * garbage is not 0.
+        var kgroups = (jn + 3) // 4
+        comptime for c in range(NCH):
+            var accv = Array[SIMD[DType.float32, LANES], qt * DV](
+                uninitialized=True
+            )
+            comptime for r in range(qt):
+                comptime for v in range(DV):
+                    accv[r * DV + v] = acc.unsafe_load[width=LANES](
+                        r * head_dim + c * dc + v * LANES
+                    )
+            var kg = 0
+            while kg < kgroups:
+                var pv = Array[SIMD[DType.float32, LANES], qt](
+                    uninitialized=True
+                )
+                comptime for r in range(qt):
+                    pv[r] = probs.unsafe_load[width=LANES](r * ks + kg * 4)
+                # The four keys of the group are the four *lanes* of the
+                # probability vector, so this has to be comptime: a runtime
+                # lane index would spill the vector to the stack.
+                comptime for kgi in range(4):
+                    var vv = Array[SIMD[DType.float32, LANES], DV](
+                        uninitialized=True
+                    )
+                    comptime for v in range(DV):
+                        vv[v] = v_base.unsafe_load[width=LANES](
+                            (t0 + kg * 4 + kgi) * job.v_stride_t
+                            + c * dc
+                            + v * LANES
+                        )
+                    comptime for r in range(qt):
+                        comptime for v in range(DV):
+                            accv[r * DV + v] += vv[v] * SIMD[DType.float32, LANES](
+                                pv[r][kgi]
+                            )
+                kg += 1
+            comptime for r in range(qt):
+                comptime for v in range(DV):
+                    acc.unsafe_store[width=LANES](
+                        r * head_dim + c * dc + v * LANES, accv[r * DV + v]
+                    )
+
+        t0 += ks
+
+    comptime for r in range(qt):
+        if r < nrows:
+            var out = o_base.unsafe_offset((q0 + r) * job.o_stride_t)
+            var vis = seq_k > 0
+            if job.causal:
+                vis = q0 + r + diag + 1 > 0
+            var s = row_sum[r].reduce_add()
+            if vis and s > Scalar[DType.float32](0.0):
+                var inv = SIMD[DType.float32, LANES](
+                    Scalar[DType.float32](1.0) / s
+                )
+                comptime for i in range(NV):
+                    out.unsafe_store[width=LANES](
+                        i * LANES,
+                        acc.unsafe_load[width=LANES](r * head_dim + i * LANES)
+                        * inv,
+                    )
+            else:
+                comptime for i in range(NV):
+                    out.unsafe_store[width=LANES](
+                        i * LANES, SIMD[DType.float32, LANES](0.0)
+                    )
+
+
+comptime TBLK = 16"""Tokens transposed at a time: 16 floats / 32 bf16 is one 64-byte store, so the
 destination is written a cache line at a time instead of 4 bytes at a time (which
 is what ``torch.permute(...).contiguous()`` does here -- 5-15 GB/s)."""
 
@@ -1430,7 +2096,10 @@ def _transpose_head[
                     )
         else:
             # 16 tokens = 8 key pairs = 64 bf16 per head-dim group: one 128-byte
-            # store, 4 head dims of one key per 8-byte load.
+            # store, 4 head dims of one key per 8-byte load. Blocked by key
+            # tile: ``[tile][dim group][key pair][8]``, so one tile's K for every
+            # dim group is contiguous (16 allocations instead of 16 strided runs
+            # when the QK sweep walks the groups).
             comptime for g in range(head_dim // 4):
                 var v = SIMD[dtype, 4 * TBLK](0.0)
                 comptime for i in range(TBLK):
@@ -1441,7 +2110,10 @@ def _transpose_head[
                         comptime for d in range(4):
                             v[4 * i + d] = q4[d]
                 dst.unsafe_store[width=4 * TBLK](
-                    g * job.kt_stride_d + t0 * 4, v
+                    (t0 // job.kt_blk) * ((head_dim // 4) * job.kt_stride_d)
+                    + g * job.kt_stride_d
+                    + (t0 % job.kt_blk) * 4,
+                    v,
                 )
         t0 += TBLK
 
@@ -1493,10 +2165,17 @@ def _vpack_head[
 ](job: TransposeJob, batch: Int, head: Int):
     """Copy one (batch, kv head) of V into the ``bfmmla`` P@V operand layout.
 
-    ``[head_dim/2, seq_k/4, 8]``: eight bf16 = one head-dim pair across four
+    ``[seq_k/4, head_dim/2, 8]``: eight bf16 = one head-dim pair across four
     keys (four of dim ``2d``, then four of dim ``2d+1``). P@V contracts over
     keys, so the operand's two 4-lane halves are the two *output dims*; V's
     natural row-major layout has them interleaved with the key index instead.
+
+    Key group outermost, head-dim pair inner: P@V walks "all dim pairs of one
+    key group" (a contiguous 512 B run at head_dim 64) so its inner loop needs
+    no address arithmetic at all -- the old ``[dim pair][key group]`` order had
+    to add a runtime stride per dim pair, which was 8 of the 35 instructions in
+    that loop. The padding lanes of the last key group are written as zeros:
+    the kernel reads the whole group and ``0 * NaN`` is not 0.
     """
     var src = _ptr[Scalar[dtype]](job.v).unsafe_offset(
         batch * job.v_stride_b + head * job.v_stride_h
@@ -1507,20 +2186,20 @@ def _vpack_head[
     var t0 = 0
     while t0 < job.seq_k:
         var n = min(TBLK, job.seq_k - t0)
-        # 16 tokens = 4 groups of 4 keys: 32 bf16 per head-dim pair, written as
-        # one 64-byte store from 32 2-element loads of the row-major source.
+        # 16 tokens = 4 key groups; one 8-element store per (group, dim pair).
         comptime for dp in range(head_dim // 2):
-            var v = SIMD[dtype, 2 * TBLK](0.0)
-            comptime for i in range(TBLK):
-                if i < n:
-                    var pair = src.unsafe_offset(
-                        (t0 + i) * job.v_stride_t + 2 * dp
-                    ).unsafe_load[width=2]()
-                    comptime for d in range(2):
-                        v[8 * (i // 4) + 4 * d + i % 4] = pair[d]
-            dst.unsafe_store[width=2 * TBLK](
-                dp * job.vt_stride_d + (t0 // 4) * 8, v
-            )
+            comptime for j in range(TBLK // 4):
+                var w = SIMD[dtype, 8](0.0)
+                comptime for i4 in range(4):
+                    if 4 * j + i4 < n:
+                        var pair = src.unsafe_offset(
+                            (t0 + 4 * j + i4) * job.v_stride_t + 2 * dp
+                        ).unsafe_load[width=2]()
+                        w[i4] = pair[0]
+                        w[4 + i4] = pair[1]
+                dst.unsafe_store[width=8](
+                    (t0 // 4 + j) * job.vt_stride_d + dp * 8, w
+                )
         t0 += TBLK
 
 
@@ -1675,6 +2354,53 @@ def _gomp_worker_dense(data: Int) abi("C"):
 
 
 @inline(.always)
+comptime ARM_V2 = LANES < 16
+"""Whether this build is the ARM path whose v2 kernels pair q blocks below."""
+
+
+@inline(.always)
+def _dense_arm_rows[
+    dtype: DType, head_dim: Int, qt: Int
+](job: DenseJob, batch: Int, head: Int, kv_head: Int, q0: Int):
+    """The v2 tile kernel for this dtype (bf16 ``bfmmla`` or fp32)."""
+    comptime if dtype == DType.bfloat16:
+        _dense_rows_tile[head_dim, qt, TILE_KS, 4, TILE_NSQ](
+            job, batch, head, kv_head, q0
+        )
+    else:
+        _dense_rows_tile_f32[head_dim, qt, TILE_KS, 8, 8](
+            job, batch, head, kv_head, q0
+        )
+
+
+def _dense_task_pair[
+    dtype: DType, head_dim: Int, qt: Int
+](job: DenseJob, task: Int):
+    """One work item = the cheapest *and* the most expensive q block of a head.
+
+    Causal work grows linearly with ``q0``, so round-robin over q blocks leaves
+    whichever thread draws the late blocks with ~1.4x the average work: at
+    S=128 15% of the call was sitting in the OpenMP barrier
+    (``gomp_team_barrier_wait_end`` + ``gomp_barrier_wait_end``, 14.6% of the
+    process by ``perf``). Pairing block ``g`` with block ``qgroups-1-g`` makes
+    every work item the same cost and halves the number of work items, which
+    also halves the per-item prologue.
+    """
+    var qgroups = (job.seq_q + qt - 1) // qt
+    var gpairs = (qgroups + 1) // 2
+    var gp = task % gpairs
+    var rest = task // gpairs
+    var head = rest % job.num_heads
+    var batch = rest // job.num_heads
+    var kv_head = head
+    if job.num_heads != job.num_kv_heads:
+        kv_head = head // (job.num_heads // job.num_kv_heads)
+    _dense_arm_rows[dtype, head_dim, qt](job, batch, head, kv_head, gp * qt)
+    var g2 = qgroups - 1 - gp
+    if g2 != gp:
+        _dense_arm_rows[dtype, head_dim, qt](job, batch, head, kv_head, g2 * qt)
+
+
 def _dense_task[dtype: DType, head_dim: Int, qt: Int](job: DenseJob, task: Int):
     var qgroups = (job.seq_q + qt - 1) // qt
     var g = task % qgroups
@@ -1703,13 +2429,15 @@ def _dense_task[dtype: DType, head_dim: Int, qt: Int](job: DenseJob, task: Int):
                     job, batch, head, kv_head, q0
                 )
             else:
-                # 3-4 row pairs: halve the key tile and the P@V dim-pair chunk,
-                # or the tile stops fitting in 32 registers.
-                _dense_rows_bfmmla[head_dim, qt, BKS, 4, 8](
+                _dense_arm_rows[dtype, head_dim, qt](
                     job, batch, head, kv_head, q0
                 )
         elif dtype == DType.bfloat16 and BF16_DOT:
             _dense_rows_mem[dtype, head_dim, qt, KT_TILE, 2 * LANES, True](
+                job, batch, head, kv_head, q0
+            )
+        elif qt > 4:
+            _dense_arm_rows[dtype, head_dim, qt](
                 job, batch, head, kv_head, q0
             )
         else:
@@ -1748,21 +2476,41 @@ def _dense_dispatch[
     dtype: DType, head_dim: Int, qt: Int
 ](job: DenseJob, num_workers: Int):
     var qgroups = (job.seq_q + qt - 1) // qt
+    comptime paired = (
+        LANES < 16
+        and qt > 4
+        and (dtype == DType.float32 or (dtype == DType.bfloat16 and BFMMLA))
+    )
+    comptime if paired:
+        qgroups = (qgroups + 1) // 2
     var items = job.batch * job.num_heads * qgroups
     if items == 0:
         return
-    comptime task_fn = _dense_task[dtype, head_dim, qt]
     var workers = min(num_workers, items)
-    if workers <= 1:
-        for task in range(items):
-            _dense_task[dtype, head_dim, qt](job, task)
-        return
-    var state = stack_allocation[1, DenseDispatch]()
-    state[] = DenseDispatch(job, task_fn, items)
-    comptime entry = _gomp_worker_dense
-    external_call["GOMP_parallel", NoneType](
-        entry, Int(state), Int32(workers), Int32(0)
-    )
+    comptime if paired:
+        if workers <= 1:
+            for task in range(items):
+                _dense_task_pair[dtype, head_dim, qt](job, task)
+            return
+        var state = stack_allocation[1, DenseDispatch]()
+        comptime tfp = _dense_task_pair[dtype, head_dim, qt]
+        state[] = DenseDispatch(job, tfp, items)
+        comptime entry_p = _gomp_worker_dense
+        external_call["GOMP_parallel", NoneType](
+            entry_p, Int(state), Int32(workers), Int32(0)
+        )
+    else:
+        if workers <= 1:
+            for task in range(items):
+                _dense_task[dtype, head_dim, qt](job, task)
+            return
+        var state = stack_allocation[1, DenseDispatch]()
+        comptime tfn = _dense_task[dtype, head_dim, qt]
+        state[] = DenseDispatch(job, tfn, items)
+        comptime entry_n = _gomp_worker_dense
+        external_call["GOMP_parallel", NoneType](
+            entry_n, Int(state), Int32(workers), Int32(0)
+        )
 
 
 def _run_shape[
