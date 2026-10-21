@@ -365,6 +365,28 @@ other's K.
 """
 
 
+_SCRATCH_STRIDES = {}
+
+
+def _scratch_strides(kt, vt):
+    """Cached ``.stride()`` tuples for the two pack buffers.
+
+    ``Tensor.stride(i)`` is a Python call and the pack buffers only change when
+    the shape does, so their stride tuples are cached by identity.
+    """
+    key = (id(kt), id(vt))
+    got = _SCRATCH_STRIDES.get(key)
+    # Validate on shape, not identity alone: a buffer freed by clear_scratch()
+    # or by the 64-entry bound could hand its id to a tensor of another shape,
+    # and a stale stride tuple would corrupt every later call silently.
+    if got is None or got[0] != kt.shape:
+        if len(_SCRATCH_STRIDES) > 64:
+            _SCRATCH_STRIDES.clear()
+        got = (kt.shape, kt.stride(), vt.stride() if vt is not None else None)
+        _SCRATCH_STRIDES[key] = got
+    return got[1], got[2]
+
+
 def _scratch(kind, shape, dtype):
     """A workspace tensor of ``shape``/``dtype``, reused across calls."""
     bufs = getattr(_SCRATCH, "bufs", None)
@@ -394,6 +416,7 @@ def clear_scratch() -> None:
     bufs = getattr(_SCRATCH, "bufs", None)
     if bufs is not None:
         bufs.clear()
+    _SCRATCH_STRIDES.clear()
 
 
 _QT_ENV = os.environ.get("CPU_ATTENTION_QT")
@@ -654,32 +677,38 @@ def _dense(q, k, v, scale: float, causal: bool):
               if vpack else None)
     # The pack's strides: `kt_blk` keys per contiguous K^T block, and the V
     # scratch's per-head base and per-key-group stride.
-    kt_bh, kt_d = kt.stride(1), kt.stride(3)
-    vt_bh = vt.stride(1) if vt is not None else 0
-    vt_d = vt.stride(2) if vt is not None else 0
+    # One `.stride()` per tensor: `Tensor.stride(i)` is a Python call (~0.18 us)
+    # and this path used to make nineteen of them per invocation, 7% of the
+    # whole call at S=128 by cProfile. The scratch buffers' strides come from
+    # the cache with the buffer, since they only change with the shape.
+    kt_st, vt_st = _scratch_strides(kt, vt)
+    kt_bh, kt_d = kt_st[1], kt_st[3]
+    vt_bh = vt_st[1] if vt is not None else 0
+    vt_d = vt_st[2] if vt is not None else 0
     out = torch.empty_like(q, memory_format=torch.contiguous_format)
-    qb, qtok, qh = q.stride(0), q.stride(1), q.stride(2)
+    q_st, k_st, v_st, o_st = q.stride(), k.stride(), v.stride(), out.stride()
+    qb, qtok, qh = q_st[0], q_st[1], q_st[2]
     # In mode 2 the kernel reads the packed V (one row per head dim *pair*, one
     # column per 4-key group), so hand it those strides instead.
     if vt is not None:
         # mode 2 packs V as [key group][dim pair][8] and the portable copy is
         # plain [seq, head_dim]; either way dim 2 is the stride the kernel walks
         # per key group (or per token) and dim 1 is the per-head base.
-        vb, vtok, vh = vt.stride(0), vt.stride(2), vt.stride(1)
+        vb, vtok, vh = vt_st[0], vt_st[2], vt_st[1]
         v_ptr = vt.data_ptr()
     else:
-        vb, vtok, vh = v.stride(0), v.stride(1), v.stride(2)
+        vb, vtok, vh = v_st[0], v_st[1], v_st[2]
         v_ptr = v.data_ptr()
-    ob, otok, oh = out.stride(0), out.stride(1), out.stride(2)
-    ktb = kt.stride(1)
+    ob, otok, oh = o_st[0], o_st[1], o_st[2]
+    ktb = kt_st[1]
     if mode == 2:
         # [tile][dim group][key pair][8]: stride(3) is one head-dim group
         # inside a tile, 8 is one key pair. (The tile stride is derived in the
         # kernel from the dim-group count.)
-        ktd, ktt = kt.stride(3), 8
+        ktd, ktt = kt_st[3], 8
     else:
-        ktd = kt.stride(3)                      # dim stride within a block
-        ktt = kt.stride(4) if mode == 1 else 1  # token stride inside a block
+        ktd = kt_st[3]                          # dim stride within a block
+        ktt = kt_st[4] if mode == 1 else 1      # token stride inside a block
     tasks = batch * num_heads * (-(-seq_q // qt))
     workers = _workers(tasks, 8)
     if _FUSE:
@@ -698,14 +727,14 @@ def _dense(q, k, v, scale: float, causal: bool):
             num_kv_heads,
             seq_k,
             head_dim,
-            k.stride(0),
-            k.stride(1),
-            k.stride(2),
+            k_st[0],
+            k_st[1],
+            k_st[2],
             vt_bh,
             vt_d,
-            v.stride(0),
-            v.stride(1),
-            v.stride(2),
+            v_st[0],
+            v_st[1],
+            v_st[2],
             q.data_ptr(),
             out.data_ptr(),
             seq_q,
@@ -740,15 +769,15 @@ def _dense(q, k, v, scale: float, causal: bool):
         num_kv_heads,
         seq_k,
         head_dim,
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
+        k_st[0],
+        k_st[1],
+        k_st[2],
         kt_bh,
         kt_d,
         kt_blk,
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
+        v_st[0],
+        v_st[1],
+        v_st[2],
         vt_bh,
         vt_d,
         _DTYPE_CODES[k.dtype],
