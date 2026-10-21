@@ -48,8 +48,11 @@ stated contract.
 bf16 runs on AMX (`tdpbf16ps`, 32 query rows per work item, 256-key softmax
 super-tile); fp32 runs on AMX as well, with every operand split into bf16 hi/lo
 halves and three products per phase. Last verified at `164e8e6`; `main` since
-then changed only the shared Python dispatch path, which the laptop A/B puts at
-1.04x at S=128 and 1.01x above it.
+then changed only the shared Python dispatch path (one `.stride()` per tensor,
+laptop A/B 1.04x at S=128 and 1.01x above it, parity green) and the ARM kernel,
+so the x86 kernel and its dispatch are untouched by it. **Not re-verified after
+`164e8e6`**: the spot box was reclaimed at the end of the session and the AWS CLI
+session had expired, so `docs/NEXT.md` starts there.
 
 | | beats SDPA | beats vLLM-VEC |
 |---|---|---|
@@ -68,7 +71,14 @@ Verified on `main` at `25cb62e`, `ROUNDS=21`.
 
 | | beats SDPA | beats vLLM-NEON |
 |---|---|---|
-| NEON reference | **22 / 22** | **5 / 22** |
+| NEON reference | **22 / 22** | **2-5 / 22** (a sample, see below) |
+
+**The `N/22` count against vLLM should never be quoted without this caveat.** Four
+runs of the same binary gave 5, 2, 3 and 4 fp32 rows below 1.00, with fp32
+`o/vllm` at 0.89-1.11 every time: those rows sit on the parity line and a 3%
+shift moves them across it. bf16 is stable across all four runs at 1.02-1.32 and
+never below 1.00. So the honest summary is **22/22 against SDPA, bf16 always
+above 1 (1.02-1.32), fp32 at parity (0.89-1.11)**.
 
 | shape | bf16 o/sdpa | bf16 o/vllm | fp32 o/sdpa | fp32 o/vllm |
 |---|---:|---:|---:|---:|
