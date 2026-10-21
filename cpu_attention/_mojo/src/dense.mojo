@@ -2644,3 +2644,197 @@ def run_dense(job: DenseJob, dtype_code: Int, num_workers: Int, qt: Int) raises:
         _run_dtype[DType.bfloat16](job, num_workers, qt)
     else:
         raise Error("cpu_attention dense: unsupported dtype")
+
+
+struct FusedDispatch(ImplicitlyCopyable, Movable):
+    """One ``GOMP_parallel`` region that packs K/V and then runs attention.
+
+    The two phases were two regions (``dense_transpose`` then
+    ``dense_attention``). Each fork-join costs a pool wake plus a barrier, and at
+    S=128 ``gomp_barrier_wait_end`` was 14% of the process by ``perf`` -- more
+    than the kernel's own hot loop at the small shapes. One region, one barrier,
+    with ``GOMP_barrier`` between the phases.
+    """
+
+    var tjob: TransposeJob
+    var djob: DenseJob
+    var t_fn: TransposeTaskFn
+    var d_fn: DenseTaskFn
+    var t_items: Int
+    var d_items: Int
+
+    def __init__(
+        out self,
+        tjob: TransposeJob,
+        djob: DenseJob,
+        t_fn: TransposeTaskFn,
+        d_fn: DenseTaskFn,
+        t_items: Int,
+        d_items: Int,
+    ):
+        self.tjob = tjob
+        self.djob = djob
+        self.t_fn = t_fn
+        self.d_fn = d_fn
+        self.t_items = t_items
+        self.d_items = d_items
+
+
+@export
+def _gomp_worker_fused(data: Int) abi("C"):
+    var st = MutPointer[FusedDispatch, MutUntrackedOrigin](
+        unsafe_from_address=data
+    )
+    var state = st[]
+    var threads = Int(external_call["omp_get_num_threads", Int32]())
+    var tid = Int(external_call["omp_get_thread_num", Int32]())
+    var t = tid
+    while t < state.t_items:
+        state.t_fn(state.tjob, t)
+        t += threads
+    if threads > 1:
+        # The attention phase reads what the pack wrote, so the threads have to
+        # meet here. Inside a GOMP region this is the `#pragma omp barrier` ABI.
+        external_call["GOMP_barrier", NoneType]()
+    var task = tid
+    while task < state.d_items:
+        state.d_fn(state.djob, task)
+        task += threads
+
+
+def _dense_items[dtype: DType, qt: Int](job: DenseJob) -> Int:
+    """Work items the attention phase will run (half as many when paired)."""
+    var qgroups = (job.seq_q + qt - 1) // qt
+    comptime paired = (
+        LANES < 16
+        and qt > 4
+        and (dtype == DType.float32 or (dtype == DType.bfloat16 and BFMMLA))
+    )
+    comptime if paired:
+        qgroups = (qgroups + 1) // 2
+    return job.batch * job.num_heads * qgroups
+
+
+def _dense_fused[
+    dtype: DType, head_dim: Int, qt: Int
+](
+    tjob: TransposeJob,
+    djob: DenseJob,
+    mode: Int,
+    num_workers: Int,
+    dtype_code_t: Int,
+):
+    """Pack K/V and run the attention in one OpenMP region.
+
+    ``dtype_code_t`` is the pack's dtype (the dense phase is dispatched on
+    ``dtype``, and the two are the same tensor dtype in practice, but the pack's
+    scratch has its own code path).
+    """
+    comptime T0 = _transpose_task[dtype, head_dim, 0]
+    comptime T1 = _transpose_task[dtype, head_dim, 1]
+    comptime T2 = _transpose_task[dtype, head_dim, 2]
+    var t_fn: TransposeTaskFn = T2
+    if mode == 0:
+        t_fn = T0
+    elif mode == 1:
+        t_fn = T1
+    comptime paired = (
+        LANES < 16
+        and qt > 4
+        and (dtype == DType.float32 or (dtype == DType.bfloat16 and BFMMLA))
+    )
+    comptime D1 = _dense_task[dtype, head_dim, qt]
+    comptime D2 = _dense_task_pair[dtype, head_dim, qt]
+    var d_fn: DenseTaskFn = D1
+    comptime if paired:
+        d_fn = D2
+    var t_items = tjob.batch * tjob.num_kv_heads
+    var d_items = _dense_items[dtype, qt](djob)
+    if d_items == 0:
+        return
+    var workers = min(num_workers, max(t_items, d_items))
+    if workers <= 1:
+        for i in range(t_items):
+            t_fn(tjob, i)
+        for i in range(d_items):
+            d_fn(djob, i)
+        return
+    var state = stack_allocation[1, FusedDispatch]()
+    state[] = FusedDispatch(tjob, djob, t_fn, d_fn, t_items, d_items)
+    comptime entry = _gomp_worker_fused
+    external_call["GOMP_parallel", NoneType](
+        entry, Int(state), Int32(workers), Int32(0)
+    )
+
+
+def _fused_shape[
+    dtype: DType, head_dim: Int
+](
+    tjob: TransposeJob,
+    djob: DenseJob,
+    mode: Int,
+    qt: Int,
+    num_workers: Int,
+    dtype_code_t: Int,
+) raises:
+    if qt == 2:
+        _dense_fused[dtype, head_dim, 2](
+            tjob, djob, mode, num_workers, dtype_code_t
+        )
+    elif qt == 4:
+        _dense_fused[dtype, head_dim, 4](
+            tjob, djob, mode, num_workers, dtype_code_t
+        )
+    elif qt == 6:
+        _dense_fused[dtype, head_dim, 6](
+            tjob, djob, mode, num_workers, dtype_code_t
+        )
+    elif qt == 8:
+        _dense_fused[dtype, head_dim, 8](
+            tjob, djob, mode, num_workers, dtype_code_t
+        )
+    else:
+        raise Error("cpu_attention dense: qt must be 2, 4, 6 or 8")
+
+
+def _fused_dtype[
+    dtype: DType
+](
+    tjob: TransposeJob,
+    djob: DenseJob,
+    mode: Int,
+    qt: Int,
+    num_workers: Int,
+    dtype_code_t: Int,
+) raises:
+    if djob.head_dim == 32:
+        _fused_shape[dtype, 32](tjob, djob, mode, qt, num_workers, dtype_code_t)
+    elif djob.head_dim == 64:
+        _fused_shape[dtype, 64](tjob, djob, mode, qt, num_workers, dtype_code_t)
+    elif djob.head_dim == 128:
+        _fused_shape[dtype, 128](
+            tjob, djob, mode, qt, num_workers, dtype_code_t
+        )
+    else:
+        raise Error("cpu_attention dense: unsupported head_dim")
+
+
+def run_dense_fused(
+    tjob: TransposeJob,
+    djob: DenseJob,
+    dtype_code: Int,
+    mode: Int,
+    qt: Int,
+    num_workers: Int,
+) raises:
+    """One region for the K/V pack and the attention (see ``FusedDispatch``)."""
+    if dtype_code == 0:
+        _fused_dtype[DType.float32](
+            tjob, djob, mode, qt, num_workers, dtype_code
+        )
+    elif dtype_code == 1:
+        _fused_dtype[DType.bfloat16](
+            tjob, djob, mode, qt, num_workers, dtype_code
+        )
+    else:
+        raise Error("cpu_attention dense: unsupported dtype")

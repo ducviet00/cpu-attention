@@ -28,6 +28,10 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# The pack and the kernel share one OpenMP region (one fork-join instead of
+# two), so the wrapper below has nothing to time unless the two calls are
+# separated: `CPU_ATTENTION_NO_FUSE=1` restores them.
+os.environ.setdefault("CPU_ATTENTION_NO_FUSE", "1")
 import cpu_attention as attn  # noqa: E402
 import cpu_attention._kernel as K  # noqa: E402
 from bench_vs_refs import SHAPES, load_vllm, paged_case, sdpa  # noqa: E402
