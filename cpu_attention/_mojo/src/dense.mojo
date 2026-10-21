@@ -24,9 +24,17 @@ Structure, borrowd from vLLM's ``csrc/cpu`` ``VEC`` kernel:
   row-major, so the Python side hands us a transposed scratch copy);
 * V stays row-major: ``acc[d] += p[j] * v[j][d]`` is one FMA over the head dim,
   shared by every row of the block;
-* bf16 takes the same bf16 dot-product path as the paged kernel (``dpbf16ps`` /
-  ``bfdot``), which is what makes bf16 faster than fp32 here: AVX-512 has no
-  native bf16 add/multiply, so the only thing bf16 may be used for is the dot.
+* bf16 takes a bf16 dot-product path (``dpbf16ps`` on AVX-512, ``bfdot`` on
+  pre-``bfmmla`` ARM), which is what makes bf16 faster than fp32 here: AVX-512
+  has no native bf16 add/multiply, so the only thing bf16 may be used for is the
+  dot;
+* on ARM the bf16 path is instead ``_dense_rows_bfmmla``: ``vbfmmlaq_f32``
+  accumulates a 2x2 fp32 tile per instruction (four fp32 lanes of output per
+  lane slot, against ``bfdot``'s two) on *both* phases, which is what vLLM's
+  ``csrc/cpu`` NEON kernel does and why it is the reference to beat here. K and
+  V are repacked by the Python side for it (``_transpose_head`` mode 2 packs K
+  position-paired over four head dims, ``_vpack_head`` packs V position-major
+  over head-dim pairs, because P@V contracts over keys).
 
 Work items are handed out round-robin over the OpenMP pool (``GOMP_parallel`` on
 torch's own pool, as in ``attention.mojo``) because causal masking makes the
@@ -36,7 +44,7 @@ thread would leave half the cores idle at the end of a long prefill.
 
 from std.ffi import external_call
 from std.math import exp, iota
-from std.memory import MutPointer, stack_allocation
+from std.memory import MutPointer, bitcast, stack_allocation
 from std.origin import MutUntrackedOrigin
 from std.sys import llvm_intrinsic, simd_width_of
 from std.sys.info import CompilationTarget
@@ -63,7 +71,50 @@ roofline. Tying the tile to the lane width keeps the register budget identical
 on both ISAs: 64 keys on AVX-512, 16 on NEON.
 """
 
+comptime BFMMLA = NEON_DOT
+"""NEON ``bfmmla``: a 2x2 fp32 tile per instruction, contracted over four bf16
+lanes. Four fp32 lanes of output per lane slot instead of ``bfdot``'s two, and
+one operand load feeds 2-4 instructions, which is why vLLM's ARM bf16 kernel
+runs on this instruction and not on ``bfdot`` (their ``.so`` has 9436 ``bfmmla``
+and 0 ``bfdot``). ARM-only: AVX-512's ``dpbf16ps`` already does 2x2 by itself.
+"""
+
 comptime NEG_INF = -3.4028234663852886e38
+
+
+@inline(.always)
+def _bfmmla(
+    acc: SIMD[DType.float32, 4],
+    a: SIMD[DType.bfloat16, 8],
+    b: SIMD[DType.bfloat16, 8],
+) -> SIMD[DType.float32, 4]:
+    """``acc += a @ b`` as a 2x2 fp32 tile, contracted over four bf16 lanes.
+
+    ``acc = (row0 col0, row0 col1, row1 col0, row1 col1)``; ``a`` holds the two
+    rows in its two 4-lane halves and ``b`` the two columns the same way
+    (verified against a scalar reference in ``tests/bfmmla_layout.mojo``).
+    """
+    return llvm_intrinsic[
+        "llvm.aarch64.neon.bfmmla", SIMD[DType.float32, 4], has_side_effect=False
+    ](acc, a, b)
+
+
+comptime BKS = 64
+"""Keys per P@V super-tile on the ``bfmmla`` path.
+
+The output accumulator is ``qt * head_dim`` floats, i.e. 16-32 registers per row
+on a 32-register machine, so it lives in L1 and is loaded and stored once per
+super-tile: ``2 * qt/2 * head_dim/2`` vector ops per super-tile whatever its
+size, against ``qt/2 * head_dim/2 * keys/4`` bfmmla. At 16 keys (one softmax
+step) that traffic is half the bfmmla count; at 64 keys it is an eighth. The
+softmax keeps running on 16-key steps inside the super-tile, so the register
+budget does not grow with it.
+"""
+
+comptime BDCP = 8
+"""Head-dim *pairs* per P@V chunk (16 head dims): ``qt/2 * 8`` accumulator
+registers beside one V vector and the probability panel. Mirrors vLLM's
+``NTile = 8`` output columns per gemm call."""
 
 
 struct DenseJob(Copyable, ImplicitlyCopyable, Movable):
@@ -651,6 +702,339 @@ def _dense_rows_dot[
                 )
 
 
+@inline(.always)
+def _exp2_fast(y: SIMD[DType.float32, 4]) -> SIMD[DType.float32, 4]:
+    """``2^y`` for ``y <= 0`` in about ten instructions, no libm.
+
+    ``y = n + f`` with ``n`` the rounded integer part (the add-and-subtract
+    magic-constant trick, so no round instruction), ``2^f`` from a degree-4
+    polynomial on ``[-0.5, 0.5]`` and ``2^n`` by adding ``n`` to the exponent
+    field of 1.0. Clamping at -127 makes the exponent field underflow to zero
+    bits, so every masked lane (``NEG_INF``) comes out as *exactly* 0 -- which
+    the online softmax needs and a saturating conversion would not give.
+
+    Relative error ~4e-5, i.e. two orders below the bf16 probabilities this path
+    already rounds to; ``std.math.exp`` costs ~22 instructions per vector here
+    (range reduction plus NaN/Inf/overflow fixups) and was 20% of the whole
+    dense kernel. Same trick as torch's ``fexp_u20``, which is what vLLM's ARM
+    kernel calls. Callers pass ``x * scale * log2e - m * scale * log2e`` as one
+    FMA, so this is the whole softmax.
+    """
+    comptime MAGIC = 12582912.0  # 1.5 * 2^23: add/sub rounds to nearest even
+    # One fmaxnm: NaN (a masked lane whose centre is +inf) and anything below
+    # -127 both land on -127, whose exponent field is zero bits, so p is 0.
+    var yc = _vmax(y, SIMD[DType.float32, 4](-127.0))
+    var n = (yc + SIMD[DType.float32, 4](MAGIC)) - SIMD[DType.float32, 4](
+        MAGIC
+    )
+    var f = yc - n
+    var p = SIMD[DType.float32, 4](0.009618129107628477) * f + SIMD[
+        DType.float32, 4
+    ](0.05550410866482158)
+    p = p * f + SIMD[DType.float32, 4](0.2402265069591007)
+    p = p * f + SIMD[DType.float32, 4](0.6931471805599453)
+    p = p * f + SIMD[DType.float32, 4](1.0)
+    var e = (n.cast[DType.int32]() + SIMD[DType.int32, 4](127)) << SIMD[
+        DType.int32, 4
+    ](23)
+    return p * bitcast[DType.float32](e)
+
+
+@inline(.always)
+def _vmax(
+    a: SIMD[DType.float32, 4], b: SIMD[DType.float32, 4]
+) -> SIMD[DType.float32, 4]:
+    """Elementwise max in one instruction.
+
+    ``a.lt(b).select(b, a)`` is the portable spelling (SIMD comparisons are
+    *reducing*, so ``max`` cannot be used directly) but compiles to fcmgt + bsl
+    -- two instructions on the critical path of the running-max chain, which is
+    serial. ``llvm.maxnum`` is ``fmaxnm``: one instruction, and it ignores NaN,
+    which is what lets the softmax skip the "no visible key yet" special case
+    (see ``_dense_rows_bfmmla``).
+    """
+    return llvm_intrinsic[
+        "llvm.maxnum.v4f32", SIMD[DType.float32, 4], has_side_effect=False
+    ](a, b)
+
+
+@inline(.always)
+def _dense_rows_bfmmla[
+    head_dim: Int, qt: Int, ks: Int, dcp: Int, sub: Int
+](job: DenseJob, batch: Int, head: Int, kv_head: Int, q0: Int):
+    """``_dense_rows`` with ``bfmmla`` on both phases (bf16 on NEON).
+
+    Q@K^T pairs two query rows against two key positions and P@V pairs two query
+    rows against two output dims, so each phase is one instruction per 16 MACs
+    where fp32 needs four and ``bfdot`` two. The whole task runs in 2x2 fp32
+    tiles: the logits *are* the Q@K^T accumulators, the online softmax runs on
+    both rows of a pair at once (its four lanes hold row0 twice and row1 twice),
+    and the probabilities are converted straight into the A panels P@V wants.
+
+    Layouts, all built outside this kernel:
+
+    * Q: ``[row pair][head_dim/4][8]``, eight bf16 = four head dims of row ``2p``
+      then four of row ``2p+1`` (packed here, once per work item);
+    * K: ``[head_dim/4][seq_k/2][8]`` -- four head dims of key ``2p``, then four
+      of key ``2p+1`` (``_transpose_head`` mode 2);
+    * V: ``[head_dim/2][seq_k/4][8]`` -- one head-dim pair across four keys
+      (``_vpack_head``), because P@V contracts over keys;
+    * P: ``[key group of 4][row pair][8]``, written from the softmax registers.
+    """
+    comptime RP = qt // 2  # row pairs
+    comptime DG = head_dim // 4  # Q@K^T contraction groups (4 head dims)
+    comptime DP = head_dim // 2  # P@V output dim pairs
+    comptime NS = sub // 2  # Q@K^T column pairs per softmax step
+    comptime NST = ks // sub  # softmax steps per super-tile
+    comptime NKG = ks // 4  # key groups per super-tile
+    comptime KGS = sub // 4  # key groups per softmax step
+
+    var seq_k = job.seq_k
+    var nrows = min(qt, job.seq_q - q0)
+    var diag = seq_k - job.seq_q
+    var q_base = _ptr[BFloat16](job.q).unsafe_offset(
+        batch * job.q_stride_b + head * job.q_stride_h
+    )
+    var kt_base = _ptr[BFloat16](job.kt).unsafe_offset(
+        (batch * job.num_kv_heads + kv_head) * job.kt_stride_bh
+    )
+    var vt_base = _ptr[BFloat16](job.v).unsafe_offset(
+        batch * job.v_stride_b + kv_head * job.v_stride_h
+    )
+    var o_base = _ptr[BFloat16](job.dst).unsafe_offset(
+        batch * job.o_stride_b + head * job.o_stride_h
+    )
+
+    # Q A panels: one per (row pair, 4 head dims), built once per work item.
+    var q_pan = stack_allocation[RP * DG * 8, BFloat16]()
+    comptime for rp in range(RP):
+        comptime for g in range(DG):
+            var lo = SIMD[DType.bfloat16, 4](0.0)
+            var hi = SIMD[DType.bfloat16, 4](0.0)
+            if 2 * rp < nrows:
+                lo = q_base.unsafe_offset(
+                    (q0 + 2 * rp) * job.q_stride_t + 4 * g
+                ).unsafe_load[width=4]()
+            if 2 * rp + 1 < nrows:
+                hi = q_base.unsafe_offset(
+                    (q0 + 2 * rp + 1) * job.q_stride_t + 4 * g
+                ).unsafe_load[width=4]()
+            q_pan.unsafe_store[width=8]((rp * DG + g) * 8, lo.join(hi))
+
+    var acc = stack_allocation[RP * DP * 4, DType.float32]()
+    comptime for i in range(RP * DP):
+        acc.unsafe_store[width=4](i * 4, SIMD[DType.float32, 4](0.0))
+    var row_max = Array[Float32, qt](uninitialized=True)
+    var row_sum = Array[Float32, qt](uninitialized=True)
+    comptime for r in range(qt):
+        row_max[r] = Scalar[DType.float32](NEG_INF)
+        row_sum[r] = Scalar[DType.float32](0.0)
+
+    var probs = stack_allocation[NKG * RP * 8, BFloat16]()
+    # Logits are kept in raw Q@K^T units and converted once per accumulator:
+    # exp(scale*x - m) = 2^(c1*x - m*c1) with c1 = scale * log2(e).
+    var c1 = Scalar[DType.float32](job.scale) * Scalar[DType.float32](
+        1.4426950408889634
+    )
+
+    var loop_end = seq_k
+    if job.causal:
+        loop_end = min(seq_k, q0 + nrows + diag)
+
+    var t0 = 0
+    while t0 < loop_end:
+        # ---- Q@K^T + online softmax, `sub` keys at a time. A runtime loop, not
+        # a comptime one: four unrolled copies of the softmax made the register
+        # allocator interleave them and spill the whole accumulator tile.
+        var st = 0
+        while st < NST:
+            var tok = t0 + st * sub
+            var half = tok // 2
+            var accs = Array[SIMD[DType.float32, 4], RP * NS](uninitialized=True)
+            comptime for i in range(RP * NS):
+                accs[i] = SIMD[DType.float32, 4](0.0)
+            # One K vector (2 key positions x 4 head dims) feeds every row pair;
+            # one Q panel feeds every key pair.
+            var g = 0
+            while g < DG:
+                comptime for rp in range(RP):
+                    var a = q_pan.unsafe_load[width=8]((rp * DG + g) * 8)
+                    comptime for v in range(NS):
+                        accs[rp * NS + v] = _bfmmla(
+                            accs[rp * NS + v],
+                            a,
+                            kt_base.unsafe_load[width=8](
+                                g * job.kt_stride_d + (half + v) * 8
+                            ),
+                        )
+                g += 1
+
+            # Causal tail (or the last tile of a non-causal call): kill the
+            # lanes no row may see. Lane 0,1 of a tile are keys 2v, 2v+1 of row
+            # 2rp and lanes 2,3 the same keys of row 2rp+1.
+            var boundary = tok + sub > seq_k
+            if job.causal:
+                boundary = tok + sub > q0 + diag + 1
+            if boundary:
+                comptime for rp in range(RP):
+                    var l0 = Int32(seq_k)
+                    var l1 = Int32(seq_k)
+                    if job.causal:
+                        l0 = Int32(q0 + 2 * rp + diag + 1)
+                        l1 = Int32(q0 + 2 * rp + 1 + diag + 1)
+                    var lim = SIMD[DType.int32, 4](l0, l0, l1, l1)
+                    comptime for v in range(NS):
+                        var idx = SIMD[DType.int32, 4](
+                            Int32(tok + 2 * v),
+                            Int32(tok + 2 * v + 1),
+                            Int32(tok + 2 * v),
+                            Int32(tok + 2 * v + 1),
+                        )
+                        accs[rp * NS + v] = idx.lt(lim).select(
+                            accs[rp * NS + v], SIMD[DType.float32, 4](NEG_INF)
+                        )
+
+            comptime for rp in range(RP):
+                var mx = accs[rp * NS]
+                comptime for v in range(1, NS):
+                    mx = _vmax(mx, accs[rp * NS + v])
+                var m0 = max(row_max[2 * rp], max(mx[0], mx[1]))
+                var m1 = max(row_max[2 * rp + 1], max(mx[2], mx[3]))
+                # 2^0 = 1 exactly when the max did not move, so the two rows
+                # rescale independently and a static row is a no-op.
+                var a0 = _exp2_fast(
+                    SIMD[DType.float32, 4]((row_max[2 * rp] - m0) * c1)
+                )[0]
+                var a1 = _exp2_fast(
+                    SIMD[DType.float32, 4]((row_max[2 * rp + 1] - m1) * c1)
+                )[0]
+                # One FMA per accumulator turns the scaled logit into log2 space
+                # (scale, max subtraction and the log2 factor folded into c1/c2),
+                # then 2^y is the polynomial. A row with no visible key has
+                # m == NEG_INF, so its centre overflows to +inf: the logit is
+                # -inf too, the sum is NaN, and `_exp2_fast`'s fmaxnm turns that
+                # into exactly 0 -- no special case needed.
+                var off = SIMD[DType.float32, 2](-m0 * c1).join(
+                    SIMD[DType.float32, 2](-m1 * c1)
+                )
+                var sum0 = SIMD[DType.float32, 4](0.0)
+                var sum1 = SIMD[DType.float32, 4](0.0)
+                comptime for v in range(NS // 2):
+                    var p0 = _exp2_fast(accs[rp * NS + 2 * v] * c1 + off)
+                    var p1 = _exp2_fast(accs[rp * NS + 2 * v + 1] * c1 + off)
+                    accs[rp * NS + 2 * v] = p0
+                    accs[rp * NS + 2 * v + 1] = p1
+                    sum0 += p0
+                    sum1 += p1
+                var sumv = sum0 + sum1
+                row_sum[2 * rp] = row_sum[2 * rp] * a0 + sumv[0] + sumv[1]
+                row_sum[2 * rp + 1] = row_sum[2 * rp + 1] * a1 + sumv[2] + sumv[
+                    3
+                ]
+                row_max[2 * rp] = m0
+                row_max[2 * rp + 1] = m1
+                if a0 != Scalar[DType.float32](1.0) or a1 != Scalar[
+                    DType.float32
+                ](1.0):
+                    var av = SIMD[DType.float32, 4](a0, a0, a1, a1)
+                    comptime for d in range(DP):
+                        acc.unsafe_store[width=4](
+                            (rp * DP + d) * 4,
+                            acc.unsafe_load[width=4]((rp * DP + d) * 4) * av,
+                        )
+                    # The panels already written for this super-tile are relative
+                    # to the previous max, and P@V has not consumed them yet, so
+                    # they need the same rescale (the accumulator holds only
+                    # earlier super-tiles). Rare: the running max stops moving
+                    # after the first few tiles.
+                    var av8 = SIMD[DType.float32, 4](a0).join(
+                        SIMD[DType.float32, 4](a1)
+                    )
+                    var g = 0
+                    while g < st * KGS:
+                        var pv = probs.unsafe_load[width=8]((g * RP + rp) * 8)
+                        probs.unsafe_store[width=8](
+                            (g * RP + rp) * 8,
+                            (pv.cast[DType.float32]() * av8).cast[
+                                DType.bfloat16
+                            ](),
+                        )
+                        g += 1
+                # Probabilities -> A panels: four keys of row 2rp, then four of
+                # row 2rp+1 (the two 4-lane halves of the instruction's A).
+                comptime for kg in range(KGS):
+                    var pa = accs[rp * NS + 2 * kg].cast[DType.bfloat16]()
+                    var pb = accs[rp * NS + 2 * kg + 1].cast[DType.bfloat16]()
+                    probs.unsafe_store[width=8](
+                        ((st * KGS + kg) * RP + rp) * 8,
+                        SIMD[DType.bfloat16, 8](
+                            pa[0], pa[1], pb[0], pb[1], pa[2], pa[3], pb[2], pb[3]
+                        ),
+                    )
+            st += 1
+
+        # ---- P@V over the super-tile, BDCP dim pairs at a time. Only the key
+        # groups that exist: the masked lanes' probability is exactly 0, but
+        # their V may be past the end of the packed buffer (0 * garbage is not 0).
+        var jn = min(ks, seq_k - t0)
+        var kgroups = (jn + 3) // 4
+        comptime for dc in range(0, DP, dcp):
+            var accv = Array[SIMD[DType.float32, 4], RP * dcp](uninitialized=True)
+            comptime for rp in range(RP):
+                comptime for d in range(dcp):
+                    accv[rp * dcp + d] = acc.unsafe_load[width=4](
+                        (rp * DP + dc + d) * 4
+                    )
+            var kg = 0
+            while kg < kgroups:
+                var ap = Array[SIMD[DType.bfloat16, 8], RP](uninitialized=True)
+                comptime for rp in range(RP):
+                    ap[rp] = probs.unsafe_load[width=8]((kg * RP + rp) * 8)
+                comptime for d in range(dcp):
+                    var vv = vt_base.unsafe_load[width=8](
+                        (dc + d) * job.v_stride_t + (t0 // 4 + kg) * 8
+                    )
+                    comptime for rp in range(RP):
+                        accv[rp * dcp + d] = _bfmmla(
+                            accv[rp * dcp + d], ap[rp], vv
+                        )
+                kg += 1
+            comptime for rp in range(RP):
+                comptime for d in range(dcp):
+                    acc.unsafe_store[width=4](
+                        (rp * DP + dc + d) * 4, accv[rp * dcp + d]
+                    )
+
+        t0 += ks
+
+    comptime for rp in range(RP):
+        comptime for c in range(2):
+            var r = 2 * rp + c
+            if r < nrows:
+                var out = o_base.unsafe_offset((q0 + r) * job.o_stride_t)
+                var s = row_sum[r]
+                if s > Scalar[DType.float32](0.0):
+                    var inv = SIMD[DType.float32, 4](
+                        Scalar[DType.float32](1.0) / s
+                    )
+                    comptime for d4 in range(DP // 4):
+                        var o8 = SIMD[DType.bfloat16, 8](0.0)
+                        comptime for i in range(4):
+                            var t = acc.unsafe_load[width=4](
+                                (rp * DP + d4 * 4 + i) * 4
+                            ) * inv
+                            o8[2 * i] = Scalar[DType.bfloat16](t[2 * c])
+                            o8[2 * i + 1] = Scalar[DType.bfloat16](t[2 * c + 1])
+                        out.unsafe_store[width=8](d4 * 8, o8)
+                else:
+                    # Every key of this row was masked: flash-attn returns zeros.
+                    comptime for d8 in range(DP // 4):
+                        out.unsafe_store[width=8](
+                            d8 * 8, SIMD[DType.bfloat16, 8](0.0)
+                        )
+
+
+
 comptime TBLK = 16
 """Tokens transposed at a time: 16 floats / 32 bf16 is one 64-byte store, so the
 destination is written a cache line at a time instead of 4 bytes at a time (which
@@ -658,10 +1042,17 @@ is what ``torch.permute(...).contiguous()`` does here -- 5-15 GB/s)."""
 
 
 struct TransposeJob(Copyable, ImplicitlyCopyable, Movable):
-    """K -> K^T (the Q@K^T sweep's layout), as raw addresses."""
+    """K -> K^T (the Q@K^T sweep's layout) and V -> the P@V operand layout.
+
+    ``v``/``vt`` and the ``v*``/``vt*`` strides are only read in mode 2 (the
+    ``bfmmla`` path, whose P@V contracts over keys and so needs V position-major
+    too).
+    """
 
     var k: Int
     var kt: Int
+    var v: Int
+    var vt: Int
     var batch: Int
     var num_kv_heads: Int
     var seq_k: Int
@@ -671,10 +1062,17 @@ struct TransposeJob(Copyable, ImplicitlyCopyable, Movable):
     var k_stride_h: Int
     var kt_stride_bh: Int
     var kt_stride_d: Int
+    var v_stride_b: Int
+    var v_stride_t: Int
+    var v_stride_h: Int
+    var vt_stride_bh: Int
+    var vt_stride_d: Int
 
     def __init__(out self):
         self.k = 0
         self.kt = 0
+        self.v = 0
+        self.vt = 0
         self.batch = 0
         self.num_kv_heads = 0
         self.seq_k = 0
@@ -684,17 +1082,25 @@ struct TransposeJob(Copyable, ImplicitlyCopyable, Movable):
         self.k_stride_h = 0
         self.kt_stride_bh = 0
         self.kt_stride_d = 0
+        self.v_stride_b = 0
+        self.v_stride_t = 0
+        self.v_stride_h = 0
+        self.vt_stride_bh = 0
+        self.vt_stride_d = 0
 
 
 @inline(.always)
 def _transpose_head[
-    dtype: DType, head_dim: Int, pairs: Bool
+    dtype: DType, head_dim: Int, mode: Int
 ](job: TransposeJob, batch: Int, head: Int):
     """Copy one (batch, kv head) of K into its transposed slot.
 
-    ``pairs`` builds the bf16 dot layout ``[head_dim/2, seq_k, 2]`` (the two head
-    dims a dot instruction contracts, next to the position they belong to);
-    otherwise it is one head dim per row, ``[head_dim, seq_k]``.
+    Mode 0 is one head dim per row, ``[head_dim, seq_k]``; mode 1 is the bf16
+    dot layout ``[head_dim/2, seq_k, 2]`` (the two head dims a dot instruction
+    contracts, next to the position they belong to); mode 2 is the ``bfmmla``
+    layout ``[head_dim/4, seq_k/2, 8]`` -- four head dims of key ``2p``, then the
+    same four of key ``2p+1``, which is the "2 columns x 4 contraction" operand
+    Q@K^T wants when the contraction runs over head dims.
     """
     var src = _ptr[Scalar[dtype]](job.k).unsafe_offset(
         batch * job.k_stride_b + head * job.k_stride_h
@@ -705,7 +1111,18 @@ def _transpose_head[
     var t0 = 0
     while t0 < job.seq_k:
         var n = min(TBLK, job.seq_k - t0)
-        comptime if pairs:
+        comptime if mode == 0:
+            comptime for d in range(head_dim):
+                var v = SIMD[DType.float32, TBLK](0.0)
+                comptime for i in range(TBLK):
+                    if i < n:
+                        v[i] = Scalar[DType.float32](
+                            src.unsafe_load((t0 + i) * job.k_stride_t + d)
+                        )
+                dst.unsafe_store[width=TBLK](
+                    d * job.kt_stride_d + t0, v.cast[dtype]()
+                )
+        elif mode == 1:
             comptime for d2 in range(head_dim // 2):
                 var v = SIMD[dtype, 2 * TBLK](0.0)
                 comptime for i in range(TBLK):
@@ -719,17 +1136,59 @@ def _transpose_head[
                     d2 * job.kt_stride_d + t0 * 2, v
                 )
         else:
-            comptime for d in range(head_dim):
-                var v = SIMD[DType.float32, TBLK](0.0)
+            # 16 tokens = 8 key pairs = 64 bf16 per head-dim group: one 128-byte
+            # store, 4 head dims of one key per 8-byte load.
+            comptime for g in range(head_dim // 4):
+                var v = SIMD[dtype, 4 * TBLK](0.0)
                 comptime for i in range(TBLK):
                     if i < n:
-                        v[i] = Scalar[DType.float32](
-                            src.unsafe_load((t0 + i) * job.k_stride_t + d)
-                        )
-                dst.unsafe_store[width=TBLK](
-                    d * job.kt_stride_d + t0, v.cast[dtype]()
+                        var q4 = src.unsafe_offset(
+                            (t0 + i) * job.k_stride_t + 4 * g
+                        ).unsafe_load[width=4]()
+                        comptime for d in range(4):
+                            v[4 * i + d] = q4[d]
+                dst.unsafe_store[width=4 * TBLK](
+                    g * job.kt_stride_d + t0 * 4, v
                 )
         t0 += TBLK
+
+
+@inline(.always)
+def _vpack_head[
+    dtype: DType, head_dim: Int
+](job: TransposeJob, batch: Int, head: Int):
+    """Copy one (batch, kv head) of V into the ``bfmmla`` P@V operand layout.
+
+    ``[head_dim/2, seq_k/4, 8]``: eight bf16 = one head-dim pair across four
+    keys (four of dim ``2d``, then four of dim ``2d+1``). P@V contracts over
+    keys, so the operand's two 4-lane halves are the two *output dims*; V's
+    natural row-major layout has them interleaved with the key index instead.
+    """
+    var src = _ptr[Scalar[dtype]](job.v).unsafe_offset(
+        batch * job.v_stride_b + head * job.v_stride_h
+    )
+    var dst = _ptr[Scalar[dtype]](job.vt).unsafe_offset(
+        (batch * job.num_kv_heads + head) * job.vt_stride_bh
+    )
+    var t0 = 0
+    while t0 < job.seq_k:
+        var n = min(TBLK, job.seq_k - t0)
+        # 16 tokens = 4 groups of 4 keys: 32 bf16 per head-dim pair, written as
+        # one 64-byte store from 32 2-element loads of the row-major source.
+        comptime for dp in range(head_dim // 2):
+            var v = SIMD[dtype, 2 * TBLK](0.0)
+            comptime for i in range(TBLK):
+                if i < n:
+                    var pair = src.unsafe_offset(
+                        (t0 + i) * job.v_stride_t + 2 * dp
+                    ).unsafe_load[width=2]()
+                    comptime for d in range(2):
+                        v[8 * (i // 4) + 4 * d + i % 4] = pair[d]
+            dst.unsafe_store[width=2 * TBLK](
+                dp * job.vt_stride_d + (t0 // 4) * 8, v
+            )
+        t0 += TBLK
+
 
 
 comptime TransposeTaskFn = def(TransposeJob, Int) thin -> None
@@ -763,26 +1222,30 @@ def _gomp_worker_transpose(data: Int) abi("C"):
 
 
 @inline(.always)
-def _transpose_task[
-    dtype: DType, head_dim: Int, pairs: Bool
-](job: TransposeJob, task: Int):
-    _transpose_head[dtype, head_dim, pairs](
-        job, task // job.num_kv_heads, task % job.num_kv_heads
-    )
+def _transpose_task[dtype: DType, head_dim: Int, mode: Int](
+    job: TransposeJob, task: Int
+):
+    var batch = task // job.num_kv_heads
+    var head = task % job.num_kv_heads
+    _transpose_head[dtype, head_dim, mode](job, batch, head)
+    comptime if mode == 2:
+        # The bfmmla path needs V position-major too; pack both in one pass so
+        # the call pays a single fork-join.
+        _vpack_head[dtype, head_dim](job, batch, head)
 
 
-def _transpose_dispatch[
-    dtype: DType, head_dim: Int, pairs: Bool
-](job: TransposeJob, num_workers: Int):
+def _transpose_dispatch[dtype: DType, head_dim: Int, mode: Int](
+    job: TransposeJob, num_workers: Int
+):
     var items = job.batch * job.num_kv_heads
     if items == 0:
         return
     var workers = min(num_workers, items)
     if workers <= 1:
         for task in range(items):
-            _transpose_task[dtype, head_dim, pairs](job, task)
+            _transpose_task[dtype, head_dim, mode](job, task)
         return
-    comptime task_fn = _transpose_task[dtype, head_dim, pairs]
+    comptime task_fn = _transpose_task[dtype, head_dim, mode]
     var state = stack_allocation[1, TransposeDispatch]()
     state[] = TransposeDispatch(job, task_fn, items)
     comptime entry = _gomp_worker_transpose
@@ -791,36 +1254,46 @@ def _transpose_dispatch[
     )
 
 
-def _transpose_shape[
-    dtype: DType, head_dim: Int
-](job: TransposeJob, num_workers: Int, pairs: Bool):
-    if pairs:
-        _transpose_dispatch[dtype, head_dim, True](job, num_workers)
+def _transpose_shape[dtype: DType, head_dim: Int](
+    job: TransposeJob, num_workers: Int, mode: Int
+) raises:
+    if mode == 0:
+        _transpose_dispatch[dtype, head_dim, 0](job, num_workers)
+    elif mode == 1:
+        _transpose_dispatch[dtype, head_dim, 1](job, num_workers)
+    elif mode == 2:
+        _transpose_dispatch[dtype, head_dim, 2](job, num_workers)
     else:
-        _transpose_dispatch[dtype, head_dim, False](job, num_workers)
+        raise Error("cpu_attention dense: unknown K/V layout mode")
 
 
 def _transpose_dtype[
     dtype: DType
-](job: TransposeJob, num_workers: Int, pairs: Bool) raises:
+](job: TransposeJob, num_workers: Int, mode: Int) raises:
     if job.head_dim == 32:
-        _transpose_shape[dtype, 32](job, num_workers, pairs)
+        _transpose_shape[dtype, 32](job, num_workers, mode)
     elif job.head_dim == 64:
-        _transpose_shape[dtype, 64](job, num_workers, pairs)
+        _transpose_shape[dtype, 64](job, num_workers, mode)
     elif job.head_dim == 128:
-        _transpose_shape[dtype, 128](job, num_workers, pairs)
+        _transpose_shape[dtype, 128](job, num_workers, mode)
     else:
         raise Error("cpu_attention dense: unsupported head_dim")
 
 
 def run_transpose(
-    job: TransposeJob, dtype_code: Int, num_workers: Int, pairs: Bool
+    job: TransposeJob, dtype_code: Int, num_workers: Int, mode: Int
 ) raises:
-    """Transpose K into the Q@K^T layout, in parallel over (batch, kv head)."""
+    """Pack K (and, in mode 2, V) into the layout the kernel reads.
+
+    Mode 0 is the portable ``[head_dim, seq_k]`` transpose, mode 1 the ``bfdot``
+    paired-head-dim layout, mode 2 the ``bfmmla`` layouts (K position-paired over
+    4 head dims, V position-major over head-dim pairs). Parallel over
+    (batch, kv head), one fork-join for both tensors in mode 2.
+    """
     if dtype_code == 0:
-        _transpose_dtype[DType.float32](job, num_workers, pairs)
+        _transpose_dtype[DType.float32](job, num_workers, mode)
     elif dtype_code == 1:
-        _transpose_dtype[DType.bfloat16](job, num_workers, pairs)
+        _transpose_dtype[DType.bfloat16](job, num_workers, mode)
     else:
         raise Error("cpu_attention dense: unsupported dtype")
 
@@ -876,9 +1349,27 @@ def _dense_task[dtype: DType, head_dim: Int, qt: Int](job: DenseJob, task: Int):
     comptime if LANES < 16:
         # NEON: `head_dim / LANES` floats per row is 16 registers at head_dim 64
         # whatever qt is, so the register kernel cannot hold an accumulator.
-        # Keep it in L1 and tile the head dim by two vectors instead; bf16 keeps
-        # its dot instruction through the `pairs` K layout.
-        comptime if dtype == DType.bfloat16 and BF16_DOT:
+        # bf16 runs the 2x2-tile `bfmmla` kernel, whose operands carry two query
+        # rows at a time; the 4-lane paths keep the head-dim `pairs` layout.
+        comptime if dtype == DType.bfloat16 and BFMMLA:
+            # Tile choice: ``qt/2 * sub/2`` 2x2 accumulator tiles have to fit
+            # beside the softmax working set, and the load ratio goes the other
+            # way -- (qt/2 + sub/2) / (qt/2 * sub/2) loads per instruction, 0.63
+            # at 4 rows x 16 keys and 0.5 at 8 x 8. The per-softmax-step fixed
+            # cost dominates the load ratio at head_dim 64 (a 16-key step is 16%
+            # faster than an 8-key one at qt = 4), while at head_dim 128 there
+            # is 2x the matmul per key, so 8 rows x 8 keys wins there.
+            comptime if qt <= 4:
+                _dense_rows_bfmmla[head_dim, qt, BKS, 8, 16](
+                    job, batch, head, kv_head, q0
+                )
+            else:
+                # 3-4 row pairs: halve the key tile and the P@V dim-pair chunk,
+                # or the tile stops fitting in 32 registers.
+                _dense_rows_bfmmla[head_dim, qt, BKS, 4, 8](
+                    job, batch, head, kv_head, q0
+                )
+        elif dtype == DType.bfloat16 and BF16_DOT:
             _dense_rows_mem[dtype, head_dim, qt, KT_TILE, 2 * LANES, True](
                 job, batch, head, kv_head, q0
             )
@@ -948,6 +1439,14 @@ def _run_dtype[dtype: DType](job: DenseJob, num_workers: Int, qt: Int) raises:
 def lane_width() -> Int:
     """fp32 lanes per vector in this build (16 on AVX-512, 4 on NEON)."""
     return LANES
+
+
+def has_bfmmla() -> Bool:
+    """Whether this build has NEON ``bfmmla`` (the K *and* V layouts differ)."""
+    comptime if BFMMLA:
+        return True
+    else:
+        return False
 
 
 def has_bf16_dot() -> Bool:

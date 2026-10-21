@@ -15,6 +15,7 @@ from dense import (
     DenseJob,
     TransposeJob,
     has_bf16_dot,
+    has_bfmmla,
     lane_width,
     run_dense,
     run_transpose,
@@ -24,6 +25,8 @@ from dense import (
 def dense_transpose(
     k: PythonObject,
     kt: PythonObject,
+    v: PythonObject,
+    vt: PythonObject,
     batch: PythonObject,
     num_kv_heads: PythonObject,
     seq_k: PythonObject,
@@ -33,14 +36,21 @@ def dense_transpose(
     k_stride_h: PythonObject,
     kt_stride_bh: PythonObject,
     kt_stride_d: PythonObject,
+    v_stride_b: PythonObject,
+    v_stride_t: PythonObject,
+    v_stride_h: PythonObject,
+    vt_stride_bh: PythonObject,
+    vt_stride_d: PythonObject,
     dtype: PythonObject,
-    pairs: PythonObject,
+    mode: PythonObject,
     num_workers: PythonObject,
 ) raises:
-    """Transpose K into the layout the dense kernel's Q@K^T sweep reads."""
+    """Pack K (and, in mode 2, V) into the layout the dense kernel reads."""
     var job = TransposeJob()
     job.k = Int(py=k)
     job.kt = Int(py=kt)
+    job.v = Int(py=v)
+    job.vt = Int(py=vt)
     job.batch = Int(py=batch)
     job.num_kv_heads = Int(py=num_kv_heads)
     job.seq_k = Int(py=seq_k)
@@ -50,11 +60,16 @@ def dense_transpose(
     job.k_stride_h = Int(py=k_stride_h)
     job.kt_stride_bh = Int(py=kt_stride_bh)
     job.kt_stride_d = Int(py=kt_stride_d)
+    job.v_stride_b = Int(py=v_stride_b)
+    job.v_stride_t = Int(py=v_stride_t)
+    job.v_stride_h = Int(py=v_stride_h)
+    job.vt_stride_bh = Int(py=vt_stride_bh)
+    job.vt_stride_d = Int(py=vt_stride_d)
     run_transpose(
         job,
         dtype_code=Int(py=dtype),
         num_workers=Int(py=num_workers),
-        pairs=Bool(pairs),
+        mode=Int(py=mode),
     )
 
 
@@ -70,6 +85,13 @@ def dense_bf16_dot() -> PythonObject:
     return PythonObject(False)
 
 
+def dense_bfmmla() -> PythonObject:
+    """True when the bf16 path runs on NEON ``bfmmla`` (K and V both repacked)."""
+    if has_bfmmla():
+        return PythonObject(True)
+    return PythonObject(False)
+
+
 @export
 def PyInit__C() abi("C") -> PythonObject:
     try:
@@ -78,6 +100,7 @@ def PyInit__C() abi("C") -> PythonObject:
         m.def_function[dense_attention]("dense_attention")
         m.def_function[dense_transpose]("dense_transpose")
         m.def_function[dense_bf16_dot]("dense_bf16_dot")
+        m.def_function[dense_bfmmla]("dense_bfmmla")
         m.def_function[dense_lanes]("dense_lanes")
         return m.finalize()
     except e:
