@@ -211,6 +211,50 @@ Note for anyone measuring: `flush.py` sets `CPU_ATTENTION_NO_FUSE` (it needs the
 unfused path to split pack from kernel), so a change to the *fused* call path
 does not show up there at all. Use `flash_attn_func` directly or the matrix.
 
+## The co-issue restructure: built twice, loses twice, and the reason is decisive
+
+`mixed.c` says the machine co-issues (8 bfmmla 3.98 cycles, 8 fmla 2.99, 8+8
+**3.99**), so the fp32 softmax ought to hide inside a tile's matmul. Built the
+full version (all 4 row pairs' exp interleaved with the next tile's Q@K^T) and
+the half version (row pairs 0,1 only, so the fused body carries 16 + 2 + 2 + 4
+registers instead of 16 + 4 + 4 + 4), each with double-buffered logits:
+
+| | cycles/row-key | instr/row-key | stack refs per fused iteration |
+|---|---:|---:|---:|
+| baseline | 5.68 | 20.87 | - |
+| full co-issue | 6.07 | 22.4 | 80 |
+| half co-issue | 5.84 | 21.13 | 40 |
+
+Both lose. The register pressure explains the spill traffic but **not** the
+verdict, because the trend is monotone in the interleaved fraction: less
+interleaving is less bad, converging to the baseline at zero.
+
+The real reason is in the loop shape. The Q@K^T body is 26 instructions per 16
+bfmmla, i.e. **3.25 IPC for 8 cycles of matmul**, against a machine that sustains
+~3.5. It is already issue-bound, so there are no spare issue slots for the exp to
+hide in; interleaving adds branches, spill traffic and register pressure on top.
+`mixed.c`'s 8+8-in-3.99 is 8 FMAs and nothing else -- no loads, no stores, no
+address arithmetic. **Any future "co-issue the softmax" proposal has to first
+show the matmul loop has spare *issue* slots, not spare matmul cycles.**
+
+## The bf16 D=128 probability panels: worth 0%, not 2/row-key
+
+The 2-per-row-key panel reload looked like the D=128 story (3 rows at 1.12-1.13).
+Ablated it (constant panel, timing only):
+
+| | baseline | panel ablated |
+|---|---:|---:|
+| 1024:16:128 bf16 | 6251-6439 us | 6374 |
+| 512:32:128 bf16 | ~3520 | 3523 |
+| 2048:8:64 bf16 (control) | 7240 | 7241 |
+
+Zero. So the D=128 second kernel has no headroom from that direction, and the
+alternative structures are register-infeasible anyway: panels-resident wants a
+16-key tile (4 kg x RP = 16 registers) but the P@V accumulator round trip is
+`DP*RP*2 = 512` ops per tile whatever `dcp` is, i.e. 4/row-key at 16 keys against
+0.5 at 128; and halving the rows to afford `dcp=8` halves the panels but doubles
+the V loads.
+
 ## Dead ends (measured, do not repeat)
 
 * **Q@K^T loop unrolled x2** (two head-dim groups per iteration, to halve the
