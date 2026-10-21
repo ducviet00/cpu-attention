@@ -140,6 +140,18 @@ cannot do raises `NotImplementedError` instead of being silently ignored: `qv`,
 `pack_gqa`, `sm_margin`, `scheduler_metadata`, `rotary_interleaved`) are
 accepted and ignored.
 
+On x86 CPUs with **AMX** the dense path is a different kernel:
+`cpu_attention/_mojo/src/dense_amx.mojo`, 32 query rows per work item, K and V
+packed into the AMX operand layouts, one softmax pass per 256-key super-tile, and
+`tdpbf16ps` for both phases — which is worth 4-9.6x over the AVX-512 path and
+takes bf16 from 1.7-6.8x behind torch SDPA on a Xeon to 1.4-2.4x ahead of it.
+It is selected at compile time (`CompilationTarget._has_feature["amx-tile"]`) and
+gated at run time on `arch_prctl(XFEATURE_XTILEDATA)`, so every other CPU, and
+`CPU_ATTENTION_AMX=0`, falls back to the AVX-512/NEON kernels below. The AMX tile
+instructions are emitted from Mojo inline assembly (`amx.mojo`) — a C shim is not
+needed; `AGENTS.md` §14 has the details and the one trap (AT&T operand order puts
+the destination tile last).
+
 `flash_attn_func` keeps flash-attn's dense shape — `q [B, Sq, H, D]`,
 `k`/`v [B, Sk, Hk, D]`, MQA/GQA, bottom-right-aligned `causal`, `softmax_scale` —
 and *drops* the arguments the kernel cannot honour (`dropout_p`, `window_size`,
@@ -319,9 +331,12 @@ Measured, interleaved, on the Ryzen: 1.13x at 256x16x128 and 1.25x at
 The current table, the measurement protocol and the list of what moved it live in
 `docs/STATUS.md`; it is regenerated from `tests/bench_vs_refs.py --json` with
 `scripts/scorecard.py`, never typed by hand. Headline, Ryzen 7 7840H, 8 threads,
-causal, ratios `ours/baseline` (`<1` wins): **22 of 22 rows beat SDPA and 10 of
-22 beat vLLM's VEC kernel**, and every fp32 row that still loses is a
-pre-AMX-codegen artefact on a box without AMX rather than a structural wall.
+causal, ratios `ours/baseline` (`<1` wins). On the Xeon: **22 of 22 rows beat
+SDPA and 22 of 22 beat vLLM's VEC kernel** — bf16 via AMX (`tdpbf16ps`) and fp32
+via AMX as well, by splitting each fp32 operand into bf16 hi/lo halves and
+keeping three products per phase (error 5.5-7.6e-5 against a 2e-4 gate). On the
+Graviton: 22 of 22 beat SDPA and fp32 is at parity with vLLM's NEON kernel
+(0.89-1.11 run to run), with bf16 2-32% behind it.
 
 The three moves that mattered most, in order, were: **reusing the K/V pack
 workspace** instead of `torch.empty` per call (1.4-1.7x -- the pack was writing
