@@ -1425,7 +1425,12 @@ def _dense_rows_tile[
             # tile body that spilled (the compiler interleaved the chains) and
             # did not fit the I-cache.
             var off = m_new * (-c1)
-            var sumv = SIMD[DType.float32, 4](0.0)
+            # One partial sum per key group of the two the loop consumes, folded
+            # once: a single `sumv` is a 16-long serial `fadd` chain per row pair
+            # per tile, and it showed up as 5% of the backend stalls.
+            var sumv = Array[SIMD[DType.float32, 4], 2](uninitialized=True)
+            sumv[0] = SIMD[DType.float32, 4](0.0)
+            sumv[1] = SIMD[DType.float32, 4](0.0)
             # Nothing visible yet anywhere: the panels have to be exactly zero,
             # because -inf * -c1 is +inf and would exponentiate to 1, not 0.
             var blind = m_new.reduce_max() == Scalar[DType.float32](NEG_INF)
@@ -1457,7 +1462,7 @@ def _dense_rows_tile[
                             * c1
                             + off
                         )
-                        sumv += p0 + p1
+                        sumv[u] += p0 + p1
                         # Row 0's four keys are lanes 0,1 of both exponentials
                         # and row 1's are lanes 2,3, so a panel is two 4-lane
                         # half-shuffles, two truncating converts and a join.
@@ -1476,7 +1481,8 @@ def _dense_rows_tile[
                             ),
                         )
                     kg += 2
-            s_v[rp] = s_v[rp] + _swap_pairs(sumv) + sumv
+            var st = sumv[0] + sumv[1]
+            s_v[rp] = s_v[rp] + _swap_pairs(st) + st
 
         # ---- 3. P@V over the tile, dcp dim pairs at a time. Only the key
         # groups that exist (``nkg``, decided in phase 1): masked lanes are
@@ -1728,19 +1734,25 @@ def _dense_rows_tile_f32[
                             * SIMD[DType.float32, LANES](alpha),
                         )
                     row_sum[r] *= SIMD[DType.float32, LANES](alpha)
-            var sumv = SIMD[DType.float32, LANES](0.0)
+            # Two partial sums, folded once: one accumulator is a 16-long
+            # serial `fadd` chain per row per tile (the same fix as the bf16
+            # kernel, where it was worth 8% of the whole call).
+            var sumv = Array[SIMD[DType.float32, LANES], 2](uninitialized=True)
+            sumv[0] = SIMD[DType.float32, LANES](0.0)
+            sumv[1] = SIMD[DType.float32, LANES](0.0)
             var k = 0
             # Only the keys that exist, rounded up to a whole 4-key group (the
             # logits past `jn` are NEG_INF, so exp of them is exactly 0).
-            while k < min(ks, (jn + 3) // 4 * 4):
+            var kend = min(ks, (jn + 3) // 4 * 4)
+            while k < kend:
                 var p = _vexp[LANES](
                     logits.unsafe_load[width=LANES](r * ks + k)
                     + SIMD[DType.float32, LANES](off)
                 )
-                sumv += p
+                sumv[(k // LANES) % 2] += p
                 probs.unsafe_store[width=LANES](r * ks + k, p)
                 k += LANES
-            row_sum[r] += sumv
+            row_sum[r] += sumv[0] + sumv[1]
 
         # ---- 3. P@V over the tile, `dc` floats of the head dim at a time, four
         # keys at a time. Only the key groups that exist: the masked lanes'
