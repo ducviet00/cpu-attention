@@ -43,7 +43,7 @@ thread would leave half the cores idle at the end of a long prefill.
 """
 
 from std.ffi import external_call
-from std.math import exp, iota
+from std.math import exp, fma, iota
 from std.memory import MutPointer, bitcast, stack_allocation
 from std.origin import MutUntrackedOrigin
 from std.sys import llvm_intrinsic, simd_width_of
@@ -210,6 +210,49 @@ def _bf16_dot[
         return out
 
 
+def _vexp[
+    width: Int
+](x: SIMD[DType.float32, width]) -> SIMD[DType.float32, width]:
+    """``exp(x)`` for ``x <= 0`` as a Cephes-degree polynomial plus an exponent
+    bit-trick, in ~10 FMAs and three live vectors.
+
+    ``std.math.exp`` on a SIMD is *not* this: on the AVX-512 host it costs ~36
+    cycles per lane here (it is not vectorised into a polynomial), which at
+    head_dim 128 was 58% of the dense kernel's time -- and its scratch footprint
+    also pushes the P@V accumulator out of registers. Clamping at -87 (exp(-87) =
+    1.6e-38) keeps the 2^k scale in range; masked lanes carry NEG_INF, so they
+    land on the clamp and contribute ~0.
+    """
+    comptime LOG2E = 1.4426950408889634
+    comptime LN2_HI = 0.693145751953125
+    comptime LN2_LO = 1.428606765330187e-6
+    var xc = max(x, SIMD[DType.float32, width](-87.0))
+    # Round to nearest through the +1.5*2^23 trick: branch-free, and the low
+    # mantissa bits of `t` hold the integer k.
+    comptime MAGIC = 12582912.0
+    var t = fma(xc, SIMD[DType.float32, width](LOG2E), SIMD[DType.float32, width](MAGIC))
+    var kf = t - SIMD[DType.float32, width](MAGIC)
+    var r = fma(-kf, SIMD[DType.float32, width](LN2_HI), xc)
+    r = fma(-kf, SIMD[DType.float32, width](LN2_LO), r)
+    var p = SIMD[DType.float32, width](1.9875691500e-4)
+    p = fma(p, r, SIMD[DType.float32, width](1.3981999507e-3))
+    p = fma(p, r, SIMD[DType.float32, width](8.3334519073e-3))
+    p = fma(p, r, SIMD[DType.float32, width](4.1665795894e-2))
+    p = fma(p, r, SIMD[DType.float32, width](1.6666665459e-1))
+    p = fma(p, r, SIMD[DType.float32, width](5.0000001201e-1))
+    p = fma(p, r, SIMD[DType.float32, width](1.0))
+    p = fma(p, r, SIMD[DType.float32, width](1.0))
+    var ki = kf.cast[DType.int32]()
+    var sbits = (ki + SIMD[DType.int32, width](127)) << SIMD[DType.int32, width](23)
+    return p * bitcast[DType.float32, width](sbits)
+
+
+@inline(.always)
+def _vexp_f(x: Scalar[DType.float32]) -> Scalar[DType.float32]:
+    """Scalar ``exp`` through the same polynomial (the online-softmax rescale)."""
+    return _vexp[1](SIMD[DType.float32, 1](x))[0]
+
+
 @inline(.always)
 def _dense_rows[
     dtype: DType, head_dim: Int, qt: Int
@@ -308,10 +351,10 @@ def _dense_rows[
             )
             var alpha = Scalar[DType.float32](0.0)
             if m_new > Scalar[DType.float32](NEG_INF):
-                alpha = exp(m_old - m_new)
+                alpha = _vexp_f(m_old - m_new)
             var p = SIMD[DType.float32, KT_TILE](0.0)
             if m_new > Scalar[DType.float32](NEG_INF):
-                p = exp(logits[r] - m_new)
+                p = _vexp[KT_TILE](logits[r] - m_new)
             row_sum[r] = row_sum[r] * alpha + Scalar[DType.float32](
                 p.reduce_add()
             )
@@ -493,10 +536,10 @@ def _dense_rows_mem[
             )
             var alpha = Scalar[DType.float32](0.0)
             if m_new > Scalar[DType.float32](NEG_INF):
-                alpha = exp(m_old - m_new)
+                alpha = _vexp_f(m_old - m_new)
             var p = SIMD[DType.float32, kt](0.0)
             if m_new > Scalar[DType.float32](NEG_INF):
-                p = exp(logits[r] - m_new)
+                p = _vexp[kt](logits[r] - m_new)
             # Nothing accumulated yet (row_sum == 0 implies acc is all zeros) or
             # the max did not move: both are exact no-ops for the rescale.
             if row_sum[r] > Scalar[DType.float32](0.0) and alpha != Scalar[
@@ -662,10 +705,10 @@ def _dense_rows_dot[
             )
             var alpha = Scalar[DType.float32](0.0)
             if m_new > Scalar[DType.float32](NEG_INF):
-                alpha = exp(m_old - m_new)
+                alpha = _vexp_f(m_old - m_new)
             var p = SIMD[DType.float32, KT_TILE](0.0)
             if m_new > Scalar[DType.float32](NEG_INF):
-                p = exp(logits[r] - m_new)
+                p = _vexp[KT_TILE](logits[r] - m_new)
             row_sum[r] = row_sum[r] * alpha + Scalar[DType.float32](
                 p.reduce_add()
             )
