@@ -673,7 +673,7 @@ shown to be already done by the compiler. In order of what actually paid:
 | one-row-pair / L1-staged logits / pipelining | -11% / 0% / -11% | falsified |
 | KV splits, GQA packing, mask-by-range, probs aliasing | <=4%, not needed for MHA | rejected |
 | lane-indexed FMA (vLLM's `vfmaq_laneq_f32`) | **already emitted**: 100 of 360 `fmla` in the ARM fp32 kernel are `fmla v.4s, v.4s, vN.s[k]` | nothing to do |
-| AMX (16x16 bf16 tiles) | 4-7x, but needs an `x86_amx` tile type Mojo cannot express -- a C shim is the only route, and it helps Xeon bf16 only | open, expensive |
+| AMX (16x16 bf16 tiles) | **4-9.6x on bf16** (`cpu_attention/_csrc/dense_amx.c`) | done for bf16; see below on Mojo vs C |
 
 So: on x86 and ARM the kernel is **at or ahead of SDPA nearly everywhere**
 (Graviton 17/22, laptop 11/12, Xeon 4/22 where bf16 SDPA has AMX), and
@@ -843,3 +843,36 @@ default of 16 is also the C++ kernel's best point (67 vs 76 µs at block 32).
 8. **`partial_simd_load`** for tails instead of `iota`+`select` (cosmetic).
 9. **T5** (root `AGENTS.md`): same paged path, but its per-layer pointwise chains
    are what the frozen compile graphs fuse, so the CPU gains would be larger.
+
+## 14. AMX from Mojo: the "C shim is the only route" claim was wrong
+
+LLVM's AMX *intrinsics* (`llvm.x86.tileloadd64`, `tdpbf16ps`, ...) really are
+unreachable from Mojo, because they take and return the `x86_amx` type and Mojo
+cannot name it. But that type exists only so a compiler can track tile
+registers, and a tile register can equally be spelled *inside the instruction
+text*. `std.sys.inlined_assembly` does that, and MAX itself reaches Apple's AMX
+this way (`max/kernels/src/linalg/arch/cpu/apple_amx_intrinsics.mojo` emits raw
+`.word` encodings). Verified in this repo:
+
+```bash
+mojo build -I cpu_attention/_mojo/src --target-triple x86_64-unknown-linux-gnu \
+    --target-cpu sapphirerapids --emit asm \
+    cpu_attention/_mojo/tests/amx_smoke.mojo -o /tmp/amx.s
+grep tdpbf16ps /tmp/amx.s     # tdpbf16ps %tmm2, %tmm0, %tmm1
+```
+
+`cpu_attention/_mojo/src/amx.mojo` has the primitives (`ldtilecfg`,
+`tileloadd`, `tdpbf16ps`, `tilestored`, `tilezero`, `tilerelease`) with the tile
+number as a *compile-time* parameter interpolated into the asm string, so one
+call site serves every tile. `tests/amx_smoke.mojo` is a 16x16x32 bf16 GEMM
+against a scalar reference; it needs an AMX CPU to run.
+
+What the C shim still buys, and why it is what ships today: LLVM does not model
+tile registers, so a `tileloadd` can be hoisted above a `tdpbf16ps` that still
+reads the tile (a WAR hazard with silently wrong results), which forces a
+`~{memory}` clobber on every primitive and gives up some software pipelining
+that gcc's intrinsics keep. So the Mojo port must be A/B'd, not assumed. It is
+still the right destination: one build artifact instead of two, no ctypes
+marshalling, no GIL-released mutex, and the AMX path can be gated at compile
+time with `CompilationTarget._has_feature["amxbf16"]()` exactly like the AVX-512
+and NEON paths already are.
