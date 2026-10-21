@@ -20,6 +20,7 @@ from dense import (
     run_dense,
     run_transpose,
 )
+from amx import amx_init
 from dense_amx import AMX, AmxJob, PackJob, run_dense_amx
 
 
@@ -96,6 +97,18 @@ def dense_bfmmla() -> PythonObject:
     return PythonObject(False)
 
 
+def dense_amx_init() -> PythonObject:
+    """Ask the kernel for AMX tile-data permission; False means unusable here.
+
+    Must succeed before any tile instruction: `#XF` state is off by default and
+    the first tile instruction is SIGILL without it. Called once per process
+    from `cpu_attention._kernel.amx_available()`.
+    """
+    if amx_init():
+        return PythonObject(True)
+    return PythonObject(False)
+
+
 def dense_has_amx() -> PythonObject:
     """True when this build has the AMX kernel (x86 target with amx-tile+bf16).
     """
@@ -132,14 +145,19 @@ def dense_amx_attention(
     kp_bh: PythonObject,
     vp_bh: PythonObject,
     kb16: PythonObject,
+    kb32: PythonObject,
     dc32: PythonObject,
     dc16: PythonObject,
     scale: PythonObject,
     causal: PythonObject,
     kt: PythonObject,
     num_workers: PythonObject,
+    fp32: PythonObject,
 ) raises:
-    """Pack K/V into the AMX operand layouts and run the bf16 attention.
+    """Pack K/V into the AMX operand layouts and run the attention.
+
+    ``fp32`` selects the three-term hi/lo arithmetic (every operand split into
+    two bf16 halves, three products per phase), which is fp32-accurate.
 
     ``kp``/``vp`` are caller-owned workspace (see ``cpu_attention._kernel``);
     the pack writes every tile it will read, so nothing needs zeroing except
@@ -161,6 +179,7 @@ def dense_amx_attention(
     pack.num_kv_heads = Int(py=num_kv_heads)
     pack.batch = Int(py=batch)
     pack.kb16 = Int(py=kb16)
+    pack.kb32 = Int(py=kb32)
     pack.dc32 = Int(py=dc32)
     pack.dc16 = Int(py=dc16)
     pack.kp_bh = Int(py=kp_bh)
@@ -190,6 +209,7 @@ def dense_amx_attention(
     job.kt = Int(py=kt)
     job.dc32 = Int(py=dc32)
     job.dc16 = Int(py=dc16)
+    job.fp32 = Bool(fp32)
     run_dense_amx(pack, job, num_workers=Int(py=num_workers), kt=Int(py=kt))
 
 
@@ -204,6 +224,7 @@ def PyInit__C() abi("C") -> PythonObject:
         m.def_function[dense_bfmmla]("dense_bfmmla")
         m.def_function[dense_lanes]("dense_lanes")
         m.def_function[dense_has_amx]("dense_has_amx")
+        m.def_function[dense_amx_init]("dense_amx_init")
         m.def_function[dense_amx_attention]("dense_amx_attention")
         return m.finalize()
     except e:

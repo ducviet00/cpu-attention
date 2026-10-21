@@ -14,9 +14,6 @@ import threading
 import torch
 
 _LIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_C.so")
-_CSRC_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "_csrc_kernels.so"
-)
 
 # The kernel specializes on head_dim at compile time; anything else raises.
 _HEAD_DIMS = {32, 64, 128}
@@ -476,163 +473,74 @@ def _qt_for(
     return 10
 
 
-_CSRC = None
-"""ctypes handle for ``_csrc_kernels.so`` (the gcc-build AMX kernels), or False."""
-
 _AMX_ENV = os.environ.get("CPU_ATTENTION_AMX", "1") != "0"
 # fp32 goes through the same kernel with bf16 hi/lo operand splitting (three
 # products per phase); this switch is for A/B and for falling back if a future
-# CPU disagrees with the measured error.
+# CPU disagrees with the measured 5.5-7.6e-5 error.
 _AMX_FP32_ENV = os.environ.get("CPU_ATTENTION_AMX_FP32", "1") != "0"
-_KT_ENV = os.environ.get("CPU_ATTENTION_KT", "0")
-# Profiling only: "pack" skips the attention loop, "attn" skips the pack (which
-# then reads a stale buffer, so the result is garbage -- timings only).
-_AMX_MODE = os.environ.get("CPU_ATTENTION_AMX_MODE", "")
 
-
-def _csrc():
-    """The gcc-built x86 kernels, or None when they are unavailable here."""
-    global _CSRC
-    if _CSRC is None:
-        try:
-            import ctypes
-
-            lib = ctypes.CDLL(os.environ.get("CPU_ATTENTION_CSRC", _CSRC_PATH))
-            lib.dense_amx_ok.restype = ctypes.c_int
-            lib.dense_amx_ok.argtypes = []
-            argtypes = (
-                [ctypes.c_void_p] * 4
-                + [ctypes.c_int64] * 18
-                + [ctypes.c_double]
-                + [ctypes.c_int64] * 3
-            )
-            for name in ("dense_amx_bf16", "dense_amx_fp32"):
-                fn = getattr(lib, name, None)
-                if fn is not None:
-                    fn.restype = ctypes.c_int
-                    fn.argtypes = argtypes
-            _CSRC = lib
-        except (OSError, AttributeError):
-            _CSRC = False
-    return _CSRC or None
-
-
-_AMX_OK = None
+_AMX_ENTRY = None
 
 
 def amx_available() -> bool:
-    """True when this build/CPU can run the AMX bf16 dense kernel.
+    """True when this build can run the AMX dense kernel (bf16 or fp32).
 
-    Cached: `dense_amx_ok()` calls `arch_prctl(ARCH_REQ_XCOMP_PERM)` to ask for
-    tile-data permission, i.e. a syscall, and the answer cannot change within a
-    process. Without the cache every bf16 call paid that syscall even on a CPU
-    that has no AMX at all.
+    Cached: the first call asks the kernel for tile-data permission
+    (`arch_prctl`), which is a syscall, and the answer cannot change inside a
+    process. Doing it here (rather than per call) is also what makes the tile
+    instructions legal at all -- `#XF` state is off by default, and the first
+    tile instruction is SIGILL without it. Torch's oneDNN normally asks for it
+    too, but that is an implementation detail of the wheel, not a guarantee.
     """
-    global _AMX_OK
-    if _AMX_OK is None:
-        lib = _csrc()
-        _AMX_OK = bool(lib is not None and _AMX_ENV and lib.dense_amx_ok() == 1)
-    return _AMX_OK
+    global _AMX_ENTRY
+    if _AMX_ENTRY is None:
+        mod = module()
+        gate = getattr(mod, "dense_has_amx", None) if mod else None
+        init = getattr(mod, "dense_amx_init", None) if mod else None
+        if gate is None or init is None or not gate() or not init():
+            _AMX_ENTRY = False
+        else:
+            _AMX_ENTRY = mod.dense_amx_attention
+    return _AMX_ENTRY is not False and _AMX_ENTRY is not None and _AMX_ENV
 
 
 def _amx_dense(q, k, v, scale: float, causal: bool):
-    """Run the C/AMX kernel, or return None when it cannot take this call.
+    """Run the AMX kernel, or return None when it cannot take this call.
 
-    bf16 is native (Q/K/P are already bf16); fp32 runs the same kernel with every
-    operand split into bf16 hi/lo and three products per phase, which is fp32
-    accurate (3e-5 measured) at 3x the tile ops. One work item is 32 query rows
-    of one (batch, head); anything else falls back to the Mojo path.
+    bf16 is native; fp32 runs the same kernel with every operand split into bf16
+    hi/lo and three products per phase (fp32-accurate at 3x the tile ops). One
+    work item is 32 query rows of one (batch, head); anything else -- no AMX in
+    this build, an unsupported head dim, the switch turned off -- falls back to
+    the AVX-512 path in this file.
     """
-    lib = _csrc()
-    if lib is None or not _AMX_ENV:
+    if not amx_available():
         return None
-    if not amx_available() or q.shape[-1] not in (32, 64, 128):
+    if q.shape[-1] not in (32, 64, 128) or q.dtype not in _DTYPE_CODES:
         return None
     fp32 = q.dtype == torch.float32
     if fp32 and not _AMX_FP32_ENV:
         return None
-    entry = getattr(lib, "dense_amx_fp32" if fp32 else "dense_amx_bf16", None)
-    if entry is None:
-        return None
-    if q.dtype not in _DTYPE_CODES:
-        return None
-    out = torch.empty_like(q, memory_format=torch.contiguous_format)
     batch, seq_q, num_heads, head_dim = q.shape
     seq_k, num_kv_heads = k.shape[1], k.shape[2]
-    qs, ks, vs, os_ = q.stride(), k.stride(), v.stride(), out.stride()
-    tasks = batch * num_heads * (-(-seq_q // 32))
-    rc = entry(
-        q.data_ptr(), k.data_ptr(), v.data_ptr(), out.data_ptr(),
-        batch, seq_q, seq_k, num_heads, num_kv_heads, head_dim,
-        qs[0], qs[1], qs[2],
-        ks[0], ks[1], ks[2],
-        vs[0], vs[1], vs[2],
-        os_[0], os_[1], os_[2],
-        float(scale), int(bool(causal)),
-        _workers(tasks, 8),
-        int(_KT_ENV or 0)
-        | (1 << 16 if _AMX_MODE == "pack" else 0)
-        | (1 << 17 if _AMX_MODE == "attn" else 0)
-        | (int(_AMX_MODE[3:], 16) << 18 if _AMX_MODE.startswith("abl") else 0),
-    )
-    return out if rc == 0 else None
-
-
-_AMX_IMPL = os.environ.get("CPU_ATTENTION_AMX_IMPL", "mojo")
-
-
-def _mojo_amx():
-    """Return the extension's AMX entry point, bound once, or None."""
-    global _MOJO_AMX
-    try:
-        if _MOJO_AMX is None:
-            mod = require()
-            _MOJO_AMX = mod.dense_amx_attention if mod.dense_has_amx() else False
-    except (AttributeError, RuntimeError):
-        _MOJO_AMX = False
-    return _MOJO_AMX or None
-
-
-_MOJO_AMX = None
-
-
-def amx_mojo_available() -> bool:
-    """True when the *Mojo* AMX kernel is compiled in and usable here."""
-    return _mojo_amx() is not None and amx_available() and _AMX_IMPL != "c"
-
-
-def _amx_dense_mojo(q, k, v, scale: float, causal: bool):
-    """Run the Mojo AMX kernel, or None when it cannot take this call.
-
-    bf16 only for now: fp32 goes through the C kernel's 3-term path (every
-    operand split into bf16 hi/lo, three products), which this port does not
-    carry yet. The packed K/V slabs are workspace, like the AVX-512 pack's, so
-    they are not re-faulted every call.
-    """
-    entry = _mojo_amx()
-    if entry is None or _AMX_IMPL == "c" or not _AMX_ENV:
+    if seq_q < 1 or seq_k < 1 or num_kv_heads < 1:
         return None
-    if q.dtype != torch.bfloat16 or not amx_available():
-        return None
-    batch, seq_q, num_heads, head_dim = q.shape
-    seq_k, num_kv_heads = k.shape[1], k.shape[2]
-    if head_dim not in (32, 64, 128) or seq_k < 1 or seq_q < 1:
-        return None
-    # Layout the kernel reads: one 1 KB tile per (key block, dim chunk).
+    # The layouts the kernel reads: one 1 KB tile per (key block, dim chunk);
+    # fp32 packs an (hi, lo) slab pair, so the pitch is 1024 bf16, not 512.
     kb32 = -(-seq_k // 32)          # V blocks: 32 keys
     kb16 = kb32 * 2                 # K blocks: 16 keys
     dc32, dc16 = head_dim // 32, head_dim // 16
-    kp_bh, vp_bh = kb16 * dc32 * 512, kb32 * dc16 * 512
+    slab = 1024 if fp32 else 512
+    kp_bh, vp_bh = kb16 * dc32 * slab, kb32 * dc16 * slab
     nbh = batch * num_kv_heads
     kp = _scratch("amx_kp", (nbh * kp_bh,), torch.bfloat16)
     vp = _scratch("amx_vp", (nbh * vp_bh,), torch.bfloat16)
     out = torch.empty_like(q, memory_format=torch.contiguous_format)
     qs, ks, vs, os_ = q.stride(), k.stride(), v.stride(), out.stride()
-    # Match the C kernel's default super-tile (it is clamped to MAXKT = 512
-    # inside the kernel; 256 measured best on the Xeon).
+    # 256-key super-tiles measured best on the Xeon (128 is 6% slower, 384/512
+    # lose the logits+prob+acc working set out of L1).
     kt = int(os.environ.get("CPU_ATTENTION_AMX_KT") or 256)
     tasks = batch * num_heads * (-(-seq_q // 32))
-    entry(
+    _AMX_ENTRY(
         q.data_ptr(), kp.data_ptr(), vp.data_ptr(), out.data_ptr(),
         k.data_ptr(), v.data_ptr(),
         batch, seq_q, seq_k, num_heads, num_kv_heads, head_dim,
@@ -642,7 +550,7 @@ def _amx_dense_mojo(q, k, v, scale: float, causal: bool):
         os_[0], os_[1], os_[2],
         kp_bh, vp_bh, kb16, kb32, dc32, dc16,
         float(scale), int(bool(causal)), kt,
-        _workers(tasks, 8),
+        _workers(tasks, 8), int(fp32),
     )
     return out
 

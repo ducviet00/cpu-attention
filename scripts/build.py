@@ -4,14 +4,16 @@
     uv run --extra build python scripts/build.py --tests    # + standalone test
 
 The mojo compiler comes from the ``build`` extra (the PyPI ``mojo`` wheel), so
-uv is the only tool needed.  The shared library resolves the libgomp symbols at
+uv is the only tool needed. Everything the kernels do -- including Intel AMX,
+which used to need a gcc-built C shim -- now comes out of this one build: the
+tile instructions are emitted as inline assembly in ``_mojo/src/amx.mojo``
+because LLVM's AMX *intrinsics* traffic in a type Mojo cannot name.  The shared library resolves the libgomp symbols at
 load time (torch has libgomp loaded), but the standalone test binary links them,
 so ``--tests`` needs libgomp -- the system copy, or torch's bundled
 ``libgomp.so.1`` -- and is skipped with a note when neither is there.
 """
 
 import os
-import platform
 import shutil
 import subprocess
 import sys
@@ -21,37 +23,6 @@ SRC = os.path.join(ROOT, "cpu_attention", "_mojo", "src")
 TESTS = os.path.join(ROOT, "cpu_attention", "_mojo", "tests")
 BUILD = os.path.join(ROOT, "cpu_attention", "_mojo", "build")
 LIB = os.path.join(ROOT, "cpu_attention", "_C.so")
-
-# The AMX/AVX-512 C kernels (x86 only): a second extension module next to
-# _C.so, loaded with ctypes. Kept out of the Mojo build because AMX needs
-# tileloadd/tdpbf16ps on 16x16 tiles, which Mojo cannot express.
-CSRC = os.path.join(ROOT, "cpu_attention", "_csrc")
-CLIB = os.path.join(ROOT, "cpu_attention", "_csrc_kernels.so")
-C_SOURCES = ["dense_amx.c"]
-C_FLAGS = [
-    "-O3", "-fPIC", "-shared", "-std=c11", "-fopenmp", "-fno-math-errno",
-    "-mavx512f", "-mavx512bw", "-mavx512dq", "-mavx512vl", "-mavx512bf16",
-    "-mamx-tile", "-mamx-bf16", "-mamx-int8",
-]
-
-
-def build_c() -> None:
-    """gcc-build the C kernels; silently skipped off x86_64."""
-    if not sys.platform.startswith("linux") or platform.machine() not in (
-        "x86_64", "AMD64",
-    ):
-        print("skip the C kernels: linux x86_64 only")
-        return
-    cc = os.environ.get("CC", "gcc")
-    if shutil.which(cc) is None:
-        print(f"skip the C kernels: no {cc}")
-        return
-    srcs = [os.path.join(CSRC, s) for s in C_SOURCES]
-    if not all(os.path.exists(s) for s in srcs):
-        print("skip the C kernels: sources missing")
-        return
-    _run(cc, *C_FLAGS, *srcs, "-o", CLIB)
-    print(f"built {CLIB}")
 
 
 def _run(*args: str) -> None:
@@ -102,7 +73,6 @@ def main() -> None:
         *flags,
     )
     print(f"built {LIB}")
-    build_c()
     if "--tests" not in sys.argv:
         return
     if not flags:
