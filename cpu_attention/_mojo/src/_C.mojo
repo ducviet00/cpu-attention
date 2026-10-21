@@ -11,6 +11,63 @@ from std.os import abort
 from std.python import PythonObject
 from std.python.bindings import PythonModuleBuilder
 from attention import Job, run
+from dense import (
+    DenseJob,
+    TransposeJob,
+    has_bf16_dot,
+    lane_width,
+    run_dense,
+    run_transpose,
+)
+
+
+def dense_transpose(
+    k: PythonObject,
+    kt: PythonObject,
+    batch: PythonObject,
+    num_kv_heads: PythonObject,
+    seq_k: PythonObject,
+    head_dim: PythonObject,
+    k_stride_b: PythonObject,
+    k_stride_t: PythonObject,
+    k_stride_h: PythonObject,
+    kt_stride_bh: PythonObject,
+    kt_stride_d: PythonObject,
+    dtype: PythonObject,
+    pairs: PythonObject,
+    num_workers: PythonObject,
+) raises:
+    """Transpose K into the layout the dense kernel's Q@K^T sweep reads."""
+    var job = TransposeJob()
+    job.k = Int(py=k)
+    job.kt = Int(py=kt)
+    job.batch = Int(py=batch)
+    job.num_kv_heads = Int(py=num_kv_heads)
+    job.seq_k = Int(py=seq_k)
+    job.head_dim = Int(py=head_dim)
+    job.k_stride_b = Int(py=k_stride_b)
+    job.k_stride_t = Int(py=k_stride_t)
+    job.k_stride_h = Int(py=k_stride_h)
+    job.kt_stride_bh = Int(py=kt_stride_bh)
+    job.kt_stride_d = Int(py=kt_stride_d)
+    run_transpose(
+        job,
+        dtype_code=Int(py=dtype),
+        num_workers=Int(py=num_workers),
+        pairs=Bool(pairs),
+    )
+
+
+def dense_lanes() -> PythonObject:
+    """fp32 lanes per vector (16 on AVX-512, 4 on NEON)."""
+    return PythonObject(Int32(lane_width()))
+
+
+def dense_bf16_dot() -> PythonObject:
+    """True when the kernel uses the bf16 dot-product (paired) K layout."""
+    if has_bf16_dot():
+        return PythonObject(True)
+    return PythonObject(False)
 
 
 @export
@@ -18,6 +75,10 @@ def PyInit__C() abi("C") -> PythonObject:
     try:
         var m = PythonModuleBuilder("_C")
         m.def_function[attention]("attention")
+        m.def_function[dense_attention]("dense_attention")
+        m.def_function[dense_transpose]("dense_transpose")
+        m.def_function[dense_bf16_dot]("dense_bf16_dot")
+        m.def_function[dense_lanes]("dense_lanes")
         return m.finalize()
     except e:
         abort(String("error creating cpu_attention._C: ", e))
@@ -79,4 +140,71 @@ def attention(
         num_workers=Int(py=num_workers),
         do_store=Bool(do_store),
         do_attend=Bool(do_attend),
+    )
+
+
+def dense_attention(
+    q: PythonObject,
+    kt: PythonObject,
+    v: PythonObject,
+    dst: PythonObject,
+    batch: PythonObject,
+    seq_q: PythonObject,
+    seq_k: PythonObject,
+    num_heads: PythonObject,
+    num_kv_heads: PythonObject,
+    head_dim: PythonObject,
+    q_stride_b: PythonObject,
+    q_stride_t: PythonObject,
+    q_stride_h: PythonObject,
+    kt_stride_bh: PythonObject,
+    kt_stride_d: PythonObject,
+    kt_stride_t: PythonObject,
+    v_stride_b: PythonObject,
+    v_stride_t: PythonObject,
+    v_stride_h: PythonObject,
+    o_stride_b: PythonObject,
+    o_stride_t: PythonObject,
+    o_stride_h: PythonObject,
+    scale: PythonObject,
+    causal: PythonObject,
+    dtype: PythonObject,
+    qt: PythonObject,
+    num_workers: PythonObject,
+) raises:
+    """Run the dense (non-paged) attention kernel.
+
+    ``kt`` is K transposed for the Q@K^T sweep (see ``dense.mojo``); ``qt`` is
+    the query rows per work item (2, 4 or 8).
+    """
+    var job = DenseJob()
+    job.q = Int(py=q)
+    job.kt = Int(py=kt)
+    job.v = Int(py=v)
+    job.dst = Int(py=dst)
+    job.batch = Int(py=batch)
+    job.seq_q = Int(py=seq_q)
+    job.seq_k = Int(py=seq_k)
+    job.num_heads = Int(py=num_heads)
+    job.num_kv_heads = Int(py=num_kv_heads)
+    job.head_dim = Int(py=head_dim)
+    job.q_stride_b = Int(py=q_stride_b)
+    job.q_stride_t = Int(py=q_stride_t)
+    job.q_stride_h = Int(py=q_stride_h)
+    job.kt_stride_bh = Int(py=kt_stride_bh)
+    job.kt_stride_d = Int(py=kt_stride_d)
+    job.kt_stride_t = Int(py=kt_stride_t)
+    job.v_stride_b = Int(py=v_stride_b)
+    job.v_stride_t = Int(py=v_stride_t)
+    job.v_stride_h = Int(py=v_stride_h)
+    job.o_stride_b = Int(py=o_stride_b)
+    job.o_stride_t = Int(py=o_stride_t)
+    job.o_stride_h = Int(py=o_stride_h)
+    job.scale = Float32(Float64(py=scale))
+    job.causal = Bool(causal)
+    run_dense(
+        job,
+        dtype_code=Int(py=dtype),
+        num_workers=Int(py=num_workers),
+        qt=Int(py=qt),
     )

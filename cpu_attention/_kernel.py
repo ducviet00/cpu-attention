@@ -1,10 +1,10 @@
-"""Loader and call plumbing for the Mojo paged-attention kernel.
+"""Loader and call plumbing for the Mojo attention kernels.
 
 The kernel is built from ``cpu_attention/_mojo`` into ``cpu_attention/_C.so``
-(``pixi run build`` from that directory). Set ``CPU_ATTENTION_LIB`` to point at
-another build. Everything here is optional: without the shared library (or on an
-unsupported configuration) :func:`is_available` is False and every entry point
-raises ``RuntimeError``.
+by ``uv run --extra build python scripts/build.py``. Set ``CPU_ATTENTION_LIB``
+to point at another build. Everything here is optional: without the shared
+library (or on an unsupported configuration) :func:`is_available` is False and
+every entry point raises ``RuntimeError``.
 """
 
 import importlib.util
@@ -52,8 +52,9 @@ def require():
     mod = module()
     if mod is None:
         raise RuntimeError(
-            "cpu_attention: the Mojo kernel is not built; run `pixi run build` in "
-            "cpu_attention/_mojo (or set CPU_ATTENTION_LIB)"
+            "cpu_attention: the Mojo kernel is not built; run "
+            "`uv run --extra build python scripts/build.py` (or set "
+            "CPU_ATTENTION_LIB)"
         )
     return mod
 
@@ -223,3 +224,146 @@ def _paged(
         scale,
         do_store,
     )
+
+
+_TRANSPOSE = None
+
+
+def _transpose_attention():
+    """Return the extension's K-transpose entry point, bound once."""
+    global _TRANSPOSE
+    if _TRANSPOSE is None:
+        _TRANSPOSE = require().dense_transpose
+    return _TRANSPOSE
+
+
+_DENSE = None
+
+
+def _dense_attention():
+    """Return the extension's dense entry point, bound once."""
+    global _DENSE
+    if _DENSE is None:
+        _DENSE = require().dense_attention
+    return _DENSE
+
+
+_LANES = None
+
+
+def _lanes() -> int:
+    """fp32 lanes per vector in the built kernel (16 on AVX-512, 4 on NEON)."""
+    global _LANES
+    if _LANES is None:
+        _LANES = int(require().dense_lanes())
+    return _LANES
+
+
+_BF16_DOT = None
+
+
+def _bf16_dot() -> bool:
+    """True when the built kernel has a bf16 dot-product instruction.
+
+    The transposed-K layout depends on it (paired head dims for the dot, one
+    head dim per position otherwise), so the caller has to know which one the
+    compiled kernel expects.
+    """
+    global _BF16_DOT
+    if _BF16_DOT is None:
+        _BF16_DOT = bool(require().dense_bf16_dot())
+    return _BF16_DOT
+
+
+_QT = 4
+"""Query rows per work item (``CPU_ATTENTION_QT`` overrides it).
+
+Bounded by the register file: the output accumulator is ``qt * head_dim / LANES``
+zmm and the tile logits another ``qt * 64 / LANES``, so ~32 registers cap
+``qt * head_dim`` near 512. Bigger blocks amortize the K^T/V loads over more rows
+and shrink the per-tile softmax, but spill the accumulator; 4 measured best for
+every supported head dim and dtype on the AVX-512 boxes (2 and 8 are switchable
+through the environment).
+"""
+
+_QT_ENV = os.environ.get("CPU_ATTENTION_QT")
+
+def _dense(q, k, v, scale: float, causal: bool):
+    """Run the dense kernel over contiguous-``head_dim`` q/k/v (already checked)."""
+    batch, seq_q, num_heads, head_dim = q.shape
+    seq_k, num_kv_heads = k.shape[1], k.shape[2]
+    if _QT_ENV:
+        qt = int(_QT_ENV)
+    elif _lanes() < 16:
+        # 4-lane registers: head_dim/4 floats is 16 registers per row at
+        # head_dim 64, so two rows is all that fits beside the logits.
+        qt = 2
+    else:
+        qt = _QT
+
+    # Q@K^T wants K transposed (one head dim, all positions contiguous), which a
+    # dense K is not. The dot path additionally wants (k[2d], k[2d+1]) pairs of a
+    # position adjacent, so the layout differs per path -- the kernel's pages are
+    # the same trade, done at store time. Padded to the key tile (64) so the last
+    # tile never reads past the buffer; the mask kills the padding lanes.
+    seq_k_pad = -(-seq_k // 64) * 64
+    pairs = k.dtype == torch.bfloat16 and _bf16_dot()
+    if pairs:
+        kt = torch.empty(
+            (batch, num_kv_heads, head_dim // 2, seq_k_pad, 2), dtype=k.dtype
+        )
+    else:
+        kt = torch.empty((batch, num_kv_heads, head_dim, seq_k_pad), dtype=k.dtype)
+    _transpose_attention()(
+        k.data_ptr(),
+        kt.data_ptr(),
+        batch,
+        num_kv_heads,
+        seq_k,
+        head_dim,
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        kt.stride(1),
+        kt.stride(2),
+        _DTYPE_CODES[k.dtype],
+        pairs,
+        _workers(batch * num_kv_heads, seq_k // 64),
+    )
+
+    out = torch.empty_like(q, memory_format=torch.contiguous_format)
+    qb, qtok, qh = q.stride(0), q.stride(1), q.stride(2)
+    vb, vtok, vh = v.stride(0), v.stride(1), v.stride(2)
+    ob, otok, oh = out.stride(0), out.stride(1), out.stride(2)
+    ktb, ktd, ktt = kt.stride(1), kt.stride(2), kt.stride(3)
+    tasks = batch * num_heads * (-(-seq_q // qt))
+    _dense_attention()(
+        q.data_ptr(),
+        kt.data_ptr(),
+        v.data_ptr(),
+        out.data_ptr(),
+        batch,
+        seq_q,
+        seq_k,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        qb,
+        qtok,
+        qh,
+        ktb,
+        ktd,
+        ktt,
+        vb,
+        vtok,
+        vh,
+        ob,
+        otok,
+        oh,
+        scale,
+        causal,
+        _DTYPE_CODES[q.dtype],
+        qt,
+        _workers(tasks, 8),
+    )
+    return out

@@ -52,11 +52,19 @@ its `TileGemm82` micro-kernel (`csrc/cpu/cpu_attn_impl.hpp`):
 * `reshape_and_cache` in the same transposed-K layout, so both backends share
   cache tensors and `stage_cross_kv`.
 
+There is a second kernel for the other half of flash-attention — **dense
+attention** (`flash_attn_func`): whole `seqlen_q x seqlen_k` attention on
+contiguous `q`/`k`/`v`, causal (bottom-right aligned) or not, MHA/MQA/GQA,
+fp32/bf16. vLLM has no cache-free attention kernel (its only entry point is the
+paged `cpu_attention_with_kv_cache`), so this one borrows vLLM's *structure*
+(Q-tile of rows held in registers across the K/V sweep, transposed K, online
+softmax) rather than a specific file. See "Dense attention" below.
+
 Not ported (deliberately — the engine never calls them):
 
-* multi-token queries / chunked prefill, sliding windows, ALiBi, softcap,
-  attention sinks, FP8 KV cache, GQA (the kernel keeps the `q_heads_per_kv`
-  mapping but BART/Florence-2 are MHA),
+* multi-token queries on the *paged* path (chunked prefill), sliding windows,
+  ALiBi, softcap, attention sinks, FP8 KV cache (the paged kernel keeps the
+  `q_heads_per_kv` mapping but BART/Florence-2 are MHA),
 * the `VEC16` / `NEON` / `AMX` / `RVV` / `VSX` / `VXE` ISAs and the vLLM
   work-item scheduler. One task owns one `(sequence, head)` pair end to end, so
   there is no KV split, no scratch buffer and no cross-thread reduction.
@@ -120,29 +128,24 @@ flash_attn_with_kvcache(
     slot_mapping=None,
     check_inputs=True,
 )
-flash_attn_func(
-    q,
-    k,
-    v,
-    dropout_p=0.0,
-    softmax_scale=None,
-    causal=False,
-    window_size=(-1, -1),
-    softcap=0.0,
-    alibi_slopes=None,
-    deterministic=False,
-    return_attn_probs=False,
-)
+flash_attn_func(q, k, v, softmax_scale=None, causal=False)
 ```
 
-Every flash-attn argument is accepted; what the kernel cannot do raises
-`NotImplementedError` instead of being silently ignored: `qv`, `rotary_*`,
-`cache_leftpad`, `cu_seqlens_*`, `max_seqlen_q`, `*_descale`, `window_size`,
-`softcap`, `attention_chunk`, `return_softmax_lse`, `seqlen > 1` (the kernel
-decodes one query token per sequence), and any `flash_attn_func` call with more
-than one query token. The tuning hints (`num_splits`, `pack_gqa`, `sm_margin`,
-`scheduler_metadata`, `rotary_interleaved`) are accepted and ignored, and
-`deterministic` is a no-op because the forward pass always is.
+`flash_attn_with_kvcache` accepts every flash-attn argument; what the kernel
+cannot do raises `NotImplementedError` instead of being silently ignored: `qv`,
+`rotary_*`, `cache_leftpad`, `cu_seqlens_*`, `max_seqlen_q`, `*_descale`,
+`window_size`, `softcap`, `attention_chunk`, `return_softmax_lse`, and
+`seqlen > 1` (the paged kernel decodes one query token per sequence — use
+`flash_attn_func` for whole prompts). The tuning hints (`num_splits`,
+`pack_gqa`, `sm_margin`, `scheduler_metadata`, `rotary_interleaved`) are
+accepted and ignored.
+
+`flash_attn_func` keeps flash-attn's dense shape — `q [B, Sq, H, D]`,
+`k`/`v [B, Sk, Hk, D]`, MQA/GQA, bottom-right-aligned `causal`, `softmax_scale` —
+and *drops* the arguments the kernel cannot honour (`dropout_p`, `window_size`,
+`softcap`, `alibi_slopes`, `deterministic`, `return_attn_probs`) instead of
+taking them and raising. `flash_attn_varlen_func` and the packed variants raise
+`NotImplementedError`.
 
 Deliberate differences from flash-attn:
 
@@ -163,8 +166,7 @@ calls the thin aliases `self_attention(...)` / `cross_attention(...)` (the same
 kernel call, geometry already checked by the runner): the checked entry point
 costs ~4% end to end at the engine's 24 calls per decode step, ~2% with
 `check_inputs=False`, so the aliases stay on the hot path. `flash_attn_func`
-with one query token stages the K/V into a temporary paged cache (a real dense
-multi-token kernel is not ported; the BART encoder keeps its SDPA path).
+runs the dense kernel below for any `seqlen_q` (one query token included).
 
 ## Design
 
@@ -282,6 +284,102 @@ At `b1` the two server boxes are 0.70-0.83 (`self`) and 0.99-1.14 (`cross`); at
 1024-token rows are memory-roofline bound on both servers (231-298 GB/s measured
 on Graviton, 133 GB/s from L3 on the Xeon) and insensitive to the kernel, which
 is also where the run-to-run spread is largest (+-10-25% on Graviton).
+
+## Dense attention
+
+`flash_attn_func(q, k, v, softmax_scale=None, causal=False)` — one work item owns
+`qt` consecutive query rows of one (batch, head) for the whole key sweep, so its
+online-softmax accumulator lives in registers and K/V are read once per row
+block. Keys are scored `KT_TILE` at a time; for that, K is handed over
+*transposed* (one `reshape/permute` produces it, and the kernel has a blocked
+parallel transpose pass for it, 40-70 GB/s against 11-15 GB/s for
+`torch.permute(...).contiguous()`), which is what lets one broadcast-FMA cover
+64 positions. V stays row-major, so `acc[d] += p[j] * v[j][d]` is one FMA per
+head-dim chunk shared by every row of the block. bf16 runs Q@K^T on the bf16 dot
+instruction (`dpbf16ps` / `bfdot`) with fp32 P@V, the same split as the paged
+kernel, and is therefore **faster than fp32** — the opposite of a bf16-native
+kernel on AVX-512, which has no native bf16 add/multiply.
+
+Work items are handed out round-robin over the same libgomp pool: causal masking
+makes the last query rows ~2x more expensive than the first, and a contiguous
+slice per thread leaves half the cores idle at the end of a prefill.
+
+`qt = 4` for every head dim, `KT_TILE = 64` (32 was 6% slower on bf16 and 16% on
+fp32; 8 was 20-40% slower than 4). Both are above the paged kernel's numbers
+because a dense call has no page-boundary to respect. `CPU_ATTENTION_QT`
+overrides `qt` for experiments.
+
+### Against torch SDPA
+
+Ryzen 7 7840H, 8 threads, causal, `tests/bench_dense.py`, two runs (median of a
+150 ms budget per cell; the spread between runs is < 6%). Ratio `sdpa / ours`,
+so > 1 is faster, and it includes the K transpose + allocation each call:
+
+| case | bf16 | fp32 |
+|---|---:|---:|
+| S=128 H=8 D=64 | 1.27-1.37 | 0.93-1.03 |
+| S=512 H=8 D=64 | 2.51-2.53 | 1.95-1.98 |
+| S=1024 H=8 D=64 | 2.05-2.07 | 1.49 |
+| S=2048 H=8 D=64 | 1.83-1.86 | 1.30-1.33 |
+| S=4096 H=8 D=64 | 1.66-1.70 | 1.03-1.05 |
+| S=256 H=16 D=128 | 1.43-1.44 | 1.43-1.45 |
+| S=1024 H=16 D=128 | 1.41-1.43 | 0.83-0.86 |
+| S=2048 H=16 D=128 | 1.25-1.26 | 0.94-1.01 |
+| S=512 H=32 D=128 | 1.58-1.67 | 1.34-1.44 |
+| S=1024 H=8 D=32 | 1.79-1.81 | 1.54-1.56 |
+| B=2 S=1024 H=8 D=64 | 2.15-2.16 | 1.49-1.51 |
+| GQA H=16/Hk=4 S=512 D=64 | 2.52-2.53 | 1.95-2.04 |
+
+Non-causal (the encoder case) is the same story with a smaller margin, because
+every query block sweeps the whole key range: 1.0-1.55x on bf16 and 0.6-1.2x on
+fp32, the low end again `H=16 D=128`.
+
+### On Graviton 5 (Neoverse-V3, 8 cores)
+
+The same table on a `c7g`-class ARM box, causal, interleaved against SDPA and
+against vLLM's `csrc/cpu` NEON kernel (built from upstream, `bfmmla` path) —
+ours / vLLM / SDPA in µs:
+
+| case | bf16 | fp32 |
+|---|---|---|
+| S=512 H=8 D=64 | 858 / 240 / 557 | 1121 / 605 / 1750 |
+| S=1024 H=8 D=64 | 3282 / 915 / 1468 | 4321 / 2261 / 4654 |
+| S=2048 H=8 D=64 | 13063 / 3482 / 6012 | 16934 / 8874 / 14742 |
+| S=1024 H=16 D=128 | 12636 / 2851 / 6340 | 16999 / 9433 / 14629 |
+| S=2048 H=16 D=128 | 49320 / 11051 / 17094 | 71521 / 36312 / 46331 |
+
+So on ARM the dense kernel is **0.35-0.65x SDPA on bf16 and 0.65-1.56x on fp32**,
+and 2-4x behind vLLM: 330 vs 1234 GFLOP/s bf16, 250 vs 480 fp32. Two reasons,
+both measured:
+
+* NEON vectors are 4 fp32 lanes, not 16, so every fp32-phase instruction buys a
+  quarter of the work it does on AVX-512. Tying the key tile to the lane width
+  (`KT_TILE = 4 * LANES`: 64 keys on x86, 16 on NEON), keeping the accumulator in
+  L1 on ARM (`dc = 2 * LANES`) and running bf16 Q@K^T on `bfdot` there too was
+  worth **16-32%** (S=1024/H=16/D=128: 18.6 -> 12.6 ms bf16);
+* P@V is still fp32 on ARM, while vLLM's NEON kernel runs **`bfmmla`** for both
+  phases (9436 `bfmmla` / 0 `bfdot` in their `.so`), i.e. 2x the MACs per
+  instruction over `bfdot` and 4x over fp32 lanes. That, plus a position-paired V
+  layout for a bf16 P@V, is the next step (`AGENTS.md` §13.4).
+
+**Read these as bands, not points.** This laptop throttles to ~2.0 GHz under
+sustained AVX-512 (and a second session on the box makes it worse), and the
+fp32 / `D=128` causal ratio measured anywhere from 0.63 to 1.09 for the same
+binary depending on when it ran. Interleaved A/B in one process is the only
+number to trust; `tests/bench_dense.py` blocks per variant, so use it for
+orders of magnitude. Blocking the kernel further is not where the remaining gap
+is: `qt` 2/4/6/8 and a KV-outer (L2-chunked) loop order both measured within 1%
+at `D=128`, and coming level with vLLM there needs a GEMM-tile inner loop
+(`AGENTS.md` §9.9-9.10, §13.3).
+
+Absolute throughput (causal, S=2048): bf16 936 GFLOP/s at H=8/D=64 and 645 at
+H=16/D=128; fp32 700 and 444. For reference, vLLM's `csrc/cpu` `VEC` kernel in
+its chunked-prefill mode reached 915 GFLOP/s fp32 on this box (staged cache, no
+transpose), and torch SDPA 570 — so the bf16 path matches vLLM's fp32 and beats
+it outright once the key transpose is counted in. The one shape where fp32 still
+loses (`H=16 D=128`, mid-size) is the register wall: `qt * head_dim` above ~512
+spills the accumulator, and `qt` cannot grow, so K^T/V are re-read once per 4
+rows.
 
 ## End to end (engine)
 

@@ -8,8 +8,7 @@ name so ``from cpu_attention.flash_attn_interface import flash_attn_func`` works
 
 import torch
 
-from ._kernel import _paged, supported
-from .ops import reshape_and_cache
+from ._kernel import _DTYPE_CODES, _HEAD_DIMS, _dense, _paged, supported
 
 
 def _lens_tensor(cache_seqlens, batch: int, device):
@@ -236,51 +235,30 @@ def flash_attn_with_kvcache(
     return out.unsqueeze(1)
 
 
-def flash_attn_func(
-    q,
-    k,
-    v,
-    dropout_p=0.0,
-    softmax_scale=None,
-    causal=False,
-    window_size=(-1, -1),
-    softcap=0.0,
-    alibi_slopes=None,
-    deterministic=False,
-    return_attn_probs=False,
-):
-    """``flash_attn_func`` for the single query token this kernel supports.
+def flash_attn_func(q, k, v, softmax_scale=None, causal=False):
+    """Dense attention, flash-attn's ``flash_attn_func``.
 
-    With ``q`` of length 1 the causal mask keeps every key, so ``k``/``v`` may be
-    any length and ``causal`` does not change the result.  For ``seqlen > 1``
-    (e.g. the BART encoder) this raises ``NotImplementedError``: dense
-    multi-token attention is not ported, so the engine keeps its dense path
-    (SDPA on CPU, FlashAttention-2 on CUDA).  ``dropout_p``, ``alibi_slopes``,
-    ``window_size``, ``softcap`` and ``return_attn_probs`` are rejected;
-    ``deterministic`` is accepted and ignored (the forward pass always is).
+    ``q`` is ``[batch, seqlen_q, nheads, headdim]`` and ``k``/``v`` are
+    ``[batch, seqlen_k, nheads_k, headdim]``; MQA/GQA is ``nheads % nheads_k ==
+    0`` with query head ``h`` reading KV head ``h // (nheads // nheads_k)``.
+    ``causal`` uses flash-attn's bottom-right alignment (query ``i`` sees keys
+    ``j <= i + seqlen_k - seqlen_q``), so rows with no visible key come back
+    zero.  ``softmax_scale`` defaults to ``1 / sqrt(headdim)``.
+
+    Dropped from flash-attn's signature rather than accepted-and-rejected:
+    ``dropout_p``, ``window_size``, ``softcap``, ``alibi_slopes``,
+    ``deterministic`` and ``return_attn_probs`` (inference-only forward pass, no
+    local attention, no bias terms).
     """
-    if dropout_p:
-        raise NotImplementedError("cpu_attention: inference only, dropout_p must be 0")
-    if alibi_slopes is not None:
-        raise NotImplementedError("cpu_attention: `alibi_slopes` is not supported")
-    if window_size != (-1, -1):
-        raise NotImplementedError("cpu_attention: sliding windows are not supported")
-    if softcap:
-        raise NotImplementedError("cpu_attention: softcapping is not supported")
-    if return_attn_probs:
-        raise NotImplementedError("cpu_attention: `return_attn_probs` is not supported")
     if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
         raise ValueError(
             "cpu_attention: q/k/v must be [batch, seqlen, nheads, headdim]"
         )
     batch, q_len, num_heads, head_dim = q.shape
-    if q_len != 1:
-        raise NotImplementedError(
-            f"cpu_attention decodes one query token per sequence; got seqlen={q_len}"
-        )
     kv_len, num_kv_heads = k.shape[1], k.shape[2]
     if (
         kv_len < 1
+        or q_len < 1
         or k.shape[0] != batch
         or k.shape[3] != head_dim
         or v.shape != k.shape
@@ -289,45 +267,26 @@ def flash_attn_func(
         or v.dtype != q.dtype
     ):
         raise ValueError(
-            "cpu_attention: k/v must be [batch, seqlen, nheads_k, headdim] and match q"
+            "cpu_attention: k/v must be [batch, seqlen_k, nheads_k, headdim] and "
+            "match q (nheads divisible by nheads_k)"
         )
-    if not supported(q.dtype, 16, head_dim):
+    if head_dim not in _HEAD_DIMS:
         raise ValueError(
-            f"cpu_attention cannot run dtype={q.dtype}, head_dim={head_dim}"
+            f"cpu_attention cannot run head_dim={head_dim} (32, 64 or 128)"
         )
+    if q.dtype not in _DTYPE_CODES:
+        raise ValueError(f"cpu_attention cannot run dtype={q.dtype}")
     scale = head_dim**-0.5 if softmax_scale is None else softmax_scale
-    # The kernel is paged: stage K/V into a temporary one-page-per-16-tokens
-    # cache, then run the usual single-token paged attention over it.
-    block = 16
-    blocks = (kv_len + block - 1) // block
-    shape = (batch * blocks, num_kv_heads, block, head_dim)
-    k_cache = torch.empty(shape, dtype=q.dtype, device=q.device)
-    v_cache = torch.empty(shape, dtype=q.dtype, device=q.device)
-    page_table = torch.arange(batch * blocks, dtype=torch.int32, device=q.device)
-    page_table = page_table.reshape(batch, blocks)
-    pos = torch.arange(kv_len, dtype=torch.int64, device=q.device)
-    slots = (page_table[:, pos // block] * block + pos % block).reshape(-1)
-    reshape_and_cache(
-        k.reshape(batch * kv_len, num_kv_heads, head_dim),
-        v.reshape(batch * kv_len, num_kv_heads, head_dim),
-        k_cache,
-        v_cache,
-        slots,
-    )
-    lens = torch.full((batch,), kv_len, dtype=torch.int32, device=q.device)
-    out = _paged(
-        q.squeeze(1),
-        None,
-        None,
-        k_cache,
-        v_cache,
-        None,
-        page_table,
-        lens,
-        scale,
-        do_store=False,
-    )
-    return out.unsqueeze(1)
+    # The kernel reads the head dim contiguously and takes every other stride
+    # explicitly, so a [batch, seq, nheads*headdim] slice of a projection works
+    # as is; only a strided head dim needs a copy.
+    if q.stride(-1) != 1:
+        q = q.contiguous()
+    if k.stride(-1) != 1:
+        k = k.contiguous()
+    if v.stride(-1) != 1:
+        v = v.contiguous()
+    return _dense(q, k, v, scale, causal)
 
 
 def flash_attn_varlen_func(
@@ -338,20 +297,14 @@ def flash_attn_varlen_func(
     cu_seqlens_k,
     max_seqlen_q,
     max_seqlen_k,
-    dropout_p=0.0,
     softmax_scale=None,
     causal=False,
-    window_size=(-1, -1),
-    softcap=0.0,
-    alibi_slopes=None,
-    deterministic=False,
-    return_attn_probs=False,
-    block_table=None,
 ):
-    """Not implemented: the kernel decodes one query token per sequence."""
+    """Not implemented: variable-length packing is not ported (use padded q/k/v)."""
     raise NotImplementedError(
-        "cpu_attention: variable-length multi-token attention is not ported; "
-        "use flash_attn_with_kvcache for the paged decode path"
+        "cpu_attention: variable-length attention is not ported; "
+        "use flash_attn_func for dense padded q/k/v, or flash_attn_with_kvcache "
+        "for the paged decode path"
     )
 
 

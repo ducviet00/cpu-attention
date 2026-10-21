@@ -7,9 +7,13 @@ as `attn_backend="mojo"`. Read this before touching the kernel; the root
 
 ## 1. Status in one line
 
-One source file, compile-time per-ISA paths (AVX512-BF16 `vdpbf16ps` + fp32 P@V
-on x86; NEON `bfdot` QK **and** P@V on ARM), bit-identical to `csrc/` on x86,
-≤1e-3 on ARM (bf16 probabilities). Beats `csrc/` at `cross b8/ctx256` by 1.4× on
+Two kernels, compile-time per-ISA paths (AVX512-BF16 `vdpbf16ps` + fp32 P@V on
+x86; NEON `bfdot` QK **and** P@V on ARM): the paged decoder step
+(`attention.mojo`) and dense attention (`dense.mojo`, `flash_attn_func`, §4a —
+vLLM has no cache-free kernel to port, so that one is built from vLLM's
+structure). Paged is bit-identical to `csrc/` on x86, ≤1e-3 on ARM (bf16
+probabilities); dense is ≤4e-6 vs SDPA in fp32 and ~1 bf16 ulp in bf16, and is
+1.3-2.5x SDPA on bf16 / 1.0-2.0x on fp32 (§9.4). Beats `csrc/` at `cross b8/ctx256` by 1.4× on
 the 4-core Xeon and 2.0× on Graviton 5, parity-or-better elsewhere. It runs on
 torch's own OpenMP pool (`GOMP_parallel`), which makes the engine **faster than
 the vendored C++ backend end to end** on the laptop: 392-396 vs 364-377 tok/s at
@@ -22,15 +26,18 @@ cpu_attention/
   __init__.py               public API (flash-attn names + low-level ops)
   flash_attn_interface.py   flash_attn_with_kvcache / flash_attn_func / rejects
   ops.py                    self_attention / cross_attention / reshape_and_cache
-  _kernel.py                .so loader, 23-arg call, worker policy
+  _kernel.py                .so loader, paged + dense calls, worker policy
   _C.so                     built kernel (gitignored; `scripts/build.py`)
   _mojo/
-    src/attention.mojo      the kernel
-    src/attention.mojo      the kernel (Job, store, generic + dot attention, dispatch)
-    src/_C.mojo             Python extension: PyInit__C, one `attention(...)` entry
+    src/attention.mojo      paged kernel (Job, store, generic + dot attention, dispatch)
+    src/dense.mojo          dense kernel (DenseJob, q-block sweep, K transpose pass)
+    src/_C.mojo             Python extension: PyInit__C, `attention`, `dense_attention`,
+                            `dense_transpose`, `dense_bf16_dot`
     tests/test_attention.mojo  standalone parity test vs a scalar fp32 reference
     tests/bench_qk.mojo     isolated QK micro-benchmark (fp32 vs dpbf16ps)
 tests/test_flash_api.py     the flash-shaped API vs an SDPA reference
+tests/test_dense.py         dense kernel vs SDPA (41 checks: shapes, GQA, masks)
+tests/bench_dense.py        dense kernel vs SDPA, the table in README §Dense
 README.md                   user-facing: design, per-box tables, "what not to redo"
 AGENTS.md                   this file
 ```
@@ -65,6 +72,8 @@ From this repo's root (needs the `.so` above):
 
 ```bash
 python tests/test_flash_api.py          # flash-shaped API vs SDPA (35 checks)
+python tests/test_dense.py              # dense kernel vs SDPA (41 checks)
+python tests/bench_dense.py             # dense kernel vs SDPA, two dtypes
 ```
 
 Engine-level parity and the kernel A/B live in fast-encdec:
@@ -113,6 +122,78 @@ attending to every cached position. That makes the causal mask the cache tail.
 - Supported: `head_dim` 32/64/128 (compile-time specialisations), fp32/bf16,
   `block_size` a multiple of 16. fp16 is rejected (no `avx512_fp16` on these
   boxes).
+
+
+## 4a. The dense kernel (`dense.mojo`, `flash_attn_func`)
+
+vLLM has **no** cache-free attention kernel: the only attention entry points in
+`csrc/cpu` are `cpu_attention_with_kv_cache` and `mla_decode`, both paged, and
+its "dense" prefill is the same kernel fed `query_start_loc` with many query
+tokens per request (Q-tile `MaxQHeadNumPerIteration` = 8 on `VEC`, 32 on AMX).
+Its `use_sdpa_prefill` is deprecated and the zentorch encoder path is a
+delegation to torch. So the dense kernel is built from vLLM's *structure*, not
+ported file-for-file.
+
+- **Work item = `qt` consecutive query rows of one (batch, head), swept over the
+  whole key range**, so the `head_dim`-wide output accumulator stays in
+  registers and K/V are read once per row block. `qt = 4` for every head dim
+  (`CPU_ATTENTION_QT` overrides): `qt * head_dim` above ~512 elements spills the
+  accumulator, and 8 was 20-40% slower than 4, 2 was worse still.
+- **K is transposed first** (`dense_transpose`, blocked 16 tokens = one 64-byte
+  store, 40-70 GB/s against 11-15 GB/s for `torch.permute(...).contiguous()`;
+  the Python side just allocates the scratch). That is what lets one
+  broadcast-FMA cover `KT_TILE = 64` positions — 32 was 6% slower on bf16 and
+  16% on fp32. V stays row-major.
+- **Causal mask is bottom-right aligned**: row `i` keeps keys `j <= i + (seq_k -
+  seq_q)`. The k-loop stops at `q0 + nrows + diag`, and only the boundary tile
+  builds a per-row lane mask; rows whose limit is negative write zeros.
+- **P@V only walks keys that exist** (`min(KT_TILE, seq_k - t0)`): the masked
+  lanes have probability exactly 0, but reading their V would run past the
+  tensor and `0 * garbage` is not 0 (§11.6).
+- **Dispatch is round-robin** (`task += threads`), not a contiguous slice, for
+  the same reason: causal work grows with `q0`, so a contiguous slice leaves
+  half the cores idle at the end of a prefill.
+- **Three row kernels, chosen at compile time**: `_dense_rows` (acc + logits in
+  registers, used when `qt * head_dim <= 384`), `_dense_rows_mem` (acc in L1 and
+  the head dim tiled by 32, used above that -- head_dim 128 -- so nothing
+  spills; within 1% of the register version, kept because it is the no-spill
+  path and it is what makes `qt = 8` usable there) and `_dense_rows_dot` (bf16).
+- bf16 uses the dot instruction for Q@K^T and fp32 for P@V, like the paged
+  kernel, which is why **bf16 is faster than fp32** here (936 vs 700 GFLOP/s at
+  S=2048, H=8, D=64) — a bf16-native kernel on AVX-512 is slower than fp32.
+
+## 4b. The dense kernel on ARM (measured on a Graviton 5 / Neoverse-V3)
+
+The dense kernel was written and tuned on AVX-512 and it showed: against SDPA it
+was 0.24-0.50x on bf16 and 0.65-1.24x on fp32, and 2-4x behind vLLM's NEON
+kernel. Three fixes, in order of payoff:
+
+1. **Tile sizes must be lane-relative, not x86-relative.** `KT_TILE` was a flat
+   64, i.e. 4 registers of positions on AVX-512 but 16 on NEON; with `qt = 4` a
+   block wanted 64 logit + 64 accumulator registers on a 32-register machine and
+   spilled everything. `KT_TILE = 4 * LANES` (64 x86 / 16 NEON) plus `qt = 2` on
+   ARM (`_lanes() < 16` in `_kernel.py`) fixed that.
+2. **On ARM the accumulator goes to L1 for every head dim** (`_dense_rows_mem`
+   with `dc = 2 * LANES`): `head_dim / LANES` floats per row is 16 registers at
+   head_dim 64 whatever `qt` is, so the register kernel cannot hold it.
+3. **bf16 keeps its dot instruction inside that kernel** (`pairs: Bool` on
+   `_dense_rows_mem`): the paired K layout and `bfdot` for Q@K^T, which is what
+   the Q-outer register kernel already did. Without it bf16 read the unpaired
+   layout Python never wrote (18/41 parity checks failed).
+
+Together: 16-32% on ARM (S=1024/H=16/D=128 bf16 18.6 -> 12.6 ms; fp32 S=512
+1121 vs 1410 us). Still behind **vLLM's `bfmmla`**: their `.so` has 9436 `bfmmla`
+and 0 `bfdot`, and they get 1234 GFLOP/s bf16 / 480 fp32 against our 330 / 250.
+`bfdot` is 2x fp32 lanes; `bfmmla` is 4x, and it is a 2x2 matmul so it also
+amortizes the loads. Their fp32 is at ~100% of the NEON fp32 roofline, ours at
+~55%. Next step is §13.4: `bfmmla` for both phases, which needs a
+position-paired V layout (the dense analogue of the paged NEON V page).
+
+Also: the ARM build needs **libgomp linked into the extension**. Leaving `omp_*`
+undefined for load time works on x86 because torch brings a global copy, but on
+aarch64 torch's bundled `libgomp.so.1` is `RTLD_LOCAL` and `import` fails with
+`undefined symbol: omp_get_thread_num`. `scripts/build.py` now links it (same
+soname, so the loader still reuses torch's copy when it is already loaded).
 
 ## 5. One source, two ISAs
 
@@ -311,6 +392,36 @@ i.e. attention 29.8-49.6 + interference +39.2 against 90.7 + 25.9.
    bf16 add/mul/fma — a bf16-native kernel scalarizes. Widening to fp32 and using
    bf16 only for the dot instruction is what makes this port fast.
 
+8. **The laptop throttles to ~2.0 GHz under sustained AVX-512** (`scaling_cur_freq`
+   reads 2004 MHz mid-sweep; a second session on the box pushes the load average
+   past 2). Absolute times and even *ratios* move 30-50% between sessions — the
+   fp32/D=128 causal ratio measured 0.63 to 1.09 for the same binary. Only
+   interleaved A/B inside one process is trustworthy (`/tmp`-style script: run
+   variant A, B, A, B... and take per-variant medians); `tests/bench_dense.py`
+   blocks per variant and is therefore a coarse number only.
+9. **Nothing about the dense kernel's blocking matters**: with drift-controlled
+   A/B, `qt` = 2/4/6/8 sits within 1% at head_dim 128 (register spilling is not
+   the limiter), and the KV-outer loop order (vLLM's: one (batch, head) per work
+   item, L2-sized key chunks, `acc`/`m`/`l` in memory) is also within 1% there
+   (+5-9% at head_dim 64, where it is not needed). An 8x smaller KV working set
+   (GQA `Hk=1`) does run **1.72x** faster, but that is K/V *shared across heads*,
+   which neither loop order reproduces per head — so the D=128 gap is not
+   bandwidth. What is left is instruction density: vLLM is 1.2x ahead at
+   head_dim 64 and 1.7x at 128, the ratio growing with head_dim, i.e. their
+   `TileGemm82` micro-kernel does more per FMA than the broadcast-FMA inner
+   loops here. Closing it is a GEMM-tile rewrite (§13.3), not a knob.
+
+10. **Dense kernel (laptop, 8 threads, causal, `tests/bench_dense.py`)**: bf16 is
+   1.26-2.5× torch SDPA, fp32 1.0-2.0× — except `H=16/D=128` at S=1024 (0.83×,
+   the register wall above) and S=128 (0.93×, where the call is 80 µs and SDPA
+   is 78). Absolute: bf16 936 GFLOP/s (H=8/D=64) and 645 (H=16/D=128); fp32 700
+   and 444. vLLM's `VEC` prefill on the same box is 915 GFLOP/s fp32 (its own
+   cache is already staged, so it pays no transpose), SDPA 570 — i.e. bf16 here
+   matches vLLM's fp32. Phase probes say the split is roughly Q@K^T 40%, P@V
+   40%, softmax/mask 20% at `qt = 4`; a `qt`-block big enough to shrink the K/V
+   re-reads further (vLLM keeps the partial output in memory and runs 8-32
+   rows) is the next structural step, not a knob.
+
 ## 10. Final three-box numbers (ratio `mojo/vllm`, <1 = faster)
 
 `benchmarks/attn_backend.py --mode kernel` + `benchmarks/kernel_ab.py`, two runs
@@ -360,6 +471,26 @@ default of 16 is also the C++ kernel's best point (67 vs 76 µs at block 32).
    degenerate on the tiny model; the standalone test against a scalar fp32
    reference is the real gate. Keep both.
 
+6. **Dense: the causal limit is inclusive.** `j <= i + (seq_k - seq_q)`, so the
+   `select` needs `t < limit + 1`. Shipped with `t < limit`, which dropped the
+   diagonal key: correct for non-causal (fp32 matched SDPA to 3e-7) and wrong
+   only under `causal`, i.e. exactly the case the engine would use first.
+7. **Dense: P@V must not read past `seq_k`.** The tile is a fixed 64 keys, so the
+   last tile of a short `seq_k` has lanes whose probability is exactly 0 — but
+   reading their V walks past the tensor and `0 * NaN = NaN`. It looked like a
+   dtype bug (bf16 "failed", fp32 "passed") because it depended on what the
+   allocator left there: the same case gave 4e-7 or NaN on consecutive runs.
+   Loop bound is now `min(KT_TILE, seq_k - t0)`.
+8. **Dense: query rows past `seq_q` must not be loaded.** A `qt`-row block reads
+   all `qt` rows unconditionally, so the last block of `seq_q = 1` read three
+   rows of garbage (and NaN'd through `exp`). Guarded with `if r < nrows`; the
+   masked-out rows are computed but never stored.
+9. **Dense: `torch.permute(...).contiguous()` for the K transpose costs more
+   than the kernel sometimes.** 11-15 GB/s (element-wise, because the innermost
+   dim after the permute has stride 1) — 1.5 ms for the 16 MB K of
+   `S=1024/H=16/D=128`, which was the whole reason fp32 lost that shape. The
+   blocked Mojo pass (16 tokens per 64-byte store) does it at 40-70 GB/s.
+
 ## 12. Box access and environment
 
 | box | IP | notes |
@@ -388,15 +519,33 @@ default of 16 is also the C++ kernel's best point (67 vs 76 µs at block 32).
 1. **bf16 P@V on x86** (probabilities quantized like MAX/`csrc`-AMX): halves the
    P@V multiply count, ~30% at short contexts; costs bit-parity with `csrc/`.
    Only worth it if the engine, not the kernel table, is the target.
-2. **Chunked prefill / multi-token queries**: needs the mask logic generalised
-   (the port assumes one query token at the last position). MAX's
-   `MaskStrategy.start_column` / `total_iters` is the structure to copy.
-3. **GQA/MQA**: one KV page shared by `q_heads_per_kv` heads would let one task
+2. **Chunked prefill on the paged path**: still the paged kernel's one gap
+   (the dense kernel already does multi-token queries). It needs the paged
+   mask generalised to `j <= q0 + r + (len - q)` and the group loop to start at
+   the row's window instead of position 0 — the dense kernel's boundary-tile
+   mask (§4a) is the worked-out version of exactly that logic.
+3. **Dense: a GEMM micro-kernel for both phases** (vLLM's `TileGemm82`).
+   Measured facts (§9.9-9.10): blocking does not matter, bandwidth does not
+   matter, and the gap to vLLM grows with head_dim (1.2x at 64, 1.7x at 128), so
+   the remaining cost is FMA *density*: 8 rows x 8-column register tiles for
+   Q@K^T (one reload of K^T feeds 8 accumulator updates in registers instead of
+   1) and the same for P@V, with the accumulator in memory. Both variants tried
+   this round — head-dim-tiled acc in L1, and KV-outer chunks — were within 1%
+   of the current kernel, so a rewrite must change the *inner* GEMM, not the
+   loop order or the buffers.
+4. **Dense: `bfmmla` on ARM for both phases.** `bfdot` gives 2x the fp32-lane
+   MACs, `bfmmla` gives 4x and amortizes the loads over a 2x2 output tile -- that
+   is where vLLM's 1234 GFLOP/s bf16 on Graviton comes from (`cpu_attn_neon_bfmmla.hpp`
+   is the file to read). It needs V in a *position*-paired layout
+   (`[seq_k/2][head_dim][2]`), i.e. a second transpose pass, plus 2x4 / 4x2
+   operand staging for `llvm.aarch64.neon.bfmmla`. Expect ~2x over the current
+   ARM bf16 path, which is still 3.7x behind vLLM.
+5. **GQA/MQA**: one KV page shared by `q_heads_per_kv` heads would let one task
    amortise the K/V loads over several query heads — and only then does AMX
    (16-row tiles) become interesting. Not needed for BART/Florence-2.
-4. ~~Own thread pool~~ **Done, differently**: not a pool of our own (no win,
+6. ~~Own thread pool~~ **Done, differently**: not a pool of our own (no win,
    §9.3) but `GOMP_parallel` on torch's pool. A hand-rolled pool cannot beat it
    because the win is *reusing* the pool that is already awake.
-5. **`partial_simd_load`** for tails instead of `iota`+`select` (cosmetic).
-6. **T5** (root `AGENTS.md`): same paged path, but its per-layer pointwise chains
+7. **`partial_simd_load`** for tails instead of `iota`+`select` (cosmetic).
+8. **T5** (root `AGENTS.md`): same paged path, but its per-layer pointwise chains
    are what the frozen compile graphs fuse, so the CPU gains would be larger.

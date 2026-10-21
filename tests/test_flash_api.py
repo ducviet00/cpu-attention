@@ -15,7 +15,9 @@ import cpu_attention as attn
 
 def main():
     if not attn.is_available():
-        print("SKIP: cpu_attention/_C.so is not built (pixi run build)")
+        print(
+            "SKIP: cpu_attention/_C.so is not built (uv run --extra build python scripts/build.py)"
+        )
         return
 
     fails = flash_api()
@@ -322,20 +324,20 @@ def flash_api():
         ),
     )
     rejects(
-        "flash_attn_func seqlen=2",
-        lambda: attn.flash_attn_func(q.repeat(1, 2, 1, 1), dk, dv),
+        "dense head_dim=96",
+        lambda: attn.flash_attn_func(
+            torch.zeros(B, 8, H, 96),
+            torch.zeros(B, 8, H, 96),
+            torch.zeros(B, 8, H, 96),
+        ),
     )
     rejects(
-        "flash_attn_func dropout",
-        lambda: attn.flash_attn_func(q, dk, dv, dropout_p=0.1),
-    )
-    rejects(
-        "flash_attn_func alibi",
-        lambda: attn.flash_attn_func(q, dk, dv, alibi_slopes=torch.zeros(H)),
-    )
-    rejects(
-        "flash_attn_func window",
-        lambda: attn.flash_attn_func(q, dk, dv, window_size=(2, 0)),
+        "dense nheads not divisible by nheads_k",
+        lambda: attn.flash_attn_func(
+            torch.zeros(B, 8, 6, 64),
+            torch.zeros(B, 8, 4, 64),
+            torch.zeros(B, 8, 4, 64),
+        ),
     )
     return fails
 

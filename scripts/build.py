@@ -50,12 +50,29 @@ def main() -> None:
             "mojo not found: run `uv sync --extra build` first, or "
             "`uv run --extra build python scripts/build.py`"
         )
-    _run(mojo, "build", os.path.join(SRC, "_C.mojo"), "--emit", "shared-lib", "-o", LIB)
+    # Link libgomp into the extension instead of leaving `omp_*` undefined for
+    # load time: on x86 torch happens to bring a global copy, but on aarch64 its
+    # bundled libgomp.so.1 is RTLD_LOCAL, so `import` fails with "undefined
+    # symbol: omp_get_thread_num". Same soname either way, so the loader reuses
+    # torch's copy when it is already in the process.
+    flags = _libgomp_flags()
+    if flags is None:
+        print("warning: no libgomp found; the extension may not import")
+        flags = []
+    _run(
+        mojo,
+        "build",
+        os.path.join(SRC, "_C.mojo"),
+        "--emit",
+        "shared-lib",
+        "-o",
+        LIB,
+        *flags,
+    )
     print(f"built {LIB}")
     if "--tests" not in sys.argv:
         return
-    flags = _libgomp_flags()
-    if flags is None:
+    if not flags:
         print("skip the standalone test: no libgomp to link against")
         return
     os.makedirs(BUILD, exist_ok=True)
