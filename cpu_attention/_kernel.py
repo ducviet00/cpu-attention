@@ -598,8 +598,19 @@ def _amx_dense(q, k, v, scale: float, causal: bool):
     return out
 
 
+
+
 def _dense(q, k, v, scale: float, causal: bool):
-    """Run the dense kernel over contiguous-``head_dim`` q/k/v (already checked)."""
+    """Run the dense kernel over contiguous-``head_dim`` q/k/v (already checked).
+
+    The Python side of this is not free: measured in isolation (the extension
+    entries replaced by no-ops) it was 5.2 us at 128:8:64, 13% of the call, of
+    which nineteen `Tensor.stride(i)` calls were the largest single item --
+    `stride(i)` is a Python call, ~0.18 us each. It is 3.6 us now, with one
+    `stride()` per tensor and the pack buffers' tuples cached; a whole-plan cache
+    was tried too and measured worse than that, at the cost of holding the
+    caller's tensors alive.
+    """
     batch, seq_q, num_heads, head_dim = q.shape
     seq_k, num_kv_heads = k.shape[1], k.shape[2]
     out = _amx_dense(q, k, v, scale, causal)
