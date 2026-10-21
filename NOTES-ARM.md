@@ -429,12 +429,16 @@ suites green, ratios `ours/baseline` (<1 = a win), ours includes the K/V pack:
 
 | | vs torch SDPA | vs vLLM `csrc/cpu` |
 |---|---|---|
-| bf16, 11 shapes | 0.48-0.85 (11/11) | 1.03-1.13 long, 1.12-1.32 short |
-| fp32, 11 shapes | 0.35-0.91 (11/11) | 0.91-1.07 (5/11) |
+| bf16, 11 shapes | 0.48-0.85 (11/11) | 1.02-1.32, never below 1.00 |
+| fp32, 11 shapes | 0.34-0.91 (11/11) | 0.89-1.07, i.e. parity |
 
-**22/22 beat SDPA and 5/22 beat vLLM, from 17/22 and 0/22 at the start of the
-ARM campaign.** Bands are run-to-run: the box drifts ~5% and Graviton's
-1024-token rows more, so treat a row within 0.05 of 1.00 as parity.
+**22/22 beat SDPA and 2-5 of 22 beat vLLM, from 17/22 and 0/22 at the start of
+the ARM campaign.** The range on that second number is not sloppiness: three
+runs of the *same binary* on this box gave 5, 2 and 3 fp32 rows below 1.00
+(0.89-1.07 all three times), because those rows sit on the parity line and a
+row lands on either side of it with a 3% shift. Quote bf16 as
+"1.02-1.32, always above 1" and fp32 as "at parity"; the "N/22 vs vLLM" count is
+±2 and should never be quoted without the band.
 
 What the remainder is, by family:
 
