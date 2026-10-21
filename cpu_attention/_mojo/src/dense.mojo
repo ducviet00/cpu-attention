@@ -1275,10 +1275,19 @@ def _dense_rows_tile[
         var mt = Array[SIMD[DType.float32, 4], RP](uninitialized=True)
         comptime for rp in range(RP):
             mt[rp] = SIMD[DType.float32, 4](NEG_INF)
+        # Only the key sub-blocks that exist: the last row of the block sees no
+        # key past ``t0 + jn``, so everything beyond is masked to NEG_INF anyway
+        # and the whole sub-block (Q@K^T, max, exp, P@V) is wasted work. At
+        # S=128 that waste was ~1.5x of the called-for work; at S>=2048 it is
+        # noise.
+        # (Up to the *causal* limit of the block's last row, not seq_k: past
+        # ``loop_end`` every row of the block is masked anyway.)
+        var jn = min(ks, loop_end - t0)
+        var nkp = min(NKP, (jn + 2 * nsq - 1) // (2 * nsq) * nsq)
         # K^T is blocked by ``kt_blk`` (= the tile size here), so the whole
         # tile's K is one contiguous run and a sub-block reads it linearly.
         var sb = 0
-        while sb < NKP:
+        while sb < nkp:
             var accs = Array[SIMD[DType.float32, 4], RP * nsq](
                 uninitialized=True
             )
@@ -1349,6 +1358,10 @@ def _dense_rows_tile[
             sb += nsq
 
         # ---- 2. One softmax update for the whole tile, then exp + panels.
+        # Key groups that exist, rounded up to a multiple of two (the exp loop
+        # consumes two per iteration) and never past the sub-blocks the QK pass
+        # actually filled.
+        var nkg = min(NKG, (jn + 7) // 8 * 2)
         comptime for rp in range(RP):
             # Does this tile show this row pair anything at all? False only in
             # the last tile of a block whose early rows' window ends earlier.
@@ -1378,7 +1391,7 @@ def _dense_rows_tile[
             var blind = m_new.reduce_max() == Scalar[DType.float32](NEG_INF)
             var kg = 0
             if not has and blind:
-                while kg < NKG:
+                while kg < nkg:
                     probs.unsafe_store[width=8](
                         (kg * RP + rp) * 8, SIMD[DType.bfloat16, 8](0.0)
                     )
@@ -1388,7 +1401,7 @@ def _dense_rows_tile[
                 # dependency chain and two of them per iteration (32 cycles of
                 # latency against ~20 instructions of work) does not fill the
                 # pipeline; four in flight does.
-                while kg < NKG:
+                while kg < nkg:
                     comptime for u in range(2):
                         var p0 = _exp2_fast(
                             logits.unsafe_load[width=4](
@@ -1426,10 +1439,10 @@ def _dense_rows_tile[
             s_v[rp] = s_v[rp] + _swap_pairs(sumv) + sumv
 
         # ---- 3. P@V over the tile, dcp dim pairs at a time. Only the key
-        # groups that exist: masked lanes are exactly 0 but their V may be past
-        # the end of the packed buffer (0 * garbage is not 0).
-        var jn = min(ks, seq_k - t0)
-        var kgroups = (jn + 3) // 4
+        # groups that exist (``nkg``, decided in phase 1): masked lanes are
+        # exactly 0 but their V may be past the end of the packed buffer
+        # (0 * garbage is not 0).
+        var kgroups = nkg
         comptime for dc in range(0, DP, dcp):
             var accv = Array[SIMD[DType.float32, 4], RP * dcp](
                 uninitialized=True
@@ -1587,8 +1600,11 @@ def _dense_rows_tile_f32[
         var mvec = Array[SIMD[DType.float32, LANES], qt](uninitialized=True)
         comptime for r in range(qt):
             mvec[r] = SIMD[DType.float32, LANES](NEG_INF)
+        # Up to the causal limit of the block's last row (see the bf16 kernel).
+        var jn = min(ks, loop_end - t0)
+        var nkb = min(NKB, (jn + kb - 1) // kb)
         var sb = 0
-        while sb < NKB:
+        while sb < nkb:
             var ko = sb * kb
             var accs = Array[SIMD[DType.float32, LANES], qt * KV](
                 uninitialized=True
@@ -1674,7 +1690,9 @@ def _dense_rows_tile_f32[
                     row_sum[r] *= SIMD[DType.float32, LANES](alpha)
             var sumv = SIMD[DType.float32, LANES](0.0)
             var k = 0
-            while k < ks:
+            # Only the keys that exist, rounded up to a whole 4-key group (the
+            # logits past `jn` are NEG_INF, so exp of them is exactly 0).
+            while k < min(ks, (jn + 3) // 4 * 4):
                 var p = _vexp[LANES](
                     logits.unsafe_load[width=LANES](r * ks + k)
                     + SIMD[DType.float32, LANES](off)
@@ -1688,7 +1706,6 @@ def _dense_rows_tile_f32[
         # keys at a time. Only the key groups that exist: the masked lanes'
         # probability is exactly 0, but their V may be past the end of the
         # tensor and 0 * garbage is not 0.
-        var jn = min(ks, seq_k - t0)
         var kgroups = (jn + 3) // 4
         comptime for c in range(NCH):
             var accv = Array[SIMD[DType.float32, LANES], qt * DV](
