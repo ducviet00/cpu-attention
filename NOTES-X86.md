@@ -697,3 +697,42 @@ for D=64 (2 row groups x 2 dim chunks), the B operand 2 and the C tiles 4: that
 is 10. Hoisting Q out of the key-chunk loop would need the whole Q panel live in
 tiles across chunks, which does not fit; the alternatives are 16-key chunks
 (2 C tiles, worse softmax) or D=32 only. Recorded so it is not attempted again.
+
+## Round 7 — the pack is COLD-READ-BOUND. Question closed for real.
+
+The standalone bench re-runs the same tiles, so K/V stay in L1/L2 — but in the
+real matrix our call is interleaved with SDPA and vLLM, whose own traffic pushes
+K/V out, and in a real model the previous layer does the same. So the pack may be
+paying cold reads. `tests/bench_amx_phases.py --flush <MB>` now evicts between
+timed calls (this box reports **480 MB of L3**, so a useful flush is several
+hundred MB), and the same in-call phases re-measured (2 threads, medians of 15):
+
+| S=128 H=8 D=64 | hot | flushed (600 MB) | cold minus the `nothing` baseline |
+|---|---:|---:|---:|
+| nothing (region + marshalling) | 8.8 | 97.1 | — |
+| pack only | 12.6 | 122.4 | **3.8 hot -> 25.3 cold (6.7x)** |
+| full | 61.8 | 169.7 | 53.0 hot -> 72.6 cold (+37%) |
+
+| S=256 H=16 D=128 | hot | flushed | net pack |
+|---|---:|---:|---:|
+| nothing | 8.5 | 96.6 | — |
+| pack only | 64.3 | 228.5 | 55.8 -> 131.9 (2.4x) |
+| full | 428.9 | 580.6 | 420 -> 484 (+15%) |
+
+**The pack is cold-read-bound, and that is the whole 5x.** The standalone 22 ns/tile
+is a *hot* number (L2-resident source and destination); the same work on cold data
+costs 6.7x more at S=128, and nothing about it is instruction count, the transpose
+network, or the clock (round 6b: 3.8 GHz sustained, no downclock). It is
+irreducible in the two-pass structure: **we must read K and V once from outside
+cache, and a two-pass kernel pays one extra cold read+write of the packed copy
+that a fused one-pass kernel would not.**
+
+That closes the bf16 short-S pack thread for good, and it is the honest reason the
+five bf16 rows against vLLM-AMX sit at 1.0-1.15: their timed region starts with
+K/V already staged, ours starts cold. The only version that would change it is the
+one-pass design (read K directly into tiles for QK by swapping the A/B operands
+and packing only V, at S <= 256) — a different kernel, not a pack fix, and not
+started.
+
+x86 is frozen at `21/22` against the campaign's literal bar (`--isa vec`), one row
+open at ~1.15, both parity suites green.
