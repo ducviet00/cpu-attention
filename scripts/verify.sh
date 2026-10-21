@@ -64,8 +64,14 @@ for ISA in $ISAS; do
   # Single-quoted: the tilde must reach the remote shell unexpanded.
   REF='~/vllm_cpu_build/vllm_cpu_attn_bench.so'
   [ "$ISA" = "amx" ] && REF='~/vllm_cpu_build/vllm_cpu_attn_bench_amx.so'
-  echo "== matrix, isa=$ISA =="
-  "${SSH[@]}" "bash -lc 'cd ~/cpu-attention && .venv/bin/python tests/bench_vs_refs.py --vllm $REF --isa $ISA --rounds 5 --json ~/verify-$LABEL-$ISA.json 2>/dev/null | tail -3'"
+  # vLLM's AMX path is bf16-only (`TileGemm224` is specialised for a BFloat16
+  # query; an fp32 query trips TORCH_CHECK and aborts the process), so the amx
+  # matrix runs bf16 only. fp32 has no AMX kernel anywhere, which is why VEC is
+  # that column's honest baseline.
+  DT=""
+  [ "$ISA" = "amx" ] && DT="--dtype bf16"
+  echo "== matrix, isa=$ISA$DT =="
+  "${SSH[@]}" "bash -lc 'cd ~/cpu-attention && .venv/bin/python tests/bench_vs_refs.py --vllm $REF --isa $ISA $DT --rounds 5 --json ~/verify-$LABEL-$ISA.json 2>/dev/null | tail -3'"
 done
 
 echo "== scorecard (local) =="
