@@ -46,6 +46,12 @@ def main() -> int:
     ap.add_argument("--workers", type=int, default=0,
                     help="CPU_ATTENTION_WORKERS equivalent, 0 = automatic")
     ap.add_argument("--qt", type=int, default=0)
+    ap.add_argument("--kt-stride", type=int, default=0,
+                    help="SYNTHETIC address-pattern probe: override the element "
+                         "stride between K^T head-dim rows (0 = the real layout). "
+                         "A small stride makes the whole K^T panel L1/L2-resident "
+                         "without changing one instruction, at the price of wrong "
+                         "numbers. Isolates 'misses' from 'loop structure'.")
     ap.add_argument("--vllm", default=C.VLLM_DEFAULT)
     args = ap.parse_args()
 
@@ -91,15 +97,26 @@ def main() -> int:
                             v.stride(1), v.stride(2), 0, 0,
                             K._DTYPE_CODES[k.dtype], mode, workers)
         else:
-            tasks = 1 * heads * (-(-seq // K._QT))
-            fn = lambda: dn(q.data_ptr(), kt.data_ptr(), v.data_ptr(),
+            qt_used = args.qt or K._QT
+            tasks = 1 * heads * (-(-seq // qt_used))
+            ktb, ktd, ktt = kt.stride(1), kt.stride(2), kt.stride(3)
+            kt_use = kt
+            if args.kt_stride:
+                # SYNTHETIC: same instruction stream, same tile count, same load
+                # count; only the element stride between head-dim rows changes, so
+                # the whole K^T panel becomes L1/L2-resident. Numbers are wrong on
+                # purpose -- this measures the address pattern, nothing else.
+                need = dim * args.kt_stride + seq + 256
+                kt_use = torch.zeros(need, dtype=k.dtype)
+                ktb, ktd, ktt = 0, args.kt_stride, 1
+            fn = lambda: dn(q.data_ptr(), kt_use.data_ptr(), v.data_ptr(),
                             out.data_ptr(), 1, seq, seq, heads, heads, dim,
                             q.stride(0), q.stride(1), q.stride(2),
-                            kt.stride(1), kt.stride(2), kt.stride(3),
+                            ktb, ktd, ktt,
                             v.stride(0), v.stride(1), v.stride(2),
                             out.stride(0), out.stride(1), out.stride(2),
                             scale, causal, K._DTYPE_CODES[q.dtype],
-                            K._QT, K._workers(tasks, 8))
+                            qt_used, K._workers(tasks, 8))
         if args.variant == "transpose":
             fn()  # once, so --variant nokt (below) has a transposed K
     else:

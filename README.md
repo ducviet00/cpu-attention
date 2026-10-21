@@ -359,6 +359,12 @@ torch SDPA (same session, interleaved):
 | S=2048 H=16 D=128 | 49432 | **15715** | 10931 | 17027 |
 | S=512 H=32 D=128 | 6687 | **2371** | 1501 | 3722 |
 
+Rows per work item is the lever that binds on ARM as it does on x86: the fp32
+default used to be 2 rows (the worst measured point), and `qt=6` is
+**1.37-1.39x** on the whole call at D=64 (S=1024/2048) -- that row went from
+0.79x SDPA to **1.15x**. Decoupling `qt` from the bf16 tile geometry was tried and
+rejected (0.86x: 32 logit registers at `RP=4 x NS=8` spill).
+
 That is 2.2-3.2x, and 331 -> 853 GFLOP/s at D=64 / 348 -> 1093 at D=128 (both
 S=2048): **bf16 now beats SDPA at every D=128 size (1.12-1.57x) and up to
 S=1024 at D=64, but is still 1.44-1.8x behind vLLM** and 5-13% behind SDPA at

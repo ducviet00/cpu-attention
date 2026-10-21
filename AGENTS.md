@@ -208,6 +208,25 @@ every tile. The lever is a register-lean (vLLM-style) softmax with the logits in
 L1 and one row pair live at a time — §13.4. fp32 on ARM has no matrix-multiply
 instruction, so it stays at ~250 GFLOP/s against vLLM's 480 and needs §13.3.
 
+**Rows per work item is the one lever that moved ARM fp32**: the default was
+`qt=2` (the worst measured point). Measured on m9g, fractions of `qt=4`,
+interleaved, medians of 5: `qt=2` 0.77-0.80x, `qt=6` **1.09-1.11x**, `qt=8`
+0.76-0.78x (register wall). `_kernel._qt_for` now picks 6 for fp32 at head_dim
+<= 64 and `seq_k >= 1024`, and the drift-controlled A/B of the *whole call* is
+**1.37-1.39x** (S=1024/2048, H=8, D=64) — that row went from 0.79x SDPA to
+**1.15x**. head_dim 128 deliberately stays at 2 (32 registers per row already).
+For bf16 it returns 8 rows at head_dim 128 and 4 at 64, where the `bfmmla` kernel
+was already optimal.
+
+**Decoupling `qt` from the tile geometry on ARM was tried and rejected** (the
+worker's own abandon criterion fired): at fixed `qt=8`, `sub=16/dcp=8` measures
+0.862x against the merged `qt=4/8,16` and 0.940x against the old coupled
+`qt=8/4,8` — `RP=4 x NS=8` is 32 logit registers before any operand, so the
+allocator spills more than the 2x key-tile amortisation returns. With `qt` at its
+per-dtype optimum (4 bf16, 6 fp32), the residual 3.76 cycles/row-key at D=64 are
+**not** recoverable through row count or tile shape: they are spill and latency
+inside the 23% softmax block.
+
 Also: the ARM build needs **libgomp linked into the extension**. Leaving `omp_*`
 undefined for load time works on x86 because torch brings a global copy, but on
 aarch64 torch's bundled `libgomp.so.1` is `RTLD_LOCAL` and `import` fails with
