@@ -1,7 +1,10 @@
 # When AWS access is back
 
-1. `aws login` (the CLI session expired mid-session; the x86 spot box was
-   reclaimed and could not be checked or replaced).
+1. **`aws login`, then `bench-stop 13.210.162.215`.** The CLI session expired
+   mid-session: the x86 spot box was reclaimed and could not be checked or
+   replaced, and the Graviton box is still running unattended (~$0.20/hr) with no
+   way to terminate it without the API. It is idle and holds nothing but the
+   repo, the venv and some JSON results.
 
 2. Re-verify `main` on the Xeon, which is the one table that is stale:
 
