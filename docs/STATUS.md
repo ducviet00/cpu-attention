@@ -81,13 +81,13 @@ measured ceilings of 4.0 (bf16) and 9.4 (fp32) cycles per row-key.
 1. **ARM bf16** (1.06-1.42) and **ARM fp32 at short S** (1.12-1.18). The ARM
    kernel just moved to vLLM's *structure* (L1 logits tile, one softmax per
    64-key tile, 8 rows per work item), which took bf16 from 1.39-2.35 to
-   1.07-1.32 and fp32 from 1.19-1.60 to 0.96-1.19. Perf says we are now at
-   vLLM's instruction count for bf16 (20.99 vs 20.88 per row-key) and behind on
-   IPC (3.62 vs 4.07) — and the 2026-10-22 IPC study (NOTES-ARM.md, "The 0.5
-   IPC") says that residue is **not a removable instruction**: measured at
-   2048:8:64 with the counters subtracted, we execute *fewer* instructions than
-   vLLM (20.10 vs 20.96 per row-key) and take more cycles (5.645 vs 5.319, IPC
-   3.56 vs 3.94), the inner loops are identical in shape (1.44 vs 1.47
+   1.07-1.32 and fp32 from 1.19-1.60 to 0.96-1.19. Perf puts us at vLLM's
+   instruction count for bf16 and behind on IPC — and the 2026-10-22 IPC study
+   (NOTES-ARM.md, "The 0.5 IPC", counters taken by subtracting two iteration
+   counts rather than from one process run) says that residue is **not a
+   removable instruction**: measured at 2048:8:64 we execute *fewer* instructions
+   than vLLM (20.10 vs 20.96 per row-key) and take more cycles (5.645 vs 5.319,
+   IPC 3.56 vs 3.94), the inner loops are identical in shape (1.44 vs 1.47
    instructions per `bfmmla`, both spill-free), and the one instruction class we
    have and they do not (the two constant-seed `mov`s per exp) is *cheaper* than
    the arithmetic that would replace it: removing them measured 2.5% slower,
