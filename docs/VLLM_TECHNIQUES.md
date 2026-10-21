@@ -48,6 +48,20 @@ an issue-slot one.
 | 15 | `vec16` variant for `head_dim % 32 != 0` | `cpu_attn_vec16.hpp` | only 32/64/128 | missing, irrelevant to the shapes we run |
 | 16 | no software prefetch in the VEC loop (`vec_op::prefetch` exists at `cpu_types_x86.hpp:1125` but `cpu_attn_*.hpp` never calls it) | — | we do not either | equal — upstream relies on the layout being streamable (#2) |
 
+## Where the time goes (ablation, ARM bfmmla kernel, interleaved)
+
+| phase | share | vs vLLM |
+|---|---:|---|
+| Q@K^T | 29% | **parity** (`bfmmla` both phases) |
+| P@V | 31% | **parity** |
+| softmax + bookkeeping | **40%** | theirs ≈ **9%** (from `1.45 = 1/(0.60+s)`) |
+
+Byte-level: their `apply_softmax` reduces max/sum once per **row per tile**
+(480-1024 keys); ours once per **row per 16-key step** (7 `fmax` + a horizontal
+reduce, twice). Per-64-key max/alpha would be worth 1.18-1.22x (`nomax` ablation),
+but a 32-key step measured **0.84x** because 8 more accumulators spill — so the
+fix is to move the logits out of the register file, not to change the step.
+
 ## The short list
 
 0. **What actually binds (measured, after #2 died).** Two deficits, and neither
@@ -63,7 +77,12 @@ an issue-slot one.
    threads, and the row effect is 1.18-1.19x *independently of which kernel runs*
    (register 1.19x, L1-acc 1.18x — the L1-acc kernel is 6% slower wherever both
    are legal, so raise `qt`, do not port the mem path).
-2. **Softmax off the inner loop** at `qt=8` with the vLLM structure (logits and
+2. **The softmax block** (40% of our time vs ~9% of theirs) — the only remaining
+   uniform gap, and the same for both ISAs. Restructure it as its own pass over a
+   logits tile in L1/L2, so the Q@K^T and P@V loops become pure GEMMs and the
+   max/sum reduce happens once per tile. Bounded at 1.10-1.20x; a rewrite of the
+   row kernel, not a knob (a 32-key step measured 0.84x).
+3. **Softmax off the inner loop** at `qt=8` with the vLLM structure (logits and
    probabilities in a buffer, `kt` up to 512): predicted to lift IPC 1.57 -> >=2.0
    for <=15% more instructions. Kill switch: abandon if IPC stays below 1.8 or
    `in/pair` rises above 15%.

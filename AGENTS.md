@@ -596,6 +596,25 @@ i.e. attention 29.8-49.6 + interference +39.2 against 90.7 + 25.9.
    vLLM at S=128** because their `reshape_and_cache` costs more than our
    transpose, and the GOMP pool is a 2.5x win, not a cost.
 
+10b. **The remainder is the softmax block, and that is now measured by ablation,
+   not inferred.** Interleaved phase ablations of the ARM `bfmmla` kernel
+   (`PROFILE`-style: patch out one phase, run through `ab_two_trees.py`, with an
+   identity patch as control): Q@K^T **29%**, P@V **31%**, softmax +
+   bookkeeping **40%** of the call. Q@K^T and P@V are *at parity with vLLM*
+   (bf16 `bfmmla` both phases, 2560 instructions in the `.so`), so
+   `1.45 = 1/(0.60 + s)` puts vLLM's softmax at **~9%**. Two independent workers
+   on two boxes reached the same conclusion from different probes, and the
+   MQA-vs-MHA probe (identical flops, 8x less K/V: **1.00-1.14x**) independently
+   kills the traffic theory the x86 stride probe killed.
+
+   Byte-level evidence for the difference: vLLM reduces max/sum once per **row
+   per tile** (480-1024 keys) in `apply_softmax`; we do it per **row per 16-key
+   step** (7 `fmax` + a horizontal reduce, twice). A per-64-key instead of
+   per-16-key max/alpha is worth **1.18-1.22x** (`nomax` ablation) — but it can
+   only be collected by moving the logits out of the register file, because a
+   32-key softmax step alone measures **0.84x** (8 more live accumulators spill).
+   That is why this is a rewrite of the row kernel rather than a knob.
+
 11. **Dense kernel (laptop, 8 threads, causal, `tests/bench_dense.py`)**: bf16 is
    1.26-2.5× torch SDPA, fp32 1.0-2.0× — except `H=16/D=128` at S=1024 (0.83×,
    the register wall above) and S=128 (0.93×, where the call is 80 µs and SDPA
