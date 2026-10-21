@@ -15,21 +15,22 @@ from cpu_attention import flash_attn_with_kvcache, flash_attn_func
 
 ## Install
 
-```bash
-uv pip install -e . --no-deps     # or: pip install -e . --no-deps
-```
-
-The Python side is pure Python; the kernel itself is a shared library that has
-to be built once on the target machine (it is compiled for the host CPU):
+uv is the only tool needed: the Mojo compiler comes from the PyPI `mojo`
+wheel (`build` extra), and torch from the CPU index.
 
 ```bash
-cd cpu_attention/_mojo
-pixi run build                    # -> cpu_attention/_C.so, links -lgomp
-pixi run test                     # standalone kernel test (no torch)
+uv sync --extra build                              # torch + mojo + this package
+uv run --extra build python scripts/build.py --tests   # -> cpu_attention/_C.so
+uv run python tests/test_flash_api.py              # 35 checks vs SDPA
 ```
 
-Then check it: `python tests/test_flash_api.py`. Without `_C.so`,
-`cpu_attention.is_available()` is False and the entry points raise a clear
+`scripts/build.py` builds the extension and, with `--tests`, the standalone
+kernel test (11 cases, run immediately). The test binary links libgomp; the
+build script uses torch's bundled `libgomp.so.1` when the system has no copy.
+
+To use it from another project, point that project's environment at this
+checkout (`uv pip install -e . --no-deps`). Without `_C.so`,
+`cpu_attention.is_available()` is False and every entry point raises a clear
 `RuntimeError`; `CPU_ATTENTION_LIB` points the loader at another build, and
 `CPU_ATTENTION_WORKERS` pins the worker count.
 
@@ -66,10 +67,12 @@ last position, so the causal mask is exactly the cache tail.
 
 ## Build details
 
-The kernel dispatches on libgomp (`GOMP_parallel`), so the build needs
-`-Xlinker -lgomp` and is Linux-only; the pixi env is `mojo` alone (no `max`
-package). `mojo run` cannot run the kernel — the JIT cannot resolve the OpenMP
-symbols — which is why `pixi run test` builds a binary first.
+The kernel dispatches on libgomp (`GOMP_parallel`). The extension itself does
+not link it — the symbols resolve when the library is loaded, and `cpu_attention`
+imports torch first, which brings `libgomp.so.1` in — but the standalone test is
+an executable and does need the library at link time, hence `--tests` above.
+`mojo run` cannot run the kernel either (its JIT cannot resolve the OpenMP
+symbols), which is why the build script produces a binary.
 
 `mojo build` targets the **host CPU** (`--print-effective-target` shows
 `znver4 +avx512bf16` on the dev box), so rebuild per machine rather than copying
@@ -334,7 +337,7 @@ pool either sleeps (103-140 µs wake, 24 times per step) or spins (which steals
 GEMM cycles — MAX's default 200 µs spin cost 4.5% end to end and was worse than
 useless). Running the kernel on the pool that *torch* keeps busy between calls
 removes the wake entirely, and it also removes the need for the `max` package:
-`_mojo/pixi.toml` depends on `mojo` alone now.
+the build needs only the `mojo` wheel (uv's `build` extra).
 
 What that is worth, measured in one harness (8 matmuls ~ 0.8 ms between calls,
 i.e. the engine's cadence; per-call numbers include the call itself):
@@ -384,7 +387,7 @@ cpu_attention/
   _kernel.py                    .so loader, 23-arg call, worker policy
   _C.so                         built kernel (gitignored)
   _mojo/
-    pixi.toml                   Mojo nightly env (no MAX dependency)
+scripts/build.py              uv-driven build (mojo wheel from PyPI)
     src/attention.mojo          the kernel (Job, store, attention, dispatch)
     src/_C.mojo                 Python extension module (PyInit__C)
     tests/test_attention.mojo   standalone parity test against a scalar reference

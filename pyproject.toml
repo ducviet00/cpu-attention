@@ -12,7 +12,16 @@ dependencies = ["torch>=2.0"]
 license = { file = "LICENSE" }
 
 [project.optional-dependencies]
-test = ["transformers"]
+# The Mojo compiler, from the PyPI wheel: uv is the only tool needed.
+build = ["mojo>=1.1"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [tool.setuptools.packages.find]
 include = ["cpu_attention*"]

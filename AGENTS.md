@@ -23,9 +23,9 @@ cpu_attention/
   flash_attn_interface.py   flash_attn_with_kvcache / flash_attn_func / rejects
   ops.py                    self_attention / cross_attention / reshape_and_cache
   _kernel.py                .so loader, 23-arg call, worker policy
-  _C.so                     built kernel (gitignored; `pixi run build`)
+  _C.so                     built kernel (gitignored; `scripts/build.py`)
   _mojo/
-    pixi.toml               Mojo nightly, no MAX; platforms = linux-64, linux-aarch64
+    src/attention.mojo      the kernel
     src/attention.mojo      the kernel (Job, store, generic + dot attention, dispatch)
     src/_C.mojo             Python extension: PyInit__C, one `attention(...)` entry
     tests/test_attention.mojo  standalone parity test vs a scalar fp32 reference
@@ -45,20 +45,21 @@ dispatch lives in `layers/attention.py` and compile gating in
 ## 3. Build, run, test
 
 ```bash
-cd cpu_attention/_mojo
-pixi run build        # mojo build src/_C.mojo --emit shared-lib -o ../_C.so -Xlinker -lgomp
-pixi run test         # mojo build -I src tests/test_attention.mojo -o build/test_attention \
-                      #     -Xlinker -lgomp && build/test_attention        -> 11 OK lines
+uv sync --extra build                                  # torch + the mojo wheel
+uv run --extra build python scripts/build.py --tests   # _C.so + 11 kernel cases
 ```
 
-`-Xlinker -lgomp` is a hard build dependency: the kernel dispatches on libgomp
-(§4), so the `.so` records `DT_NEEDED libgomp.so.1` and the standalone test
-binary links it too. Two consequences:
-`mojo run` **cannot** run the kernel (the JIT cannot resolve `GOMP_parallel` /
-`omp_get_thread_num` and fails with `Symbols not found`), which is why the `test`
-task builds a binary and runs it; and the backend is Linux-only, so `pixi.toml`
-lists `linux-64`/`linux-aarch64` only. The env depends on `mojo` alone — no
-`max` package, no MAX thread pool, no `MODULAR_THREAD_BUSY_WAIT_US`.
+`mojo` comes from the PyPI wheel (`[project.optional-dependencies] build`), so
+uv is the only tool; there is no pixi env any more.
+
+The extension leaves the libgomp symbols undefined (they resolve at load time;
+`cpu_attention` imports torch first, which loads `libgomp.so.1`), while the
+standalone test binary links them — `scripts/build.py --tests` uses the system
+`libgomp.so` or torch's bundled `libgomp.so.1`. `mojo run` **cannot** run the
+kernel (its JIT cannot resolve `GOMP_parallel` / `omp_get_thread_num` and fails
+with `Symbols not found`), which is why the build script produces a binary. The
+backend is Linux-only: no Windows/macOS libgomp, and the mojo wheel's target is
+the host CPU.
 
 From this repo's root (needs the `.so` above):
 
@@ -140,9 +141,9 @@ Verify both targets without the hardware (this is the cheap CI check):
 
 ```bash
 cd mojo
-pixi run mojo build --emit llvm _mojo/src/_C.mojo -o /tmp/x86.ll
+uv run --extra build mojo build --emit llvm _mojo/src/_C.mojo -o /tmp/x86.ll
 grep -c dpbf16ps /tmp/x86.ll                     # 73 on the current tree
-pixi run mojo build --emit llvm --target-triple aarch64-unknown-linux-gnu \
+uv run --extra build mojo build --emit llvm --target-triple aarch64-unknown-linux-gnu \
     --target-cpu neoverse-v3 _mojo/src/_C.mojo -o /tmp/arm.ll
 grep -c neon.bfdot /tmp/arm.ll                   # 5665 on the current tree
 ```
@@ -370,14 +371,14 @@ default of 16 is also the C++ kernel's best point (67 vs 76 µs at block 32).
 - Both checkouts live on the boxes: `~/fast-encdec` and `~/cpu-attention`,
   with the library installed editable into the engine env
   (`uv pip install -e ~/cpu-attention --no-deps`) and `_C.so` rebuilt there
-  (`pixi run build`), so a sync of the Python side alone is enough unless the
+  (`uv run --extra build python scripts/build.py`), so a sync of the Python
+  side alone is enough unless the
   kernel changed. **Never `rm -rf ~/fast-encdec` on the servers** — their
   `~/venv` is a symlink into `~/fast-encdec/.venv`.
-- Both servers need `pixi` (`~/.pixi/bin/pixi`), `gcc/g++/ninja` (for the `csrc`
-  JIT), and `pixi run build` after every sync. `_mojo/pixi.toml` lists
-  `linux-64`, `linux-aarch64` only (libgomp dispatch) and the env is `mojo`
-  alone, ~1.2 GB. `pixi run test` needs no `gcc`: it links the conda-forge
-  libgomp that ships with the env, and the `.so` records an RPATH into it.
+- Both servers need `uv` and `gcc/g++/ninja` (the latter for fast-encdec's
+  `csrc` JIT); rebuild the kernel after a sync with
+  `uv run --extra build python scripts/build.py`. `scripts/build.py --tests`
+  links torch's bundled `libgomp.so.1`, so no system libgomp package is needed.
 - `benchmarks/kernel_ab.py --threads N --workers N` pins the knobs; `0` means
   "torch default / the kernel's physical-core rule". These boxes drift ±10% and
   Graviton's 1024-token rows ±25%, so always run it twice and report the band.
