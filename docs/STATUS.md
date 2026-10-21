@@ -59,6 +59,11 @@ Ablations on x86 fp32, interleaved A/B against a patched tree:
   to) is **1-5%**;
 * explicit `fma()` instead of `*`/`+` is **0%** -- the multiply/add pairs already
   contract on this toolchain, contrary to the note in `AGENTS.md`;
+* dropping the per-tile `reduce_max` entirely (keep the first tile's max as a
+  reference, with a `sum > 1e25` overflow fallback that recomputes the tile
+  exactly) is **net zero**: 1.10x at 512x32x128, 1.00x at 256, 0.98x at 1024,
+  0.96x at 4096, parity green. Preferring the shape that wins is not a result;
+  this is the sixth softmax restructure to lose or tie.
 * non-causal we are at **parity** with vLLM's VEC kernel (1024x16x128: ours
   618M instructions / 382M cycles, vLLM 572M / 364M, IPC 1.62 vs 1.57). Causal
   costs us 9-22% relative and vLLM nothing, and that is where the remaining
