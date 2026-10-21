@@ -211,6 +211,74 @@ Note for anyone measuring: `flush.py` sets `CPU_ATTENTION_NO_FUSE` (it needs the
 unfused path to split pack from kernel), so a change to the *fused* call path
 does not show up there at all. Use `flash_attn_func` directly or the matrix.
 
+## The 0.5 IPC: measured, attributed, and it is not a removable instruction
+
+The last open question was why we run at vLLM's instruction count and below its
+IPC. Answered on m9g at 2048:8:64 bf16, one run at a time, counters taken by
+subtracting 10- and 40-iteration runs of the same driver (`perf stat` over a
+python process is otherwise 99% torch import):
+
+| | instructions/row-key | cycles/row-key | IPC |
+|---|---:|---:|---:|
+| ours | **20.10** | **5.645** | **3.56** |
+| vLLM (`vllm_cpu_attn_bench.so`) | 20.96 | 5.319 | 3.94 |
+
+**We execute 4.1% fewer instructions and take 6.1% more cycles.** `bench_phases`
+puts the K/V pack at 1.5% of that call, so both sides are kernel numbers. That
+kills the "we waste instructions somewhere" family of explanations before any
+code reading: there is nothing to delete.
+
+Static diff of the inner loops (`analyze_asm.py`, their symbols resolve):
+
+| loop | instructions | bfmmla | per bfmmla | stack refs |
+|---|---:|---:|---:|---:|
+| ours, Q@K^T steady state | 23 | 16 | 1.44 | 0 |
+| ours, Q@K^T epilogue (max + store) | 132 | 32 | 4.13 | 2 |
+| ours, Q@K^T epilogue, masked | 180 | 32 | 5.63 | 6 |
+| theirs, Q@K^T steady state | 94 | 64 | 1.47 | 0 |
+| theirs, whole tile loop | 166-230 | 32-64 | 5.2-3.6 | 6-17 |
+
+Same shape, same density, both spill-free in the steady state. Theirs fuses more
+per iteration and carries `zip1/zip2/stp` output packing inside the loop; ours
+carries a mask epilogue (`cmgt` 16 + `bif` 16 + `fmaxnm` 20 per 32 bfmmla) that
+only runs on boundary tiles.
+
+Stall attribution, same event (`armv8_pmuv3_0/stall_backend/`) on both kernels:
+
+| | ours | theirs |
+|---|---|---|
+| bfmmla | 22% | **27%** |
+| loads (ldp+ldr) | 24% (ldp 24) | 24% (ldr 15, ldp 9) |
+| scalar/vector add | **18%** | 9% |
+| mov | **11%** | ~0 |
+| fadd (row sums) | 3% | 10% |
+| mask (fcmgt/bsl/bic) | ~0 | 7% |
+
+The one class we have that they do not is `mov`: two constant-seed register
+copies per exp evaluation (`mov v23.16b, v4.16b`), because LLVM splits the
+degree-3 Horner into two chains and each needs a copy of a constant vector to
+start from. That is 0.5 of our 20.1 instructions per row-key (2.5%) and 11% of
+our stalls, so it looked like the find.
+
+It is not. Rewriting the polynomial to seed with a *multiply* into a fresh
+register (0 `mov`, +1 `fmul`, same dependent depth) measured **2.5% slower**
+(7422 vs 7240 us at 2048:8:64; 1926 vs 1879 at 1024:8:64; 6435 vs 6251-6439 at
+1024:16:128). The experiment is the explanation: **the softmax binds on FP-pipe
+slots, not on instruction count**, so trading an integer-pipe `mov` for an
+`fmul` is a loss, and our exp's `mov`s are the cheap encoding of the polynomial
+rather than waste. It also explains why vLLM's `fast_exp_f16` uses fp16 (half the
+FP-pipe pressure at the same lane count) and why our fp16 version measured +1.7%
+anyway: the conversions land on the same pipes.
+
+So the residue is a diffuse FP-pipe/scheduling difference, not an instruction:
+we are leaner, they are issuing slightly more matmul per cycle (27% of their
+stalls are on `bfmmla` against 22% of ours), and the 0.33 cycles/row-key of gap
+is spread across the exp, the loads and the address arithmetic with no single
+site carrying it. Per the campaign's stop rule this is the "parity in code,
+residual is scheduling" branch, and the two structural levers that could still
+touch it — fp16 exp, hiding the softmax inside the matmul — are both measured
+and both lost.
+
 ## The co-issue restructure: built twice, loses twice, and the reason is decisive
 
 `mixed.c` says the machine co-issues (8 bfmmla 3.98 cycles, 8 fmla 2.99, 8+8

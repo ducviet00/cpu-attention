@@ -9,6 +9,27 @@ log of what actually moved.
 `ours / baseline < 1`, for both baselines, on both platforms, for all 22 rows of
 `tests/bench_vs_refs.py`. Below 1 is a win.
 
+## Two rules for optimization claims
+
+**Show spare *issue* slots, not spare matmul cycles.** A microbenchmark of pure
+`bfmmla`s against pure `fmla`s says the machine co-issues them (8 + 8 in 3.99
+cycles). It does not follow that a softmax can be hidden inside a matmul loop:
+the Q@K^T body is 26 instructions per 16 `bfmmla`, i.e. 3.25 IPC for 8 cycles of
+matmul against a machine that sustains ~3.5, so that loop is already issue-bound
+and has nothing to give. Three co-issue builds (all four row pairs, two, and the
+half-exp variant) measured +5%, +3.7% and +0.7% cycles/row-key respectively —
+monotone in the interleaved fraction, converging on the baseline, which is the
+signature of an overhead with no upside. Before proposing any fusion, count the
+instructions *inside* the loop that is supposed to host the work.
+
+**Measure the kernel's own counters by subtracting two iteration counts, never
+from one process run.** `perf stat` over a python driver is mostly torch import
+(82 M instructions, 40 M cycles at any iteration count you care to name); run the
+same driver at `N` and `M` iterations and divide the difference by `N - M`. On
+the box, also beware that `P=~/prof/one.py` inside a loop leaves a literal `~`
+(unquoted `~/prof/one.py` is what expands) and silently measures a 12 ms
+"failed to open file" instead — the numbers look plausible and are garbage.
+
 ## Verified tables, 2026-10-22
 
 `scripts/verify.sh` on each box: clean rebuild from scratch, both parity suites
@@ -62,9 +83,19 @@ measured ceilings of 4.0 (bf16) and 9.4 (fp32) cycles per row-key.
    64-key tile, 8 rows per work item), which took bf16 from 1.39-2.35 to
    1.07-1.32 and fp32 from 1.19-1.60 to 0.96-1.19. Perf says we are now at
    vLLM's instruction count for bf16 (20.99 vs 20.88 per row-key) and behind on
-   IPC (3.62 vs 4.07); the next measured items are the two fork-joins (18% of an
-   S=128 call), the bf16 D=128 probability-panel loads, and fp32's `ldp`/address
-   stalls.
+   IPC (3.62 vs 4.07) — and the 2026-10-22 IPC study (NOTES-ARM.md, "The 0.5
+   IPC") says that residue is **not a removable instruction**: measured at
+   2048:8:64 with the counters subtracted, we execute *fewer* instructions than
+   vLLM (20.10 vs 20.96 per row-key) and take more cycles (5.645 vs 5.319, IPC
+   3.56 vs 3.94), the inner loops are identical in shape (1.44 vs 1.47
+   instructions per `bfmmla`, both spill-free), and the one instruction class we
+   have and they do not (the two constant-seed `mov`s per exp) is *cheaper* than
+   the arithmetic that would replace it: removing them measured 2.5% slower,
+   because the softmax binds on FP-pipe slots, not on instruction count. What is
+   left is a diffuse FP-pipe/scheduling residual; the two remaining structural
+   levers (fp16 exp like their `fast_exp_f16`, and hiding the softmax in the
+   matmul) have both been built and both lost. The next measured items are the
+   two fork-joins (18% of an S=128 call) and the pack at short S.
 2. **x86 bf16 at short/medium S against vLLM's AMX build** (1.03-1.62). The pack
    is memory-bound at 88% of memcpy, so this needs the kernel, not the pack.
 3. **x86 `128:8:64 fp32`** (1.18 against VEC), the only VEC row left.
