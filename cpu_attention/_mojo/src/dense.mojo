@@ -95,7 +95,9 @@ def _bfmmla(
     (verified against a scalar reference in ``tests/bfmmla_layout.mojo``).
     """
     return llvm_intrinsic[
-        "llvm.aarch64.neon.bfmmla", SIMD[DType.float32, 4], has_side_effect=False
+        "llvm.aarch64.neon.bfmmla",
+        SIMD[DType.float32, 4],
+        has_side_effect=False,
     ](acc, a, b)
 
 
@@ -230,7 +232,9 @@ def _vexp[
     # Round to nearest through the +1.5*2^23 trick: branch-free, and the low
     # mantissa bits of `t` hold the integer k.
     comptime MAGIC = 12582912.0
-    var t = fma(xc, SIMD[DType.float32, width](LOG2E), SIMD[DType.float32, width](MAGIC))
+    var t = fma(
+        xc, SIMD[DType.float32, width](LOG2E), SIMD[DType.float32, width](MAGIC)
+    )
     var kf = t - SIMD[DType.float32, width](MAGIC)
     var r = fma(-kf, SIMD[DType.float32, width](LN2_HI), xc)
     r = fma(-kf, SIMD[DType.float32, width](LN2_LO), r)
@@ -243,13 +247,16 @@ def _vexp[
     p = fma(p, r, SIMD[DType.float32, width](1.0))
     p = fma(p, r, SIMD[DType.float32, width](1.0))
     var ki = kf.cast[DType.int32]()
-    var sbits = (ki + SIMD[DType.int32, width](127)) << SIMD[DType.int32, width](23)
+    var sbits = (ki + SIMD[DType.int32, width](127)) << SIMD[
+        DType.int32, width
+    ](23)
     return p * bitcast[DType.float32, width](sbits)
 
 
 @inline(.always)
 def _vexp_f(x: Scalar[DType.float32]) -> Scalar[DType.float32]:
-    """Scalar ``exp`` through the same polynomial (the online-softmax rescale)."""
+    """Scalar ``exp`` through the same polynomial (the online-softmax rescale).
+    """
     return _vexp[1](SIMD[DType.float32, 1](x))[0]
 
 
@@ -511,7 +518,9 @@ def _dense_rows_mem[
                 ).cast[DType.float32]()
                 comptime for r in range(qt):
                     logits[r] += (
-                        SIMD[DType.float32, kt](qv.unsafe_load(r * head_dim + d))
+                        SIMD[DType.float32, kt](
+                            qv.unsafe_load(r * head_dim + d)
+                        )
                         * kv
                     )
                 d += 1
@@ -581,9 +590,12 @@ def _dense_rows_mem[
             var s = row_sum[r]
             if s > Scalar[DType.float32](0.0):
                 out.unsafe_store[width=head_dim](
-                    (acc.unsafe_load[width=head_dim](r * head_dim).cast[
-                        DType.float32
-                    ]() * (Scalar[DType.float32](1.0) / s)).cast[dtype]()
+                    (
+                        acc.unsafe_load[width=head_dim](r * head_dim).cast[
+                            DType.float32
+                        ]()
+                        * (Scalar[DType.float32](1.0) / s)
+                    ).cast[dtype]()
                 )
             else:
                 out.unsafe_store[width=head_dim](
@@ -767,9 +779,7 @@ def _exp2_fast(y: SIMD[DType.float32, 4]) -> SIMD[DType.float32, 4]:
     # One fmaxnm: NaN (a masked lane whose centre is +inf) and anything below
     # -127 both land on -127, whose exponent field is zero bits, so p is 0.
     var yc = _vmax(y, SIMD[DType.float32, 4](-127.0))
-    var n = (yc + SIMD[DType.float32, 4](MAGIC)) - SIMD[DType.float32, 4](
-        MAGIC
-    )
+    var n = (yc + SIMD[DType.float32, 4](MAGIC)) - SIMD[DType.float32, 4](MAGIC)
     var f = yc - n
     var p = SIMD[DType.float32, 4](0.009618129107628477) * f + SIMD[
         DType.float32, 4
@@ -803,6 +813,19 @@ def _vmax(
     return llvm_intrinsic[
         "llvm.maxnum.v4f32", SIMD[DType.float32, 4], has_side_effect=False
     ](a, b)
+
+
+@inline(.always)
+def _swap_pairs(v: SIMD[DType.float32, 4]) -> SIMD[DType.float32, 4]:
+    """``(v1, v0, v3, v2)``: exchange each row's two key lanes.
+
+    The ``bfmmla`` accumulator tile holds ``(row0 key j, row0 key j+1, row1 key
+    j, row1 key j+1)``, so lanes 0-1 belong to row 0 and 2-3 to row 1. Adding
+    ``v`` to its own swap therefore duplicates each row's *pair sum* into both
+    of its lanes, and ``max`` does the same for the pair max -- no horizontal
+    reduce, no vector-to-scalar move.
+    """
+    return SIMD[DType.float32, 4](v[1], v[0], v[3], v[2])
 
 
 @inline(.always)
@@ -871,11 +894,17 @@ def _dense_rows_bfmmla[
     var acc = stack_allocation[RP * DP * 4, DType.float32]()
     comptime for i in range(RP * DP):
         acc.unsafe_store[width=4](i * 4, SIMD[DType.float32, 4](0.0))
-    var row_max = Array[Float32, qt](uninitialized=True)
-    var row_sum = Array[Float32, qt](uninitialized=True)
-    comptime for r in range(qt):
-        row_max[r] = Scalar[DType.float32](NEG_INF)
-        row_sum[r] = Scalar[DType.float32](0.0)
+    # The online-softmax state is one 4-lane vector per row pair, in the same
+    # (row0, row0, row1, row1) lane order as an accumulator tile, so the max
+    # update, the rescale factor and the exponent offset are all one vector op
+    # with no vector-to-scalar round trip. Keeping them scalar cost ~20% of the
+    # kernel: every 16-key step did `umov` per row for the max, a scalar
+    # `fmax`/`fmul`, then a `dup` to get back into a vector for the exp.
+    var m_v = Array[SIMD[DType.float32, 4], RP](uninitialized=True)
+    var s_v = Array[SIMD[DType.float32, 4], RP](uninitialized=True)
+    comptime for rp in range(RP):
+        m_v[rp] = SIMD[DType.float32, 4](NEG_INF)
+        s_v[rp] = SIMD[DType.float32, 4](0.0)
 
     var probs = stack_allocation[NKG * RP * 8, BFloat16]()
     # Logits are kept in raw Q@K^T units and converted once per accumulator:
@@ -897,7 +926,9 @@ def _dense_rows_bfmmla[
         while st < NST:
             var tok = t0 + st * sub
             var half = tok // 2
-            var accs = Array[SIMD[DType.float32, 4], RP * NS](uninitialized=True)
+            var accs = Array[SIMD[DType.float32, 4], RP * NS](
+                uninitialized=True
+            )
             comptime for i in range(RP * NS):
                 accs[i] = SIMD[DType.float32, 4](0.0)
             # One K vector (2 key positions x 4 head dims) feeds every row pair;
@@ -942,61 +973,55 @@ def _dense_rows_bfmmla[
                         )
 
             comptime for rp in range(RP):
-                var mx = accs[rp * NS]
-                comptime for v in range(1, NS):
-                    mx = _vmax(mx, accs[rp * NS + v])
-                var m0 = max(row_max[2 * rp], max(mx[0], mx[1]))
-                var m1 = max(row_max[2 * rp + 1], max(mx[2], mx[3]))
-                # 2^0 = 1 exactly when the max did not move, so the two rows
-                # rescale independently and a static row is a no-op.
-                var a0 = _exp2_fast(
-                    SIMD[DType.float32, 4]((row_max[2 * rp] - m0) * c1)
-                )[0]
-                var a1 = _exp2_fast(
-                    SIMD[DType.float32, 4]((row_max[2 * rp + 1] - m1) * c1)
-                )[0]
-                # One FMA per accumulator turns the scaled logit into log2 space
-                # (scale, max subtraction and the log2 factor folded into c1/c2),
-                # then 2^y is the polynomial. A row with no visible key has
-                # m == NEG_INF, so its centre overflows to +inf: the logit is
-                # -inf too, the sum is NaN, and `_exp2_fast`'s fmaxnm turns that
-                # into exactly 0 -- no special case needed.
-                var off = SIMD[DType.float32, 2](-m0 * c1).join(
-                    SIMD[DType.float32, 2](-m1 * c1)
-                )
-                var sum0 = SIMD[DType.float32, 4](0.0)
-                var sum1 = SIMD[DType.float32, 4](0.0)
-                comptime for v in range(NS // 2):
-                    var p0 = _exp2_fast(accs[rp * NS + 2 * v] * c1 + off)
-                    var p1 = _exp2_fast(accs[rp * NS + 2 * v + 1] * c1 + off)
-                    accs[rp * NS + 2 * v] = p0
-                    accs[rp * NS + 2 * v + 1] = p1
-                    sum0 += p0
-                    sum1 += p1
-                var sumv = sum0 + sum1
-                row_sum[2 * rp] = row_sum[2 * rp] * a0 + sumv[0] + sumv[1]
-                row_sum[2 * rp + 1] = row_sum[2 * rp + 1] * a1 + sumv[2] + sumv[
-                    3
-                ]
-                row_max[2 * rp] = m0
-                row_max[2 * rp + 1] = m1
-                if a0 != Scalar[DType.float32](1.0) or a1 != Scalar[
-                    DType.float32
-                ](1.0):
-                    var av = SIMD[DType.float32, 4](a0, a0, a1, a1)
+                # Max over the NS accumulators as a tree: same op count, depth
+                # log2(NS) instead of NS-1, and nothing feeds a scalar.
+                comptime H1 = NS // 2
+                var l1 = Array[SIMD[DType.float32, 4], H1](uninitialized=True)
+                comptime for v in range(H1):
+                    l1[v] = _vmax(
+                        accs[rp * NS + 2 * v], accs[rp * NS + 2 * v + 1]
+                    )
+                comptime H2 = H1 // 2
+                var l2 = Array[SIMD[DType.float32, 4], H2](uninitialized=True)
+                comptime for v in range(H2):
+                    l2[v] = _vmax(l1[2 * v], l1[2 * v + 1])
+                var mx = l2[0]
+                comptime for v in range(1, H2):
+                    mx = _vmax(mx, l2[v])
+                # Row max: (max key pair, max key pair, ...), broadcast per row.
+                var m_cand = _vmax(m_v[rp], _vmax(mx, _swap_pairs(mx)))
+                var gap = m_v[rp] - m_cand
+                # `gap` is <= 0 in every visible lane, so "did the max move" is
+                # one horizontal max and a compare -- the branch is only taken
+                # when some row's max actually grew.
+                var need = gap.reduce_max() < Scalar[DType.float32](0.0)
+                var m_new = m_v[rp]
+                var alpha = SIMD[DType.float32, 4](1.0)
+                if need:
+                    m_new = m_cand
+                    alpha = _exp2_fast(gap * c1)
+                m_v[rp] = m_new
+                # scale, max subtraction and the log2 factor in one FMA per
+                # accumulator, in the same lane order as the tile.
+                var off = m_new * (-c1)
+                var sumv = SIMD[DType.float32, 4](0.0)
+                comptime for v in range(NS):
+                    var p = _exp2_fast(accs[rp * NS + v] * c1 + off)
+                    accs[rp * NS + v] = p
+                    sumv += p
+                s_v[rp] = s_v[rp] * alpha + _swap_pairs(sumv) + sumv
+                if need:
                     comptime for d in range(DP):
                         acc.unsafe_store[width=4](
                             (rp * DP + d) * 4,
-                            acc.unsafe_load[width=4]((rp * DP + d) * 4) * av,
+                            acc.unsafe_load[width=4]((rp * DP + d) * 4) * alpha,
                         )
                     # The panels already written for this super-tile are relative
                     # to the previous max, and P@V has not consumed them yet, so
                     # they need the same rescale (the accumulator holds only
                     # earlier super-tiles). Rare: the running max stops moving
                     # after the first few tiles.
-                    var av8 = SIMD[DType.float32, 4](a0).join(
-                        SIMD[DType.float32, 4](a1)
-                    )
+                    var av8 = alpha.interleave(alpha)
                     var g = 0
                     while g < st * KGS:
                         var pv = probs.unsafe_load[width=8]((g * RP + rp) * 8)
@@ -1015,7 +1040,14 @@ def _dense_rows_bfmmla[
                     probs.unsafe_store[width=8](
                         ((st * KGS + kg) * RP + rp) * 8,
                         SIMD[DType.bfloat16, 8](
-                            pa[0], pa[1], pb[0], pb[1], pa[2], pa[3], pb[2], pb[3]
+                            pa[0],
+                            pa[1],
+                            pb[0],
+                            pb[1],
+                            pa[2],
+                            pa[3],
+                            pb[2],
+                            pb[3],
                         ),
                     )
             st += 1
@@ -1026,7 +1058,9 @@ def _dense_rows_bfmmla[
         var jn = min(ks, seq_k - t0)
         var kgroups = (jn + 3) // 4
         comptime for dc in range(0, DP, dcp):
-            var accv = Array[SIMD[DType.float32, 4], RP * dcp](uninitialized=True)
+            var accv = Array[SIMD[DType.float32, 4], RP * dcp](
+                uninitialized=True
+            )
             comptime for rp in range(RP):
                 comptime for d in range(dcp):
                     accv[rp * dcp + d] = acc.unsafe_load[width=4](
@@ -1059,17 +1093,27 @@ def _dense_rows_bfmmla[
             var r = 2 * rp + c
             if r < nrows:
                 var out = o_base.unsafe_offset((q0 + r) * job.o_stride_t)
-                var s = row_sum[r]
-                if s > Scalar[DType.float32](0.0):
+                # A row whose whole window lies at a negative key index (the
+                # bottom-right aligned causal mask with seq_q > seq_k) sees no
+                # key at all: its accumulator is `2^-127`-scaled garbage, so it
+                # is written as zeros, as flash-attn does.
+                var vis = seq_k > 0
+                if job.causal:
+                    vis = q0 + r + diag + 1 > 0
+                var s = s_v[rp][2 * c]
+                if vis and s > Scalar[DType.float32](0.0):
                     var inv = SIMD[DType.float32, 4](
                         Scalar[DType.float32](1.0) / s
                     )
                     comptime for d4 in range(DP // 4):
                         var o8 = SIMD[DType.bfloat16, 8](0.0)
                         comptime for i in range(4):
-                            var t = acc.unsafe_load[width=4](
-                                (rp * DP + d4 * 4 + i) * 4
-                            ) * inv
+                            var t = (
+                                acc.unsafe_load[width=4](
+                                    (rp * DP + d4 * 4 + i) * 4
+                                )
+                                * inv
+                            )
                             o8[2 * i] = Scalar[DType.bfloat16](t[2 * c])
                             o8[2 * i + 1] = Scalar[DType.bfloat16](t[2 * c + 1])
                         out.unsafe_store[width=8](d4 * 8, o8)
@@ -1079,7 +1123,6 @@ def _dense_rows_bfmmla[
                         out.unsafe_store[width=8](
                             d8 * 8, SIMD[DType.bfloat16, 8](0.0)
                         )
-
 
 
 comptime TBLK = 16
@@ -1237,7 +1280,6 @@ def _vpack_head[
         t0 += TBLK
 
 
-
 comptime TransposeTaskFn = def(TransposeJob, Int) thin -> None
 
 
@@ -1269,9 +1311,9 @@ def _gomp_worker_transpose(data: Int) abi("C"):
 
 
 @inline(.always)
-def _transpose_task[dtype: DType, head_dim: Int, mode: Int](
-    job: TransposeJob, task: Int
-):
+def _transpose_task[
+    dtype: DType, head_dim: Int, mode: Int
+](job: TransposeJob, task: Int):
     var batch = task // job.num_kv_heads
     var head = task % job.num_kv_heads
     _transpose_head[dtype, head_dim, mode](job, batch, head)
@@ -1281,9 +1323,9 @@ def _transpose_task[dtype: DType, head_dim: Int, mode: Int](
         _vpack_head[dtype, head_dim](job, batch, head)
 
 
-def _transpose_dispatch[dtype: DType, head_dim: Int, mode: Int](
-    job: TransposeJob, num_workers: Int
-):
+def _transpose_dispatch[
+    dtype: DType, head_dim: Int, mode: Int
+](job: TransposeJob, num_workers: Int):
     var items = job.batch * job.num_kv_heads
     if items == 0:
         return
@@ -1301,9 +1343,9 @@ def _transpose_dispatch[dtype: DType, head_dim: Int, mode: Int](
     )
 
 
-def _transpose_shape[dtype: DType, head_dim: Int](
-    job: TransposeJob, num_workers: Int, mode: Int
-) raises:
+def _transpose_shape[
+    dtype: DType, head_dim: Int
+](job: TransposeJob, num_workers: Int, mode: Int) raises:
     if mode == 0:
         _transpose_dispatch[dtype, head_dim, 0](job, num_workers)
     elif mode == 1:
