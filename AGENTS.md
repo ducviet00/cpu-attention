@@ -654,6 +654,35 @@ i.e. attention 29.8-49.6 + interference +39.2 against 90.7 + 25.9.
    (a stale max with a group-level fixup) that has not been tried. Fifth
    softmax-restructure attempt that lost or tied; do not redo the first four.
 
+## 10c. Levers exhausted — read before proposing another
+
+Everything in `csrc/cpu` that differs from us has now been ported, falsified, or
+shown to be already done by the compiler. In order of what actually paid:
+
+| lever | result | status |
+|---|---|---|
+| per-head-contiguous K/V (vLLM's page layout) | **2.0x** (S=4096/D=128 fp32 0.61x -> 1.24x SDPA) | ported |
+| rows per K/V sweep (`qt`) | 1.14-1.19x x86, 1.42-1.73x ARM fp32 D=128 | ported (`_qt_for`) |
+| worker count for the K/V pack | 1.34x at S<=128 | ported |
+| ARM bf16 softmax state in vector lanes | 1.01-1.06x | ported |
+| fast exp (deg-5 poly + bit insert) | +18% x86 bf16 D=128 | ported (`_vexp`, `_exp2_fast`) |
+| register-tiled GEMM micro-kernel | 1.63x **slower** | falsified |
+| L2-sized logits tile / memory logits | 0.74-0.81x, twice, independently | falsified |
+| 32-key softmax step | 0.84x | falsified |
+| deferred row-sum + FA4 -8 threshold | 1.00x | falsified |
+| one-row-pair / L1-staged logits / pipelining | -11% / 0% / -11% | falsified |
+| KV splits, GQA packing, mask-by-range, probs aliasing | <=4%, not needed for MHA | rejected |
+| lane-indexed FMA (vLLM's `vfmaq_laneq_f32`) | **already emitted**: 100 of 360 `fmla` in the ARM fp32 kernel are `fmla v.4s, v.4s, vN.s[k]` | nothing to do |
+| AMX (16x16 bf16 tiles) | 4-7x, but needs an `x86_amx` tile type Mojo cannot express -- a C shim is the only route, and it helps Xeon bf16 only | open, expensive |
+
+So: on x86 and ARM the kernel is **at or ahead of SDPA nearly everywhere**
+(Graviton 17/22, laptop 11/12, Xeon 4/22 where bf16 SDPA has AMX), and
+**1.2-2.3x behind vLLM**. The remainder is fused-loop IPC (1.4 vs 2.9) that five
+restructuring attempts failed to recover, so "beat vLLM" needs either the AMX
+shim (Xeon bf16 only) or a from-scratch vLLM-shaped kernel whose two independent
+prototypes both lost 20-26%.
+
+
 11. **Dense kernel (laptop, 8 threads, causal, `tests/bench_dense.py`)**: bf16 is
    1.26-2.5× torch SDPA, fp32 1.0-2.0× — except `H=16/D=128` at S=1024 (0.83×,
    the register wall above) and S=128 (0.93×, where the call is 80 µs and SDPA
