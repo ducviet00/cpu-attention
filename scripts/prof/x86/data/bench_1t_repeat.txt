@@ -1,0 +1,26 @@
+threads=1 causal=True vllm=vllm_cpu_attn_bench.so isa=vec kv_split=False
+    parity ours: max|d|=4.768e-07 rel=1.36e-07
+    parity vllm: max|d|=4.023e-07 rel=1.15e-07
+  S= 2048 H= 8 D= 64 fp32: ours= 68112.8us vllm= 30890.0us sdpa= 39353.6us  | ours/sdpa= 1.73x vllm/sdpa= 0.78x  (ours    63 GF/s vllm   139 GF/s sdpa   109 GF/s)
+    parity ours: max|d|=7.812e-03 rel=2.59e-03
+    parity vllm: max|d|=7.812e-03 rel=2.59e-03
+  S= 2048 H= 8 D= 64 bf16: ours= 46939.7us vllm= 34660.3us sdpa= 13659.1us  | ours/sdpa= 3.44x vllm/sdpa= 2.54x  (ours    91 GF/s vllm   124 GF/s sdpa   314 GF/s)
+    parity ours: max|d|=2.146e-06 rel=5.36e-07
+    parity vllm: max|d|=2.146e-06 rel=5.36e-07
+  S= 1024 H=16 D=128 fp32: ours= 74506.0us vllm= 31610.3us sdpa= 45470.7us  | ours/sdpa= 1.64x vllm/sdpa= 0.70x  (ours    58 GF/s vllm   136 GF/s sdpa    94 GF/s)
+    parity ours: max|d|=1.562e-02 rel=4.00e-03
+    parity vllm: max|d|=1.562e-02 rel=4.00e-03
+  S= 1024 H=16 D=128 bf16: ours= 60251.6us vllm= 31907.2us sdpa= 12206.9us  | ours/sdpa= 4.94x vllm/sdpa= 2.61x  (ours    71 GF/s vllm   135 GF/s sdpa   352 GF/s)
+    parity ours: max|d|=4.470e-07 rel=1.52e-07
+    parity vllm: max|d|=3.576e-07 rel=1.21e-07
+  S=  512 H= 8 D= 64 fp32: ours=  2629.2us vllm=  2101.0us sdpa=  3991.5us  | ours/sdpa= 0.66x vllm/sdpa= 0.53x  (ours   102 GF/s vllm   128 GF/s sdpa    67 GF/s)
+    parity ours: max|d|=1.562e-02 rel=5.10e-03
+    parity vllm: max|d|=1.562e-02 rel=5.10e-03
+  S=  512 H= 8 D= 64 bf16: ours=  3111.8us vllm=  2287.0us sdpa=  1595.6us  | ours/sdpa= 1.95x vllm/sdpa= 1.43x  (ours    86 GF/s vllm   117 GF/s sdpa   168 GF/s)
+    parity ours: max|d|=3.576e-07 rel=1.16e-07
+    parity vllm: max|d|=0.000e+00 rel=0.00e+00
+  S=  128 H= 8 D= 64 fp32: ours=   284.7us vllm=   190.0us sdpa=   341.6us  | ours/sdpa= 0.83x vllm/sdpa= 0.56x  (ours    59 GF/s vllm    88 GF/s sdpa    49 GF/s)
+    parity ours: max|d|=1.562e-02 rel=4.18e-03
+    parity vllm: max|d|=1.562e-02 rel=4.18e-03
+  S=  128 H= 8 D= 64 bf16: ours=   295.7us vllm=   181.2us sdpa=   155.2us  | ours/sdpa= 1.91x vllm/sdpa= 1.17x  (ours    57 GF/s vllm    93 GF/s sdpa   108 GF/s)
+wrote /tmp/final.json
