@@ -14,6 +14,9 @@ import threading
 import torch
 
 _LIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_C.so")
+_CSRC_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "_csrc_kernels.so"
+)
 
 # The kernel specializes on head_dim at compile time; anything else raises.
 _HEAD_DIMS = {32, 64, 128}
@@ -324,7 +327,6 @@ def _bfmmla() -> bool:
 
 _QT = 4
 """Query rows per work item (``CPU_ATTENTION_QT`` overrides it).
-
 Bounded by the register file: the output accumulator is ``qt * head_dim / LANES``
 zmm and the tile logits another ``qt * 64 / LANES``, so ~32 registers cap
 ``qt * head_dim`` near 512. Bigger blocks amortize the K^T/V loads over more rows
@@ -442,33 +444,132 @@ def _qt_for(
     # 1.18x), so this is the rows, not the kernel. bf16 D=64 is the exception:
     # 8 rows x 64 dims of accumulator is 32 zmm, and the spill instructions eat
     # more than the wider sweep gains (a wash). head_dim 32 gains nothing (0.94x).
-    if seq_k < 1024:
-        # Short and medium keys: 6 rows, not 4. Measured on the Ryzen (fp32,
-        # interleaved, min of 3 processes): 1.13x at 256x16x128 and 1.25x at
-        # 512x32x128 over 4 rows, 1.01x at 512x8x64 -- the traffic per row-key
-        # is D*4/qt bytes for both Q@K^T and P@V, so 4 rows move 1.5x the
-        # bytes of 6 and that is what binds once the key range is a few hundred
-        # tokens. Below 256 keys 4 still wins (1.5x over 8 at 128x8x64: too
-        # little work per work item for a wide row block).
-        return 4 if seq_k < 256 else 6
-    if head_dim == 32:
-        return 4
+    # ---- bf16 without an AMX kernel (ARM, and x86 when AMX is unavailable) --
     if is_bf16:
+        if seq_k < 1024:
+            return 4 if seq_k < 256 else 6
         # 6, not 8, in the L1-accumulator bf16 kernel: 1.03-1.06x at head_dim
         # 128 (48 zmm of accumulator against 64 at 8 rows). At head_dim 64 the
         # register dot kernel is not row-limited and 4 vs 6 is a wash
         # (0.98-1.04x), so 4 stays.
         return 6 if head_dim >= 128 else 4
-    # 6, not 8, at head_dim <= 64: 1.10x on the Ryzen at 1024x8x64. At head_dim
-    # 128 rows cost 64 zmm of accumulator in the L1-accumulator kernel and 8 vs
-    # 6 is a wash (0.99-1.00x), so 6 is kept for one rule fewer.
-    return 6
+    # ---- fp32 -------------------------------------------------------------
+    # Rows are the only axis K/V is reused across, so traffic per row-key is
+    # D*4/qt bytes for Q@K^T and again for P@V. Both boxes were swept; where
+    # they disagree the Xeon wins, since it is the target:
+    #   Ryzen (8 cores, 32 MB L3): 6 beats 4 by 1.13x at 256x16x128 and 1.25x
+    #     at 512x32x128, and 8 beats 6 by nothing anywhere.
+    #   Xeon (2 cores, 480 MB L3), interleaved medians of 5: head_dim 64 ->
+    #     6 beats 4 by 1.19-1.40x and 8 by 5-18%; head_dim 128 -> 10 beats 8 by
+    #     1.05-1.08x and 4 by 1.5x at seq >= 1024, while 512x32x128 prefers 8
+    #     (1.08x over 6).
+    if seq_k < 256:
+        # Too little work per work item for a wide row block: 4 beats 8 by 1.5x
+        # at 128x8x64.
+        return 4
+    if head_dim == 32:
+        return 4
+    if head_dim <= 64:
+        return 6
+    if seq_k < 1024:
+        return 8 if seq_k >= 512 else 6
+    return 10
+
+
+_CSRC = None
+"""ctypes handle for ``_csrc_kernels.so`` (the gcc-build AMX kernels), or False."""
+
+_AMX_ENV = os.environ.get("CPU_ATTENTION_AMX", "1") != "0"
+_KT_ENV = os.environ.get("CPU_ATTENTION_KT", "0")
+# Profiling only: "pack" skips the attention loop, "attn" skips the pack (which
+# then reads a stale buffer, so the result is garbage -- timings only).
+_AMX_MODE = os.environ.get("CPU_ATTENTION_AMX_MODE", "")
+
+
+def _csrc():
+    """The gcc-built x86 kernels, or None when they are unavailable here."""
+    global _CSRC
+    if _CSRC is None:
+        try:
+            import ctypes
+
+            lib = ctypes.CDLL(os.environ.get("CPU_ATTENTION_CSRC", _CSRC_PATH))
+            lib.dense_amx_ok.restype = ctypes.c_int
+            lib.dense_amx_ok.argtypes = []
+            fn = lib.dense_amx_bf16
+            fn.restype = ctypes.c_int
+            fn.argtypes = (
+                [ctypes.c_void_p] * 4
+                + [ctypes.c_int64] * 18
+                + [ctypes.c_double]
+                + [ctypes.c_int64] * 3
+            )
+            _CSRC = lib
+        except (OSError, AttributeError):
+            _CSRC = False
+    return _CSRC or None
+
+
+_AMX_OK = None
+
+
+def amx_available() -> bool:
+    """True when this build/CPU can run the AMX bf16 dense kernel.
+
+    Cached: `dense_amx_ok()` calls `arch_prctl(ARCH_REQ_XCOMP_PERM)` to ask for
+    tile-data permission, i.e. a syscall, and the answer cannot change within a
+    process. Without the cache every bf16 call paid that syscall even on a CPU
+    that has no AMX at all.
+    """
+    global _AMX_OK
+    if _AMX_OK is None:
+        lib = _csrc()
+        _AMX_OK = bool(lib is not None and _AMX_ENV and lib.dense_amx_ok() == 1)
+    return _AMX_OK
+
+
+def _amx_dense(q, k, v, scale: float, causal: bool):
+    """Run the C/AMX kernel, or return None when it cannot take this call.
+
+    One work item is 32 query rows of one (batch, head), so the kernel is only
+    reachable for bf16 with a supported head dim; everything else falls back to
+    the Mojo path.
+    """
+    lib = _csrc()
+    if lib is None or not _AMX_ENV:
+        return None
+    if not amx_available() or q.shape[-1] not in (32, 64, 128):
+        return None
+    out = torch.empty_like(q, memory_format=torch.contiguous_format)
+    batch, seq_q, num_heads, head_dim = q.shape
+    seq_k, num_kv_heads = k.shape[1], k.shape[2]
+    qs, ks, vs, os_ = q.stride(), k.stride(), v.stride(), out.stride()
+    tasks = batch * num_heads * (-(-seq_q // 32))
+    rc = lib.dense_amx_bf16(
+        q.data_ptr(), k.data_ptr(), v.data_ptr(), out.data_ptr(),
+        batch, seq_q, seq_k, num_heads, num_kv_heads, head_dim,
+        qs[0], qs[1], qs[2],
+        ks[0], ks[1], ks[2],
+        vs[0], vs[1], vs[2],
+        os_[0], os_[1], os_[2],
+        float(scale), int(bool(causal)),
+        _workers(tasks, 8),
+        int(_KT_ENV or 0)
+        | (1 << 16 if _AMX_MODE == "pack" else 0)
+        | (1 << 17 if _AMX_MODE == "attn" else 0)
+        | (int(_AMX_MODE[3:], 16) << 18 if _AMX_MODE.startswith("abl") else 0),
+    )
+    return out if rc == 0 else None
 
 
 def _dense(q, k, v, scale: float, causal: bool):
     """Run the dense kernel over contiguous-``head_dim`` q/k/v (already checked)."""
     batch, seq_q, num_heads, head_dim = q.shape
     seq_k, num_kv_heads = k.shape[1], k.shape[2]
+    if q.dtype == torch.bfloat16:
+        out = _amx_dense(q, k, v, scale, causal)
+        if out is not None:
+            return out
     bfmmla = k.dtype == torch.bfloat16 and _bfmmla()
     if _QT_ENV:
         qt = int(_QT_ENV)

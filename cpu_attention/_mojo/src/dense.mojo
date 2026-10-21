@@ -1776,8 +1776,13 @@ def _run_shape[
         _dense_dispatch[dtype, head_dim, 6](job, num_workers)
     elif qt == 8:
         _dense_dispatch[dtype, head_dim, 8](job, num_workers)
+    elif qt == 10:
+        # Additive arm for the x86 sweep on the Xeon; no ARM path selects it.
+        _dense_dispatch[dtype, head_dim, 10](job, num_workers)
+    elif qt == 12:
+        _dense_dispatch[dtype, head_dim, 12](job, num_workers)
     else:
-        raise Error("cpu_attention dense: qt must be 2, 4, 6 or 8")
+        raise Error("cpu_attention dense: qt must be 2, 4, 6, 8, 10 or 12")
 
 
 def _run_dtype[dtype: DType](job: DenseJob, num_workers: Int, qt: Int) raises:
