@@ -329,7 +329,15 @@ def _qt_for(
     So 4 -> 6 is a free win once the key range is long enough for the extra
     traffic reduction to pay for the shorter per-row block, and 8 loses to the
     register wall (``head_dim / LANES`` = 16 accumulator registers per row at
-    head_dim 64). head_dim 128 is left at 2: 32 registers per row already.
+    head_dim 64).
+
+    head_dim 128 takes the same 6, which is *not* the "32 registers per row
+    already" argument one would make from the register file: this kernel keeps
+    the output accumulator in L1 (``acc``/``accv`` are stack allocations), so
+    rows cost ``kt + dc`` registers per row, not ``head_dim``, and the row count
+    is what divides the 16-byte K/V loads. Measured interleaved on m9g against
+    the shipped ``qt=2``, ``qt=6`` is 1.42x at S=1024, 1.52x at S=2048 and 1.73x
+    at S=4096 (fp32, H=16, D=128); ``qt=4`` and ``qt=8`` are 1.18x and 1.55x.
 
     bf16 on ARM is a different path (``bfmmla``) that keeps its own tile
     geometry, and head_dim picks the rows there; x86 (``lanes == 16``) keeps 4.
@@ -345,7 +353,10 @@ def _qt_for(
     if lanes < 16:
         if head_dim <= 64:
             return 6 if seq_k >= 1024 else 4
-        return 2
+        # head_dim 128 takes the same 6 (1.42-1.73x over the old qt=2); the
+        # "32 registers per row" argument does not apply because this kernel keeps
+        # the accumulator in L1, so a row costs kt + dc registers.
+        return 6
     # x86. Measured on m8i (4 physical cores), 1/4/8 threads, interleaved:
     # qt=8 is 1.19x at head_dim 64 fp32 and 1.14x at 128, and the row effect is
     # 1.18-1.19x no matter which kernel runs (register 1.19x, L1-accumulator
@@ -416,7 +427,12 @@ def _dense(q, k, v, scale: float, causal: bool):
         vt.stride(2) if vt is not None else 0,
         _DTYPE_CODES[k.dtype],
         mode,
-        _workers(batch * num_kv_heads, seq_k // 64),
+        # The pack is one task per (batch, kv head) and each task does
+        # `seq_k` strided row copies, so "pages" has to count tokens, not
+        # 64-token blocks: at 8 heads the old `seq_k // 64` kept the pack
+        # single-threaded up to seq_k 512, where it costs 23.7 us of a 71 us
+        # call at S=128 (8 workers: 5.5 us).
+        _workers(batch * num_kv_heads, seq_k // 8),
     )
 
     out = torch.empty_like(q, memory_format=torch.contiguous_format)
