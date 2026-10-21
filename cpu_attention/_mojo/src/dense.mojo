@@ -2302,6 +2302,53 @@ def _gomp_worker_dense(data: Int) abi("C"):
 
 
 @inline(.always)
+comptime ARM_V2 = LANES < 16
+"""Whether this build is the ARM path whose v2 kernels pair q blocks below."""
+
+
+@inline(.always)
+def _dense_arm_rows[
+    dtype: DType, head_dim: Int, qt: Int
+](job: DenseJob, batch: Int, head: Int, kv_head: Int, q0: Int):
+    """The v2 tile kernel for this dtype (bf16 ``bfmmla`` or fp32)."""
+    comptime if dtype == DType.bfloat16:
+        _dense_rows_tile[head_dim, qt, TILE_KS, 4, TILE_NSQ](
+            job, batch, head, kv_head, q0
+        )
+    else:
+        _dense_rows_tile_f32[head_dim, qt, TILE_KS, 8, 8](
+            job, batch, head, kv_head, q0
+        )
+
+
+def _dense_task_pair[
+    dtype: DType, head_dim: Int, qt: Int
+](job: DenseJob, task: Int):
+    """One work item = the cheapest *and* the most expensive q block of a head.
+
+    Causal work grows linearly with ``q0``, so round-robin over q blocks leaves
+    whichever thread draws the late blocks with ~1.4x the average work: at
+    S=128 15% of the call was sitting in the OpenMP barrier
+    (``gomp_team_barrier_wait_end`` + ``gomp_barrier_wait_end``, 14.6% of the
+    process by ``perf``). Pairing block ``g`` with block ``qgroups-1-g`` makes
+    every work item the same cost and halves the number of work items, which
+    also halves the per-item prologue.
+    """
+    var qgroups = (job.seq_q + qt - 1) // qt
+    var gpairs = (qgroups + 1) // 2
+    var gp = task % gpairs
+    var rest = task // gpairs
+    var head = rest % job.num_heads
+    var batch = rest // job.num_heads
+    var kv_head = head
+    if job.num_heads != job.num_kv_heads:
+        kv_head = head // (job.num_heads // job.num_kv_heads)
+    _dense_arm_rows[dtype, head_dim, qt](job, batch, head, kv_head, gp * qt)
+    var g2 = qgroups - 1 - gp
+    if g2 != gp:
+        _dense_arm_rows[dtype, head_dim, qt](job, batch, head, kv_head, g2 * qt)
+
+
 def _dense_task[dtype: DType, head_dim: Int, qt: Int](job: DenseJob, task: Int):
     var qgroups = (job.seq_q + qt - 1) // qt
     var g = task % qgroups
@@ -2330,12 +2377,7 @@ def _dense_task[dtype: DType, head_dim: Int, qt: Int](job: DenseJob, task: Int):
                     job, batch, head, kv_head, q0
                 )
             else:
-                # v2: the key tile's logits staged in L1 (one softmax over
-                # ``TILE_KS`` keys instead of one per 16), which is what lets
-                # the row block grow to 8 rows -- and rows are the only lever
-                # on the K/V read traffic, since they are what a K vector is
-                # amortised over. ``CPU_ATTENTION_QT=4`` still selects v1.
-                _dense_rows_tile[head_dim, qt, TILE_KS, 4, TILE_NSQ](
+                _dense_arm_rows[dtype, head_dim, qt](
                     job, batch, head, kv_head, q0
                 )
         elif dtype == DType.bfloat16 and BF16_DOT:
@@ -2343,10 +2385,7 @@ def _dense_task[dtype: DType, head_dim: Int, qt: Int](job: DenseJob, task: Int):
                 job, batch, head, kv_head, q0
             )
         elif qt > 4:
-            # fp32 v2: the key tile's logits in L1, one softmax per 64 keys,
-            # 8 rows. ``CPU_ATTENTION_QT=4`` still selects the old 16-key
-            # online-softmax path for an A/B.
-            _dense_rows_tile_f32[head_dim, qt, TILE_KS, 8, 8](
+            _dense_arm_rows[dtype, head_dim, qt](
                 job, batch, head, kv_head, q0
             )
         else:
@@ -2372,21 +2411,41 @@ def _dense_dispatch[
     dtype: DType, head_dim: Int, qt: Int
 ](job: DenseJob, num_workers: Int):
     var qgroups = (job.seq_q + qt - 1) // qt
+    comptime paired = (
+        LANES < 16
+        and qt > 4
+        and (dtype == DType.float32 or (dtype == DType.bfloat16 and BFMMLA))
+    )
+    comptime if paired:
+        qgroups = (qgroups + 1) // 2
     var items = job.batch * job.num_heads * qgroups
     if items == 0:
         return
-    comptime task_fn = _dense_task[dtype, head_dim, qt]
     var workers = min(num_workers, items)
-    if workers <= 1:
-        for task in range(items):
-            _dense_task[dtype, head_dim, qt](job, task)
-        return
-    var state = stack_allocation[1, DenseDispatch]()
-    state[] = DenseDispatch(job, task_fn, items)
-    comptime entry = _gomp_worker_dense
-    external_call["GOMP_parallel", NoneType](
-        entry, Int(state), Int32(workers), Int32(0)
-    )
+    comptime if paired:
+        if workers <= 1:
+            for task in range(items):
+                _dense_task_pair[dtype, head_dim, qt](job, task)
+            return
+        var state = stack_allocation[1, DenseDispatch]()
+        comptime tfp = _dense_task_pair[dtype, head_dim, qt]
+        state[] = DenseDispatch(job, tfp, items)
+        comptime entry_p = _gomp_worker_dense
+        external_call["GOMP_parallel", NoneType](
+            entry_p, Int(state), Int32(workers), Int32(0)
+        )
+    else:
+        if workers <= 1:
+            for task in range(items):
+                _dense_task[dtype, head_dim, qt](job, task)
+            return
+        var state = stack_allocation[1, DenseDispatch]()
+        comptime tfn = _dense_task[dtype, head_dim, qt]
+        state[] = DenseDispatch(job, tfn, items)
+        comptime entry_n = _gomp_worker_dense
+        external_call["GOMP_parallel", NoneType](
+            entry_n, Int(state), Int32(workers), Int32(0)
+        )
 
 
 def _run_shape[
