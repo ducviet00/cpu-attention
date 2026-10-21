@@ -313,11 +313,13 @@ def _dense(q, k, v, scale: float, causal: bool):
     if _QT_ENV:
         qt = int(_QT_ENV)
     elif bfmmla:
-        # The bfmmla kernel carries two query rows per 2x2 tile and the whole
-        # softmax is charged per (row block, key tile), so more rows per work
-        # item is nearly free: 8 rows measures 2% faster than 4 at head_dim 64
-        # and 5% at 128 (where the key tile halves to keep the tile in registers).
-        qt = 8
+        # The bfmmla kernel carries two query rows per 2x2 tile and charges the
+        # whole softmax per (row block, key tile), so rows per work item are
+        # nearly free. head_dim decides: at 64 there is room for a 16-key tile
+        # with 4 rows (849 GFLOP/s vs 828 with 8 rows/8 keys), at 128 the key
+        # tile halves to 8 keys to stay inside 32 registers either way and 8
+        # rows wins (1122 vs 1032).
+        qt = 8 if head_dim >= 128 else 4
     elif _lanes() < 16:
         # 4-lane registers: head_dim/4 floats is 16 registers per row at
         # head_dim 64, so two rows is all that fits beside the logits.

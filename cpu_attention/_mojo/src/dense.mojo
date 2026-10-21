@@ -24,9 +24,17 @@ Structure, borrowd from vLLM's ``csrc/cpu`` ``VEC`` kernel:
   row-major, so the Python side hands us a transposed scratch copy);
 * V stays row-major: ``acc[d] += p[j] * v[j][d]`` is one FMA over the head dim,
   shared by every row of the block;
-* bf16 takes the same bf16 dot-product path as the paged kernel (``dpbf16ps`` /
-  ``bfdot``), which is what makes bf16 faster than fp32 here: AVX-512 has no
-  native bf16 add/multiply, so the only thing bf16 may be used for is the dot.
+* bf16 takes a bf16 dot-product path (``dpbf16ps`` on AVX-512, ``bfdot`` on
+  pre-``bfmmla`` ARM), which is what makes bf16 faster than fp32 here: AVX-512
+  has no native bf16 add/multiply, so the only thing bf16 may be used for is the
+  dot;
+* on ARM the bf16 path is instead ``_dense_rows_bfmmla``: ``vbfmmlaq_f32``
+  accumulates a 2x2 fp32 tile per instruction (four fp32 lanes of output per
+  lane slot, against ``bfdot``'s two) on *both* phases, which is what vLLM's
+  ``csrc/cpu`` NEON kernel does and why it is the reference to beat here. K and
+  V are repacked by the Python side for it (``_transpose_head`` mode 2 packs K
+  position-paired over four head dims, ``_vpack_head`` packs V position-major
+  over head-dim pairs, because P@V contracts over keys).
 
 Work items are handed out round-robin over the OpenMP pool (``GOMP_parallel`` on
 torch's own pool, as in ``attention.mojo``) because causal masking makes the
@@ -107,15 +115,6 @@ comptime BDCP = 8
 """Head-dim *pairs* per P@V chunk (16 head dims): ``qt/2 * 8`` accumulator
 registers beside one V vector and the probability panel. Mirrors vLLM's
 ``NTile = 8`` output columns per gemm call."""
-
-comptime BSUB = 16
-"""Keys per Q@K^T + softmax step on the ``bfmmla`` path.
-
-``qt/2 * sub/2`` 2x2 accumulator tiles have to fit beside the softmax working
-set, so the tile shrinks as the row block grows: 16 keys (16 tiles) at ``qt = 4``,
-8 keys (12-16 tiles) at ``qt = 6-8``. The load ratio moves the other way --
-``(qt/2 + sub/2) / (qt/2 * sub/2)`` loads per instruction, 0.63 at 4x16 and 0.5
-at 8x8 -- so both are worth having, and ``qt`` is the knob that decides."""
 
 
 struct DenseJob(Copyable, ImplicitlyCopyable, Movable):
@@ -722,9 +721,9 @@ def _exp2_fast(y: SIMD[DType.float32, 4]) -> SIMD[DType.float32, 4]:
     FMA, so this is the whole softmax.
     """
     comptime MAGIC = 12582912.0  # 1.5 * 2^23: add/sub rounds to nearest even
-    var yc = y.lt(SIMD[DType.float32, 4](-127.0)).select(
-        SIMD[DType.float32, 4](-127.0), y
-    )
+    # One fmaxnm: NaN (a masked lane whose centre is +inf) and anything below
+    # -127 both land on -127, whose exponent field is zero bits, so p is 0.
+    var yc = _vmax(y, SIMD[DType.float32, 4](-127.0))
     var n = (yc + SIMD[DType.float32, 4](MAGIC)) - SIMD[DType.float32, 4](
         MAGIC
     )
@@ -745,8 +744,18 @@ def _exp2_fast(y: SIMD[DType.float32, 4]) -> SIMD[DType.float32, 4]:
 def _vmax(
     a: SIMD[DType.float32, 4], b: SIMD[DType.float32, 4]
 ) -> SIMD[DType.float32, 4]:
-    """Elementwise max (SIMD comparisons are reducing, so spell it as a blend)."""
-    return a.lt(b).select(b, a)
+    """Elementwise max in one instruction.
+
+    ``a.lt(b).select(b, a)`` is the portable spelling (SIMD comparisons are
+    *reducing*, so ``max`` cannot be used directly) but compiles to fcmgt + bsl
+    -- two instructions on the critical path of the running-max chain, which is
+    serial. ``llvm.maxnum`` is ``fmaxnm``: one instruction, and it ignores NaN,
+    which is what lets the softmax skip the "no visible key yet" special case
+    (see ``_dense_rows_bfmmla``).
+    """
+    return llvm_intrinsic[
+        "llvm.maxnum.v4f32", SIMD[DType.float32, 4], has_side_effect=False
+    ](a, b)
 
 
 @inline(.always)
@@ -899,23 +908,25 @@ def _dense_rows_bfmmla[
                 var a1 = _exp2_fast(
                     SIMD[DType.float32, 4]((row_max[2 * rp + 1] - m1) * c1)
                 )[0]
-                # A row with no visible key yet has m == NEG_INF on both sides;
-                # centre it on 0 so the masked lanes come out as 0, not 2^0.
-                var off_lo = SIMD[DType.float32, 2](0.0)
-                var off_hi = SIMD[DType.float32, 2](0.0)
-                if m0 > Scalar[DType.float32](NEG_INF):
-                    off_lo = SIMD[DType.float32, 2](-m0 * c1)
-                if m1 > Scalar[DType.float32](NEG_INF):
-                    off_hi = SIMD[DType.float32, 2](-m1 * c1)
                 # One FMA per accumulator turns the scaled logit into log2 space
                 # (scale, max subtraction and the log2 factor folded into c1/c2),
-                # then 2^y is the polynomial.
-                var off = off_lo.join(off_hi)
-                var sumv = SIMD[DType.float32, 4](0.0)
-                comptime for v in range(NS):
-                    var p = _exp2_fast(accs[rp * NS + v] * c1 + off)
-                    sumv += p
-                    accs[rp * NS + v] = p
+                # then 2^y is the polynomial. A row with no visible key has
+                # m == NEG_INF, so its centre overflows to +inf: the logit is
+                # -inf too, the sum is NaN, and `_exp2_fast`'s fmaxnm turns that
+                # into exactly 0 -- no special case needed.
+                var off = SIMD[DType.float32, 2](-m0 * c1).join(
+                    SIMD[DType.float32, 2](-m1 * c1)
+                )
+                var sum0 = SIMD[DType.float32, 4](0.0)
+                var sum1 = SIMD[DType.float32, 4](0.0)
+                comptime for v in range(NS // 2):
+                    var p0 = _exp2_fast(accs[rp * NS + 2 * v] * c1 + off)
+                    var p1 = _exp2_fast(accs[rp * NS + 2 * v + 1] * c1 + off)
+                    accs[rp * NS + 2 * v] = p0
+                    accs[rp * NS + 2 * v + 1] = p1
+                    sum0 += p0
+                    sum1 += p1
+                var sumv = sum0 + sum1
                 row_sum[2 * rp] = row_sum[2 * rp] * a0 + sumv[0] + sumv[1]
                 row_sum[2 * rp + 1] = row_sum[2 * rp + 1] * a1 + sumv[2] + sumv[
                     3
@@ -1341,15 +1352,20 @@ def _dense_task[dtype: DType, head_dim: Int, qt: Int](job: DenseJob, task: Int):
         # bf16 runs the 2x2-tile `bfmmla` kernel, whose operands carry two query
         # rows at a time; the 4-lane paths keep the head-dim `pairs` layout.
         comptime if dtype == DType.bfloat16 and BFMMLA:
+            # Tile choice: ``qt/2 * sub/2`` 2x2 accumulator tiles have to fit
+            # beside the softmax working set, and the load ratio goes the other
+            # way -- (qt/2 + sub/2) / (qt/2 * sub/2) loads per instruction, 0.63
+            # at 4 rows x 16 keys and 0.5 at 8 x 8. The per-softmax-step fixed
+            # cost dominates the load ratio at head_dim 64 (a 16-key step is 16%
+            # faster than an 8-key one at qt = 4), while at head_dim 128 there
+            # is 2x the matmul per key, so 8 rows x 8 keys wins there.
             comptime if qt <= 4:
                 _dense_rows_bfmmla[head_dim, qt, BKS, 8, 16](
                     job, batch, head, kv_head, q0
                 )
             else:
-                # 3-4 row pairs: halve the key tile (8 keys = 12-16 tiles) and
-                # the P@V dim-pair chunk, or the tile stops fitting in 32
-                # registers -- which is what made qt = 8 spill and run 15%
-                # slower than qt = 6 when both used the qt = 4 tile.
+                # 3-4 row pairs: halve the key tile and the P@V dim-pair chunk,
+                # or the tile stops fitting in 32 registers.
                 _dense_rows_bfmmla[head_dim, qt, BKS, 4, 8](
                     job, batch, head, kv_head, q0
                 )
