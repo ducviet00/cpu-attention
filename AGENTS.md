@@ -452,14 +452,22 @@ i.e. attention 29.8-49.6 + interference +39.2 against 90.7 + 25.9.
    bf16 add/mul/fma — a bf16-native kernel scalarizes. Widening to fp32 and using
    bf16 only for the dot instruction is what makes this port fast.
 
-8. **The laptop throttles to ~2.0 GHz under sustained AVX-512** (`scaling_cur_freq`
+8. **A throttled baseline invalidates an optimisation.** A worker rewrote the
+   fp32 inner loop, measured 2.2-4.7x against a baseline taken while the box sat
+   at ~2 GHz, and the result was **1.63x slower at head_dim 64** than the kernel
+   it replaced (and 1.03-1.17x slower at 128). The fix is process-level
+   interleaving: `tests/ab_two_trees.py --old <tree> --new <tree>` runs one short
+   process per tree in alternating rounds and takes the median of the per-round
+   medians, so drift cannot favour either side. Run it before believing any
+   cross-run speedup.
+9. **The laptop throttles to ~2.0 GHz under sustained AVX-512** (`scaling_cur_freq`
    reads 2004 MHz mid-sweep; a second session on the box pushes the load average
    past 2). Absolute times and even *ratios* move 30-50% between sessions — the
    fp32/D=128 causal ratio measured 0.63 to 1.09 for the same binary. Only
    interleaved A/B inside one process is trustworthy (`/tmp`-style script: run
    variant A, B, A, B... and take per-variant medians); `tests/bench_dense.py`
    blocks per variant and is therefore a coarse number only.
-9. **Nothing about the dense kernel's blocking matters**: with drift-controlled
+10. **Nothing about the dense kernel's blocking matters**: with drift-controlled
    A/B, `qt` = 2/4/6/8 sits within 1% at head_dim 128 (register spilling is not
    the limiter), and the KV-outer loop order (vLLM's: one (batch, head) per work
    item, L2-sized key chunks, `acc`/`m`/`l` in memory) is also within 1% there
@@ -471,7 +479,7 @@ i.e. attention 29.8-49.6 + interference +39.2 against 90.7 + 25.9.
    `TileGemm82` micro-kernel does more per FMA than the broadcast-FMA inner
    loops here. Closing it is a GEMM-tile rewrite (§13.3), not a knob.
 
-10. **Dense kernel (laptop, 8 threads, causal, `tests/bench_dense.py`)**: bf16 is
+11. **Dense kernel (laptop, 8 threads, causal, `tests/bench_dense.py`)**: bf16 is
    1.26-2.5× torch SDPA, fp32 1.0-2.0× — except `H=16/D=128` at S=1024 (0.83×,
    the register wall above) and S=128 (0.93×, where the call is 80 µs and SDPA
    is 78). Absolute: bf16 936 GFLOP/s (H=8/D=64) and 645 (H=16/D=128); fp32 700
@@ -550,6 +558,15 @@ default of 16 is also the C++ kernel's best point (67 vs 76 µs at block 32).
    dim after the permute has stride 1) — 1.5 ms for the 16 MB K of
    `S=1024/H=16/D=128`, which was the whole reason fp32 lost that shape. The
    blocked Mojo pass (16 tokens per 64-byte store) does it at 40-70 GB/s.
+
+11b. **`exp` on a SIMD is not a polynomial in this stdlib.** `std.math.exp`
+   costs ~22 instructions per vector here (`~36 cycles/lane` in the x86 worker's
+   measurement, which made it 58% of *their* kernel). `_vexp` in `dense.mojo`
+   (Cephes degree-8 + magic-constant rounding + exponent insert, ~10 FMAs) is
+   neutral on AVX-512 fp32 but worth **+18% on x86 bf16 head_dim 128** (647 ->
+   782 GFLOP/s, i.e. vLLM parity) and 20% on NEON. Clamping at -87 keeps masked
+   lanes at ~0, and `fma()` from `std.math` is what guarantees contraction -- the
+   multiply/add pairs in this kernel did *not* fuse on their own.
 
 ## 12. Box access and environment
 
