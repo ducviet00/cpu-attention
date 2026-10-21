@@ -1123,10 +1123,12 @@ def _dense_rows_bfmmla[
                 var ap = Array[SIMD[DType.bfloat16, 8], RP](uninitialized=True)
                 comptime for rp in range(RP):
                     ap[rp] = probs.unsafe_load[width=8]((kg * RP + rp) * 8)
+                # One pointer bump per key group, then every dim pair is a
+                # compile-time offset off it: taking the stride inside the d loop
+                # turned each of the `dcp` loads into a `madd`.
+                var vp = vbase.unsafe_offset(kg * job.v_stride_t)
                 comptime for d in range(dcp):
-                    var vv = vbase.unsafe_load[width=8](
-                        kg * job.v_stride_t + d * 8
-                    )
+                    var vv = vp.unsafe_load[width=8](d * 8)
                     comptime for rp in range(RP):
                         accv[rp * dcp + d] = _bfmmla(
                             accv[rp * dcp + d], ap[rp], vv
@@ -1660,15 +1662,15 @@ def _dense_rows_tile_f32[
                 accs[i] = zero
             var d = 0
             while d < head_dim:
+                var kp = kt_sub.unsafe_offset(d * KS_STRIDE)
                 var kv = Array[SIMD[DType.float32, LANES], KV](
                     uninitialized=True
                 )
                 comptime for v in range(KV):
-                    kv[v] = kt_sub.unsafe_load[width=LANES](
-                        d * KS_STRIDE + v * LANES
-                    )
+                    kv[v] = kp.unsafe_load[width=LANES](v * LANES)
+                var qp = q_t.unsafe_offset(d * qt)
                 comptime for h in range(qt // LANES):
-                    var qv = q_t.unsafe_load[width=LANES](d * qt + h * LANES)
+                    var qv = qp.unsafe_load[width=LANES](h * LANES)
                     comptime for i in range(LANES):
                         comptime for v in range(KV):
                             accs[(h * LANES + i) * KV + v] += (
@@ -1773,21 +1775,24 @@ def _dense_rows_tile_f32[
                 var pv = Array[SIMD[DType.float32, LANES], qt](
                     uninitialized=True
                 )
+                # One base per key group: `r * ks` is then a compile-time offset,
+                # instead of an address computation per row.
+                var pp = probs.unsafe_offset(kg * 4)
                 comptime for r in range(qt):
-                    pv[r] = probs.unsafe_load[width=LANES](r * ks + kg * 4)
+                    pv[r] = pp.unsafe_load[width=LANES](r * ks)
                 # The four keys of the group are the four *lanes* of the
                 # probability vector, so this has to be comptime: a runtime
                 # lane index would spill the vector to the stack.
+                var vg = v_base.unsafe_offset(
+                    (t0 + kg * 4) * job.v_stride_t + c * dc
+                )
                 comptime for kgi in range(4):
                     var vv = Array[SIMD[DType.float32, LANES], DV](
                         uninitialized=True
                     )
                     comptime for v in range(DV):
-                        vv[v] = v_base.unsafe_load[width=LANES](
-                            (t0 + kg * 4 + kgi) * job.v_stride_t
-                            + c * dc
-                            + v * LANES
-                        )
+                        vv[v] = vg.unsafe_load[width=LANES](v * LANES)
+                    vg = vg.unsafe_offset(job.v_stride_t)
                     comptime for r in range(qt):
                         comptime for v in range(DV):
                             accv[r * DV + v] += vv[v] * SIMD[DType.float32, LANES](
