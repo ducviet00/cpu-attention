@@ -305,6 +305,50 @@ through the environment).
 
 _QT_ENV = os.environ.get("CPU_ATTENTION_QT")
 
+
+def _qt_for(
+    lanes: int, is_bf16: bool, head_dim: int, seq_k: int, bfmmla: bool
+) -> int:
+    """Query rows per work item, per (ISA, dtype, head_dim, seq_k).
+
+    ``qt`` is the *only* dimension across which K/V is reused, so traffic per
+    row-key scales as ``1/qt``. That is what binds on the server boxes (see
+    ``PROFILE_ARM.md`` §10 and ``PROFILE_X86.md``): on x86 fp32 the load-bound
+    fraction is 48% vs vLLM's 15% and ``CPU_ATTENTION_QT=8`` is worth 1.20-1.34x.
+
+    ARM (``lanes < 16``), fp32/bfdot, head_dim 64, measured on m9g
+    (Neoverse-V3, 3.28 GHz, single core, interleaved, medians of 5, parity
+    asserted per variant), as a fraction of qt=4::
+
+        S        1024    2048    4096
+        qt=2     0.80x   0.79x   0.77x
+        qt=4     1.00x   1.00x   1.00x
+        qt=6     1.09x   1.10x   1.11x
+        qt=8     0.78x   0.76x   0.76x
+
+    So 4 -> 6 is a free win once the key range is long enough for the extra
+    traffic reduction to pay for the shorter per-row block, and 8 loses to the
+    register wall (``head_dim / LANES`` = 16 accumulator registers per row at
+    head_dim 64). head_dim 128 is left at 2: 32 registers per row already.
+
+    bf16 on ARM is a different path (``bfmmla``) that keeps its own tile
+    geometry, and head_dim picks the rows there; x86 (``lanes == 16``) keeps 4.
+    """
+    if bfmmla:
+        # The bfmmla kernel carries two query rows per 2x2 tile and charges the
+        # whole softmax per (row block, key tile), so rows per work item are
+        # nearly free. head_dim decides: at 64 there is room for a 16-key tile
+        # with 4 rows (849 GFLOP/s vs 828 with 8 rows/8 keys), at 128 the key
+        # tile halves to 8 keys to stay inside 32 registers either way and 8
+        # rows wins (1122 vs 1032).
+        return 8 if head_dim >= 128 else 4
+    if lanes < 16:
+        if head_dim <= 64:
+            return 6 if seq_k >= 1024 else 4
+        return 2
+    return _QT
+
+
 def _dense(q, k, v, scale: float, causal: bool):
     """Run the dense kernel over contiguous-``head_dim`` q/k/v (already checked)."""
     batch, seq_q, num_heads, head_dim = q.shape
@@ -312,20 +356,8 @@ def _dense(q, k, v, scale: float, causal: bool):
     bfmmla = k.dtype == torch.bfloat16 and _bfmmla()
     if _QT_ENV:
         qt = int(_QT_ENV)
-    elif bfmmla:
-        # The bfmmla kernel carries two query rows per 2x2 tile and charges the
-        # whole softmax per (row block, key tile), so rows per work item are
-        # nearly free. head_dim decides: at 64 there is room for a 16-key tile
-        # with 4 rows (849 GFLOP/s vs 828 with 8 rows/8 keys), at 128 the key
-        # tile halves to 8 keys to stay inside 32 registers either way and 8
-        # rows wins (1122 vs 1032).
-        qt = 8 if head_dim >= 128 else 4
-    elif _lanes() < 16:
-        # 4-lane registers: head_dim/4 floats is 16 registers per row at
-        # head_dim 64, so two rows is all that fits beside the logits.
-        qt = 2
     else:
-        qt = _QT
+        qt = _qt_for(_lanes(), k.dtype == torch.bfloat16, head_dim, seq_k, bfmmla)
 
     # Q@K^T wants K transposed (one head dim, all positions contiguous), which a
     # dense K is not. Each bf16 path asks for its own packing: the dot pairs two

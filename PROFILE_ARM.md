@@ -582,3 +582,61 @@ current `qt=4` at S=4096 D=64 bf16 in an `tests/ab_two_trees.py` run (interleave
 alternating rounds). If it is not, the remaining 3.76 cycles of ARM overhead are
 latency/spill inside the softmax block rather than traffic, and the next target is the
 `[sp, ...]` traffic (21-26% of the super-tile loop body) rather than `qt`.
+
+## 11. Round 3 (implementation, dated): fp32 `qt=6` merged, tile decoupling rejected
+
+Two changes were attempted against the §10 diagnosis. Increments are over the
+pre-round `main`, measured on a fresh m9g (Neoverse-V3) with single-core,
+process-interleaved, alternating-round medians — never a single run.
+
+### 11.1 Change 1 — fp32 `qt` rule: **MERGED**, 1.37-1.39x
+
+`_kernel.py` now picks rows per work item by (ISA, dtype, head_dim, seq_k) in
+`_qt_for(...)`, carrying the measured table in its docstring; `CPU_ATTENTION_QT`
+still overrides. On ARM fp32/D=64 the old default was `qt=2`, which the sweep in
+§10 showed is the worst point (0.77-0.80x of `qt=4`). Drift-controlled A/B,
+`tests/ab_two_trees.py --old <pre-change> --new . --dtype fp32 --threads 1`:
+
+| shape | dtype | old µs | new µs | ratio |
+|---|---|---:|---:|---:|
+| S=1024 H=8 D=64 | fp32 | 31260 | 22809 | **1.37x** |
+| S=2048 H=8 D=64 | fp32 | 123317 | 88666 | **1.39x** |
+| S=1024 H=16 D=128 | fp32 | 120462 | 120511 | 1.00x |
+| S=2048 H=16 D=128 | fp32 | 498506 | 498766 | 1.00x |
+
+D=128 is deliberately unchanged (32 registers per row already; the rule keeps
+`qt=2` there), so the change is inert where it was not measured. `tests/test_dense.py`
+41/41 and `tests/test_flash_api.py` green after the change. GF/s: 35 → 48 at
+2048:8:64 fp32, i.e. now 1.15x SDPA on that row (was 0.79x).
+
+### 11.2 Change 2 — decouple `qt` from the tile geometry: **REJECTED (regressed)**
+
+Tested the cheap form of §10.2 first: keep `sub=16, dcp=8` for every `qt`
+(`BIG_TILE`) instead of flipping to `(4,8)` above `qt=4`, and compare at *fixed*
+`qt=8` so only the geometry differs (`scripts/prof/arm/ab_rounds.py`, 5
+alternating rounds, S=4096 H=8 D=64 bf16):
+
+| variant | qt | tile | µs | vs qt=4 |
+|---|---:|---|---:|---:|
+| `new_qt4` (merged default) | 4 | (8,16) | **151567** | 1.000x |
+| `old_qt8` | 8 | (4,8) | 161183 | 0.940x |
+| `new_qt8` (`BIG_TILE`) | 8 | (8,16) | 175812 | 0.862x |
+
+So: (i) `qt=8` loses regardless of geometry, reproducing §10's 0.94x; (ii) the
+decoupled `(8,16)` geometry at `RP=4` is **9% worse than the coupled `(4,8)`** —
+175812 vs 161183. `RP=4` x `NS=8` is 32 logit registers before any operand, so
+the allocator spills more than the 2x key-tile amortisation returns.
+
+**This fires the §10.2 abandon criterion** (`≥5% faster` required; −16% observed),
+so the kernel change was reverted and `dense.mojo` is untouched this round. Per
+that criterion, the remaining 3.76 cycles/row-key of ARM overhead are **not**
+recoverable through row-count/tile geometry — they are spill and latency inside
+the 23% softmax block, plus the 1/qt traffic that is already at its ARM optimum
+for bf16 (`qt=4`) and now for fp32 (`qt=6`).
+
+### 11.3 Attribution
+
+If only one change can be merged: **take change 1** — 1.37-1.39x on ARM fp32,
+zero effect at D=128, no kernel edit, parity green. Change 2 is a regression and
+must not be merged; the `qt`-based traffic lever is now exhausted on ARM bf16,
+which closes §10.2 and points the next round at the softmax block's `[sp]` traffic.
