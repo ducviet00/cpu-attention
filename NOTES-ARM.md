@@ -145,6 +145,39 @@ Consequences:
 `bench_vs_refs.py` for short shapes; `perf stat` remains fine for instruction
 counts at S>=1024.
 
+## fp16 softmax: the arithmetic is faster, the kernel is not
+
+NEON fp16 is 8 lanes per 128-bit vector, so the softmax's exp/sum/max should cost
+half the instructions. Measured per-instruction throughput
+(`scripts/prof/arm/f16perf.c`, 8 accumulators):
+
+| | cycles / 8 instructions | per instruction |
+|---|---:|---:|
+| `fmla v.4s` (fp32) | 3.97 | 2.0/cycle |
+| `fmla v.8h` (fp16) | 2.90 | 2.8/cycle |
+| `fmul v.8h` | 1.98 | 4.0/cycle |
+| `fadd v.8h` | 2.27 | 3.5/cycle |
+| `fmaxnm v.8h` | 2.43 | 3.3/cycle |
+
+So 1.4x per instruction and ~2.8x per element. Implemented (`_exp2_f16`: clamp,
+`roundeven.v8f16`, degree-3 poly, `fcvtzs`+`shl`+`fmul`, all 8-lane) with the
+panel order built in fp32 first, one `fcvtn`+`fcvtn2` to get the 8 lanes, a `+4`
+headroom offset folded into the per-row `off` (so the fp16 denormal cliff sits at
+2^-18 of the row max and the exponent field stays in [1,15]; the +4 cancels in
+acc/sum), and the row sum accumulated in one fp16 vector, converted once per
+tile.
+
+Result: **instructions 20.87 -> 18.75 per row-key (-10%) and wall time +1.7%
+(7248 -> 7344 us at S=2048; +3.8% at 1024:16:128)**. IPC 3.56 -> 3.28 and
+`stall_backend` up: the fp32->fp16 conversion of the two argument halves and the
+fp16->bf16 conversion of the panel sit on the critical path, and they cost more
+than the halved polynomial saves. Parity was fine (7.8e-3 / 1.6e-2). Reverted.
+
+If this is worth revisiting it needs the *conversions* removed, not the exp made
+faster: i.e. keep the tiles in fp16 end to end (fp16 K/V panels via the matmul),
+which is blocked because `bfmmla` takes bf16 operands and fp16 K/V would break
+the range contract for general inputs.
+
 ## Dead ends (measured, do not repeat)
 
 * **Q@K^T loop unrolled x2** (two head-dim groups per iteration, to halve the
@@ -189,7 +222,21 @@ estimate of "14-18% of an S=128 call" came from `gomp_barrier_wait_end` *sample
 share* at a trivial shape, which overstates it: the barrier is most of the
 *CPU* time there only because the work is ~1 us.
 
-## Scoreboard (dev box, 4 cores, pack included, rounds 9, after this session)
+## Scoreboard (dev box, 4 cores, pack included, rounds 21, clean process)
+
+o/vllm bf16 **1.03-1.34**, fp32 **0.91-1.10**; 22/22 vs SDPA, 5/22 vs vLLM.
+Rows above the line: bf16 1.03, 1.06, 1.07, 1.07, 1.11, 1.13, 1.13, 1.14, 1.21,
+1.26, 1.34 and fp32 1.03, 1.03, 1.03, 1.05, 1.10.
+
+### Row-1 caveat, and my own mistake
+
+`bench_vs_refs.py` now burns 1.2 s before the first shape, and row 1 reads 54 us
+/ 0.61 / 1.33 correctly -- *provided nothing else is running*. A `verify.sh`
+launched while a previous run was still alive reported the S=128 bf16 row as
+1.47 / 2.83 (ours 117 us, SDPA 132 us, vLLM 116 us: every variant 2.5x slow).
+That was my own overlap, not the harness. One run at a time.
+
+### Earlier table (rounds 9, before the output rewrite)
 
 `tests/bench_vs_refs.py`, o/vllm: bf16 **1.03-1.36**, fp32 **0.91-1.12**;
 **22/22** rows beat SDPA (was 17/22 at the start of the campaign, 22/22 after the
