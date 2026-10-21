@@ -578,6 +578,75 @@ def _amx_dense(q, k, v, scale: float, causal: bool):
     return out if rc == 0 else None
 
 
+_AMX_IMPL = os.environ.get("CPU_ATTENTION_AMX_IMPL", "mojo")
+
+
+def _mojo_amx():
+    """Return the extension's AMX entry point, bound once, or None."""
+    global _MOJO_AMX
+    try:
+        if _MOJO_AMX is None:
+            mod = require()
+            _MOJO_AMX = mod.dense_amx_attention if mod.dense_has_amx() else False
+    except (AttributeError, RuntimeError):
+        _MOJO_AMX = False
+    return _MOJO_AMX or None
+
+
+_MOJO_AMX = None
+
+
+def amx_mojo_available() -> bool:
+    """True when the *Mojo* AMX kernel is compiled in and usable here."""
+    return _mojo_amx() is not None and amx_available() and _AMX_IMPL != "c"
+
+
+def _amx_dense_mojo(q, k, v, scale: float, causal: bool):
+    """Run the Mojo AMX kernel, or None when it cannot take this call.
+
+    bf16 only for now: fp32 goes through the C kernel's 3-term path (every
+    operand split into bf16 hi/lo, three products), which this port does not
+    carry yet. The packed K/V slabs are workspace, like the AVX-512 pack's, so
+    they are not re-faulted every call.
+    """
+    entry = _mojo_amx()
+    if entry is None or _AMX_IMPL == "c" or not _AMX_ENV:
+        return None
+    if q.dtype != torch.bfloat16 or not amx_available():
+        return None
+    batch, seq_q, num_heads, head_dim = q.shape
+    seq_k, num_kv_heads = k.shape[1], k.shape[2]
+    if head_dim not in (32, 64, 128) or seq_k < 1 or seq_q < 1:
+        return None
+    # Layout the kernel reads: one 1 KB tile per (key block, dim chunk).
+    kb32 = -(-seq_k // 32)          # V blocks: 32 keys
+    kb16 = kb32 * 2                 # K blocks: 16 keys
+    dc32, dc16 = head_dim // 32, head_dim // 16
+    kp_bh, vp_bh = kb16 * dc32 * 512, kb32 * dc16 * 512
+    nbh = batch * num_kv_heads
+    kp = _scratch("amx_kp", (nbh * kp_bh,), torch.bfloat16)
+    vp = _scratch("amx_vp", (nbh * vp_bh,), torch.bfloat16)
+    out = torch.empty_like(q, memory_format=torch.contiguous_format)
+    qs, ks, vs, os_ = q.stride(), k.stride(), v.stride(), out.stride()
+    # Match the C kernel's default super-tile (it is clamped to MAXKT = 512
+    # inside the kernel; 256 measured best on the Xeon).
+    kt = int(os.environ.get("CPU_ATTENTION_AMX_KT") or 256)
+    tasks = batch * num_heads * (-(-seq_q // 32))
+    entry(
+        q.data_ptr(), kp.data_ptr(), vp.data_ptr(), out.data_ptr(),
+        k.data_ptr(), v.data_ptr(),
+        batch, seq_q, seq_k, num_heads, num_kv_heads, head_dim,
+        qs[0], qs[1], qs[2],
+        ks[0], ks[1], ks[2],
+        vs[0], vs[1], vs[2],
+        os_[0], os_[1], os_[2],
+        kp_bh, vp_bh, kb16, kb32, dc32, dc16,
+        float(scale), int(bool(causal)), kt,
+        _workers(tasks, 8),
+    )
+    return out
+
+
 def _dense(q, k, v, scale: float, causal: bool):
     """Run the dense kernel over contiguous-``head_dim`` q/k/v (already checked)."""
     batch, seq_q, num_heads, head_dim = q.shape
