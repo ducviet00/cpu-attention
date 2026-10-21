@@ -1,0 +1,19 @@
+[workspace]
+authors = ["ducviet00 <vietyb00@gmail.com>"]
+channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
+name = "cpu-attention"
+# Linux only: the kernel runs on torch's OpenMP pool via libgomp, which is
+# linked into the extension (`-Xlinker -lgomp`).
+platforms = ["linux-64", "linux-aarch64"]
+version = "0.1.0"
+
+[tasks]
+# Build the Python extension module the `cpu_attention` package loads (../_C.so).
+build = "mkdir -p build && mojo build src/_C.mojo --emit shared-lib -o ../_C.so -Xlinker -lgomp"
+# Standalone kernel test (no torch, no Python): layout, tail masking, online softmax.
+# -lgomp: the kernel runs on torch's OpenMP pool (GOMP_parallel), so the binary
+# must link libgomp; `mojo run` JITs and cannot resolve it, hence build + run.
+test = "mkdir -p build && mojo build -I src tests/test_attention.mojo -o build/test_attention -Xlinker -lgomp && build/test_attention"
+
+[dependencies]
+mojo = ">=1.2.0.dev2026102005,<2"
