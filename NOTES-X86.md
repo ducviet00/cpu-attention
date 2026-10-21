@@ -287,3 +287,82 @@ registers -- dense.mojo's formulation, replacing my unpack/permute2x128 version
 with two stack arrays) changed nothing measurable: the pack is memory-bound, not
 instruction-bound. It stays because it is smaller and has no stack traffic, and
 `dense_amx_pack_selftest` now verifies both formulations agree.
+
+---
+
+# Round 3 — the AMX kernel in Mojo (the C shim is gone)
+
+Branch `x86-amx-mojo` off `main` (23df21e). The campaign's finish line is one
+language and one build artifact, so the kernel now lives in
+`cpu_attention/_mojo/src/dense_amx.mojo` (`amx.mojo` underneath) and
+`cpu_attention/_csrc/`, `scripts/build.py`'s gcc step, the ctypes plumbing and
+`_csrc_kernels.so` are deleted.
+
+**The port had never executed.** It compiled for `--target-cpu sapphirerapids`
+and the emitted instructions were checked, but every parity run before this one
+was served by the C shim: `main`'s Python gate sent fp32 to C, and for bf16
+`_mojo_amx()` gated on `dense_has_amx()` — which was False — so the "c vs mojo"
+A/B I ran earlier compared the C kernel with itself (1.00x everywhere, which
+should have been the tell). Lesson: a dispatch experiment needs an assertion
+that the *other* path is the one running.
+
+## Three bugs, all only findable on hardware
+
+1. **Element offsets used as byte addresses.** Mojo has no typed pointers, so
+   every offset must be scaled by the element size; half the file added element
+   offsets to a byte address. That is correct only at offset 0 (batch 0, first
+   head, first key block), so the symptom was "NaN / O(1) errors for multi-head
+   or multi-block, fine for the first one". `_ea(base, elem, esize)` now makes
+   the convention explicit at every site and is the first place to look.
+2. **The V pack wrote hi and lo to the same slab.** A shared `dst` plus
+   `512 + r*32` in one store and `r*32` in another: the lo slab came out equal
+   to the hi slab, i.e. a silent **2x in P@V** (V=1 in, 2.0 out). Separate
+   `hi_p`/`lo_p` pointers. Found by dumping the packed workspace and comparing
+   it against the source, not by reading the kernel.
+3. **The QK key-block pitch was hardcoded 512 bf16** while fp32 packs an
+   (hi, lo) pair per (key block, dim chunk), pitch 1024. Invisible for key
+   block 0, wrong for every later one: it only showed at `seq_k > 32`, and only
+   in fp32. Exactly the bug the C kernel had.
+
+Also: `_C.dense_amx_init()` now exposes the `arch_prctl(ARCH_REQ_XCOMP_PERM)`
+probe, so `_kernel.amx_available()` asks for tile-data permission itself rather
+than relying on torch's oneDNN having done it.
+
+## Performance: C vs Mojo, interleaved (`tests/ab_two_trees.py`)
+
+Ratio is **C/Mojo**, so <1 means the Mojo kernel is slower. Same box, alternating
+processes, medians of the per-round medians.
+
+| shape | bf16 first run | bf16 final | fp32 final |
+|---|---|---|---|
+| 128:8:64 | 0.84 | 0.88 | 1.01 |
+| 1024:8:64 | 0.83 | 0.97 | 0.94 |
+| 4096:8:64 | 0.78 | 0.96 | 0.95 |
+| 1024:16:128 | 0.84 | 0.97 | 0.96 |
+| 4096:16:128 | 0.82 | 0.97 | 0.95 |
+
+Two things closed almost all of the 16-22% gap:
+
+* **`stack_allocation` aligns to the element size**, so the logits/prob/acc/qpad
+  buffers were 4- or 2-byte aligned while every access to them is 64 bytes — each
+  one split a cache line. `alignment=64` (the C version got it free from
+  `posix_memalign`) is worth **~15%** and is now commented as load-bearing in the
+  source. This is the single most portable Mojo lesson from the port.
+* Nothing else did. Removing the `~{memory}` clobber from `tdpbf16ps`/`tilezero`
+  (register-only instructions; `has_side_effect=True` still pins them in
+  program order) was **neutral** — 0.86/0.82/0.77 vs 0.88/0.83/0.78 — so the
+  "the clobber costs pipelining" theory that the gap suggested is falsified. It
+  is kept anyway because it describes the instruction correctly. `perf stat` on
+  1024:16:128 bf16 agrees that instruction count is not the残 residue: +4%
+  instructions, +8% cycles.
+* The remaining 3-5% on the long shapes and 12% at 128:8:64 is unexplained and
+  small; 128:8:64 is a 60 µs call dominated by per-call fixed costs.
+
+## Test lesson that cost the most time
+
+The `amx.mojo` smoke test compared a 16x16x32 GEMM against a scalar reference
+built from `a[i] = (i%7)*0.25`, `b[i] = (i%5)*-0.5` and reported 0.0 against a
+**wrong** B-operand model, because that data is regular enough to fit two
+different layouts. **Layout tests need irregular data.** With `(i*37)%101` the
+same test separates them immediately, and it also caught that
+`tdpbf16ps`'s AT&T operand order puts the destination tile *last*.
