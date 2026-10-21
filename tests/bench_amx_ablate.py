@@ -1,10 +1,11 @@
 """Phase ablation of the AMX attention loop: Q@K^T vs softmax vs P@V.
 
-Interleaved, one process. Numbers come from the C kernel's profiling bits
-(`CPU_ATTENTION_AMX_MODE=abl1` = no Q@K^T, `abl2` = no softmax, `abl4` = no
-P@V), so the loop structure is unchanged -- only the phase is skipped.
+The kernel has profiling bits (`CPU_ATTENTION_AMX_MODE`, see `_kernel.py`) that
+skip one phase; the loop structure is otherwise unchanged, so the difference is
+that phase's cost. Round-robin in one process: these boxes throttle, so a
+cross-run comparison is meaningless.
 
-    .venv/bin/python tests/bench_amx_ablate.py
+    .venv/bin/python tests/bench_amx_ablate.py --dtype bf16
 """
 
 import argparse
@@ -20,10 +21,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cpu_attention._kernel as K  # noqa: E402
 from bench_vs_refs import SHAPES, sdpa  # noqa: E402
 
+MODES = {"full": 0, "noPack": 1, "noAttn": 2, "noAll": 3,
+         "noQK": 16, "noSM": 32, "noPV": 64}
+
 
 def bench(fns, rounds):
     for f in fns.values():
-        for _ in range(2):
+        for _ in range(3):
             f()
     s = {n: [] for n in fns}
     for _ in range(rounds):
@@ -36,45 +40,43 @@ def bench(fns, rounds):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--rounds", type=int, default=7)
+    ap.add_argument("--rounds", type=int, default=9)
     ap.add_argument("--threads", type=int, default=0)
-    ap.add_argument("--shapes", default="")
+    ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp32"])
+    ap.add_argument("--shapes", default="128:8:64,256:16:128,512:8:64,1024:16:128")
     args = ap.parse_args()
     torch.set_num_threads(args.threads or torch.get_num_threads())
-    shapes = SHAPES
-    if args.shapes:
-        want = {tuple(int(x) for x in s.split(":")) for s in args.shapes.split(",")}
-        shapes = [s for s in shapes if s in want]
-
-    print(f"threads={torch.get_num_threads()}   bf16 causal, us; "
-          "shares are of the attention part (full - pack)")
+    dt = torch.bfloat16 if args.dtype == "bf16" else torch.float32
+    want = {tuple(int(x) for x in s.split(":")) for s in args.shapes.split(",")}
+    shapes = [s for s in SHAPES if s in want] or sorted(want)
+    print(f"threads={torch.get_num_threads()} {args.dtype}; shares are of the "
+          f"attention part (total - pack - fixed)")
     for seq, heads, dim in shapes:
-        q = torch.randn(1, seq, heads, dim, dtype=torch.bfloat16)
-        k = torch.randn(1, seq, heads, dim, dtype=torch.bfloat16)
-        v = torch.randn(1, seq, heads, dim, dtype=torch.bfloat16)
-        modes = {"full": "", "noqk": "abl1", "nosm": "abl2", "nopv": "abl4",
-                 "pack": "attn", "sdpa": None}
+        q = torch.randn(1, seq, heads, dim, dtype=dt)
+        k = torch.randn_like(q)
+        v = torch.randn_like(q)
         fns = {}
-        for name, mode in modes.items():
-            if mode is None:
-                fns[name] = lambda: sdpa(q, k, v, True)
-            else:
-                def f(mode=mode):
-                    K._AMX_MODE = mode
-                    K._dense(q, k, v, dim ** -0.5, True)
-                fns[name] = f
+        for name, bit in MODES.items():
+            def f(bit=bit):
+                K._AMX_MODE_V = bit
+                K._dense(q, k, v, dim ** -0.5, True)
+            fns[name] = f
+        fns["sdpa"] = lambda: sdpa(q, k, v, True)
         m = bench(fns, args.rounds)
-        K._AMX_MODE = ""
-        attn = m["full"] - m["pack"]
-        qk = attn - (m["noqk"] - m["pack"])
-        sm = attn - (m["nosm"] - m["pack"])
-        pv = attn - (m["nopv"] - m["pack"])
-        print(f"  S={seq:5d} H={heads:2d} D={dim:3d}: full={m['full']:7.0f} "
-              f"pack={m['pack']:6.0f} attn={attn:7.0f} | "
-              f"qk={qk:6.0f} ({100*qk/attn:3.0f}%) "
-              f"sm={sm:6.0f} ({100*sm/attn:3.0f}%) "
-              f"pv={pv:6.0f} ({100*pv/attn:3.0f}%) "
-              f"resid={attn-qk-sm-pv:5.0f} | o/sdpa {m['full']/m['sdpa']:4.2f}")
+        K._AMX_MODE_V = 0
+        pack = m["full"] - m["noPack"]      # marginal cost of the pack
+        attn = m["full"] - m["noAttn"]      # marginal cost of the attention loop
+        fixed = m["noAll"]                  # neither phase: region + marshalling
+        # each phase's marginal cost, as a share of the attention part
+        qk = m["full"] - m["noQK"]
+        sm = m["full"] - m["noSM"]
+        pv = m["full"] - m["noPV"]
+        print(f"  S={seq:5d} H={heads:2d} D={dim:3d}: total={m['full']:6.0f} "
+              f"pack={pack:5.0f} ({100*pack/m['full']:3.0f}%) "
+              f"fixed={fixed:4.0f} attn={attn:6.0f} | "
+              f"qk={100*qk/attn:3.0f}% sm={100*sm/attn:3.0f}% "
+              f"pv={100*pv/attn:3.0f}% resid={100*(1-(qk+sm+pv)/attn):4.0f}% "
+              f"o/sdpa {m['full']/m['sdpa']:4.2f}")
     return 0
 
 

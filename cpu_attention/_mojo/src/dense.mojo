@@ -2793,8 +2793,17 @@ def _fused_shape[
         _dense_fused[dtype, head_dim, 8](
             tjob, djob, mode, num_workers, dtype_code_t
         )
+    elif qt == 10:
+        # The x86 fp32 row count (`_kernel._qt_for`); no ARM path selects it.
+        _dense_fused[dtype, head_dim, 10](
+            tjob, djob, mode, num_workers, dtype_code_t
+        )
+    elif qt == 12:
+        _dense_fused[dtype, head_dim, 12](
+            tjob, djob, mode, num_workers, dtype_code_t
+        )
     else:
-        raise Error("cpu_attention dense: qt must be 2, 4, 6 or 8")
+        raise Error("cpu_attention dense: qt must be 2, 4, 6, 8, 10 or 12")
 
 
 def _fused_dtype[

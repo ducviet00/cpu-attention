@@ -71,7 +71,7 @@ for ISA in $ISAS; do
   DT=""
   [ "$ISA" = "amx" ] && DT="--dtype bf16"
   echo "== matrix, isa=$ISA$DT =="
-  "${SSH[@]}" "bash -lc 'cd ~/cpu-attention && .venv/bin/python tests/bench_vs_refs.py --vllm $REF --isa $ISA $DT --rounds 5 --json ~/verify-$LABEL-$ISA.json 2>/dev/null | tail -3'"
+  "${SSH[@]}" "bash -lc 'cd ~/cpu-attention && .venv/bin/python tests/bench_vs_refs.py --vllm $REF --isa $ISA $DT --rounds ${ROUNDS:-9} --json ~/verify-$LABEL-$ISA.json 2>/dev/null | tail -3'"
 done
 
 echo "== scorecard (local) =="
@@ -79,4 +79,6 @@ mkdir -p /tmp/verify
 for ISA in $ISAS; do
   scp -q -i "$SSH_KEY" "$HOST:~/verify-$LABEL-$ISA.json" "/tmp/verify/$LABEL-$ISA.json"
 done
-ls /tmp/verify/"$LABEL"-*.json | xargs .venv/bin/python scripts/scorecard.py
+# scorecard.py is stdlib-only and this script is often run from a worktree that
+# has no .venv of its own.
+ls /tmp/verify/"$LABEL"-*.json | xargs python3 "$(dirname "${BASH_SOURCE[0]}")/scorecard.py"
