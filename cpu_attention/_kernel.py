@@ -275,6 +275,23 @@ def _bf16_dot() -> bool:
     return _BF16_DOT
 
 
+_BFMMLA = None
+
+
+def _bfmmla() -> bool:
+    """True when the bf16 path runs on NEON ``bfmmla``.
+
+    That kernel reads a different K *and* V layout (position-paired K over four
+    head dims, position-major V over head-dim pairs), so the caller allocates
+    both scratch buffers and packs V as well as K.
+    """
+    global _BFMMLA
+    if _BFMMLA is None:
+        _BFMMLA = bool(require().dense_bfmmla())
+    return _BFMMLA
+
+
+
 _QT = 4
 """Query rows per work item (``CPU_ATTENTION_QT`` overrides it).
 
@@ -292,8 +309,15 @@ def _dense(q, k, v, scale: float, causal: bool):
     """Run the dense kernel over contiguous-``head_dim`` q/k/v (already checked)."""
     batch, seq_q, num_heads, head_dim = q.shape
     seq_k, num_kv_heads = k.shape[1], k.shape[2]
+    bfmmla = k.dtype == torch.bfloat16 and _bfmmla()
     if _QT_ENV:
         qt = int(_QT_ENV)
+    elif bfmmla:
+        # The bfmmla kernel carries two query rows per 2x2 tile and the whole
+        # softmax is charged per (row block, key tile), so more rows per work
+        # item is nearly free: 8 rows measures 2% faster than 4 at head_dim 64
+        # and 5% at 128 (where the key tile halves to keep the tile in registers).
+        qt = 8
     elif _lanes() < 16:
         # 4-lane registers: head_dim/4 floats is 16 registers per row at
         # head_dim 64, so two rows is all that fits beside the logits.
@@ -302,21 +326,34 @@ def _dense(q, k, v, scale: float, causal: bool):
         qt = _QT
 
     # Q@K^T wants K transposed (one head dim, all positions contiguous), which a
-    # dense K is not. The dot path additionally wants (k[2d], k[2d+1]) pairs of a
-    # position adjacent, so the layout differs per path -- the kernel's pages are
-    # the same trade, done at store time. Padded to the key tile (64) so the last
-    # tile never reads past the buffer; the mask kills the padding lanes.
+    # dense K is not. Each bf16 path asks for its own packing: the dot pairs two
+    # head dims of a position, bfmmla pairs two positions of four head dims and
+    # needs V repacked too (its P@V contracts over keys). Padded to the key tile
+    # (64) so the last tile never reads past the buffer; the mask kills the
+    # padding lanes.
     seq_k_pad = -(-seq_k // 64) * 64
-    pairs = k.dtype == torch.bfloat16 and _bf16_dot()
-    if pairs:
+    if bfmmla:
+        mode = 2
         kt = torch.empty(
-            (batch, num_kv_heads, head_dim // 2, seq_k_pad, 2), dtype=k.dtype
+            (batch, num_kv_heads, head_dim // 4, seq_k_pad // 2, 8), dtype=k.dtype
         )
+        vt = torch.empty(
+            (batch, num_kv_heads, head_dim // 2, seq_k_pad // 4, 8), dtype=v.dtype
+        )
+    elif k.dtype == torch.bfloat16 and _bf16_dot():
+        mode = 1
+        kt = torch.empty((batch, num_kv_heads, head_dim // 2, seq_k_pad, 2),
+                         dtype=k.dtype)
+        vt = None
     else:
+        mode = 0
         kt = torch.empty((batch, num_kv_heads, head_dim, seq_k_pad), dtype=k.dtype)
+        vt = None
     _transpose_attention()(
         k.data_ptr(),
         kt.data_ptr(),
+        v.data_ptr() if vt is not None else 0,
+        vt.data_ptr() if vt is not None else 0,
         batch,
         num_kv_heads,
         seq_k,
@@ -326,21 +363,33 @@ def _dense(q, k, v, scale: float, causal: bool):
         k.stride(2),
         kt.stride(1),
         kt.stride(2),
+        v.stride(0),
+        v.stride(1),
+        v.stride(2),
+        vt.stride(1) if vt is not None else 0,
+        vt.stride(2) if vt is not None else 0,
         _DTYPE_CODES[k.dtype],
-        pairs,
+        mode,
         _workers(batch * num_kv_heads, seq_k // 64),
     )
 
     out = torch.empty_like(q, memory_format=torch.contiguous_format)
     qb, qtok, qh = q.stride(0), q.stride(1), q.stride(2)
-    vb, vtok, vh = v.stride(0), v.stride(1), v.stride(2)
+    # In mode 2 the kernel reads the packed V (one row per head dim *pair*, one
+    # column per 4-key group), so hand it those strides instead.
+    if vt is not None:
+        vb, vtok, vh = vt.stride(0), vt.stride(2), vt.stride(1)
+        v_ptr = vt.data_ptr()
+    else:
+        vb, vtok, vh = v.stride(0), v.stride(1), v.stride(2)
+        v_ptr = v.data_ptr()
     ob, otok, oh = out.stride(0), out.stride(1), out.stride(2)
     ktb, ktd, ktt = kt.stride(1), kt.stride(2), kt.stride(3)
     tasks = batch * num_heads * (-(-seq_q // qt))
     _dense_attention()(
         q.data_ptr(),
         kt.data_ptr(),
-        v.data_ptr(),
+        v_ptr,
         out.data_ptr(),
         batch,
         seq_q,
