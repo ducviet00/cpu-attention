@@ -479,6 +479,12 @@ _AMX_ENV = os.environ.get("CPU_ATTENTION_AMX", "1") != "0"
 # CPU disagrees with the measured 5.5-7.6e-5 error.
 _AMX_FP32_ENV = os.environ.get("CPU_ATTENTION_AMX_FP32", "1") != "0"
 
+# Profiling only (see tests/bench_amx_phases.py): 1 skips the K/V pack, 2 skips
+# the attention. The results are garbage in either mode; timings only.
+# Profiling only: 1 skip pack, 2 skip attention, 4/8 skip V/K pack, 16/32/64
+# skip Q@K^T / softmax / P@V. Results are garbage in any of these; timings only.
+_AMX_MODE_V = int(os.environ.get("CPU_ATTENTION_AMX_MODE", "0") or 0)
+
 _AMX_ENTRY = None
 
 
@@ -550,7 +556,7 @@ def _amx_dense(q, k, v, scale: float, causal: bool):
         os_[0], os_[1], os_[2],
         kp_bh, vp_bh, kb16, kb32, dc32, dc16,
         float(scale), int(bool(causal)), kt,
-        _workers(tasks, 8), int(fp32),
+        _workers(tasks, 8), int(fp32), int(_AMX_MODE_V),
     )
     return out
 

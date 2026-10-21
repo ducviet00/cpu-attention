@@ -153,6 +153,7 @@ def dense_amx_attention(
     kt: PythonObject,
     num_workers: PythonObject,
     fp32: PythonObject,
+    mode: PythonObject,
 ) raises:
     """Pack K/V into the AMX operand layouts and run the attention.
 
@@ -210,6 +211,7 @@ def dense_amx_attention(
     job.dc32 = Int(py=dc32)
     job.dc16 = Int(py=dc16)
     job.fp32 = Bool(fp32)
+    job.mode = Int(py=mode)
     run_dense_amx(pack, job, num_workers=Int(py=num_workers), kt=Int(py=kt))
 
 

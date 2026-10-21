@@ -366,3 +366,89 @@ built from `a[i] = (i%7)*0.25`, `b[i] = (i%5)*-0.5` and reported 0.0 against a
 different layouts. **Layout tests need irregular data.** With `(i*37)%101` the
 same test separates them immediately, and it also caught that
 `tdpbf16ps`'s AT&T operand order puts the destination tile *last*.
+
+---
+
+# Round 4 — the short-S rows: the per-call intercept, measured
+
+Branch `x86-small-s`. Question: why do the short/medium bf16 rows lose to
+vLLM-AMX, and is `128:8:64 fp32` (1.18 vs VEC) the same problem.
+
+## The answer, in one table
+
+`/tmp/intercept.py` style sweep, H=8 D=64 bf16 causal, 2 threads, medians:
+
+| S | ours us | vLLM-AMX us | ratio |
+|---:|---:|---:|---:|
+| 8 | 19 | 4 | 4.37 |
+| 16 | 22 | 7 | 3.11 |
+| 32 | 18 | 11 | 1.70 |
+| 64 | 29 | 26 | 1.14 |
+| 128 | 68 | 59 | 1.15 |
+| 256 | 200 | 179 | 1.12 |
+
+Fit the two lines: **our slope is 0.38 us/key, vLLM's is 0.43.** We are *faster
+per key than their AMX kernel*. The whole deficit is the intercept: **ours ~18 us,
+theirs ~4 us**, and it is flat in S, so it is exactly what dominates the seven
+losing rows and it is the same thing that loses `128:8:64 fp32`.
+
+## What the intercept is made of (`tests/bench_amx_phases.py`)
+
+| shape | total | pack | attention | fixed (region + marshalling) |
+|---|---:|---:|---:|---:|
+| 128:8:64 bf16 | 52 | 16 (31%) | 31 (60%) | 7.3 |
+| 256:16:128 bf16 | 431 | 116 (27%) | 338 | 13 |
+| 512:8:64 bf16 | 417 | 96 (23%) | 346 | 10 |
+| 128:8:64 fp32 | 97 | 37 (38%) | 61 | 7.9 |
+
+and inside the attention (`tests/bench_amx_ablate.py`, marginal cost of each
+phase as a share of the attention part): **Q@K^T 33-40%, softmax 45-55%, P@V
+0-10%** at these shapes — the softmax is the largest single piece, and P@V is
+nearly free once the accumulator is L1-resident.
+
+Independent confirmation that it is a *fixed* cost, not work: a heads sweep at
+S=128 gives +4.8 us per 4 items, i.e. **~1.2 us per work item on top of its
+matmul**, and our per-item overhead is about the same as vLLM's. Their advantage
+is entirely that their timed region starts with K/V already staged.
+
+## What I changed and what it was worth
+
+* **16x16 transpose in place, two temporaries.** The first version built a new
+  16-register array per stage, so 32 zmm were live on a 32-register machine.
+  K pack 19 -> 14 us, fp32 pack 44 -> 37. Ported.
+* **Profiling knobs** (`CPU_ATTENTION_AMX_MODE` bit table in the kernel header)
+  and `tests/bench_amx_phases.py` / `tests/bench_amx_ablate.py` rewritten for
+  them. These are what produced the tables above; keep them.
+
+## Falsified this round
+
+* **Hoisting the bounds check out of the pack's unrolled load loop.** The theory
+  was that 16 conditional loads per tile put every load in its own basic block
+  (IPC 0.16). Measured: neutral (pack 16-17 vs 14-16, inside noise). Reverted.
+* **Cost-ordered work-item dispatch.** A causal item's cost is proportional to
+  its key range, so plain round-robin gives one thread blocks 0+2 and the other
+  1+3 (128 vs 192 units at S=128) and the call scaled only 1.08x on two cores.
+  Ordering items by descending cost and round-robining over that should balance
+  it exactly. Measured: **no change at S=128 and 3% worse at 1024:16:128 and
+  4096:16:128**. Reverted. So the imbalance is not what limits the S=128 call.
+* **More threads.** 3T and 4T are within 1% of 2T at every shape
+  (2T/1T 1.83x, 4T/1T 1.83x at 1024:16:128), so this box has ~2 cores' worth of
+  throughput and `_physical_cores()` capping at 2 is right. Worth recording:
+  `/sys/.../thread_siblings_list` says cpu0 and cpu2 are siblings, but
+  `taskset -c 0,2` is *faster* than `taskset -c 0-1` (59 vs 65 us at S=128), i.e.
+  the VM's topology labels do not describe the host's real cores. Do not trust
+  them for affinity decisions.
+
+## The open item, with the numbers that bracket it
+
+The pack moves 512 KB (read+write) in 16 us at S=128 = **32 GB/s**, against a
+measured 139 GB/s for an L2-resident copy of that size. Its instruction budget is
+~96 per 1 KB tile (16 loads of 64 B, 64 `vpermt2d`, 16 stores) = ~25 K
+instructions per thread = **~2 us at 1.2 IPC**. Both estimates say 2-4 us; it
+takes 16. There are **no zmm spills** in either worker (`objdump` on
+`_gomp_worker_amx_bf16`: 0 `vmovdqu64 %zmm,(%rsp)`, 12 static `tileloadd`,
+2352 instructions total), so it is not register pressure. Something is stalling
+inside the pack loop that neither the instruction count nor the traffic explains,
+and that is the one thing left that would close these rows: at 3x the pack rate
+S=128 would be 52 -> 41 us against vLLM's 46-59, i.e. every remaining bf16 row
+and the fp32 row would flip.

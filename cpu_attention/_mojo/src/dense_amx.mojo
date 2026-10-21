@@ -191,171 +191,60 @@ def _row32(
 
 
 @inline(.always)
-def _tp16_i32(
-    m: Array[SIMD[DType.int32, 16], 16]
-) -> Array[SIMD[DType.int32, 16], 16]:
-    """16x16 transpose of 32-bit units, in registers.
+def _tp16_i32(m: Array[SIMD[DType.int32, 16], 16]) -> Array[
+    SIMD[DType.int32, 16], 16
+]:
+    """16x16 transpose of 32-bit units, in place, two registers of temporaries.
 
-    Four stages; stage `k` swaps bit `k` of the row index with bit `k` of the
-    lane index, and their product is the transpose. The same network as
-    `dense._tr16`, over int32 because a B tile is addressed in 32-bit units.
+    Stage `k` swaps bit `k` of the row index with bit `k` of the lane index, and
+    the product of the four stages is the transpose. The first version built a
+    *new* 16-register array per stage (`o`, then `a = o`), so 32 zmm were live on
+    a 32-register machine; each stage now writes back the pair it read, so the
+    peak is 16 + 2. Measured: worth ~25% of the K pack (a tile stays in
+    registers instead of round-tripping 2 KB through the stack).
     """
     var a = m.copy()
     comptime for k in range(4):
         comptime step = 1 << k
-        var o = Array[SIMD[DType.int32, 16], 16](uninitialized=True)
         comptime for i in range(16):
             comptime if (i >> k) & 1 == 0:
                 comptime b = i | step
                 comptime if k == 0:
-                    o[i] = a[i].shuffle[
-                        0,
-                        16,
-                        2,
-                        18,
-                        4,
-                        20,
-                        6,
-                        22,
-                        8,
-                        24,
-                        10,
-                        26,
-                        12,
-                        28,
-                        14,
-                        30,
+                    var t0 = a[i].shuffle[
+                        0, 16, 2, 18, 4, 20, 6, 22, 8, 24, 10, 26, 12, 28, 14, 30
                     ](a[b])
-                    o[b] = a[i].shuffle[
-                        1,
-                        17,
-                        3,
-                        19,
-                        5,
-                        21,
-                        7,
-                        23,
-                        9,
-                        25,
-                        11,
-                        27,
-                        13,
-                        29,
-                        15,
-                        31,
+                    var t1 = a[i].shuffle[
+                        1, 17, 3, 19, 5, 21, 7, 23, 9, 25, 11, 27, 13, 29, 15, 31
                     ](a[b])
+                    a[i] = t0
+                    a[b] = t1
                 comptime if k == 1:
-                    o[i] = a[i].shuffle[
-                        0,
-                        1,
-                        16,
-                        17,
-                        4,
-                        5,
-                        20,
-                        21,
-                        8,
-                        9,
-                        24,
-                        25,
-                        12,
-                        13,
-                        28,
-                        29,
+                    var t0 = a[i].shuffle[
+                        0, 1, 16, 17, 4, 5, 20, 21, 8, 9, 24, 25, 12, 13, 28, 29
                     ](a[b])
-                    o[b] = a[i].shuffle[
-                        2,
-                        3,
-                        18,
-                        19,
-                        6,
-                        7,
-                        22,
-                        23,
-                        10,
-                        11,
-                        26,
-                        27,
-                        14,
-                        15,
-                        30,
-                        31,
+                    var t1 = a[i].shuffle[
+                        2, 3, 18, 19, 6, 7, 22, 23, 10, 11, 26, 27, 14, 15, 30, 31
                     ](a[b])
+                    a[i] = t0
+                    a[b] = t1
                 comptime if k == 2:
-                    o[i] = a[i].shuffle[
-                        0,
-                        1,
-                        2,
-                        3,
-                        16,
-                        17,
-                        18,
-                        19,
-                        8,
-                        9,
-                        10,
-                        11,
-                        24,
-                        25,
-                        26,
-                        27,
+                    var t0 = a[i].shuffle[
+                        0, 1, 2, 3, 16, 17, 18, 19, 8, 9, 10, 11, 24, 25, 26, 27
                     ](a[b])
-                    o[b] = a[i].shuffle[
-                        4,
-                        5,
-                        6,
-                        7,
-                        20,
-                        21,
-                        22,
-                        23,
-                        12,
-                        13,
-                        14,
-                        15,
-                        28,
-                        29,
-                        30,
-                        31,
+                    var t1 = a[i].shuffle[
+                        4, 5, 6, 7, 20, 21, 22, 23, 12, 13, 14, 15, 28, 29, 30, 31
                     ](a[b])
+                    a[i] = t0
+                    a[b] = t1
                 comptime if k == 3:
-                    o[i] = a[i].shuffle[
-                        0,
-                        1,
-                        2,
-                        3,
-                        4,
-                        5,
-                        6,
-                        7,
-                        16,
-                        17,
-                        18,
-                        19,
-                        20,
-                        21,
-                        22,
-                        23,
+                    var t0 = a[i].shuffle[
+                        0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23
                     ](a[b])
-                    o[b] = a[i].shuffle[
-                        8,
-                        9,
-                        10,
-                        11,
-                        12,
-                        13,
-                        14,
-                        15,
-                        24,
-                        25,
-                        26,
-                        27,
-                        28,
-                        29,
-                        30,
-                        31,
+                    var t1 = a[i].shuffle[
+                        8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31
                     ](a[b])
-        a = o.copy()
+                    a[i] = t0
+                    a[b] = t1
     return a.copy()
 
 
@@ -586,6 +475,10 @@ struct AmxJob(Copyable, ImplicitlyCopyable, Movable):
     var dc32: Int
     var dc16: Int
     var fp32: Bool
+    var mode: Int
+    """Profiling only (CPU_ATTENTION_AMX_MODE): bit 0 skips the pack, bit 1 the
+    attention, bit 2 the V pack, bit 3 the K pack, bits 4/5/6 the Q@K^T, softmax
+    and P@V phases. Results are garbage whenever a bit is set."""
 
     def __init__(out self):
         self.q = 0
@@ -612,6 +505,7 @@ struct AmxJob(Copyable, ImplicitlyCopyable, Movable):
         self.dc32 = 0
         self.dc16 = 0
         self.fp32 = False
+        self.mode = 0
 
 
 @inline(.always)
@@ -743,7 +637,7 @@ def _amx_dense_item[
         var nkp = nch * KEYCH
 
         # ---- Q@K^T: KEYCH keys at a time, 32 rows, into fp32 logits ----
-        for ch in range(nch):
+        for ch in range(0 if (job.mode & 16) != 0 else nch):
             var k0 = t0 + ch * KEYCH
             # kstride, not 512: fp32 pairs a (hi, lo) slab per (key block, dim
             # chunk), so the pitch doubles. Getting this wrong is invisible for
@@ -812,7 +706,7 @@ def _amx_dense_item[
                         j += 16
 
         # ---- online softmax over the whole super-tile ----
-        for rg in range(2):
+        for rg in range(0 if (job.mode & 32) != 0 else 2):
             var lp = logits.unsafe_offset(rg * 16 * kt)
             var m_old = m1 if rg == 1 else m0
             for r in range(16):
@@ -872,7 +766,7 @@ def _amx_dense_item[
                 s0 = fma(s0, alpha, rows)
 
         # ---- P@V over the super-tile, two dim chunks (four accumulators) ----
-        var nks = (nk + 31) // 32
+        var nks = nk // 32 if (job.mode & 64) != 0 else (nk + 31) // 32
         var first = t0 == 0
         var dc = 0
         while dc < D // 16:
@@ -998,7 +892,12 @@ def _amx_worker[
     var nbh = state.pack.batch * state.pack.num_kv_heads
     var kinds = state.pack.kb16 * nbh  # K tasks first, then V
     var task = tid
+    if (state.job.mode & 1) != 0:
+        task = state.pack_items  # profiling: skip the pack
     while task < state.pack_items:
+        if (state.job.mode & 4) != 0 and task < kinds:
+            task += threads
+            continue
         if task < kinds:
             var kb = task % state.pack.kb16
             var bh = task // state.pack.kb16
@@ -1008,7 +907,7 @@ def _amx_worker[
                 bh % state.pack.num_kv_heads,
                 kb,
             )
-        else:
+        elif (state.job.mode & 8) == 0:  # profiling: bit 3 skips only the K pack
             var t = task - kinds
             var kb = t % state.pack.kb32
             var bh = t // state.pack.kb32
@@ -1039,6 +938,8 @@ def _amx_worker[
     var pplo = _ptr[BFloat16](Int(prob) + QROWS * MAXKT * 2)
     var qplo = _ptr[BFloat16](Int(qpad) + QROWS * DMAX * 2)
     task = tid
+    if (state.job.mode & 2) != 0:
+        task = state.items  # profiling: skip the attention
     var nqg = (state.job.seq_q + QROWS - 1) // QROWS
     while task < state.items:
         var g = task % nqg
