@@ -32,7 +32,7 @@ an issue-slot one.
 | # | technique | upstream | ours | verdict |
 |---|---|---|---|---|
 | 1 | 8-row x 32-key register-tiled micro-kernel, acc in registers, k-loop over head_dim | `cpu_attn_vec.hpp:37-130` | `_dense_rows` (4 rows x 64 keys) | same shape, different constant; `qt` is the knob |
-| 2 | **K^T stored block-major inside a page: `[head_dim, block_size]`, `k_cache_token_group_stride = BlockSizeAlignment = 32`** | `cpu_attn_vec.hpp:204-208`, page walk `cpu_attn_impl.hpp:1222-1276` | **no**: `_transpose_head` writes `[head_dim, seq_k]` | **MISSING — the one structural difference.** A Q@K^T tile then reads 128 rows at `block_size` stride inside a 64 KB page that the next 3 sub-tiles re-touch; ours reads 128 rows at `seq_k` stride (8 KB at S=2048/D=128 fp32) spread over 1 MB, so per tile we open 128 streams into a 1 MB stripe instead of streaming one 64 KB block. Same bytes, different locality: matches the measured L2 demand-miss 5.97% vs 0.07% and `bound_on_loads` 48% vs 15% |
+| 2 | K^T stored block-major inside a page (`[head_dim, block_size]`, `k_cache_token_group_stride = 32`) | `cpu_attn_vec.hpp:204-208`, walk `cpu_attn_impl.hpp:1222-1276` | we write `[head_dim, seq_k]` | **FALSIFIED as a cause — do not port.** It correlates with the L2 miss rate (5.97% vs 0.07%) but the correlation is not causal: overriding only the strides the kernel is handed, so that the K and V panels shrink to **88 KB total (L1-resident)** and the strided walk becomes dense, buys **1-2%** (`PROFILE_X86.md`, stride-override probe). The `l2_rqsts.demand_data_rd_miss` counter is a vPMU artefact on that box — it reports the same absolute count (5.7 M/call) for an 88 KB set as for a 1 MB one. Keeping our layout also protects the paged kernel, which already beats vLLM |
 | 3 | V row-major per page (`[block_size, head_dim]`), so P@V's B operand is 2 vectors of 32 contiguous dims per key | `cpu_attn_vec.hpp:216` | same (V is `[seq_k, head_dim]`) | have it |
 | 4 | P@V accumulator in memory, `accum_c` = "add onto first iteration's output" so it is never zeroed | `cpu_attn_impl.hpp:1330-1360` | `_dense_rows_mem` does the L1 acc, but zeroes it explicitly | partial |
 | 5 | P@V tiled over the head dim by `headdim_alignment = 32` | `:1330` | `dc = 2*LANES` (32 x86 / 8 NEON) | have it |
@@ -50,17 +50,28 @@ an issue-slot one.
 
 ## The short list
 
-1. **#2, block-major K^T.** The only row where the *storage layout*, not the
-   arithmetic, differs, and it is exactly the shape of the measured stall
-   profile. Our transpose already walks 16-token blocks, so writing
-   `[seq_k/BS][head_dim][BS]` instead of `[head_dim][seq_k]` is a small change on
-   the Python/writer side plus a stride in the kernel. Test: the same
-   `ab_two_trees.py` A/B with `l2_rqsts` counted per arm.
-2. **#14, AMX** for bf16 on Xeon, if Xeon is a deployment target — the only way to
+0. **What actually binds (measured, after #2 died).** Two deficits, and neither
+   is bytes: (a) the **load:FMA ratio sets a hard floor** — at `qt=4/kt=32` the
+   Q@K^T loop needs 6 zmm loads per 8 FMAs, so `llvm-mca` gives 1.0 FMA/cycle even
+   with every load in L1, and we run 0.42; (b) the **serial softmax chain**
+   (`reduce_max -> exp -> reduce_add -> rescale`) drains the pipeline every 32-64
+   keys — a tile is ~5 000 instructions, the reorder buffer cannot span two, and
+   vLLM reaches IPC 2.94 where we reach 1.41 *with fewer instructions per
+   row-key* (32.9 vs 35.3). Both point at the same lever: **more rows per K/V
+   sweep** (`qt`), which raises the FMA-per-load ratio and shortens the softmax
+   share. Measured on x86: `qt=8` is 1.19x (D=64 fp32) / 1.14x (D=128) at 1-8
+   threads, and the row effect is 1.18-1.19x *independently of which kernel runs*
+   (register 1.19x, L1-acc 1.18x — the L1-acc kernel is 6% slower wherever both
+   are legal, so raise `qt`, do not port the mem path).
+2. **Softmax off the inner loop** at `qt=8` with the vLLM structure (logits and
+   probabilities in a buffer, `kt` up to 512): predicted to lift IPC 1.57 -> >=2.0
+   for <=15% more instructions. Kill switch: abandon if IPC stays below 1.8 or
+   `in/pair` rises above 15%.
+3. **#14, AMX** for bf16 on Xeon, if Xeon is a deployment target — the only way to
    be competitive with SDPA there (it uses AMX: 5x our bf16).
-3. **#8 + #9 + #7** as a group (~8% combined) once #2 is in — cheap, and they
+4. **#8 + #9 + #7** as a group (~8% combined) once #2 is in — cheap, and they
    only make sense on top of a bigger tile.
-4. **#13, GQA head packing** if the target models are GQA rather than MHA.
+5. **#13, GQA head packing** if the target models are GQA rather than MHA.
 
 ## Deliberately not ported
 

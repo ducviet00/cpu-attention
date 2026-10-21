@@ -558,6 +558,18 @@ i.e. attention 29.8-49.6 + interference +39.2 against 90.7 + 25.9.
    `[BKS, 4, 8]` (half the key tile, double the row pairs) and blows the register
    file — that is a config coupling, not a row-count limit.
 
+   **The layout/bandwidth reading of those counters is also dead** (the x86
+   worker retracted its own round-1 mechanism with a stride-override probe:
+   starving K and V to an 88 KB, L1-resident working set buys **1-2%**, and the
+   `l2_rqsts` counter turns out to be a vPMU artefact that reports the same
+   absolute miss count for 88 KB and 1 MB). What binds is (a) the load:FMA ratio
+   as a *floor* -- 6 zmm loads per 8 FMAs at `qt=4/kt=32` gives 1.0 FMA/cycle even
+   with all loads in L1 -- and (b) the serial
+   `reduce_max -> _vexp -> reduce_add -> rescale` chain draining the pipeline
+   every 32-64 keys; vLLM reaches IPC 2.94 where we reach 1.41 *with fewer*
+   instructions per row-key. `qt` is the lever for both, and the row effect is
+   1.18-1.19x independent of which kernel runs (register or L1-acc).
+
    Why the old "blocking does not matter" note was wrong: it was measured on the
    **laptop**, 8 threads, 32 MB L3 and a private 1 MB L2 per core, where K/V
    traffic per row was not the binding term. On a 4-physical-core server slice

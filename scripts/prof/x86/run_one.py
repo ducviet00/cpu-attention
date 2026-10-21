@@ -46,6 +46,9 @@ def main() -> int:
     ap.add_argument("--workers", type=int, default=0,
                     help="CPU_ATTENTION_WORKERS equivalent, 0 = automatic")
     ap.add_argument("--qt", type=int, default=0)
+    ap.add_argument("--v-stride", type=int, default=0,
+                    help="SYNTHETIC, same idea for V: override the element stride "
+                         "between cache lines of the V sweep (0 = real layout).")
     ap.add_argument("--kt-stride", type=int, default=0,
                     help="SYNTHETIC address-pattern probe: override the element "
                          "stride between K^T head-dim rows (0 = the real layout). "
@@ -109,11 +112,18 @@ def main() -> int:
                 need = dim * args.kt_stride + seq + 256
                 kt_use = torch.zeros(need, dtype=k.dtype)
                 ktb, ktd, ktt = 0, args.kt_stride, 1
-            fn = lambda: dn(q.data_ptr(), kt_use.data_ptr(), v.data_ptr(),
+            vb, vtok, vh = v.stride(0), v.stride(1), v.stride(2)
+            v_use = v
+            if args.v_stride:
+                # same instruction stream, V confined to a small buffer
+                need = dim * args.v_stride + 256
+                v_use = torch.zeros(need, dtype=v.dtype)
+                vb, vtok, vh = 0, args.v_stride, 0
+            fn = lambda: dn(q.data_ptr(), kt_use.data_ptr(), v_use.data_ptr(),
                             out.data_ptr(), 1, seq, seq, heads, heads, dim,
                             q.stride(0), q.stride(1), q.stride(2),
                             ktb, ktd, ktt,
-                            v.stride(0), v.stride(1), v.stride(2),
+                            vb, vtok, vh,
                             out.stride(0), out.stride(1), out.stride(2),
                             scale, causal, K._DTYPE_CODES[q.dtype],
                             qt_used, K._workers(tasks, 8))
