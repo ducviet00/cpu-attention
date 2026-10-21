@@ -383,7 +383,7 @@ def _dense_rows[
         # Only the keys that exist: a short last tile has KT_TILE - jn masked
         # lanes whose probability is exactly 0, and reading their V would walk
         # past the end of the tensor (0 * garbage is garbage, not 0).
-        var jn = min(KT_TILE, seq_k - t0)
+        var jn = min(KT_TILE, loop_end - t0)
         var j = 0
         while j < jn:
             var vrow = v_base.unsafe_load[width=head_dim](
@@ -586,7 +586,7 @@ def _dense_rows_mem[
             row_max[r] = m_new
             probs.unsafe_store[width=kt](r * kt, p)
 
-        var jn = min(kt, seq_k - t0)
+        var jn = min(kt, loop_end - t0)
         comptime for dci in range(head_dim // dc):
             var accv = Array[SIMD[DType.float32, dc], qt](uninitialized=True)
             comptime for r in range(qt):
@@ -759,7 +759,7 @@ def _dense_rows_dot[
         # Only the keys that exist: a short last tile has KT_TILE - jn masked
         # lanes whose probability is exactly 0, and reading their V would walk
         # past the end of the tensor (0 * garbage is garbage, not 0).
-        var jn = min(KT_TILE, seq_k - t0)
+        var jn = min(KT_TILE, loop_end - t0)
         var j = 0
         while j < jn:
             var vrow = v_base.unsafe_load[width=head_dim](
