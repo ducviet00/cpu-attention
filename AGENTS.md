@@ -467,17 +467,40 @@ i.e. attention 29.8-49.6 + interference +39.2 against 90.7 + 25.9.
    interleaved A/B inside one process is trustworthy (`/tmp`-style script: run
    variant A, B, A, B... and take per-variant medians); `tests/bench_dense.py`
    blocks per variant and is therefore a coarse number only.
-10. **Nothing about the dense kernel's blocking matters**: with drift-controlled
-   A/B, `qt` = 2/4/6/8 sits within 1% at head_dim 128 (register spilling is not
-   the limiter), and the KV-outer loop order (vLLM's: one (batch, head) per work
-   item, L2-sized key chunks, `acc`/`m`/`l` in memory) is also within 1% there
-   (+5-9% at head_dim 64, where it is not needed). An 8x smaller KV working set
-   (GQA `Hk=1`) does run **1.72x** faster, but that is K/V *shared across heads*,
-   which neither loop order reproduces per head — so the D=128 gap is not
-   bandwidth. What is left is instruction density: vLLM is 1.2x ahead at
-   head_dim 64 and 1.7x at 128, the ratio growing with head_dim, i.e. their
-   `TileGemm82` micro-kernel does more per FMA than the broadcast-FMA inner
-   loops here. Closing it is a GEMM-tile rewrite (§13.3), not a knob.
+10. **Nothing about the dense kernel's blocking matters**, and the *reason* is
+   not what it looks like. Drift-controlled A/B: `qt` = 2/4/6/8 sits within 1% at
+   head_dim 128, the KV-outer loop order (one (batch, head) per work item,
+   L2-sized key chunks, `acc`/`m`/`l` in memory) is within 1% (+5-9% at head_dim
+   64), a head-dim-tiled L1 accumulator is within 1%, and a hand-written
+   register-tiled GEMM (`_dense_rows_gemm`, explicit `fma`, logits and
+   probabilities in registers, pointer-bumped K/V) was **1.63x slower at fp32
+   head_dim 64 and 1.03-1.17x slower at 128**.
+
+   That kills the obvious theory, which this file used to state: "we issue ~4
+   instructions per 2 FMAs, a GEMM micro-tile issues 1 load per 8, so build a
+   GEMM tile". It is wrong on both halves.
+
+   * *Loads were never the constraint.* `qt` **is** the FMA-per-load ratio of
+     P@V (one V vector feeds `qt` FMAs), and sweeping it 2 -> 8 changes nothing,
+     so the load ports are not binding. Per d-iteration the Q@K^T loop already
+     runs ~10 loads against 16 `vfmadd` in 16 cycles: the FMA port is saturated
+     at ~1 zmm FMA/cycle and the loads use a quarter of their capacity. There is
+     nothing for a tile to win.
+   * *What costs is instruction count in the softmax and dependency latency.*
+     `std.math.exp` was **22 instructions per vector** (58% of the worker's
+     kernel, ~17% of a tile in ours); `_vexp` at ~10 is worth +18% on x86 bf16
+     head_dim 128. On ARM the `bfmmla` pipe runs at **1.02-1.30/cycle against a
+     measured ceiling of 2.0** (0.152 ns/instr, marginal fit **0.5 cycle per
+     `bfmmla`** = exactly the ceiling), and the whole deficit is a **~3.0
+     cycles/row-key softmax that does not overlap the matmul** (37% of the D=64
+     runtime, 12 instructions/row-key against 5 of real work, ~60% of it
+     `ldr/str q,[sp]` spill and remat). x86 agrees: phase split at D=128 is
+     Q@K^T 31% / softmax+P@V 69%.
+
+   Corollary that bit twice: **adding loads does hurt** (ARM "one row pair at a
+   time" duplicates K loads -> -11%), while *removing* them (GEMM tile,
+   L1-staged logits) buys nothing. So: the target is fewer instructions and
+   better overlap in the softmax, not a different tiling.
 
 11. **Dense kernel (laptop, 8 threads, causal, `tests/bench_dense.py`)**: bf16 is
    1.26-2.5× torch SDPA, fp32 1.0-2.0× — except `H=16/D=128` at S=1024 (0.83×,
@@ -601,15 +624,14 @@ default of 16 is also the C++ kernel's best point (67 vs 76 µs at block 32).
    mask generalised to `j <= q0 + r + (len - q)` and the group loop to start at
    the row's window instead of position 0 — the dense kernel's boundary-tile
    mask (§4a) is the worked-out version of exactly that logic.
-3. **Dense: a GEMM micro-kernel for both phases** (vLLM's `TileGemm82`).
-   Measured facts (§9.9-9.10): blocking does not matter, bandwidth does not
-   matter, and the gap to vLLM grows with head_dim (1.2x at 64, 1.7x at 128), so
-   the remaining cost is FMA *density*: 8 rows x 8-column register tiles for
-   Q@K^T (one reload of K^T feeds 8 accumulator updates in registers instead of
-   1) and the same for P@V, with the accumulator in memory. Both variants tried
-   this round — head-dim-tiled acc in L1, and KV-outer chunks — were within 1%
-   of the current kernel, so a rewrite must change the *inner* GEMM, not the
-   loop order or the buffers.
+3. **Dense: ~~a GEMM micro-kernel for both phases~~ — falsified, do not retry.**
+   `_dense_rows_gemm` was built and measured (§9.10): 1.63x *slower* at fp32
+   head_dim 64, 1.03-1.17x slower at 128. The premise ("1 load per 8 FMAs beats
+   1 per 2") does not hold because these cores are not load-bound (see §9.10).
+   What the same worker did find is worth keeping: **multiply/add pairs did not
+   contract on their own** in the fp32 loops (`vmulps` + `vaddps`), so `fma()`
+   from `std.math` should be explicit wherever a loop is written fresh.
+
 4. **ARM: the softmax, not the tile.** Round 2 built four variants and reverted
    all of them (numbers in `4c7ca5d`), which fixes the remaining 1.45x
    precisely. Measured on the box: `bfmmla` issues at **2.0/cycle** (0.152 ns,
