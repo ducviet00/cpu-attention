@@ -480,6 +480,10 @@ _CSRC = None
 """ctypes handle for ``_csrc_kernels.so`` (the gcc-build AMX kernels), or False."""
 
 _AMX_ENV = os.environ.get("CPU_ATTENTION_AMX", "1") != "0"
+# fp32 goes through the same kernel with bf16 hi/lo operand splitting (three
+# products per phase); this switch is for A/B and for falling back if a future
+# CPU disagrees with the measured error.
+_AMX_FP32_ENV = os.environ.get("CPU_ATTENTION_AMX_FP32", "1") != "0"
 _KT_ENV = os.environ.get("CPU_ATTENTION_KT", "0")
 # Profiling only: "pack" skips the attention loop, "attn" skips the pack (which
 # then reads a stale buffer, so the result is garbage -- timings only).
@@ -496,14 +500,17 @@ def _csrc():
             lib = ctypes.CDLL(os.environ.get("CPU_ATTENTION_CSRC", _CSRC_PATH))
             lib.dense_amx_ok.restype = ctypes.c_int
             lib.dense_amx_ok.argtypes = []
-            fn = lib.dense_amx_bf16
-            fn.restype = ctypes.c_int
-            fn.argtypes = (
+            argtypes = (
                 [ctypes.c_void_p] * 4
                 + [ctypes.c_int64] * 18
                 + [ctypes.c_double]
                 + [ctypes.c_int64] * 3
             )
+            for name in ("dense_amx_bf16", "dense_amx_fp32"):
+                fn = getattr(lib, name, None)
+                if fn is not None:
+                    fn.restype = ctypes.c_int
+                    fn.argtypes = argtypes
             _CSRC = lib
         except (OSError, AttributeError):
             _CSRC = False
@@ -531,21 +538,30 @@ def amx_available() -> bool:
 def _amx_dense(q, k, v, scale: float, causal: bool):
     """Run the C/AMX kernel, or return None when it cannot take this call.
 
-    One work item is 32 query rows of one (batch, head), so the kernel is only
-    reachable for bf16 with a supported head dim; everything else falls back to
-    the Mojo path.
+    bf16 is native (Q/K/P are already bf16); fp32 runs the same kernel with every
+    operand split into bf16 hi/lo and three products per phase, which is fp32
+    accurate (3e-5 measured) at 3x the tile ops. One work item is 32 query rows
+    of one (batch, head); anything else falls back to the Mojo path.
     """
     lib = _csrc()
     if lib is None or not _AMX_ENV:
         return None
     if not amx_available() or q.shape[-1] not in (32, 64, 128):
         return None
+    fp32 = q.dtype == torch.float32
+    if fp32 and not _AMX_FP32_ENV:
+        return None
+    entry = getattr(lib, "dense_amx_fp32" if fp32 else "dense_amx_bf16", None)
+    if entry is None:
+        return None
+    if q.dtype not in _DTYPE_CODES:
+        return None
     out = torch.empty_like(q, memory_format=torch.contiguous_format)
     batch, seq_q, num_heads, head_dim = q.shape
     seq_k, num_kv_heads = k.shape[1], k.shape[2]
     qs, ks, vs, os_ = q.stride(), k.stride(), v.stride(), out.stride()
     tasks = batch * num_heads * (-(-seq_q // 32))
-    rc = lib.dense_amx_bf16(
+    rc = entry(
         q.data_ptr(), k.data_ptr(), v.data_ptr(), out.data_ptr(),
         batch, seq_q, seq_k, num_heads, num_kv_heads, head_dim,
         qs[0], qs[1], qs[2],
@@ -566,10 +582,9 @@ def _dense(q, k, v, scale: float, causal: bool):
     """Run the dense kernel over contiguous-``head_dim`` q/k/v (already checked)."""
     batch, seq_q, num_heads, head_dim = q.shape
     seq_k, num_kv_heads = k.shape[1], k.shape[2]
-    if q.dtype == torch.bfloat16:
-        out = _amx_dense(q, k, v, scale, causal)
-        if out is not None:
-            return out
+    out = _amx_dense(q, k, v, scale, causal)
+    if out is not None:
+        return out
     bfmmla = k.dtype == torch.bfloat16 and _bfmmla()
     if _QT_ENV:
         qt = int(_QT_ENV)

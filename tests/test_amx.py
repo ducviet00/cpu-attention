@@ -53,6 +53,7 @@ def bench(fns, rounds=5):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--dtype", default="bf16", choices=["bf16", "fp32", "both"])
     ap.add_argument("--bench", action="store_true")
     ap.add_argument("--rounds", type=int, default=5)
     ap.add_argument("--threads", type=int, default=0)
@@ -70,20 +71,24 @@ def main() -> int:
     if args.shapes:
         shapes = [tuple(int(x) for x in s.split(":")) for s in args.shapes.split(",")]
 
+    dts = {"bf16": [torch.bfloat16], "fp32": [torch.float32],
+           "both": [torch.bfloat16, torch.float32]}[args.dtype]
     bad = 0
     for seq, heads, dim in shapes:
+      for dt in dts:
         for causal in (True, False):
-            q = torch.randn(1, seq, heads, dim, dtype=torch.bfloat16)
-            k = torch.randn(1, seq, heads, dim, dtype=torch.bfloat16)
-            v = torch.randn(1, seq, heads, dim, dtype=torch.bfloat16)
+            q = torch.randn(1, seq, heads, dim, dtype=dt)
+            k = torch.randn(1, seq, heads, dim, dtype=dt)
+            v = torch.randn(1, seq, heads, dim, dtype=dt)
             ref = sdpa(q, k, v, causal).transpose(1, 2).contiguous()
             got = run(q, k, v, causal, True)
             mojo = run(q, k, v, causal, False)
             d_amx = (got.float() - ref.float()).abs().max().item()
             d_mojo = (mojo.float() - ref.float()).abs().max().item()
-            ok = d_amx <= 3e-2
+            ok = d_amx <= (3e-2 if dt == torch.bfloat16 else 2e-4)
             bad += 0 if ok else 1
-            print(f"  S={seq:5d} H={heads:2d} D={dim:3d} causal={int(causal)}: "
+            tag = "bf16" if dt == torch.bfloat16 else "fp32"
+            print(f"  S={seq:5d} H={heads:2d} D={dim:3d} {tag} causal={int(causal)}: "
                   f"amx max|d|={d_amx:.2e} mojo={d_mojo:.2e} "
                   f"{'OK' if ok else 'FAIL'}")
             if not ok:
