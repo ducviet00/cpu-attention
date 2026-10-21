@@ -493,7 +493,9 @@ def _dense(q, k, v, scale: float, causal: bool):
     # seq_k 4096) -- 16 scattered cache lines per key tile, which is the same
     # defect the bf16 path had. 64 keys covers the widest key tile either kernel
     # uses.
-    kt_blk = 4 * _lanes() if _lanes() >= 16 and not bfmmla else 64
+    # Every fast path blocks K^T by 64 keys, and the tile kernels take that as a
+    # *compile-time* stride (a runtime stride turned each address into a `madd`).
+    kt_blk = 64
     if bfmmla:
         mode = 2
         # K blocked by key tile (64 keys): one tile's K for every head-dim group

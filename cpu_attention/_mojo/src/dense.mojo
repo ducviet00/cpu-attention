@@ -897,9 +897,13 @@ def _dense_rows_bfmmla[
     )
 
     # Q A panels: one per (row pair, 4 head dims), built once per work item.
+    # ``[head-dim group][row pair][8]``: one group's four row-pair panels are
+    # then 64 contiguous bytes and load as two `ldp`s. Laid out ``[rp][g][8]``
+    # they are 128 elements apart and cost four separate loads in the innermost
+    # loop of the Q@K^T sweep.
     var q_pan = stack_allocation[RP * DG * 8, BFloat16]()
-    comptime for rp in range(RP):
-        comptime for g in range(DG):
+    comptime for g in range(DG):
+        comptime for rp in range(RP):
             var lo = SIMD[DType.bfloat16, 4](0.0)
             var hi = SIMD[DType.bfloat16, 4](0.0)
             if 2 * rp < nrows:
@@ -910,7 +914,7 @@ def _dense_rows_bfmmla[
                 hi = q_base.unsafe_offset(
                     (q0 + 2 * rp + 1) * job.q_stride_t + 4 * g
                 ).unsafe_load[width=4]()
-            q_pan.unsafe_store[width=8]((rp * DG + g) * 8, lo.join(hi))
+            q_pan.unsafe_store[width=8]((g * RP + rp) * 8, lo.join(hi))
 
     var acc = stack_allocation[RP * DP * 4, DType.float32]()
     comptime for i in range(RP * DP):
@@ -964,7 +968,7 @@ def _dense_rows_bfmmla[
             var g = 0
             while g < DG:
                 comptime for rp in range(RP):
-                    var a = q_pan.unsafe_load[width=8]((rp * DG + g) * 8)
+                    var a = q_pan.unsafe_load[width=8]((g * RP + rp) * 8)
                     comptime for v in range(NS):
                         accs[rp * NS + v] = _bfmmla(
                             accs[rp * NS + v],
@@ -1166,6 +1170,19 @@ tile has to be a multiple of 64 because the K scratch is padded to 64 keys and
 the QK pass reads whole sub-blocks.
 """
 
+comptime KT_PAIR_STRIDE = (KS_STRIDE // 2) * 8
+"""Elements between head-dim groups in the bf16 K^T layout
+(``[tile][dim group][key pair][8]``): 32 key pairs x 8 bf16."""
+
+comptime KS_STRIDE = 64
+"""Keys per contiguous K^T block, as a *compile-time* stride.
+
+The fp32 Q@K^T sweep reads one head dim's 64 keys per iteration; taking that
+stride from the job turned every increment into a `madd`. 64 is what
+``_kernel.kt_blk`` sets for every fast path (the x86 blocking is also 64), and
+``_dense_dispatch`` falls back to the generic kernel if it ever is not.
+"""
+
 comptime TILE_NSQ = 4
 """Key *pairs* per QK sub-block: ``qt/2 * nsq`` fp32 accumulator registers.
 
@@ -1238,7 +1255,7 @@ def _dense_rows_tile[
                 hi = q_base.unsafe_offset(
                     (q0 + 2 * rp + 1) * job.q_stride_t + 4 * g
                 ).unsafe_load[width=4]()
-            q_pan.unsafe_store[width=8]((rp * DG + g) * 8, lo.join(hi))
+            q_pan.unsafe_store[width=8]((g * RP + rp) * 8, lo.join(hi))
 
     # Output accumulator: [row pair][dim pair][4], in L1 like v1's.
     var acc = stack_allocation[RP * DP * 4, DType.float32]()
@@ -1271,6 +1288,8 @@ def _dense_rows_tile[
             (t0 // job.kt_blk) * (DG * job.kt_stride_d)
             + ((t0 % job.kt_blk) // 2) * 8
         )
+        # (recomputed per sub-block below: a tile wider than ``kt_blk`` would
+        # step out of its key-pair run into the next head-dim group.)
         # ---- 1. Q@K^T into the logits buffer, and the tile max on the way.
         var mt = Array[SIMD[DType.float32, 4], RP](uninitialized=True)
         comptime for rp in range(RP):
@@ -1288,6 +1307,10 @@ def _dense_rows_tile[
         # tile's K is one contiguous run and a sub-block reads it linearly.
         var sb = 0
         while sb < nkp:
+            var kt_sub = kt_base.unsafe_offset(
+                ((t0 + 2 * sb) // job.kt_blk) * (DG * job.kt_stride_d)
+                + (((t0 + 2 * sb) % job.kt_blk) // 2) * 8
+            )
             var accs = Array[SIMD[DType.float32, 4], RP * nsq](
                 uninitialized=True
             )
@@ -1296,23 +1319,23 @@ def _dense_rows_tile[
             # sub-block.
             var zero = SIMD[DType.float32, 4](0.0)
             comptime for rp in range(RP):
-                var a0 = q_pan.unsafe_load[width=8]((rp * DG) * 8)
+                var a0 = q_pan.unsafe_load[width=8]((0 * RP + rp) * 8)
                 comptime for v in range(nsq):
                     accs[rp * nsq + v] = _bfmmla(
                         zero,
                         a0,
-                        kt_tile.unsafe_load[width=8]((sb + v) * 8),
+                        kt_sub.unsafe_load[width=8](v * 8),
                     )
             var g = 1
             while g < DG:
                 comptime for rp in range(RP):
-                    var a = q_pan.unsafe_load[width=8]((rp * DG + g) * 8)
+                    var a = q_pan.unsafe_load[width=8]((g * RP + rp) * 8)
                     comptime for v in range(nsq):
                         accs[rp * nsq + v] = _bfmmla(
                             accs[rp * nsq + v],
                             a,
-                            kt_tile.unsafe_load[width=8](
-                                g * job.kt_stride_d + (sb + v) * 8
+                            kt_sub.unsafe_load[width=8](
+                                g * KT_PAIR_STRIDE + v * 8
                             ),
                         )
                 g += 1
@@ -1592,10 +1615,6 @@ def _dense_rows_tile_f32[
 
     var t0 = 0
     while t0 < loop_end:
-        var kt_tile = kt_base.unsafe_offset(
-            (t0 // job.kt_blk) * (head_dim * job.kt_blk)
-            + (t0 % job.kt_blk)
-        )
         # ---- 1. Q@K^T into the logits buffer, with the tile max on the way.
         var mvec = Array[SIMD[DType.float32, LANES], qt](uninitialized=True)
         comptime for r in range(qt):
@@ -1606,6 +1625,10 @@ def _dense_rows_tile_f32[
         var sb = 0
         while sb < nkb:
             var ko = sb * kb
+            var kt_sub = kt_base.unsafe_offset(
+                ((t0 + ko) // job.kt_blk) * (head_dim * job.kt_blk)
+                + ((t0 + ko) % job.kt_blk)
+            )
             var accs = Array[SIMD[DType.float32, LANES], qt * KV](
                 uninitialized=True
             )
@@ -1618,8 +1641,8 @@ def _dense_rows_tile_f32[
                     uninitialized=True
                 )
                 comptime for v in range(KV):
-                    kv[v] = kt_tile.unsafe_load[width=LANES](
-                        d * job.kt_stride_d + ko + v * LANES
+                    kv[v] = kt_sub.unsafe_load[width=LANES](
+                        d * KS_STRIDE + v * LANES
                     )
                 comptime for h in range(qt // LANES):
                     var qv = q_t.unsafe_load[width=LANES](d * qt + h * LANES)

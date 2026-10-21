@@ -110,6 +110,18 @@ The causal-limit skip then added 1.5x/1.3x/1.2x at S=128/256/512 on both dtypes.
   top-left, flash-attn bottom-right. `scripts/prof/arm/dbg.py` therefore only
   uses Sq == Sk.
 
+## Scoreboard after the two tile kernels (dev box, 4 cores, pack included)
+
+`tests/bench_vs_refs.py --rounds 7`, o/vllm: bf16 **1.06-1.30**, fp32 **0.96-1.15**;
+21/22 rows beat SDPA (was 17/22), 2/22 beat vLLM (was 0/22). The warst bf16 rows
+are S=256 D=128 (1.30) and S=512 H=32 D=128 (1.24); fp32's are S=1024 D=32 (1.15)
+and S=4096 D=64 (1.14).
+
+**The first row of a `bench_vs_refs` sweep is not real**: S=128 bf16 measures
+~500 us there against 58 us in `bench_phases`, and even *SDPA* reads 357 us
+against 88 us -- the process is still at its idle clock. Report from the second
+row on, or warm the process up.
+
 ## Open
 
 * bf16 is 21.2 instructions vs vLLM's 20.9 — the remaining 18% is **IPC** (3.50
@@ -117,6 +129,16 @@ The causal-limit skip then added 1.5x/1.3x/1.2x at S=128/256/512 on both dtypes.
 * fp32 is 57.2 vs 51.6 instructions. Next candidates: K^T's dim stride is a
   compile-time 64 (`kt_blk`) but is read from the job at runtime, costing an
   address add per dim per sub-block; and the P@V probability/`V` addressing.
-* S=128 is still 1.5x (bf16) / 1.26x (fp32): 700-odd instructions of per-work-item
-  fixed cost (Q panels, accumulator zeroing, output write) over only ~540
-  row-keys of work.
+* **Short sequences are per-work-item overhead, measured**: at S=128 bf16 the
+  kernel executes 56.5 instructions/row-key against 21.2 at S=2048, at the same
+  IPC (3.52) -- so it is instruction count, not stalls. vLLM goes 20.9 -> 24.2.
+  The per-tile P@V accumulator round trip is 2*head_dim/keys per row-key (4.0 at
+  jn=8, 0.5 at jn=64), the boundary mask runs on every sub-block, and ~18% of an
+  S=128 call is still OpenMP barrier (two fork-joins per call: pack + kernel).
+  Collapsing the two GOMP regions into one (`GOMP_barrier` inside the worker) is
+  the next thing to try.
+* bf16 D=128 P@V pays 2 panel loads/row-key because the 64 dim pairs are walked
+  in 16 chunks of 4 (`RP*dcp` = 16 registers); dcp=8 would halve it but needs 32.
+* The `-e armv8_pmuv3_0/stall_backend/` sampling profile (works on this box)
+  attributes the bf16 backend stalls to `ldp` (18%) and integer `add` (17%,
+  addresses), with bfmmla at 23% -- not to the exp.
