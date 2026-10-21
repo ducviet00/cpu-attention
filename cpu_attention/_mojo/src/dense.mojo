@@ -795,6 +795,10 @@ def _vmax(
     serial. ``llvm.maxnum`` is ``fmaxnm``: one instruction, and it ignores NaN,
     which is what lets the softmax skip the "no visible key yet" special case
     (see ``_dense_rows_bfmmla``).
+
+    The intrinsic name carries the width, so this specialization is four lanes;
+    AVX-512 wants ``llvm.maxnum.v16f32`` with ``SIMD[DType.float32, 16]`` (same
+    single ``vmaxps``).
     """
     return llvm_intrinsic[
         "llvm.maxnum.v4f32", SIMD[DType.float32, 4], has_side_effect=False
