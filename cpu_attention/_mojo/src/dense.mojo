@@ -332,11 +332,13 @@ def _dense_rows[
                 d * job.kt_stride_d + kbase
             ).cast[DType.float32]()
             comptime for r in range(qt):
-                logits[r] += (
-                    SIMD[DType.float32, KT_TILE](
-                        qv.unsafe_load(r * head_dim + d)
-                    )
-                    * kv
+                # fma(), not `+=`/`*`: multiply+add pairs do not contract on
+                # their own here, and an uncontracted pair is two instructions
+                # per 16 MACs instead of one.
+                logits[r] = fma(
+                    SIMD[DType.float32, KT_TILE](qv.unsafe_load(r * head_dim + d)),
+                    kv,
+                    logits[r],
                 )
             d += 1
 
@@ -381,14 +383,20 @@ def _dense_rows[
         # Only the keys that exist: a short last tile has KT_TILE - jn masked
         # lanes whose probability is exactly 0, and reading their V would walk
         # past the end of the tensor (0 * garbage is garbage, not 0).
-        var jn = min(KT_TILE, seq_k - t0)
+        var jn = min(KT_TILE, loop_end - t0)
         var j = 0
         while j < jn:
             var vrow = v_base.unsafe_load[width=head_dim](
                 (t0 + j) * job.v_stride_t
             ).cast[DType.float32]()
             comptime for r in range(qt):
-                acc[r] += probs.unsafe_load(r * KT_TILE + j) * vrow
+                acc[r] = fma(
+                    SIMD[DType.float32, head_dim](
+                        probs.unsafe_load(r * KT_TILE + j)
+                    ),
+                    vrow,
+                    acc[r],
+                )
             j += 1
 
         t0 += KT_TILE
@@ -530,11 +538,10 @@ def _dense_rows_mem[
                     d * job.kt_stride_d + kbase
                 ).cast[DType.float32]()
                 comptime for r in range(qt):
-                    logits[r] += (
-                        SIMD[DType.float32, kt](
-                            qv.unsafe_load(r * head_dim + d)
-                        )
-                        * kv
+                    logits[r] = fma(
+                        SIMD[DType.float32, kt](qv.unsafe_load(r * head_dim + d)),
+                        kv,
+                        logits[r],
                     )
                 d += 1
 
@@ -579,7 +586,7 @@ def _dense_rows_mem[
             row_max[r] = m_new
             probs.unsafe_store[width=kt](r * kt, p)
 
-        var jn = min(kt, seq_k - t0)
+        var jn = min(kt, loop_end - t0)
         comptime for dci in range(head_dim // dc):
             var accv = Array[SIMD[DType.float32, dc], qt](uninitialized=True)
             comptime for r in range(qt):
@@ -590,7 +597,11 @@ def _dense_rows_mem[
                     (t0 + j) * job.v_stride_t + dci * dc
                 ).cast[DType.float32]()
                 comptime for r in range(qt):
-                    accv[r] += probs.unsafe_load(r * kt + j) * vrow
+                    accv[r] = fma(
+                        SIMD[DType.float32, dc](probs.unsafe_load(r * kt + j)),
+                        vrow,
+                        accv[r],
+                    )
                 j += 1
             comptime for r in range(qt):
                 acc.unsafe_store[width=dc](r * head_dim + dci * dc, accv[r])
@@ -748,14 +759,20 @@ def _dense_rows_dot[
         # Only the keys that exist: a short last tile has KT_TILE - jn masked
         # lanes whose probability is exactly 0, and reading their V would walk
         # past the end of the tensor (0 * garbage is garbage, not 0).
-        var jn = min(KT_TILE, seq_k - t0)
+        var jn = min(KT_TILE, loop_end - t0)
         var j = 0
         while j < jn:
             var vrow = v_base.unsafe_load[width=head_dim](
                 (t0 + j) * job.v_stride_t
             ).cast[DType.float32]()
             comptime for r in range(qt):
-                acc[r] += probs.unsafe_load(r * KT_TILE + j) * vrow
+                acc[r] = fma(
+                    SIMD[DType.float32, head_dim](
+                        probs.unsafe_load(r * KT_TILE + j)
+                    ),
+                    vrow,
+                    acc[r],
+                )
             j += 1
 
         t0 += KT_TILE
@@ -2416,13 +2433,26 @@ def _dense_task[dtype: DType, head_dim: Int, qt: Int](job: DenseJob, task: Int):
                 job, batch, head, kv_head, q0
             )
     elif dtype == DType.bfloat16 and BF16_DOT:
-        _dense_rows_dot[dtype, head_dim, qt](job, batch, head, kv_head, q0)
-    elif qt * head_dim > 512:
-        # acc (qt * head_dim / LANES zmm) + logits (qt * KT_TILE / LANES) no
-        # longer fit in 32 registers: keep acc in L1 and tile the head dim.
-        # The threshold is 512 rather than 384 because the register kernel is 6%
-        # faster at 8 rows x 64 dims where both are legal (measured, and it is
-        # only unusable above 512).
+        comptime if head_dim >= 128:
+            # head_dim 128 x qt rows of bf16 dot accumulator is 8 zmm per row,
+            # so `_dense_rows_dot`'s register accumulator is 64 zmm at qt = 8 and
+            # spills. The L1-accumulator variant with the same dot instruction
+            # measured 1.24-1.28x over it at 256/1024/4096 x 16 x 128 on the
+            # Ryzen, interleaved, medians of 5.
+            _dense_rows_mem[dtype, head_dim, qt, 32, 32, True](
+                job, batch, head, kv_head, q0
+            )
+        else:
+            _dense_rows_dot[dtype, head_dim, qt](job, batch, head, kv_head, q0)
+    elif qt * head_dim >= 512:
+        # acc (qt * head_dim / LANES zmm) + logits (qt * KT_TILE / LANES) do
+        # not fit in 32 registers: keep acc in L1 and tile the head dim.
+        # The threshold is `>=`, not `>`: 8 rows x 64 dims is exactly 512 floats
+        # of accumulator *plus* 8 x KT_TILE/16 = 32 zmm of logits, i.e. 64 zmm
+        # of live state, so it spills in the register kernel. Measured on the
+        # Ryzen, interleaved, medians of 5: 1.05-1.10x for the L1-accumulator
+        # kernel at 1024/2048/4096 x 8 x 64 fp32, and with qt=6 instead of 8 on
+        # top of that (CPU_ATTENTION_QT=6) the same shapes gain 1.19-1.22x.
         _dense_rows_mem[dtype, head_dim, qt, 32, 32, False](
             job, batch, head, kv_head, q0
         )
@@ -2482,8 +2512,13 @@ def _run_shape[
         _dense_dispatch[dtype, head_dim, 6](job, num_workers)
     elif qt == 8:
         _dense_dispatch[dtype, head_dim, 8](job, num_workers)
+    elif qt == 10:
+        # Additive arm for the x86 sweep on the Xeon; no ARM path selects it.
+        _dense_dispatch[dtype, head_dim, 10](job, num_workers)
+    elif qt == 12:
+        _dense_dispatch[dtype, head_dim, 12](job, num_workers)
     else:
-        raise Error("cpu_attention dense: qt must be 2, 4, 6 or 8")
+        raise Error("cpu_attention dense: qt must be 2, 4, 6, 8, 10 or 12")
 
 
 def _run_dtype[dtype: DType](job: DenseJob, num_workers: Int, qt: Int) raises:

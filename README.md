@@ -304,42 +304,39 @@ Work items are handed out round-robin over the same libgomp pool: causal masking
 makes the last query rows ~2x more expensive than the first, and a contiguous
 slice per thread leaves half the cores idle at the end of a prefill.
 
-`qt = 4` for every head dim, `KT_TILE = 64` (32 was 6% slower on bf16 and 16% on
-fp32; 8 was 20-40% slower than 4). Both are above the paged kernel's numbers
-because a dense call has no page-boundary to respect. `CPU_ATTENTION_QT`
-overrides `qt` for experiments.
+Rows per work item is the only axis K and V are reused across, so traffic per
+row-key is `head_dim * sizeof(T) / qt` bytes for Q@K^T and again for P@V, while
+the register file caps `qt * head_dim` near 512 (above that the accumulator has
+to live in L1: `_dense_rows_mem`). The shipped rule (`_kernel._qt_for`) is now
+per (ISA, dtype, head_dim, seqlen): 6 rows for fp32 from 256 keys up, 4 below
+that; 6 for bf16 at head_dim 128 (its L1-accumulator dot kernel), 4 at 64.
+Measured, interleaved, on the Ryzen: 1.13x at 256x16x128 and 1.25x at
+512x32x128 for 6 rows over 4, and 1.10x at 1024x8x64 for 6 over 8.
+`CPU_ATTENTION_QT` overrides it for experiments.
 
-### Against torch SDPA
+### Against torch SDPA and vLLM
 
-Ryzen 7 7840H, 8 threads, causal, interleaved per shape (`tests/bench_vs_refs.py`).
-Measured at **1.94 GHz** (the box throttles; the ratios are what matter, absolute
-GFLOP/s would be ~2.4x higher unthrottled):
+The current table, the measurement protocol and the list of what moved it live in
+`docs/STATUS.md`; it is regenerated from `tests/bench_vs_refs.py --json` with
+`scripts/scorecard.py`, never typed by hand. Headline, Ryzen 7 7840H, 8 threads,
+causal, ratios `ours/baseline` (`<1` wins): **22 of 22 rows beat SDPA and 10 of
+22 beat vLLM's VEC kernel**, and every fp32 row that still loses is a
+pre-AMX-codegen artefact on a box without AMX rather than a structural wall.
 
-| case | ours | SDPA | ratio | GFLOP/s |
-|---|---:|---:|---:|---:|
-| S=128 H=8 D=64 bf16 | 42 µs | 76 | **1.79x** | |
-| S=512 H=8 D=64 bf16 | 283 | 1 341 | **4.74x** | 948 |
-| S=2048 H=8 D=64 bf16 | 4 509 | 7 705 | **1.71x** | 953 |
-| S=1024 H=16 D=128 bf16 | 6 925 | 9 225 | **1.33x** | 620 |
-| S=2048 H=16 D=128 bf16 | 29 004 | 31 460 | **1.08x** | 592 |
-| S=4096 H=16 D=128 bf16 | 107 664 | 116 641 | **1.08x** | 638 |
-| S=128 H=8 D=64 fp32 | 57 | 87 | **1.54x** | |
-| S=512 H=8 D=64 fp32 | 668 | 1 280 | **1.92x** | 402 |
-| S=2048 H=8 D=64 fp32 | 6 388 | 7 333 | **1.15x** | 672 |
-| S=1024 H=16 D=128 fp32 | 9 247 | 8 747 | 0.95x | 464 |
-| S=2048 H=16 D=128 fp32 | 27 723 | 30 660 | **1.11x** | 620 |
-| S=4096 H=16 D=128 fp32 | 95 149 | 118 209 | **1.24x** | 722 |
+The three moves that mattered most, in order, were: **reusing the K/V pack
+workspace** instead of `torch.empty` per call (1.4-1.7x -- the pack was writing
+into freshly faulted pages, and `clear_page_erms` was 16.8% of a whole call);
+**rows per work item** (above); and sending 8x64 fp32 and 8x128 bf16 to the
+L1-accumulator kernels instead of spilling the register accumulator (1.05-1.10x
+and 1.19-1.39x). The older claims in this section -- that per-head-contiguous K/V
+was worth 2.0x, or that the softmax block is 40% of an x86 call -- did not
+survive re-measurement: the ablation in `docs/STATUS.md` puts the softmax at
+8-20% on x86 and 1-5% for the probability round trip.
 
-11 of 12 beat SDPA; the exception is `S=1024/D=128` fp32 at 0.95x. The two
-biggest single moves were **per-head-contiguous K and V** (vLLM's page layout;
-our dense call was reading V tokens 8 KB apart and K^T dims `seq_k` apart):
-`S=4096/H=16/D=128` fp32 went **0.61x -> 1.24x** (2.0x), and **workers-per-pack**
-sizing (the K/V pack ran single-threaded below S=512): S=512 bf16 **4.7x**.
+### On Graviton 5 (Neoverse-V3, 8 cores) -- previous campaign, superseded
 
-Against vLLM on this box we are ahead on bf16 at D=64 and ~1.2-1.3x behind on the
-rest; see `AGENTS.md` §9 for what binds (the softmax block) and what is left.
-
-### On Graviton 5 (Neoverse-V3, 8 cores)
+The numbers below are from an older tree and are kept only as history; the
+current ARM table is re-measured per session (see `docs/STATUS.md`).
 
 The dense kernel was first tuned on AVX-512 and it showed on ARM. bf16 now runs
 both phases on `bfmmla` (the 2x2 bf16 matrix-multiply, which vLLM's NEON kernel

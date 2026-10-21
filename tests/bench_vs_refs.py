@@ -48,10 +48,16 @@ SHAPES = [
 
 
 def load_vllm(path):
-    """Load the standalone csrc/cpu extension (see the build recipe in AGENTS.md)."""
+    """Load the standalone csrc/cpu extension (see the build recipe in AGENTS.md).
+
+    The module name has to match the file stem: the AMX variant is built with
+    ``-DTORCH_EXTENSION_NAME=vllm_cpu_attn_bench_amx`` so that both references
+    can live in one process, and its init function is named after it.
+    """
     if not path or not os.path.exists(path):
         return None
-    spec = importlib.util.spec_from_file_location("vllm_cpu_attn_bench", path)
+    name = os.path.basename(path).rsplit(".", 1)[0]
+    spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod

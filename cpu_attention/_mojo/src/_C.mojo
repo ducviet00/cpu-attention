@@ -20,6 +20,7 @@ from dense import (
     run_dense,
     run_transpose,
 )
+from dense_amx import AMX, AmxJob, PackJob, run_dense_amx
 
 
 def dense_transpose(
@@ -88,10 +89,108 @@ def dense_bf16_dot() -> PythonObject:
 
 
 def dense_bfmmla() -> PythonObject:
-    """True when the bf16 path runs on NEON ``bfmmla`` (K and V both repacked)."""
+    """True when the bf16 path runs on NEON ``bfmmla`` (K and V both repacked).
+    """
     if has_bfmmla():
         return PythonObject(True)
     return PythonObject(False)
+
+
+def dense_has_amx() -> PythonObject:
+    """True when this build has the AMX kernel (x86 target with amx-tile+bf16).
+    """
+    if AMX:
+        return PythonObject(True)
+    return PythonObject(False)
+
+
+def dense_amx_attention(
+    q: PythonObject,
+    kp: PythonObject,
+    vp: PythonObject,
+    dst: PythonObject,
+    k: PythonObject,
+    v: PythonObject,
+    batch: PythonObject,
+    seq_q: PythonObject,
+    seq_k: PythonObject,
+    num_heads: PythonObject,
+    num_kv_heads: PythonObject,
+    head_dim: PythonObject,
+    q_stride_b: PythonObject,
+    q_stride_t: PythonObject,
+    q_stride_h: PythonObject,
+    k_stride_b: PythonObject,
+    k_stride_t: PythonObject,
+    k_stride_h: PythonObject,
+    v_stride_b: PythonObject,
+    v_stride_t: PythonObject,
+    v_stride_h: PythonObject,
+    o_stride_b: PythonObject,
+    o_stride_t: PythonObject,
+    o_stride_h: PythonObject,
+    kp_bh: PythonObject,
+    vp_bh: PythonObject,
+    kb16: PythonObject,
+    dc32: PythonObject,
+    dc16: PythonObject,
+    scale: PythonObject,
+    causal: PythonObject,
+    kt: PythonObject,
+    num_workers: PythonObject,
+) raises:
+    """Pack K/V into the AMX operand layouts and run the bf16 attention.
+
+    ``kp``/``vp`` are caller-owned workspace (see ``cpu_attention._kernel``);
+    the pack writes every tile it will read, so nothing needs zeroing except
+    keys past ``seq_k``, which the pack writes as zero.
+    """
+    var pack = PackJob()
+    pack.k = Int(py=k)
+    pack.v = Int(py=v)
+    pack.kp = Int(py=kp)
+    pack.vp = Int(py=vp)
+    pack.seq_k = Int(py=seq_k)
+    pack.head_dim = Int(py=head_dim)
+    pack.k_stride_b = Int(py=k_stride_b)
+    pack.k_stride_t = Int(py=k_stride_t)
+    pack.k_stride_h = Int(py=k_stride_h)
+    pack.v_stride_b = Int(py=v_stride_b)
+    pack.v_stride_t = Int(py=v_stride_t)
+    pack.v_stride_h = Int(py=v_stride_h)
+    pack.num_kv_heads = Int(py=num_kv_heads)
+    pack.batch = Int(py=batch)
+    pack.kb16 = Int(py=kb16)
+    pack.dc32 = Int(py=dc32)
+    pack.dc16 = Int(py=dc16)
+    pack.kp_bh = Int(py=kp_bh)
+    pack.vp_bh = Int(py=vp_bh)
+
+    var job = AmxJob()
+    job.q = Int(py=q)
+    job.kp = Int(py=kp)
+    job.vp = Int(py=vp)
+    job.dst = Int(py=dst)
+    job.batch = Int(py=batch)
+    job.seq_q = Int(py=seq_q)
+    job.seq_k = Int(py=seq_k)
+    job.num_heads = Int(py=num_heads)
+    job.num_kv_heads = Int(py=num_kv_heads)
+    job.head_dim = Int(py=head_dim)
+    job.q_stride_b = Int(py=q_stride_b)
+    job.q_stride_t = Int(py=q_stride_t)
+    job.q_stride_h = Int(py=q_stride_h)
+    job.kp_bh = Int(py=kp_bh)
+    job.vp_bh = Int(py=vp_bh)
+    job.o_stride_b = Int(py=o_stride_b)
+    job.o_stride_t = Int(py=o_stride_t)
+    job.o_stride_h = Int(py=o_stride_h)
+    job.scale = Float32(Float64(py=scale))
+    job.causal = Bool(causal)
+    job.kt = Int(py=kt)
+    job.dc32 = Int(py=dc32)
+    job.dc16 = Int(py=dc16)
+    run_dense_amx(pack, job, num_workers=Int(py=num_workers), kt=Int(py=kt))
 
 
 @export
@@ -104,6 +203,8 @@ def PyInit__C() abi("C") -> PythonObject:
         m.def_function[dense_bf16_dot]("dense_bf16_dot")
         m.def_function[dense_bfmmla]("dense_bfmmla")
         m.def_function[dense_lanes]("dense_lanes")
+        m.def_function[dense_has_amx]("dense_has_amx")
+        m.def_function[dense_amx_attention]("dense_amx_attention")
         return m.finalize()
     except e:
         abort(String("error creating cpu_attention._C: ", e))
