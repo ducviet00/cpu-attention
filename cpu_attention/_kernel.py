@@ -421,6 +421,10 @@ def _qt_for(
         # an A/B.
         return 8
     if lanes < 16:
+        # fp32 v2 (tile logits in L1) wants 8 rows at every head dim: rows are
+        # what the K/V read is amortised over and the register file no longer
+        # caps them. ``CPU_ATTENTION_QT=4`` selects the old online-softmax path.
+        return 8
         if head_dim <= 64:
             return 6 if seq_k >= 1024 else 4
         # head_dim 128 takes the same 6 (1.42-1.73x over the old qt=2); the
@@ -484,7 +488,12 @@ def _dense(q, k, v, scale: float, causal: bool):
     # measurement: handed the blocked layout, S=4096/H=16/D=128 fp32 gains
     # 1.2-1.4x over the plain `[head_dim, seq_k]` transpose. `seq_k_pad` (i.e. no
     # blocking) keeps the 4-lane/ARM layouts byte-identical to before.
-    kt_blk = 4 * _lanes() if _lanes() >= 16 and not bfmmla else seq_k_pad
+    # Blocked for every fast path now: the ARM fp32 kernel used the unblocked
+    # layout, so its Q@K^T sweep jumped `seq_k * 4` bytes per head dim (16 KB at
+    # seq_k 4096) -- 16 scattered cache lines per key tile, which is the same
+    # defect the bf16 path had. 64 keys covers the widest key tile either kernel
+    # uses.
+    kt_blk = 4 * _lanes() if _lanes() >= 16 and not bfmmla else 64
     if bfmmla:
         mode = 2
         # K blocked by key tile (64 keys): one tile's K for every head-dim group
