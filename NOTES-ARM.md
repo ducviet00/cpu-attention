@@ -85,7 +85,13 @@ The causal-limit skip then added 1.5x/1.3x/1.2x at S=128/256/512 on both dtypes.
   four load as two `ldp`s): neutral (6.07 -> 6.17 cycles, inside the noise).
   Kept because it removes the last runtime stride from the sweep, but it is not
   where the time is.
-* **`TILE_KS = 128`**: broke parity. A tile wider than the K block steps out of
+* **Key tile 128/256** (`TILE_KS`): the per-tile P@V accumulator round trip and
+  the tile epilogue amortise with the tile size. bf16 D=64 cycles/row-key: 64
+  keys 5.86, **128 keys 5.33**, 256 keys 5.66; fp32 D=64: 14.16 / 14.07 /
+  **13.68**. So bf16 takes 128 and fp32 takes 256 (its logit buffer is half the
+  size per key). Parity is fine because the K^T base is now recomputed per
+  sub-block.
+* **`TILE_KS = 128` with the old per-tile K base**: broke parity. A tile wider than the K block steps out of
   its key-pair run into the next head-dim group; the addressing is per sub-block
   now so it would work, but the expected gain (~1.5%) did not justify chasing
   the residual flakiness.
@@ -139,6 +145,16 @@ row 1 row 0's rescale factor (caught by parity: 33/49).
 * A non-square causal shape cannot be compared against torch SDPA: torch aligns
   top-left, flash-attn bottom-right. `scripts/prof/arm/dbg.py` therefore only
   uses Sq == Sk.
+
+## The fused pack+attention region
+
+`dense_forward()` runs the pack tasks, `GOMP_barrier`, then the attention tasks
+in **one** `GOMP_parallel` (the AMX kernel's structure). Worth exactly one
+fork-join, measured interleaved on the same box: S=8 12.6 -> 10.5 us (-17%),
+S=128 55.2 -> 54.4 (-1.5%), S=256 -0.7%, S=512 -0.4%, S=2048 -0.05%. An earlier
+estimate of "14-18% of an S=128 call" came from `gomp_barrier_wait_end` *sample
+share* at a trivial shape, which overstates it: the barrier is most of the
+*CPU* time there only because the work is ~1 us.
 
 ## Scoreboard after the two tile kernels (dev box, 4 cores, pack included)
 
