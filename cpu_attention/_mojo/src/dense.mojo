@@ -137,6 +137,10 @@ struct DenseJob(Copyable, ImplicitlyCopyable, Movable):
     var kt_stride_bh: Int
     var kt_stride_d: Int
     var kt_stride_t: Int
+    # Keys per contiguous K^T block: the transposed K is `[tile][dim][kt_blk]`,
+    # so one Q@K^T tile is one linear run instead of `head_dim` rows
+    # `kt_blk * sizeof(T)` apart. Set to `seq_k_pad` for the unblocked layout.
+    var kt_blk: Int
     var v_stride_b: Int
     var v_stride_t: Int
     var v_stride_h: Int
@@ -163,6 +167,7 @@ struct DenseJob(Copyable, ImplicitlyCopyable, Movable):
         self.kt_stride_bh = 0
         self.kt_stride_d = 0
         self.kt_stride_t = 0
+        self.kt_blk = 0
         self.v_stride_b = 0
         self.v_stride_t = 0
         self.v_stride_h = 0
@@ -304,6 +309,10 @@ def _dense_rows[
 
     var t0 = 0
     while t0 < loop_end:
+        # Offset of this tile inside the (possibly blocked) K^T.
+        var kbase = (t0 // job.kt_blk) * (head_dim * job.kt_blk) + (
+            t0 % job.kt_blk
+        ) * job.kt_stride_t
         var logits = Array[SIMD[DType.float32, KT_TILE], qt](uninitialized=True)
         comptime for r in range(qt):
             logits[r] = SIMD[DType.float32, KT_TILE](0.0)
@@ -313,7 +322,7 @@ def _dense_rows[
         var d = 0
         while d < head_dim:
             var kv = kt_base.unsafe_load[width=KT_TILE](
-                d * job.kt_stride_d + t0 * job.kt_stride_t
+                d * job.kt_stride_d + kbase
             ).cast[DType.float32]()
             comptime for r in range(qt):
                 logits[r] += (
@@ -470,6 +479,10 @@ def _dense_rows_mem[
 
     var t0 = 0
     while t0 < loop_end:
+        # Offset of this tile inside the (possibly blocked) K^T.
+        var kbase = (t0 // job.kt_blk) * (head_dim * job.kt_blk) + (
+            t0 % job.kt_blk
+        ) * job.kt_stride_t
         var logits = Array[SIMD[DType.float32, kt], qt](uninitialized=True)
         comptime if pairs:
             comptime NV = kt // LANES
@@ -490,7 +503,7 @@ def _dense_rows_mem[
                             a,
                             kt_base.unsafe_load[width=OPN](
                                 dp * job.kt_stride_d
-                                + t0 * job.kt_stride_t
+                                + kbase
                                 + v * OPN
                             ),
                         )
@@ -507,7 +520,7 @@ def _dense_rows_mem[
             var d = 0
             while d < head_dim:
                 var kv = kt_base.unsafe_load[width=kt](
-                    d * job.kt_stride_d + t0 * job.kt_stride_t
+                    d * job.kt_stride_d + kbase
                 ).cast[DType.float32]()
                 comptime for r in range(qt):
                     logits[r] += (
@@ -651,6 +664,10 @@ def _dense_rows_dot[
 
     var t0 = 0
     while t0 < loop_end:
+        # Offset of this tile inside the (possibly blocked) K^T.
+        var kbase = (t0 // job.kt_blk) * (head_dim * job.kt_blk) + (
+            t0 % job.kt_blk
+        ) * job.kt_stride_t
         var accs = Array[SIMD[DType.float32, LANES], qt * NV](
             uninitialized=True
         )
@@ -668,7 +685,7 @@ def _dense_rows_dot[
                         a,
                         kt_base.unsafe_load[width=OPN](
                             dp * job.kt_stride_d
-                            + t0 * job.kt_stride_t
+                            + kbase
                             + v * OPN
                         ),
                     )
@@ -1109,6 +1126,7 @@ struct TransposeJob(Copyable, ImplicitlyCopyable, Movable):
     var k_stride_h: Int
     var kt_stride_bh: Int
     var kt_stride_d: Int
+    var kt_blk: Int
     var v_stride_b: Int
     var v_stride_t: Int
     var v_stride_h: Int
@@ -1129,6 +1147,7 @@ struct TransposeJob(Copyable, ImplicitlyCopyable, Movable):
         self.k_stride_h = 0
         self.kt_stride_bh = 0
         self.kt_stride_d = 0
+        self.kt_blk = 0
         self.v_stride_b = 0
         self.v_stride_t = 0
         self.v_stride_h = 0
@@ -1167,7 +1186,10 @@ def _transpose_head[
                             src.unsafe_load((t0 + i) * job.k_stride_t + d)
                         )
                 dst.unsafe_store[width=TBLK](
-                    d * job.kt_stride_d + t0, v.cast[dtype]()
+                    (t0 // job.kt_blk) * (head_dim * job.kt_blk)
+                    + d * job.kt_stride_d
+                    + t0 % job.kt_blk,
+                    v.cast[dtype](),
                 )
         elif mode == 1:
             comptime for d2 in range(head_dim // 2):
@@ -1180,7 +1202,10 @@ def _transpose_head[
                         v[2 * i] = row.unsafe_load(0)
                         v[2 * i + 1] = row.unsafe_load(1)
                 dst.unsafe_store[width=2 * TBLK](
-                    d2 * job.kt_stride_d + t0 * 2, v
+                    (t0 // job.kt_blk) * (head_dim * job.kt_blk)
+                    + d2 * job.kt_stride_d
+                    + (t0 % job.kt_blk) * 2,
+                    v,
                 )
         else:
             # 16 tokens = 8 key pairs = 64 bf16 per head-dim group: one 128-byte

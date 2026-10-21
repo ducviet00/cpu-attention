@@ -426,6 +426,13 @@ def _dense(q, k, v, scale: float, causal: bool):
     vpack = (v.dtype == torch.float32
              and v.numel() * v.element_size() * 2 >= _llc_bytes())
     seq_k_pad = -(-seq_k // 64) * 64
+    # K^T is blocked every `kt_blk` keys so one Q@K^T tile is a single linear run
+    # (`[tile][dim][kt_blk]`) instead of `head_dim` rows `kt_blk * elt` apart --
+    # 16 KB at seq_k 4096. Same reason as the V copy below, and the same
+    # measurement: handed the blocked layout, S=4096/H=16/D=128 fp32 gains
+    # 1.2-1.4x over the plain `[head_dim, seq_k]` transpose. `seq_k_pad` (i.e. no
+    # blocking) keeps the 4-lane/ARM layouts byte-identical to before.
+    kt_blk = 4 * _lanes() if _lanes() >= 16 and not bfmmla else seq_k_pad
     if bfmmla:
         mode = 2
         kt = torch.empty(
@@ -436,13 +443,18 @@ def _dense(q, k, v, scale: float, causal: bool):
         )
     elif k.dtype == torch.bfloat16 and _bf16_dot():
         mode = 1
-        kt = torch.empty((batch, num_kv_heads, head_dim // 2, seq_k_pad, 2),
-                         dtype=k.dtype)
+        kt = torch.empty(
+            (batch, num_kv_heads, head_dim // 2, seq_k_pad // kt_blk, kt_blk, 2),
+            dtype=k.dtype,
+        )
         vt = (torch.empty((batch, num_kv_heads, seq_k, head_dim), dtype=v.dtype)
               if vpack else None)
     else:
         mode = 0
-        kt = torch.empty((batch, num_kv_heads, head_dim, seq_k_pad), dtype=k.dtype)
+        kt = torch.empty(
+            (batch, num_kv_heads, seq_k_pad // kt_blk, head_dim, kt_blk),
+            dtype=k.dtype,
+        )
         vt = (torch.empty((batch, num_kv_heads, seq_k, head_dim), dtype=v.dtype)
               if vpack else None)
     _transpose_attention()(
@@ -458,7 +470,8 @@ def _dense(q, k, v, scale: float, causal: bool):
         k.stride(1),
         k.stride(2),
         kt.stride(1),
-        kt.stride(2),
+        kt.stride(3) if mode == 0 else (kt.stride(3) if mode == 1 else kt.stride(2)),
+        kt_blk,
         v.stride(0),
         v.stride(1),
         v.stride(2),
@@ -480,7 +493,12 @@ def _dense(q, k, v, scale: float, causal: bool):
         vb, vtok, vh = v.stride(0), v.stride(1), v.stride(2)
         v_ptr = v.data_ptr()
     ob, otok, oh = out.stride(0), out.stride(1), out.stride(2)
-    ktb, ktd, ktt = kt.stride(1), kt.stride(2), kt.stride(3)
+    ktb = kt.stride(1)
+    if mode == 2:
+        ktd, ktt = kt.stride(2), kt.stride(3)   # bfmmla: its own packing
+    else:
+        ktd = kt.stride(3)                      # dim stride within a block
+        ktt = kt.stride(4) if mode == 1 else 1  # token stride inside a block
     tasks = batch * num_heads * (-(-seq_q // qt))
     _dense_attention()(
         q.data_ptr(),
@@ -499,6 +517,7 @@ def _dense(q, k, v, scale: float, causal: bool):
         ktb,
         ktd,
         ktt,
+        kt_blk,
         vb,
         vtok,
         vh,
