@@ -655,3 +655,45 @@ per item of everything else. Both are worth attacking:
 Caveat for whoever uses bit 128: with the Q prologue skipped the kernel reads an
 uninitialised panel, and **fp32 then segfaults** (garbage logits reach a path that
 indexes past a buffer). bf16 survives. Use bit 128 for bf16 timings only.
+
+## Round 6b — the clock is NOT downclocked, and my "4x instructions" claim is retracted
+
+**Clock, measured with `perf stat -e cycles` over a 20-iteration run minus the
+same script at 0 iterations (single-threaded, 2048:8:64):**
+
+| workload | cycles/second |
+|---|---:|
+| full AMX attention (bf16) | **3.80 GHz** |
+| AVX-512 Mojo attention | 3.67 GHz |
+| scalar burn loop | 3.90 GHz |
+
+**There is no AMX downclock on this box.** So the round-6 caveat — "half of every
+5x gap I quoted may be frequency" — is **wrong and retracted**: the clock is the
+same under AMX, AVX-512 and scalar code, and the gaps are real work.
+
+**And the "~400 instructions per tile against ~96 standalone" figure does not
+survive.** It came from a `perf stat -e instructions` difference between
+pack-only and no-pack runs, and that difference is **0.9-3% of a 4.5 G-instruction
+process**, i.e. inside the process-to-process startup variance of torch itself.
+Trying to split it further (K-only vs V-only vs both, 400 calls each) gives
+incoherent numbers — K alone +140 M, V alone +145 M, both +152 M — which is the
+signature of noise, not of an accounting. **Retracted.** What is solid:
+
+* the pack costs **10-16 us** at S=128 by two independent methods that agree to
+  1% (marginal `full - noPack` = 14.5 us, isolated `packonly` = 14.4 us, and
+  pack-only skips the whole item loop so it cannot be contaminated);
+* the same tile work standalone runs at **22 ns/tile, 89 GB/s**, with the
+  transpose free (round 5);
+* the debut of the 5x: unexplained and now *not* frequency and *not* evidenced
+  by instruction count. Anyone re-opening this needs the two-point perf method
+  (100 vs 900 iterations, subtract) rather than the single-run difference.
+
+**Epilogue is not a divide artefact.** `objdump`: the bf16 worker contains
+exactly one `vdiv*` (one scalar reciprocal per row, as written) and the whole
+`.so` has zero `vdivps`. So the 3.9 us epilogue is not a vector divide.
+
+**The Q prologue cannot be hoisted with 8 tiles.** The A operand needs 4 tiles
+for D=64 (2 row groups x 2 dim chunks), the B operand 2 and the C tiles 4: that
+is 10. Hoisting Q out of the key-chunk loop would need the whole Q panel live in
+tiles across chunks, which does not fit; the alternatives are 16-key chunks
+(2 C tiles, worse softmax) or D=32 only. Recorded so it is not attempted again.
