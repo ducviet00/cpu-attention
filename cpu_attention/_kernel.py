@@ -414,13 +414,12 @@ def _qt_for(
     geometry, and head_dim picks the rows there; x86 (``lanes == 16``) keeps 4.
     """
     if bfmmla:
-        # The bfmmla kernel carries two query rows per 2x2 tile and charges the
-        # whole softmax per (row block, key tile), so rows per work item are
-        # nearly free. head_dim decides: at 64 there is room for a 16-key tile
-        # with 4 rows (849 GFLOP/s vs 828 with 8 rows/8 keys), at 128 the key
-        # tile halves to 8 keys to stay inside 32 registers either way and 8
-        # rows wins (1122 vs 1032).
-        return 8 if head_dim >= 128 else 4
+        # The bfmmla v2 kernel stages the key tile's logits in L1, so the row
+        # block is no longer capped by the register file and 8 rows is the
+        # default at every head dim (rows are what the K/V read is amortised
+        # over). ``CPU_ATTENTION_QT=4`` still selects the v1 register kernel for
+        # an A/B.
+        return 8
     if lanes < 16:
         if head_dim <= 64:
             return 6 if seq_k >= 1024 else 4
@@ -488,9 +487,15 @@ def _dense(q, k, v, scale: float, causal: bool):
     kt_blk = 4 * _lanes() if _lanes() >= 16 and not bfmmla else seq_k_pad
     if bfmmla:
         mode = 2
-        kt = _scratch("kt2", (batch, num_kv_heads, head_dim // 4, seq_k_pad // 2, 8),
-                      k.dtype)
-        vt = _scratch("vt2", (batch, num_kv_heads, head_dim // 2, seq_k_pad // 4, 8),
+        # K blocked by key tile (64 keys): one tile's K for every head-dim group
+        # is then one contiguous run, so the Q@K^T sweep walks it linearly
+        # instead of jumping seq_k/2*16 bytes per group.
+        kt_blk = 64
+        kt = _scratch("kt2", (batch, num_kv_heads, seq_k_pad // kt_blk,
+                              head_dim // 4, kt_blk // 2, 8), k.dtype)
+        # V: [key group of 4][head-dim pair][8], so P@V's inner loop walks one
+        # key group's dim pairs as a contiguous run (512 B at head_dim 64).
+        vt = _scratch("vt2", (batch, num_kv_heads, seq_k_pad // 4, head_dim // 2, 8),
                       v.dtype)
     elif k.dtype == torch.bfloat16 and _bf16_dot():
         mode = 1
@@ -517,7 +522,8 @@ def _dense(q, k, v, scale: float, causal: bool):
         k.stride(1),
         k.stride(2),
         kt.stride(1),
-        kt.stride(3) if mode == 0 else (kt.stride(3) if mode == 1 else kt.stride(2)),
+        (kt.stride(3) if mode == 0 else
+         (kt.stride(3) if mode == 1 else kt.stride(3))),
         kt_blk,
         v.stride(0),
         v.stride(1),
@@ -539,6 +545,9 @@ def _dense(q, k, v, scale: float, causal: bool):
     # In mode 2 the kernel reads the packed V (one row per head dim *pair*, one
     # column per 4-key group), so hand it those strides instead.
     if vt is not None:
+        # mode 2 packs V as [key group][dim pair][8] and the portable copy is
+        # plain [seq, head_dim]; either way dim 2 is the stride the kernel walks
+        # per key group (or per token) and dim 1 is the per-head base.
         vb, vtok, vh = vt.stride(0), vt.stride(2), vt.stride(1)
         v_ptr = vt.data_ptr()
     else:
@@ -547,7 +556,10 @@ def _dense(q, k, v, scale: float, causal: bool):
     ob, otok, oh = out.stride(0), out.stride(1), out.stride(2)
     ktb = kt.stride(1)
     if mode == 2:
-        ktd, ktt = kt.stride(2), kt.stride(3)   # bfmmla: its own packing
+        # [tile][dim group][key pair][8]: stride(3) is one head-dim group
+        # inside a tile, 8 is one key pair. (The tile stride is derived in the
+        # kernel from the dim-group count.)
+        ktd, ktt = kt.stride(3), 8
     else:
         ktd = kt.stride(3)                      # dim stride within a block
         ktt = kt.stride(4) if mode == 1 else 1  # token stride inside a block
