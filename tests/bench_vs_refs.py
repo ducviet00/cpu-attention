@@ -142,6 +142,16 @@ def main() -> int:
         shapes = [s for s in SHAPES if s in want]
     rows = []
 
+    # Raise the clock before the first timed shape. These boxes idle at a third
+    # of their sustained clock, and two warmup calls per variant are not enough
+    # to ramp: the first row of a sweep otherwise reports the *idle* number,
+    # SDPA included (measured on Graviton: S=128 bf16 500 us in row 1 vs 58 us
+    # from row 2 on, SDPA 357 vs 88). ~0.2 s of fp32 matmul is enough.
+    _burn = torch.randn(512, 512)
+    for _ in range(30):
+        _burn @ _burn
+    del _burn
+
     print(f"threads={torch.get_num_threads()} vllm={args.vllm or '-'} isa={args.isa}")
     for causal in causals:
         print(f"\ncausal={causal}   us (ratios are ours/baseline: <1 = we win)")
