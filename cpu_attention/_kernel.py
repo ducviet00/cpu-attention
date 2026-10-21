@@ -13,6 +13,9 @@ import os
 import torch
 
 _LIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_C.so")
+_CSRC_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "_csrc_kernels.so"
+)
 
 # The kernel specializes on head_dim at compile time; anything else raises.
 _HEAD_DIMS = {32, 64, 128}
@@ -323,7 +326,6 @@ def _bfmmla() -> bool:
 
 _QT = 4
 """Query rows per work item (``CPU_ATTENTION_QT`` overrides it).
-
 Bounded by the register file: the output accumulator is ``qt * head_dim / LANES``
 zmm and the tile logits another ``qt * 64 / LANES``, so ~32 registers cap
 ``qt * head_dim`` near 512. Bigger blocks amortize the K^T/V loads over more rows
@@ -401,10 +403,81 @@ def _qt_for(
     return 8
 
 
+_CSRC = None
+"""ctypes handle for ``_csrc_kernels.so`` (the gcc-build AMX kernels), or False."""
+
+_AMX_ENV = os.environ.get("CPU_ATTENTION_AMX", "1") != "0"
+_KT_ENV = os.environ.get("CPU_ATTENTION_KT", "0")
+
+
+def _csrc():
+    """The gcc-built x86 kernels, or None when they are unavailable here."""
+    global _CSRC
+    if _CSRC is None:
+        try:
+            import ctypes
+
+            lib = ctypes.CDLL(os.environ.get("CPU_ATTENTION_CSRC", _CSRC_PATH))
+            lib.dense_amx_ok.restype = ctypes.c_int
+            lib.dense_amx_ok.argtypes = []
+            fn = lib.dense_amx_bf16
+            fn.restype = ctypes.c_int
+            fn.argtypes = (
+                [ctypes.c_void_p] * 4
+                + [ctypes.c_int64] * 18
+                + [ctypes.c_double]
+                + [ctypes.c_int64] * 3
+            )
+            _CSRC = lib
+        except (OSError, AttributeError):
+            _CSRC = False
+    return _CSRC or None
+
+
+def amx_available() -> bool:
+    """True when this build/CPU can run the AMX bf16 dense kernel."""
+    lib = _csrc()
+    return bool(lib is not None and _AMX_ENV and lib.dense_amx_ok() == 1)
+
+
+def _amx_dense(q, k, v, scale: float, causal: bool):
+    """Run the C/AMX kernel, or return None when it cannot take this call.
+
+    One work item is 32 query rows of one (batch, head), so the kernel is only
+    reachable for bf16 with a supported head dim; everything else falls back to
+    the Mojo path.
+    """
+    lib = _csrc()
+    if lib is None or not _AMX_ENV:
+        return None
+    if lib.dense_amx_ok() != 1 or q.shape[-1] not in (32, 64, 128):
+        return None
+    out = torch.empty_like(q, memory_format=torch.contiguous_format)
+    batch, seq_q, num_heads, head_dim = q.shape
+    seq_k, num_kv_heads = k.shape[1], k.shape[2]
+    qs, ks, vs, os_ = q.stride(), k.stride(), v.stride(), out.stride()
+    tasks = batch * num_heads * (-(-seq_q // 32))
+    rc = lib.dense_amx_bf16(
+        q.data_ptr(), k.data_ptr(), v.data_ptr(), out.data_ptr(),
+        batch, seq_q, seq_k, num_heads, num_kv_heads, head_dim,
+        qs[0], qs[1], qs[2],
+        ks[0], ks[1], ks[2],
+        vs[0], vs[1], vs[2],
+        os_[0], os_[1], os_[2],
+        float(scale), int(bool(causal)),
+        _workers(tasks, 8), int(_KT_ENV or 0),
+    )
+    return out if rc == 0 else None
+
+
 def _dense(q, k, v, scale: float, causal: bool):
     """Run the dense kernel over contiguous-``head_dim`` q/k/v (already checked)."""
     batch, seq_q, num_heads, head_dim = q.shape
     seq_k, num_kv_heads = k.shape[1], k.shape[2]
+    if q.dtype == torch.bfloat16:
+        out = _amx_dense(q, k, v, scale, causal)
+        if out is not None:
+            return out
     bfmmla = k.dtype == torch.bfloat16 and _bfmmla()
     if _QT_ENV:
         qt = int(_QT_ENV)
