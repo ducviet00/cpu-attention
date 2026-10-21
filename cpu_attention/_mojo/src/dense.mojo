@@ -1717,7 +1717,17 @@ def _dense_task[dtype: DType, head_dim: Int, qt: Int](job: DenseJob, task: Int):
                 job, batch, head, kv_head, q0
             )
     elif dtype == DType.bfloat16 and BF16_DOT:
-        _dense_rows_dot[dtype, head_dim, qt](job, batch, head, kv_head, q0)
+        comptime if head_dim >= 128:
+            # head_dim 128 x qt rows of bf16 dot accumulator is 8 zmm per row,
+            # so `_dense_rows_dot`'s register accumulator is 64 zmm at qt = 8 and
+            # spills. The L1-accumulator variant with the same dot instruction
+            # measured 1.24-1.28x over it at 256/1024/4096 x 16 x 128 on the
+            # Ryzen, interleaved, medians of 5.
+            _dense_rows_mem[dtype, head_dim, qt, 32, 32, True](
+                job, batch, head, kv_head, q0
+            )
+        else:
+            _dense_rows_dot[dtype, head_dim, qt](job, batch, head, kv_head, q0)
     elif qt * head_dim >= 512:
         # acc (qt * head_dim / LANES zmm) + logits (qt * KT_TILE / LANES) do
         # not fit in 32 registers: keep acc in L1 and tile the head dim.

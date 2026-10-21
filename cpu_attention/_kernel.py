@@ -446,7 +446,11 @@ def _qt_for(
     if head_dim == 32:
         return 4
     if is_bf16:
-        return 8 if head_dim >= 128 else 4
+        # 6, not 8, in the L1-accumulator bf16 kernel: 1.03-1.06x at head_dim
+        # 128 (48 zmm of accumulator against 64 at 8 rows). At head_dim 64 the
+        # register dot kernel is not row-limited and 4 vs 6 is a wash
+        # (0.98-1.04x), so 4 stays.
+        return 6 if head_dim >= 128 else 4
     # 6, not 8, at head_dim <= 64: 1.10x on the Ryzen at 1024x8x64. At head_dim
     # 128 rows cost 64 zmm of accumulator in the L1-accumulator kernel and 8 vs
     # 6 is a wash (0.99-1.00x), so 6 is kept for one rule fewer.
