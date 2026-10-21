@@ -76,7 +76,7 @@ def amx_init() -> Bool:
     return (
         Int(
             external_call["syscall", Int, Int64, Int64, Int64](
-                Int64(157),  # SYS_arch_prctl on x86_64
+                Int64(158),  # SYS_arch_prctl on x86_64 (157 is prctl)
                 Int64(ARCH_REQ_XCOMP_PERM),
                 Int64(XFEATURE_XTILEDATA),
             )
@@ -166,8 +166,13 @@ def tile_zero[tile: Int]() -> None:
 @always_inline
 def tile_dpbf16ps[dst: Int, a: Int, b: Int]() -> None:
     """`tdpbf16ps`: `dst += a * b`, 16x16 bf16 tiles accumulating in fp32."""
+    # AT&T operand order is (src2, src1, dst) -- the destination tile comes
+    # LAST, unlike the Intel-syntax form gcc's intrinsic emits as an
+    # alternative. Writing the destination first assembles fine and silently
+    # computes `b += a * dst_old`, which measured as "C is all zeros" in the
+    # smoke test (tmm2 was the zeroed accumulator and also a source).
     comptime asm = (
-        "tdpbf16ps " + _tmm[dst]() + ", " + _tmm[a]() + ", " + _tmm[b]()
+        "tdpbf16ps " + _tmm[b]() + ", " + _tmm[a]() + ", " + _tmm[dst]()
     )
     inlined_assembly[
         asm,
