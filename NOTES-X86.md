@@ -545,3 +545,56 @@ more than the drift band, so it is not noise). The remaining bf16 losses against
 vLLM's AMX build are 128:8:64 (1.49), 512:32:128 (1.13), 256:16:128 (1.14),
 512:8:64 (1.07), 1024:16:128 (1.00) — every one of them the pack+fixed
 intercept measured in round 4, not the kernel.
+
+## Round 5b — the pack question is CLOSED
+
+Four more probes after the ladder, all negative. Written down so nobody
+re-derives them.
+
+**1. It is not TLB and not page faults.** `perf stat` on 400 pack-only calls vs
+400 no-pack calls (same script, same shape): `dTLB-load-misses` 2.27 M of 1.19 G
+loads = **0.19%** (the standalone loop: 0.04%), `page-faults` identical (41 800,
+all torch startup). The counters also give the pack's own cost directly: the
+difference between the two runs is **41 M instructions and 17 M cycles over 400
+calls = 102 K instructions and 42 K cycles per call**, i.e. 11 us — the same
+number the phase bench reports. The ARM agent's 28 GB/s and our 32 GB/s are not
+a TLB effect.
+
+**2. The pack retires ~400 instructions per 1 KB tile; the same tile standalone
+retires ~96.** 102 K instructions per call at S=128 is 256 tiles' worth, and the
+tile is 16 loads + 64 shuffles + 16 stores. So the in-call pack executes ~4x the
+instructions of the identical tile loop, at IPC 2.4 (so it is not stalled — it is
+doing more work). That is the whole "5x slower than standalone" mystery, and it
+is an *instruction* effect, not a memory one.
+
+**3. Three source formulations compile to the same code, and none of them change
+it.** (a) the stages in one function with `comptime for k`; (b) each stage a
+separate `@inline(.always)` function (matching `dense.mojo`'s `_tr16_s0..s3`, so
+LLVM cannot reroll across them); (c) sixteen *named* locals with all 64
+`shuffle` calls written out and no array indexing at all, so no memory form is
+expressible. All three: identical `perf` instruction count (4.564 / 4.569 /
+4.574 G over the same 400 calls, within 0.2%) and identical wall time
+(0.99-1.03x in `ab_two_trees`). Mojo/LLVM normalises them, and the 4x is what
+this expression lowers to on this toolchain. Not fixable from the source side.
+
+**4. The three-phase split is decisively out, measured not modelled.** Deferring
+P@V forces every work item's P (probabilities) to survive until the V pack
+finishes, so the per-thread P buffer grows from one item's worth to all of that
+thread's items. Writing + reading that buffer, warm, single-threaded:
+
+| shape | P per thread | traffic | cost | (V pack it would hide) |
+|---|---:|---:|---:|---:|
+| 128:8:64 | 96 KB | 192 KB | 25.8 us | ~7 us |
+| 256:16:128 | 640 KB | 1280 KB | 426 us | ~52 us |
+| 512:32:128 | 4.6 MB | 9.2 MB | 13.3 ms | ~200 us |
+
+The buffer costs **2-8x the phase it would overlap**, at every target shape, and
+it is 640 KB-4.6 MB per thread, i.e. out of L2. The "K pack | QK+softmax |
+V pack + P@V" idea is dead on its own traffic, so I did not build it.
+
+**Status: closed.** At S=128 the pack is 10-16 us of a 49-55 us call; a *free*
+pack would leave us at ~40 us against vLLM's 46-59; the pack cannot be made
+faster by any source change this toolchain responds to, and it cannot be hidden
+behind the attention without paying more than it costs. `128:8:64` bf16 (1.49)
+needs the *kernel* ~25% faster at 60 us, which is a different project and not
+started.
