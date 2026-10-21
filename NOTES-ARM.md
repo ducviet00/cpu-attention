@@ -80,6 +80,16 @@ The causal-limit skip then added 1.5x/1.3x/1.2x at S=128/256/512 on both dtypes.
   instructions) is consistent with this on ARM once the *chain latency* is
   counted, not just the instruction count.
 
+* **Compile-time K strides + contiguous Q panels** (kt_blk is always 64, so the
+  stride is folded; panels laid out `[dim group][row pair][8]` so one group's
+  four load as two `ldp`s): neutral (6.07 -> 6.17 cycles, inside the noise).
+  Kept because it removes the last runtime stride from the sweep, but it is not
+  where the time is.
+* **`TILE_KS = 128`**: broke parity. A tile wider than the K block steps out of
+  its key-pair run into the next head-dim group; the addressing is per sub-block
+  now so it would work, but the expected gain (~1.5%) did not justify chasing
+  the residual flakiness.
+
 ## Dead ends (measured, do not repeat)
 
 * **`dcp=2` in P@V** (16 -> 8 accumulator registers, hoping to kill register
