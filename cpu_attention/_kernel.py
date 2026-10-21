@@ -435,12 +435,22 @@ def _qt_for(
     # 8 rows x 64 dims of accumulator is 32 zmm, and the spill instructions eat
     # more than the wider sweep gains (a wash). head_dim 32 gains nothing (0.94x).
     if seq_k < 1024:
-        return 4
+        # Short and medium keys: 6 rows, not 4. Measured on the Ryzen (fp32,
+        # interleaved, min of 3 processes): 1.13x at 256x16x128 and 1.25x at
+        # 512x32x128 over 4 rows, 1.01x at 512x8x64 -- the traffic per row-key
+        # is D*4/qt bytes for both Q@K^T and P@V, so 4 rows move 1.5x the
+        # bytes of 6 and that is what binds once the key range is a few hundred
+        # tokens. Below 256 keys 4 still wins (1.5x over 8 at 128x8x64: too
+        # little work per work item for a wide row block).
+        return 4 if seq_k < 256 else 6
     if head_dim == 32:
         return 4
     if is_bf16:
         return 8 if head_dim >= 128 else 4
-    return 8
+    # 6, not 8, at head_dim <= 64: 1.10x on the Ryzen at 1024x8x64. At head_dim
+    # 128 rows cost 64 zmm of accumulator in the L1-accumulator kernel and 8 vs
+    # 6 is a wash (0.99-1.00x), so 6 is kept for one rule fewer.
+    return 6
 
 
 def _dense(q, k, v, scale: float, causal: bool):
