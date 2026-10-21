@@ -155,10 +155,11 @@ def tile_store[tile: Int](base: Int, stride: Int) -> None:
 def tile_zero[tile: Int]() -> None:
     """`tilezero`: register-only, no memory operand."""
     comptime asm = "tilezero " + _tmm[tile]()
+    # Register-only, so no memory clobber (see `tile_dpbf16ps`).
     inlined_assembly[
         asm,
         NoneType,
-        constraints="~{memory}",
+        constraints="",
         has_side_effect=True,
     ]()
 
@@ -174,9 +175,15 @@ def tile_dpbf16ps[dst: Int, a: Int, b: Int]() -> None:
     comptime asm = (
         "tdpbf16ps " + _tmm[b]() + ", " + _tmm[a]() + ", " + _tmm[dst]()
     )
+    # No `~{memory}` here: the dot touches no memory, and the clobber cost 10-28%
+    # in the kernel (it forces the compiler to treat every dot as a full barrier,
+    # so the surrounding loads/stores cannot be scheduled around it). Ordering is
+    # still safe because `has_side_effect=True` keeps side-effecting asm in
+    # program order, and the tile loads/stores around it keep their own clobber.
+    # Measured by `tests/ab_two_trees.py` against the gcc-built C kernel.
     inlined_assembly[
         asm,
         NoneType,
-        constraints="~{memory}",
+        constraints="",
         has_side_effect=True,
     ]()

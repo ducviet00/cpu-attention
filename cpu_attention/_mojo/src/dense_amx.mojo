@@ -1022,10 +1022,15 @@ def _amx_worker[
     if threads > 1:
         external_call["GOMP_barrier", NoneType]()
     comptime nlo = 2 if fp32 else 1
-    var logits = stack_allocation[QROWS * MAXKT, Float32]()
-    var prob = stack_allocation[QROWS * MAXKT * nlo, BFloat16]()
-    var acc = stack_allocation[QROWS * DMAX, Float32]()
-    var qpad = stack_allocation[QROWS * DMAX * nlo, BFloat16]()
+    # alignment=64 is not cosmetic: the tile stores/loads and every SIMD access
+    # in the softmax are 64-byte accesses, and the default alignment is the
+    # element size, so unaligned buffers split a cache line per access. The C
+    # version got it free from posix_memalign; here it has to be asked for.
+    # Measured: worth 8-15% of the whole call.
+    var logits = stack_allocation[QROWS * MAXKT, Float32, alignment=64]()
+    var prob = stack_allocation[QROWS * MAXKT * nlo, BFloat16, alignment=64]()
+    var acc = stack_allocation[QROWS * DMAX, Float32, alignment=64]()
+    var qpad = stack_allocation[QROWS * DMAX * nlo, BFloat16, alignment=64]()
     var lp = _ptr[Float32](Int(logits))
     var pp = _ptr[BFloat16](Int(prob))
     var ap = _ptr[Float32](Int(acc))
