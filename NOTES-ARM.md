@@ -116,8 +116,41 @@ Corollary: `alpha` must stay a **4-lane** exp in the bf16 kernel -- the two rows
 of a row pair have their own max, so collapsing it to a scalar silently gives
 row 1 row 0's rescale factor (caught by parity: 33/49).
 
+## The pack is NOT cold-read-bound on ARM (flush measurement)
+
+`scripts/prof/arm/flush.py` walks a 64 MB buffer (L3 is 48 MB) between timed calls
+and times the pack from *inside* the call, so hot and evicted are directly
+comparable -- the x86 lane found 6.7x there and it changes the plan if it holds:
+
+| 128:8:64 bf16 | hot | evicted | ratio |
+|---|---:|---:|---:|
+| pack | 8.27 us | 10.13 us | **1.23x** |
+| full call | 55.5 us | 59.4 us | 1.07x |
+
+512:8:64 pack 26.4 -> 28.6 (1.08x); 2048:8:64 107 -> 111 (1.04x). So the extra is
+just the DRAM transfer of K/V (256 KB at S=128 ~= 1.9 us at 135 GB/s), and ~8 of
+the 10 us at S=128 is **hot** work: the 4-byte gathers, at ~2 loads/cycle.
+
+Consequences:
+* "make the pack faster" is still the right lever on ARM (it is instruction
+  bound, not bandwidth bound), unlike x86 where it is one cold read;
+* a one-pass (fused pack) kernel would save the *write+read of the packed copy*
+  (~4 us at S=128, 7%) but not the gathers, so it is not the 5x the x86 story
+  would suggest;
+* and the real matrix is only 7-8% worse than a hot loop at S=128, so the
+  `bench_phases` numbers are not the lie they are on x86.
+
+**Warning on tooling**: `pk.py`'s cycle deltas are unreliable at small S (a 44%
+"improvement" at S=128 that wall-clock says is 2%). Use `flush.py` or
+`bench_vs_refs.py` for short shapes; `perf stat` remains fine for instruction
+counts at S>=1024.
+
 ## Dead ends (measured, do not repeat)
 
+* **Q@K^T loop unrolled x2** (two head-dim groups per iteration, to halve the
+  `subs` loop-back that is the hottest single instruction in the profile):
+  neutral at S=2048 (7220 vs 7226 us) and at S=128. LLVM's scheduling of the
+  16-bfmmla body was already fine.
 * **`dcp=2` in P@V** (16 -> 8 accumulator registers, hoping to kill register
   copies): 6.95 cycles, 24.35 instructions. The panel loads double and cost more
   than the copies. dcp=4 with 4 row pairs stays.
