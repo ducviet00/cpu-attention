@@ -430,13 +430,13 @@ suites green, ratios `ours/baseline` (<1 = a win), ours includes the K/V pack:
 | | vs torch SDPA | vs vLLM `csrc/cpu` |
 |---|---|---|
 | bf16, 11 shapes | 0.48-0.85 (11/11) | 1.02-1.32, never below 1.00 |
-| fp32, 11 shapes | 0.34-0.91 (11/11) | 0.89-1.07, i.e. parity |
+| fp32, 11 shapes | 0.34-0.91 (11/11) | 0.89-1.11, i.e. parity |
 
 **22/22 beat SDPA and 2-5 of 22 beat vLLM, from 17/22 and 0/22 at the start of
-the ARM campaign.** The range on that second number is not sloppiness: three
-runs of the *same binary* on this box gave 5, 2 and 3 fp32 rows below 1.00
-(0.89-1.07 all three times), because those rows sit on the parity line and a
-row lands on either side of it with a 3% shift. Quote bf16 as
+the ARM campaign.** The range on that second number is not sloppiness: four runs
+of the *same binary* on this box gave 5, 2, 3 and 4 fp32 rows below 1.00
+(0.89-1.11 across the four), because those rows sit on the parity line and land
+on either side of it with a 3% shift. Quote bf16 as
 "1.02-1.32, always above 1" and fp32 as "at parity"; the "N/22 vs vLLM" count is
 ±2 and should never be quoted without the band.
 
