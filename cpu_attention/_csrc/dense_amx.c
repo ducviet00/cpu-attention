@@ -337,7 +337,6 @@ static void dense_item(const Ctx *c, Scratch *s, int64_t b, int64_t h,
    * clamps to p = 0 and is written out as zeros. */
   __m512 m0 = _mm512_setzero_ps(), m1 = _mm512_setzero_ps();
   __m512 s0 = _mm512_setzero_ps(), s1 = _mm512_setzero_ps();
-  memset(acc, 0, (size_t)QROWS * D * sizeof(float));
 
   int64_t loop_end = seq_k;
   if (c->causal) {
@@ -434,7 +433,7 @@ static void dense_item(const Ctx *c, Scratch *s, int64_t b, int64_t h,
         m1 = m_new;
       else
         m0 = m_new;
-      if (need) {
+      if (need && t0 > 0) {  /* at t0 there is nothing to rescale yet */
         float a_sc[16];
         _mm512_storeu_ps(a_sc, alpha);
         for (int r = 0; r < 16; r++) {
@@ -524,11 +523,24 @@ static void dense_item(const Ctx *c, Scratch *s, int64_t b, int64_t h,
     /* ---- P@V over the super-tile, 2 dim chunks (4 accumulator tiles) ----- */
     if (!(c->ablate & 4)) {
       const int nks = (nk + 31) / 32;
+      const int first = (t0 == 0);
       for (int dc = 0; dc < D / 16; dc += 2) {
-        _tile_loadd(4, (void *)(acc + dc * 16), astride);
-        _tile_loadd(5, (void *)(acc + (dc + 1) * 16), astride);
-        _tile_loadd(6, (void *)(acc + 16 * D + dc * 16), astride);
-        _tile_loadd(7, (void *)(acc + 16 * D + (dc + 1) * 16), astride);
+        /* Nothing has accumulated before the first super-tile, so zero the
+         * tiles instead of reading 32*head_dim floats of fresh memory: at
+         * S=256 that memset was 16 KB per work item, i.e. ~20% of the call. */
+        if (first) {
+          _tile_zero(4);
+          _tile_zero(5);
+          _tile_zero(6);
+          _tile_zero(7);
+        } else {
+          _tile_loadd(4, (void *)(acc + dc * 16), astride);
+          _tile_loadd(5, (void *)(acc + (dc + 1) * 16), astride);
+        }
+        if (!first) {
+          _tile_loadd(6, (void *)(acc + 16 * D + dc * 16), astride);
+          _tile_loadd(7, (void *)(acc + 16 * D + (dc + 1) * 16), astride);
+        }
         for (int ks = 0; ks < nks; ks++) {
           const int64_t vb = ((t0 / 32) + ks) * c->dc16 * 512;
           _tile_loadd(0, (const void *)(prob + ks * 32), pstride);
