@@ -627,13 +627,10 @@ default of 16 is also the C++ kernel's best point (67 vs 76 µs at block 32).
    Vec16-style *single-loop* softmax over a memory-resident logits buffer
    (vLLM's actual structure, 200-300 lines, softmax only — Q@K^T, P@V and all
    layouts stay). Expected ~1.2-1.3x, i.e. ~1.15x from vLLM rather than 1.45x.
-5. **Dense: `bfmmla` on ARM for both phases** (done, see §4b). `bfdot` gives 2x the fp32-lane
-   MACs, `bfmmla` gives 4x and amortizes the loads over a 2x2 output tile -- that
-   is where vLLM's 1234 GFLOP/s bf16 on Graviton comes from (`cpu_attn_neon_bfmmla.hpp`
-   is the file to read). It needs V in a *position*-paired layout
-   (`[seq_k/2][head_dim][2]`), i.e. a second transpose pass, plus 2x4 / 4x2
-   operand staging for `llvm.aarch64.neon.bfmmla`. Expect ~2x over the current
-   ARM bf16 path, which is still 3.7x behind vLLM.
+5. **Dense: `bfmmla` on ARM for both phases** — **done** (§4b): 2.2-3.2x, 331 ->
+   853 GFLOP/s (D=64), 348 -> 1093 (D=128), bf16 now 1.12-1.57x over SDPA at
+   D=128. What is left of the vLLM gap is item 4 above.
+
 6. **GQA/MQA**: one KV page shared by `q_heads_per_kv` heads would let one task
    amortise the K/V loads over several query heads — and only then does AMX
    (16-row tiles) become interesting. Not needed for BART/Florence-2.
