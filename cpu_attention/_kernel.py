@@ -329,7 +329,15 @@ def _qt_for(
     So 4 -> 6 is a free win once the key range is long enough for the extra
     traffic reduction to pay for the shorter per-row block, and 8 loses to the
     register wall (``head_dim / LANES`` = 16 accumulator registers per row at
-    head_dim 64). head_dim 128 is left at 2: 32 registers per row already.
+    head_dim 64).
+
+    head_dim 128 takes the same 6, which is *not* the "32 registers per row
+    already" argument one would make from the register file: this kernel keeps
+    the output accumulator in L1 (``acc``/``accv`` are stack allocations), so
+    rows cost ``kt + dc`` registers per row, not ``head_dim``, and the row count
+    is what divides the 16-byte K/V loads. Measured interleaved on m9g against
+    the shipped ``qt=2``, ``qt=6`` is 1.42x at S=1024, 1.52x at S=2048 and 1.73x
+    at S=4096 (fp32, H=16, D=128); ``qt=4`` and ``qt=8`` are 1.18x and 1.55x.
 
     bf16 on ARM is a different path (``bfmmla``) that keeps its own tile
     geometry, and head_dim picks the rows there; x86 (``lanes == 16``) keeps 4.
@@ -345,7 +353,7 @@ def _qt_for(
     if lanes < 16:
         if head_dim <= 64:
             return 6 if seq_k >= 1024 else 4
-        return 2
+        return 6
     return _QT
 
 
