@@ -178,6 +178,39 @@ faster: i.e. keep the tiles in fp16 end to end (fp16 K/V panels via the matmul),
 which is blocked because `bfmmla` takes bf16 operands and fp16 K/V would break
 the range contract for general inputs.
 
+## The short-S "tile waste" hypothesis: falsified, and what the cost actually is
+
+The reasoning was that a 128-key tile makes every causal block at S=128 compute a
+full tile, so ~2x the matmul and softmax. It is not true of this code: the
+causal-limit skip (commit 659e66a) already bounds the sub-block loop *and* the
+exp loop by `jn = loop_end - t0`, so the work is proportional to the keys that
+exist. Tested anyway by rebuilding with `TILE_KS = 32`, which would have been a
+large win at short S if the waste were real:
+
+| | TILE_KS=128 | TILE_KS=32 |
+|---|---:|---:|
+| S=64:8:64 | 26.5 us | 27.2 |
+| S=128:8:64 | 55.0 | **59.6** |
+| S=512:8:64 | 506.7 | 588.0 |
+| S=2048:8:64 | 7238 | 8475 |
+
+Smaller tiles lose at *every* size (the per-tile P@V accumulator round trip and
+epilogue are paid more often), so no adaptive-tile dispatch can help.
+
+What the cost actually is: fitting kernel time = F + G*blocks + 0.4248*row_keys
+over S=64..512 gives **F = 10.0 us per call** and G = 0.07 us per q-block, and
+the model reproduces S=256 to 0.4 us. The per-call part is the whole story at
+short S (47% of an S=64 call, 21% of S=128, 4% of S=512, 0.1% of S=2048), and it
+is host-side: the extension call alone (40 args, one GOMP region, real work) is
+**3.1 us**, `torch.empty_like` 0.66, and the rest was `_dense`'s Python -- 21
+`Tensor.stride()` calls and rebuilding a 40-argument call. Caching the per-shape
+call plan (keyed on `id(q), id(k), id(v)`, holding the tensors so the ids cannot
+be reused) removes 0.6-0.8 us of it: S=8 10.1 -> 9.5, S=128 55.9 -> 55.1.
+
+Note for anyone measuring: `flush.py` sets `CPU_ATTENTION_NO_FUSE` (it needs the
+unfused path to split pack from kernel), so a change to the *fused* call path
+does not show up there at all. Use `flash_attn_func` directly or the matrix.
+
 ## Dead ends (measured, do not repeat)
 
 * **Q@K^T loop unrolled x2** (two head-dim groups per iteration, to halve the

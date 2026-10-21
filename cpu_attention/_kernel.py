@@ -575,8 +575,21 @@ def _amx_dense(q, k, v, scale: float, causal: bool):
     return out
 
 
+_PLANS = {}
+
+
 def _dense(q, k, v, scale: float, causal: bool):
-    """Run the dense kernel over contiguous-``head_dim`` q/k/v (already checked)."""
+    """Run the dense kernel over contiguous-``head_dim`` q/k/v (already checked).
+
+    Everything that depends only on the *shapes, strides and dtype* -- the row
+    block, the pack mode and its scratch, every stride argument -- is computed
+    once per shape and cached as the argument list of the fused call, with the
+    seven tensor pointers left as mutable slots. Measured on the ARM box: the
+    Python side of one call was ~5 us of which ~21 `Tensor.stride()` calls and
+    rebuilding a 40-argument call were most, against a 3.1 us extension call --
+    which is 9% of an S=128 call and 19% of an S=64 one, i.e. the whole
+    short-shape fixed cost.
+    """
     batch, seq_q, num_heads, head_dim = q.shape
     seq_k, num_kv_heads = k.shape[1], k.shape[2]
     out = _amx_dense(q, k, v, scale, causal)
@@ -683,53 +696,40 @@ def _dense(q, k, v, scale: float, causal: bool):
     tasks = batch * num_heads * (-(-seq_q // qt))
     workers = _workers(tasks, 8)
     if _FUSE:
-        # One OpenMP region for the pack and the attention, with a barrier
-        # between them: two fork-joins cost two pool wakes, and at S=128 the
-        # barrier was 14% of the process by perf. `CPU_ATTENTION_NO_FUSE=1`
-        # restores the two-call form, which is what `tests/bench_phases.py`
-        # instruments to split pack from kernel.
-        _forward()(
-            k.data_ptr(),
-            kt.data_ptr(),
-            v.data_ptr(),
-            vt.data_ptr() if vt is not None else 0,
-            v_ptr,
-            batch,
-            num_kv_heads,
-            seq_k,
-            head_dim,
-            k.stride(0),
-            k.stride(1),
-            k.stride(2),
-            vt_bh,
-            vt_d,
-            v.stride(0),
-            v.stride(1),
-            v.stride(2),
-            q.data_ptr(),
-            out.data_ptr(),
-            seq_q,
-            num_heads,
-            qb,
-            qtok,
-            qh,
-            vb,
-            vtok,
-            vh,
-            ob,
-            otok,
-            oh,
-            scale,
-            causal,
-            _DTYPE_CODES[q.dtype],
-            mode,
-            ktb,
-            ktd,
-            ktt,
-            kt_blk,
-            qt,
-            workers,
-        )
+        # Keyed on the tensors' identities, and the entry *holds* them: the ids
+        # cannot be reused while the plan is alive, so a stale plan cannot alias
+        # a different tensor. 12 `shape`/`stride` calls to build a structural key
+        # cost 1.8 us per call, which is the thing being removed.
+        key = (id(q), id(k), id(v), scale, causal)
+        hit = _PLANS.get(key)
+        args = hit[3] if hit is not None else None
+        if args is None:
+            if len(_PLANS) > 64:
+                _PLANS.clear()
+            args = [
+                0, kt.data_ptr(), v.data_ptr(),
+                vt.data_ptr() if vt is not None else 0, v_ptr,
+                batch, num_kv_heads, seq_k, head_dim,
+                k.stride(0), k.stride(1), k.stride(2),
+                vt_bh, vt_d,
+                v.stride(0), v.stride(1), v.stride(2),
+                0, 0,
+                seq_q, num_heads, qb, qtok, qh,
+                vb, vtok, vh, ob, otok, oh,
+                scale, causal, _DTYPE_CODES[q.dtype], mode,
+                ktb, ktd, ktt, kt_blk, qt, workers,
+            ]
+            _PLANS[key] = (q, k, v, args)
+        else:
+            # The pack destination is a scratch slot that only changes if the
+            # workspace was reallocated (a different shape invalidates the key).
+            args[1] = kt.data_ptr()
+            args[3] = vt.data_ptr() if vt is not None else 0
+            args[4] = v_ptr
+        args[0] = k.data_ptr()
+        args[17] = q.data_ptr()
+        args[18] = out.data_ptr()
+        _forward()(*args)
         return out
     _transpose_attention()(
         k.data_ptr(),
