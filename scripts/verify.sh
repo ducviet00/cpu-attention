@@ -71,7 +71,7 @@ for ISA in $ISAS; do
   DT=""
   [ "$ISA" = "amx" ] && DT="--dtype bf16"
   echo "== matrix, isa=$ISA$DT =="
-  "${SSH[@]}" "bash -lc 'cd ~/cpu-attention && .venv/bin/python tests/bench_vs_refs.py --vllm $REF --isa $ISA $DT --rounds 5 --json ~/verify-$LABEL-$ISA.json 2>/dev/null | tail -3'"
+  "${SSH[@]}" "bash -lc 'cd ~/cpu-attention && .venv/bin/python tests/bench_vs_refs.py --vllm $REF --isa $ISA $DT --rounds ${ROUNDS:-9} --json ~/verify-$LABEL-$ISA.json 2>/dev/null | tail -3'"
 done
 
 echo "== scorecard (local) =="
