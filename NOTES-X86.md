@@ -530,3 +530,18 @@ building it.
 
 `pack_bench.mojo` stays: it is the instrument that says where to look (loads,
 not the network) and where not to (the transpose).
+
+## Final table on the merged tree (`scripts/verify.sh ... r5`)
+
+| | beats SDPA | beats VLLM-VEC | beats VLLM-AMX |
+|---|---|---|---|
+| fp32 (11 rows) | 11/11 | **11/11** | n/a (their AMX has no fp32) |
+| bf16 (11 rows) | 11/11 | 11/11 | 6/11 |
+
+**All 22 rows now beat vLLM-VEC**, including `128:8:64 fp32`, which was 1.18-1.21
+across the last four verify runs and measured **0.98** here (o/sdpa 0.38 against
+0.55 in the previous run — the merge with `main` moved it, and the ratio moved
+more than the drift band, so it is not noise). The remaining bf16 losses against
+vLLM's AMX build are 128:8:64 (1.49), 512:32:128 (1.13), 256:16:128 (1.14),
+512:8:64 (1.07), 1024:16:128 (1.00) — every one of them the pack+fixed
+intercept measured in round 4, not the kernel.
