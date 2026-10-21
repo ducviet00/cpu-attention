@@ -156,17 +156,49 @@ estimate of "14-18% of an S=128 call" came from `gomp_barrier_wait_end` *sample
 share* at a trivial shape, which overstates it: the barrier is most of the
 *CPU* time there only because the work is ~1 us.
 
-## Scoreboard after the two tile kernels (dev box, 4 cores, pack included)
+## Scoreboard (dev box, 4 cores, pack included, rounds 9, after this session)
 
-`tests/bench_vs_refs.py --rounds 7`, o/vllm: bf16 **1.06-1.30**, fp32 **0.96-1.15**;
-21/22 rows beat SDPA (was 17/22), 2/22 beat vLLM (was 0/22). The warst bf16 rows
-are S=256 D=128 (1.30) and S=512 H=32 D=128 (1.24); fp32's are S=1024 D=32 (1.15)
-and S=4096 D=64 (1.14).
+`tests/bench_vs_refs.py`, o/vllm: bf16 **1.03-1.36**, fp32 **0.91-1.12**;
+**22/22** rows beat SDPA (was 17/22 at the start of the campaign, 22/22 after the
+tile kernels) and **4/22** beat vLLM (was 0/22 at the start, 1/22 after them).
+
+Kernel-level, thread-cycles per row-key at S=2048: bf16 D=64 **5.33** (vLLM
+5.13, 3.9% behind), fp32 D=64 **13.68** (vLLM 13.76, parity), bf16 D=128 9.76
+(~13% behind), fp32 D=128 ~1-3% behind.
+
+What is still above the line, and why:
+
+| rows | o/vllm | blocker |
+|---|---|---|
+| bf16 D=128 (4 rows) | 1.13-1.14 | 36 instructions/row-key against ~32; the P@V probability panels are reloaded per 4-dim-pair chunk (2 per row-key) because `dcp=8` needs 32 accumulator registers and spills (measured: 45.7 instructions, 12.5 cycles) |
+| bf16 D=64 long (6 rows) | 1.03-1.08 | 3.9% of kernel IPC; the exp pass runs *beside* the matmul instead of overlapping it (see the co-issue note below) |
+| bf16 short (3 rows) | 1.13-1.36 | the K/V pack is 15% of an S=128 call (28 GB/s, 4-byte gathers), plus one extra fork-join's worth of overhead |
+| fp32 (5 rows) | 1.02-1.12 | same pack cost at short lengths; long rows are at parity |
 
 **The first row of a `bench_vs_refs` sweep is not real**: S=128 bf16 measures
 ~500 us there against 58 us in `bench_phases`, and even *SDPA* reads 357 us
 against 88 us -- the process is still at its idle clock. Report from the second
 row on, or warm the process up.
+
+## The co-issue lever that is real but unimplemented
+
+`scripts/prof/arm/mixed.c` measures, on this box, **8 bfmmla 3.98 cycles, 8 fp32
+fmla 2.99, and 8 bfmmla + 8 fmla 3.99** -- the fp32 work is free alongside the
+matmul, on the other two SIMD pipes. The whole softmax pass is fp32, so in
+principle it hides inside a tile's 2048 bfmmla (1024 cycles of matmul, ~4600
+issue slots, ~1800 instructions of exp).
+
+A first implementation did exactly that (double-buffered logits, the exp of tile
+*i* interleaved with the Q@K^T of tile *i+1*, 2 key groups per sub-block) and was
+**5% slower**: 6.07 vs 5.79 cycles/row-key, 22.4 vs 21.2 instructions, with 80
+stack references per iteration -- the 16 Q@K^T accumulators and the exp state do
+not fit in 32 registers together. Halving the Q@K^T tile (nsq=2, 8 accumulators)
+was worse still (7.64 cycles) because the Q-panel loads double.
+
+The route that has not been tried: interleave only *half* the exp (2 of the 4
+row pairs) with the Q@K^T, so the live set is 16 accumulators + ~10, and run the
+other half separately. Expected ceiling is the ~1.2 cycles/row-key the exp still
+costs, i.e. ~15-20% on bf16, which is the whole remaining bf16 D=64 gap.
 
 ## Open
 
