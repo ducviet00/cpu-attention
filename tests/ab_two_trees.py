@@ -75,7 +75,12 @@ def main() -> int:
     ap.add_argument("--rounds", type=int, default=7)
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--causal", choices=["0", "1"], default="1")
+    ap.add_argument("--shapes", default="",
+                    help="comma-separated S:H:D, default: the four dense shapes")
     args = ap.parse_args()
+    shapes = SHAPES
+    if args.shapes:
+        shapes = [tuple(int(x) for x in s.split(":")) for s in args.shapes.split(",")]
     import os
     old = os.path.abspath(args.old)
     new = os.path.abspath(args.new)
@@ -88,7 +93,7 @@ def main() -> int:
     print(f"{'shape':22s} {'dtype':5s} {'old us':>9s} {'new us':>9s} {'new/old':>8s} "
           f"{'old GF':>7s} {'new GF':>7s} {'new/SDPA':>9s}")
     for dtype in dtypes:
-        for shape in SHAPES:
+        for shape in shapes:
             samples = {"old": [], "new": []}
             for _ in range(args.rounds):
                 samples["old"].append(run(old, dtype, threads, shape, causal))

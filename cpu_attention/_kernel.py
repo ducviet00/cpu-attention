@@ -334,8 +334,50 @@ every supported head dim and dtype on the AVX-512 boxes (2 and 8 are switchable
 through the environment).
 """
 
-_QT_ENV = os.environ.get("CPU_ATTENTION_QT")
+_SCRATCH = {}
+"""Reusable scratch, keyed by what it is for.
 
+`torch.empty` on a multi-megabyte buffer is not free: glibc serves it with
+`mmap`, the matching `free` unmaps it, so the next call gets fresh pages and the
+kernel faults them in one 4 KiB page at a time. `clear_page_erms` (the kernel
+zeroing those pages) measured **16.8% of a whole call** at S=1024/H=16/D=128
+fp32 against 49% for the row kernel itself, and the pack looked 6x its real cost
+because the faults landed inside it.
+
+Holding one buffer per purpose and shape removes the fault/zero pass for
+everything except the first call. It is a workspace, not a cache of results: the
+kernel writes every byte it reads, and the buffers are never returned to the
+caller (the output tensor is still a fresh allocation, since the caller owns
+it).
+"""
+
+
+def _scratch(kind, shape, dtype):
+    """A workspace tensor of ``shape``/``dtype``, reused across calls."""
+    key = (kind, shape, dtype)
+    buf = _SCRATCH.get(key)
+    if buf is None:
+        # Bound the dict: one entry per (purpose, shape, dtype) alive at a time
+        # is all the engine ever needs, but a caller looping over many shapes
+        # would otherwise grow it without limit.
+        if len(_SCRATCH) > 64:
+            _SCRATCH.clear()
+        buf = torch.empty(shape, dtype=dtype)
+        _SCRATCH[key] = buf
+    return buf
+
+
+def scratch_bytes() -> int:
+    """Bytes currently held as workspace (diagnostics / leak checks)."""
+    return sum(t.numel() * t.element_size() for t in _SCRATCH.values())
+
+
+def clear_scratch() -> None:
+    """Drop every workspace buffer (tests, or after a shape sweep)."""
+    _SCRATCH.clear()
+
+
+_QT_ENV = os.environ.get("CPU_ATTENTION_QT")
 
 def _qt_for(
     lanes: int, is_bf16: bool, head_dim: int, seq_k: int, bfmmla: bool
@@ -519,27 +561,21 @@ def _dense(q, k, v, scale: float, causal: bool):
     kt_blk = 4 * _lanes() if _lanes() >= 16 and not bfmmla else seq_k_pad
     if bfmmla:
         mode = 2
-        kt = torch.empty(
-            (batch, num_kv_heads, head_dim // 4, seq_k_pad // 2, 8), dtype=k.dtype
-        )
-        vt = torch.empty(
-            (batch, num_kv_heads, head_dim // 2, seq_k_pad // 4, 8), dtype=v.dtype
-        )
+        kt = _scratch("kt2", (batch, num_kv_heads, head_dim // 4, seq_k_pad // 2, 8),
+                      k.dtype)
+        vt = _scratch("vt2", (batch, num_kv_heads, head_dim // 2, seq_k_pad // 4, 8),
+                      v.dtype)
     elif k.dtype == torch.bfloat16 and _bf16_dot():
         mode = 1
-        kt = torch.empty(
-            (batch, num_kv_heads, head_dim // 2, seq_k_pad // kt_blk, kt_blk, 2),
-            dtype=k.dtype,
-        )
-        vt = (torch.empty((batch, num_kv_heads, seq_k, head_dim), dtype=v.dtype)
+        kt = _scratch("kt1", (batch, num_kv_heads, head_dim // 2,
+                              seq_k_pad // kt_blk, kt_blk, 2), k.dtype)
+        vt = (_scratch("vt1", (batch, num_kv_heads, seq_k, head_dim), v.dtype)
               if vpack else None)
     else:
         mode = 0
-        kt = torch.empty(
-            (batch, num_kv_heads, seq_k_pad // kt_blk, head_dim, kt_blk),
-            dtype=k.dtype,
-        )
-        vt = (torch.empty((batch, num_kv_heads, seq_k, head_dim), dtype=v.dtype)
+        kt = _scratch("kt0", (batch, num_kv_heads, seq_k_pad // kt_blk, head_dim,
+                              kt_blk), k.dtype)
+        vt = (_scratch("vt0", (batch, num_kv_heads, seq_k, head_dim), v.dtype)
               if vpack else None)
     _transpose_attention()(
         k.data_ptr(),

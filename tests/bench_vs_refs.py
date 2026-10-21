@@ -98,6 +98,17 @@ def sdpa(q, k, v, causal):
     )
 
 
+def parity(out, ref):
+    """Max abs difference against the SDPA reference, at the dtype's tolerance.
+
+    Printed beside every row so a fast-but-wrong kernel cannot look like a win:
+    the tolerance is the one tests/test_dense.py asserts (fp32 2e-4, bf16 3e-2).
+    """
+    diff = (out.float() - ref.float()).abs().max().item()
+    tol = 3e-2 if out.dtype == torch.bfloat16 else 2e-4
+    return diff, diff <= tol
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dtype", choices=["bf16", "fp32", "both"], default="both")
@@ -108,6 +119,10 @@ def main() -> int:
                     help="vLLM ISA hint: vec|amx|neon|...")
     ap.add_argument("--rounds", type=int, default=9)
     ap.add_argument("--threads", type=int, default=0)
+    ap.add_argument("--shapes", default="", help="filter, e.g. 1024:16:128,512:32:128")
+    ap.add_argument("--json", default="", help="write the table as JSON here")
+    ap.add_argument("--no-parity", action="store_true",
+                    help="skip the max|diff| vs SDPA column (faster)")
     args = ap.parse_args()
 
     torch.set_num_threads(args.threads or torch.get_num_threads())
@@ -115,11 +130,16 @@ def main() -> int:
     dtypes = {"bf16": [torch.bfloat16], "fp32": [torch.float32],
               "both": [torch.bfloat16, torch.float32]}[args.dtype]
     causals = {"0": [False], "1": [True], "both": [True, False]}[args.causal]
+    shapes = SHAPES
+    if args.shapes:
+        want = {tuple(int(x) for x in s.split(":")) for s in args.shapes.split(",")}
+        shapes = [s for s in SHAPES if s in want]
+    rows = []
 
     print(f"threads={torch.get_num_threads()} vllm={args.vllm or '-'} isa={args.isa}")
     for causal in causals:
         print(f"\ncausal={causal}   us (ratios are ours/baseline: <1 = we win)")
-        for seq, heads, dim in SHAPES:
+        for seq, heads, dim in shapes:
             for dtype in dtypes:
                 q, k, v, kc, vc, bt, slots, qsl, lens = paged_case(
                     seq, heads, dim, dtype)
@@ -127,8 +147,14 @@ def main() -> int:
                 q3 = q.unsqueeze(0)
                 k3 = k.unsqueeze(0)
                 v3 = v.unsqueeze(0)
+                ours_out = {}
+
+                def ours():
+                    ours_out["v"] = attn.flash_attn_func(
+                        q3, k3, v3, causal=causal)
+
                 variants = {
-                    "ours": lambda: attn.flash_attn_func(q3, k3, v3, causal=causal),
+                    "ours": ours,
                     "sdpa": lambda: sdpa(q3, k3, v3, causal),
                 }
                 if vllm is not None:
@@ -140,6 +166,10 @@ def main() -> int:
                         q, kc, vc, out, qsl, lens, dim ** -0.5, causal, None, -1,
                         bt, 0.0, meta, None, None, 1.0, 1.0, "auto"))
                 m = time_rounds(variants, args.rounds)
+                d_ours, ok_ours = (float("nan"), True)
+                if not args.no_parity:
+                    ref = sdpa(q3, k3, v3, causal)
+                    d_ours, ok_ours = parity(ours_out["v"].transpose(1, 2), ref)
                 flops = 4.0 * heads * seq * seq * dim * (0.5 if causal else 1.0)
                 gflops = {n: flops / (t * 1e-6) / 1e9 for n, t in m.items()}
                 tag = "bf16" if dtype is torch.bfloat16 else "fp32"
@@ -153,7 +183,31 @@ def main() -> int:
                 if "vllm" in m:
                     line += f"  o/vllm {m['ours']/m['vllm']:5.2f}"
                 line += f"   [{gflops['ours']:4.0f} GFLOP/s]"
-                print(line)
+                if not args.no_parity:
+                    line += f"  d={d_ours:.1e}{'' if ok_ours else ' PARITY-FAIL'}"
+                print(line, flush=True)
+                rows.append({
+                    "seq": seq, "heads": heads, "dim": dim, "dtype": tag,
+                    "causal": causal, "us": m["ours"], "sdpa_us": m["sdpa"],
+                    "vllm_us": m.get("vllm"),
+                    "o_sdpa": m["ours"] / m["sdpa"],
+                    "o_vllm": (m["ours"] / m["vllm"]) if "vllm" in m else None,
+                    "gflops": gflops["ours"], "maxdiff": d_ours,
+                    "parity_ok": ok_ours,
+                    "threads": torch.get_num_threads(),
+                })
+    if args.json:
+        import json
+        with open(args.json, "w") as f:
+            json.dump(rows, f, indent=1)
+        print(f"\nwrote {args.json}")
+    bad = [r for r in rows if not r["parity_ok"]]
+    if bad:
+        print(f"\nPARITY FAILURES: {len(bad)} rows")
+        for r in bad:
+            print(f"  S={r['seq']} H={r['heads']} D={r['dim']} {r['dtype']}"
+                  f" causal={r['causal']} d={r['maxdiff']:.2e}")
+        return 1
     return 0
 
 
