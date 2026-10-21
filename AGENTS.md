@@ -5,6 +5,24 @@ path of `csrc/` (the vendored vLLM CPU attention kernel), wired into the engine
 as `attn_backend="mojo"`. Read this before touching the kernel; the root
 `AGENTS.md` covers the engine side.
 
+
+## 0. Conventions (read this first)
+
+**Performance ratios are `ours / baseline`.** A ratio **below 1 means we are
+faster** than that baseline; above 1 means slower. Two baselines are reported,
+in this order: `torch SDPA` and `vLLM csrc/cpu`. So `o/sdpa 0.62, o/vllm 1.20`
+reads "1.6x faster than SDPA, 1.2x slower than vLLM". Every table in this file,
+in `README.md` and in `tests/bench_vs_refs.py` uses this direction — the older
+tables in this file were written as `baseline/ours` (a "speedup") and are being
+converted as they are touched; where a number could be ambiguous the column name
+says `o/<baseline>`.
+
+Times are microseconds of the whole call. Ours includes the K/V pack and its
+allocations; vLLM's is attention only (its cache is staged before timing), so we
+are charged for work vLLM does once per request. Measure with
+`tests/bench_vs_refs.py`, which interleaves the variants in one process — never
+compare two separate runs on these boxes (they throttle 2-2.5x).
+
 ## 1. Status in one line
 
 Two kernels, compile-time per-ISA paths (AVX512-BF16 `vdpbf16ps` + fp32 P@V on

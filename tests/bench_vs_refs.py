@@ -10,10 +10,13 @@ against each other -- compare the ratios inside one run.
     uv run python tests/bench_vs_refs.py --dtype fp32 --causal 0
     uv run python tests/bench_vs_refs.py --vllm ~/vllm_cpu_build/vllm_cpu_attn_bench.so
 
+**Ratio convention (project-wide, see AGENTS.md §0): `ours / baseline`, so a
+ratio below 1 means we are FASTER than that baseline.** `o/sdpa` and `o/vllm`
+are printed in that order, and `<1` is a win in both columns.
+
 vLLM's kernel is paged, so its K/V is staged into a block-table cache before
-timing and the measured call is attention only; ours includes the K^T transpose
-and its allocations, i.e. ours is charged for work vLLM does not do. Report both
-`ours` and `ours/sdpa`; `vllm` is the reference to beat.
+timing and the measured call is attention only; ours includes the K/V pack and
+its allocations, i.e. ours is charged for work vLLM does not do once per call.
 """
 
 import argparse
@@ -115,8 +118,7 @@ def main() -> int:
 
     print(f"threads={torch.get_num_threads()} vllm={args.vllm or '-'} isa={args.isa}")
     for causal in causals:
-        print(f"\ncausal={causal}   us: ours / sdpa" + (" / vllm" if vllm else "")
-              + "   (GFLOP/s ours, vllm)")
+        print(f"\ncausal={causal}   us (ratios are ours/baseline: <1 = we win)")
         for seq, heads, dim in SHAPES:
             for dtype in dtypes:
                 q, k, v, kc, vc, bt, slots, qsl, lens = paged_case(
@@ -142,15 +144,16 @@ def main() -> int:
                 gflops = {n: flops / (t * 1e-6) / 1e9 for n, t in m.items()}
                 tag = "bf16" if dtype is torch.bfloat16 else "fp32"
                 line = (f"  S={seq:5d} H={heads:2d} D={dim:3d} {tag}: "
-                        f"{m['ours']:9.0f} / {m['sdpa']:9.0f}")
+                        f"{m['ours']:9.0f} us")
                 if "vllm" in m:
-                    line += f" / {m['vllm']:9.0f}"
-                line += (f"   x{m['sdpa']/m['ours']:5.2f} vs sdpa "
-                         f"({gflops['ours']:4.0f} GFLOP/s")
+                    line += f" (sdpa {m['sdpa']:8.0f}, vllm {m['vllm']:8.0f})"
+                else:
+                    line += f" (sdpa {m['sdpa']:8.0f})"
+                line += f"   o/sdpa {m['ours']/m['sdpa']:5.2f}"
                 if "vllm" in m:
-                    line += (f", {m['ours']/m['vllm']:5.2f}x vllm time, "
-                             f"{gflops['vllm']:4.0f} GFLOP/s vllm")
-                print(line + ")")
+                    line += f"  o/vllm {m['ours']/m['vllm']:5.2f}"
+                line += f"   [{gflops['ours']:4.0f} GFLOP/s]"
+                print(line)
     return 0
 
 
