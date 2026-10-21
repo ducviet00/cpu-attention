@@ -10,12 +10,49 @@ Sept 2026 Arm paged-attention refactor. `vllm_cpu_attn_bench.so` was rebuilt fro
 those sources (9436 `bfmmla`); the provisioner had omitted
 `cpu_attn_neon_bfmmla.hpp`, so the reference build did not exist before this round.
 
-**Bottom line: the moderator's tile claim is refuted as the explanation of the 1.45x.**
-Per-tile fixed cost is **~0.5 cycles/row-key = ~6% of runtime (≤6% speedup), not 45%**.
-85% of the bf16 gap is one thing: **vLLM runs P@V on `bfmmla`; we run it on fp32 FMA.**
-§4 is the arithmetic, §6 is the source evidence, §7 is the ranking.
+**Bottom line (corrected — see §0): the moderator's tile claim is refuted as the
+explanation of the 1.45x** (per-tile fixed cost is ~6% of runtime). But so was my own
+first answer: **P@V is already `bfmmla` on both phases**, so the "P@V on the fp32
+pipe" attribution below is **retracted**. With both phases on the matmul pipe, both
+kernels need the same 4 cycles/row-key of `bfmmla` at D=64, and the entire 2.36-cycle
+gap is **non-matmul overhead — IPC, not instruction mix**, which is exactly what the
+x86 worker independently measured (19.07 vs 18.67 instructions/row-key, IPC 1.23 vs
+2.87). The surviving ARM lever is **traffic per row-key ∝ 1/`qt`** (§10).
 
-## 1. Method, and what could not be measured
+## 0. RETRACTION (added after the x86 worker's report)
+
+**The claim "85% of the bf16 gap is P@V on fp32 FMA; only Q@K^T uses `bfmmla`" is
+withdrawn.** I quoted the wrong function. The proof it is wrong:
+
+| evidence | fact |
+|---|---|
+| `dense.mojo:1045` | `accv[rp*dcp+d] = _bfmmla(accv[rp*dcp+d], ap[rp], vv)` — inside `_dense_rows_bfmmla`'s P@V super-tile |
+| `dense.mojo:809-826` (docstring) | "``_dense_rows`` **with `bfmmla` on both phases** (bf16 on NEON)" |
+| `dense.mojo:819` | V is packed `[head_dim/2][seq_k/4][8]` "because P@V contracts over keys" |
+| `dense.mojo:74` | `comptime BFMMLA = NEON_DOT` — true on this box (`+bf16`) |
+| `dense.mojo:1410,1416` | dispatch: `_dense_rows_bfmmla[head_dim, qt, BKS, 8, 16]` / `[..., 4, 8]` |
+| asm, `_dense_task[dtype=bf16,head_dim=64,qt=4]` | `bfmmla 80, bfdot 0` (the x86 worker counted the same 80) |
+
+What I actually cited (`dense.mojo:723-730`, `acc[r] += probs[...] * vrow`) is in
+**`_dense_rows_dot` (595-748)** — the `bfdot` fallback used when `BFMMLA` is false
+(pre-`bf16` ARM, i.e. a build whose `--target-cpu` lacks `+bf16`). It is not
+`_dense_rows_mem` either (396-593). The error was reading lines 600-800 and
+attributing them to the next function that started after them.
+
+Two consequences:
+
+1. **My fit could not have caught it.** `cycles = b/2 + f/4 + s` with `s` as the
+   residual has one free parameter per shape, so "residual 0.00" was guaranteed. The
+   moderator is right that this is not evidence. I will not rest anything on a
+   residual-with-free-parameter again; §4 is rewritten to use only measured totals
+   and a recovered *shared* term.
+2. **The x86 worker's cross-check is a second, independent refutation.** An
+   instruction-mix asymmetry of that size cannot be the dominant term when the x86
+   box has *no* such asymmetry and is **further** behind vLLM (2.25x at D=64 fp32 vs
+   our 1.45x bf16). Both boxes point the same way: **same arithmetic, worse IPC.**
+
+So: the moderator's tile claim is dead (§4.4), my P@V claim is dead (§0), and what
+survives is the *fp32/q-t* line in §5.1, now measured properly in §10.
 
 - **No PMU.** `perf_event_paranoid=4` confirmed; `sudo perf stat -e cycles true`
   returns user time only. This is a hard blocker for counter-based work.
@@ -114,14 +151,12 @@ Per **row per tile**, the non-matmul work is:
 
 Two structural facts that decide everything:
 
-1. **P@V is fp32 FMA, not `bfmmla`.** `dense.mojo:723-730`:
-   `var vrow = v_base.load[width=head_dim](...).cast[f32]()` then
-   `acc[r] += probs.load(r*KT_TILE + j) * vrow`. So P@V costs `head_dim/4` FMA per
-   (row, key) = **16 instructions per 64 MACs (4 MACs/instr)**, where Q@K^T's
-   `bfmmla` gets **16 MACs/instr**. P@V is 4x less instruction-efficient than Q@K^T
-   *and* it occupies the FMA pipes while Q@K^T occupies the matmul pipe.
-   `AGENTS.md` §4b claims `_dense_rows_bfmmla` does "`bfmmla` on both phases" —
-   **that is false for the current tree**; only Q@K^T uses it.
+1. **Both phases are `bfmmla`** (this bullet previously said P@V was fp32; withdrawn —
+   see §0). `dense.mojo:1045`. Q@K^T and P@V are each 16 MACs/instruction, so at
+   D=64 the kernel needs 8 `bfmmla` per row-key and 4 cycles of matmul at the 2/cycle
+   peak; everything else it does is overhead (§4.4.1). The dead giveaway that this
+   section was mis-written: `_dense_rows_dot`, the function I quoted, emits **zero**
+   `bfmmla` by construction.
 2. **The mask is boundary-only.** `dense.mojo:729` guards it with
    `if boundary:`, and `boundary` is true only on the last ~1-2 tiles per row
    block. So the per-lane `iota`/compare/`select` runs on <2% of tiles.
@@ -142,31 +177,76 @@ cycles/row-key  ≈  b/2  +  f/4  +  s
 
 | kernel | Q@K^T | P@V | b | f |
 |---|---|---|---|---|
-| ours bf16 | `bfmmla`, D/16 | **fp32, D/4** | D/16 | D/4 |
-| vLLM bf16 | `bfmmla`, D/16 | **`bfmmla`, D/16** | D/8 | 0 |
+| ours bf16 | `bfmmla`, D/16 | **`bfmmla`, D/16** | **D/8** | 0 |
+| vLLM bf16 | `bfmmla`, D/16 | **`bfmmla`, D/16** | **D/8** | 0 |
 
-### 4.2 Solving for the softmax term
+Both kernels are already on the matmul pipe for **both** phases (§0). So the two
+matmul terms are *equal*, and every cycle of the gap is by construction
+non-`bfmmla`: `b/2` is 4 cycles/row-key for both at D=64 and 8 at D=128. That is the
+one useful thing about this framing — it makes the gap an *overhead* measurement.
 
-| case | b/2 + f/4 | measured | ⇒ s |
+### 4.2 The overhead, by subtraction
+
+| case | b/2 (matmul floor) | measured | ⇒ overhead |
 |---|---:|---:|---:|
-| ours, D=64 | 2 + 4 = 6.0 | 7.76 | **1.76** |
-| ours, D=128 | 4 + 8 = 12.0 | 13.2 | **1.2** |
-| vLLM, D=64 | 4 + 0 = 4.0 | 5.40 | **1.40** |
-| vLLM, D=128 | 8 + 0 = 8.0 | 8.5 | **0.5** |
+| ours, D=64 | 4.0 | 7.76 | **3.76** |
+| ours, D=128 | 8.0 | 13.2 | **5.2** |
+| vLLM, D=64 | 4.0 | 5.40 | **1.40** |
+| vLLM, D=128 | 8.0 | 8.5 | **0.5** |
+
+No fitted parameter: `b` is fixed by the algorithm (D/8, verified against the source
+loop counts — Q@K^T 4/row-key + P@V 4/row-key at D=64) and the matmul floor is the
+measured 2/cycle peak (§1.1). The result: **we spend 2.7x more non-matmul cycles per
+row-key than vLLM at D=64, and ~10x at D=128.**
 
 One model, no tuning, four measurements within 5-10%. The softmax term is
 0.5-1.8 cycles/row-key in both kernels.
 
 ### 4.3 The gap, attributed
 
-| case | gap (cycles/row-key) | P@V pipe change | softmax difference | residual |
-|---|---:|---:|---:|---:|
-| D=64 bf16 | 2.36 | 4.0 − 2.0 = **2.00** | +0.36 | 0.00 |
-| D=128 bf16 | 4.70 | 8.0 − 4.0 = **4.00** | +0.70 | 0.00 |
+| case | gap (cycles/row-key) | matmul | non-matmul overhead (ours − vLLM) |
+|---|---:|---:|---|
+| D=64 bf16 | 2.36 | 0.00 (identical 4.0) | **2.36** = 3.76 − 1.40 |
+| D=128 bf16 | 4.70 | 0.00 (identical 8.0) | **4.70** = 5.2 − 0.5 |
 
-**So ~85% of the bf16 deficit at both head dims is P@V running on fp32 FMA instead
-of `bfmmla`, and ~15% is softmax.** Not the tile size, not the mask, not the
-probability buffer.
+**100% of the bf16 deficit is overhead cycles, at both head dims.** This is the same
+conclusion the x86 worker reached from counters on the other box — 19.07 vs 18.67
+instructions per row-key (a wash) but IPC 1.23 vs 2.87 — and it is why instruction
+*mix* (my retracted §7.1) could not have been the answer. What the overhead is made
+of is §4.5 and §10; the short version is K/V **traffic per row-key**, which scales as
+1/`qt`, and `qt=2→4` on this box is worth 26% (§10).
+
+### 4.4.1 Instruction accounting for the overhead (source-derived, no PMU)
+
+Per row-key, D=64, qt=4 (super-tile `ks=64`, softmax step `sub=16`, `RP=2`):
+
+| phase | bfmmla/row-key | other instructions/row-key |
+|---|---:|---|
+| Q@K^T | 4 | ~2.5 (K panels 128 + Q panels 32 per 16-key step) |
+| softmax (max, exp, sum, bf16 prob pack) | 0 | ~3.75 |
+| P@V | 4 | ~2.5 (V 512 + A panels 128 per super-tile) + acc spill 1 |
+| prob rescale round-trip (bf16→f32→mul→bf16) | 0 | ~1 |
+| **total** | **8** | **~10** |
+
+So ~18 instructions/row-key of which 8 are `bfmmla` → 4 cycles of matmul plus ~10
+instructions of overhead needing 3.76 cycles ⇒ overhead IPC ≈ 2.7. Meanwhile the asm
+shows **21-26% of the super-tile loop body is `[sp, ...]` stack traffic**, i.e. spill
+and remat is a real fraction of that 10. vLLM's equivalent is ~1.40 cycles at D=64.
+
+### 4.4.2 Does the operand-load port bind before the 2/cycle `bfmmla` ceiling?
+
+No — but only just, and it is the wrong question. Ours is **0.63 loads per
+`bfmmla`** (≈2.5 loads per row-key per phase, 8-byte/16-byte `vld1q` operand pairs),
+and the core sustains 2 loads/cycle against 2 `bfmmla`/cycle, so the *port* floor is
+`max(8/2, 5/2) = 4` cycles — the matmul floor, i.e. loads do not bind issue. vLLM is
+0.5-0.63 loads/`bfmmla` for the same reason (`gemm_8x8`: 4 A + 4 B loads per 16
+`bfmmla`). **The binding constraint is not port throughput but bytes moved per
+row-key**, because their K/V panel is reused across `MaxRows = 8` (and
+`MaxQHeadNumPerIteration = 16`) rows while ours is reused across `RP*2 = 4`: **2-4x
+more KV bytes per row-key at equal instruction count.** A register-blocked operand
+(reuse one P panel across dim chunks — already done: `ap[rp]` is loaded once per
+`kg` and used by all `dcp` dims; reuse V across row pairs — already done) would buy
+nothing further; the missing reuse is across *rows*, which is `qt`.
 
 ### 4.4 Splitting our softmax term: per-tile fixed (a) vs per-key (b)
 
@@ -333,7 +413,7 @@ the 7.76 and is already near-minimal: `_exp2_fast` ≈ 11 instructions per 4 lan
 Payoff is in cycles/row-key at the two bf16 protocol shapes, from §4.3/§4.4, not
 extrapolated from a different box.
 
-### 7.1 P@V on `bfmmla`, with bf16 probabilities in bfmmla order — **1.30-1.35x** (rank 1)
+### 7.1 ~~P@V on `bfmmla`~~ — **RETRACTED (§0). We already do this.** (was rank 1)
 
 - **Evidence**: §4.3 attributes 2.00 of the 2.36-cycle gap (D=64) and 4.00 of 4.70
   (D=128) to P@V's pipe. vLLM does exactly this (`cpu_attn_neon_bfmmla.hpp:304-313`
@@ -433,3 +513,72 @@ implies a 2x redundancy that the measured `bfmmla`/cycle does **not** support �
 §4.1's fit says Q@K^T is densely packed at 16 MACs/instr, so the source reading is
 what is wrong). `cpu_attention/_mojo/tests/bfmmla_layout.mojo` already exists for
 this.
+
+## 10. Round 2: `qt` / traffic per row-key (replaces rank 1)
+
+`qt` query rows per work item means each K/V byte is reused `qt` times, so **traffic
+per row-key ∝ 1/qt**. `_kernel._QT_ENV` is read at call time, so every `qt` is timed
+**inside one process, interleaved** (`scripts/prof/arm/qt_sweep.py`), and every `qt`
+is asserted against `qt=4` output first, so a fast-but-wrong variant cannot be
+reported. Single core, `taskset -c 3`, medians of 5.
+
+| shape | dtype | qt=2 | qt=4 | qt=6 | qt=8 |
+|---|---|---:|---:|---:|---:|
+| S=1024 D=64 | bf16 | 0.75x | **1.00x** | 0.90x | 0.94x |
+| S=2048 D=64 | bf16 | 0.74x | **1.00x** | 0.89x | 0.94x |
+| S=4096 D=64 | bf16 | 0.77x | **1.00x** | 0.90x | 0.94x |
+| S=1024 D=64 | fp32 | 0.80x | 1.00x | **1.09x** | 0.78x |
+| S=2048 D=64 | fp32 | 0.79x | 1.00x | **1.10x** | 0.76x |
+| S=4096 D=64 | fp32 | 0.77x | 1.00x | **1.11x** | 0.76x |
+
+Three things, and they are stable across a 4x range of S (so this is traffic, not
+fixed cost, and not a short-S artefact):
+
+1. **The mechanism is confirmed**: halving rows (`qt=2`) costs **23-26% in both
+   dtypes**. That is the same lever the x86 worker found (`qt=8` worth 1.20-1.34x),
+   pointing the same way.
+2. **`qt=8` does not transplant to ARM.** bf16 `qt=8` is 6% *worse* at every S, and
+   fp32 `qt=8` is 24% worse. Cause: `qt>4` switches the bfmmla path to
+   `_dense_rows_bfmmla[..., 4, 8]` (`dcp=4, sub=8`) — half the key tile and double the
+   row pairs — so `RP*4` live accumulators hit the 32-register file. For fp32,
+   `head_dim/4 = 16` registers per row × 8 rows = 128. This is the register wall, not
+   a traffic effect.
+3. **fp32 `qt=6` is a free 1.10x** at every long S (parity-verified), and it is a
+   pure dispatch change (`_kernel.py:323-329`), no kernel edit.
+
+So my earlier "fp32 is load-bound" (§5.1) is **the same phenomenon the x86 box
+measured** — load traffic per row-key — and now has a number: 1/qt, with 26% banked
+between qt=2 and qt=4 and a further ~10% at qt=6 for fp32. It does **not** reach the
+x86 box's 1.2-1.34x because our `qt>4` config change throws away more than it gains.
+
+### 10.1 Who is right about what
+
+| claim | verdict |
+|---|---|
+| moderator: L2-sized 1024-key tile is *the* cause | **refuted** — ≤5.7% (§4.4). x86 worker independently bounded it ≤1.18x even driven to zero. Mechanism real, magnitude not. |
+| moderator: mask-by-range / probs aliasing / −8 rescale are the story | **refuted** — <1%, ~3%, ~3% (§5) |
+| me: P@V on fp32 pipe is 85% of the gap | **retracted** — P@V is `bfmmla` (§0) |
+| me: the gap is 100% *overhead* cycles, not matmul | **stands** — both kernels need 4.0 cycles/row-key of `bfmmla` at D=64 (§4.2) |
+| x86 worker: same instructions, half the IPC; load-bound; `qt` is the lever | **stands, and reconciles**: on ARM the same holds, with the twist that ARM bf16 is already at its `qt` optimum and the lever only pays ~10% (fp32 qt=6) |
+| "instruction mix explains ARM" (either of us, at different times) | **refuted on both boxes** |
+
+The ARM and x86 deficits are one phenomenon seen through two dtypes: **we move more
+KV bytes per row-key and stall on them.** x86 has the headroom to fix it with `qt=8`;
+ARM bf16 does not, because our tile config is coupled to `qt`.
+
+### 10.2 Highest-expected-value experiment (2 hours, one box)
+
+**Decouple `qt` from the tile config, then measure `qt=8` with `sub=16/dcp=8`.**
+Concretely: in `_dense_task`'s bfmmla arm, pick `(dcp, sub)` by `head_dim` only
+(8,16 for D<=64) instead of by `qt`, and give `_dense_rows_bfmmla` `RP=4` row pairs
+with the accumulator spilled deliberately to an L1 tile (`_dense_rows_mem`-style,
+`dc = 2*LANES`) rather than to registers. Rationale: `qt=2→4` banked 26% by doubling
+reuse; `qt>4` currently *loses* 6% purely because of the config flip, so recovering
+that 6% plus the next increment of reuse is worth an estimated **1.1-1.2x**, and it
+composes with the fp32 `qt=6` dispatch change that is already worth 1.10x.
+
+**Abandon it if** the L1-tiled `RP=4` variant is not at least 5% faster than the
+current `qt=4` at S=4096 D=64 bf16 in an `tests/ab_two_trees.py` run (interleaved,
+alternating rounds). If it is not, the remaining 3.76 cycles of ARM overhead are
+latency/spill inside the softmax block rather than traffic, and the next target is the
+`[sp, ...]` traffic (21-26% of the super-tile loop body) rather than `qt`.
