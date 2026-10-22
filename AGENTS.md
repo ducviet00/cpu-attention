@@ -5,31 +5,52 @@ path of `csrc/` (the vendored vLLM CPU attention kernel), wired into the engine
 as `attn_backend="mojo"`. Read this before touching the kernel; the root
 `AGENTS.md` covers the engine side.
 
-> **Status of this file (2026-10-22, after the second dense-attention
-> campaign).** `docs/STATUS.md` is the current scoreboard and the falsification
-> ledger; `docs/CEILINGS.md` is the per-row headroom analysis; `docs/NEXT.md` is
-> what is left. Read those three before trusting any performance claim below.
-> Specifically, the following claims in this file no longer survive
-> measurement, and the number that kills each one is in `docs/STATUS.md`:
+> **Status of this file (2026-10-22, after the third dense-attention
+> campaign, ARM/Graviton).** `docs/STATUS.md` is the current scoreboard and the
+> falsification ledger; `docs/FINDINGS.md` is this session's independent machine
+> measurements, the harness rules, and the call-path anatomy; `docs/ARM_V2_NOTES.md`
+> and `NOTES-FAST.md`/`NOTES-BF16.md` in the agent worktrees have the per-row
+> work. Read `docs/STATUS.md` before trusting any performance claim below.
 >
-> * §4a "qt = 4 for every head dim": the shipped rule is per (ISA, dtype,
->   head_dim, seq_k) in `_kernel._qt_for`, and on ARM it is 8 for both dtypes.
+> What the third campaign changed in the kernel (details and numbers in
+> `docs/STATUS.md`):
+>
+> * **The work item is a whole (batch, head)** — one thread packs that head's
+>   K/V and then attends every one of its query blocks, with no barrier between
+>   the phases (`mode += 4`, `_kernel._dense_plan`). This, not a kernel change,
+>   was the short-S answer: `perf` had put 29% of a 128:8:64 call in the OpenMP
+>   barrier.
+> * **K^T is packed `[tile][key pair][dim group][8]`** so one Q@K^T sub-block is
+>   a linear run, and the tile is 384 keys at head_dim 128 (128 below it).
+> * **A separate short-sequence kernel** (`dense_small.mojo`, `seq_k <= 256`)
+>   rounds key coverage to 8 keys instead of 16 and packs in the same region.
+> * **The bf16 exponential is degree-2** (2.3e-3 relative, against a bf16 store
+>   two instructions later at ~4e-3), which moves bf16 `max|diff|` from 7.8e-3
+>   to 1.6e-2 against the fixed 3e-2 gate. fp32 keeps the degree-4 form.
+> * **Measure with the minimum, not the median.** On a shared box foreign load
+>   moves medians 15%. `tests/bench_vs_refs.py` prints both, and
+>   `scripts/band.py`/`scorecard.py` judge on the min. `scripts/verify.sh` waits
+>   for the load average to drop below 0.8 before it times anything.
+>
+> Claims in this file that no longer survive measurement, with the number that
+> kills each one in `docs/STATUS.md`:
+>
+> * §4a "qt = 4 for every head dim": ARM ships `qt = 8` for both dtypes
+>   (`_kernel._qt_for`); 12/16 exist and do not ship.
 > * §7/§9.3 "the Python path is 3.6 us and a plan cache measured worse": the
->   call path is 3.4 us now, of which the extension marshal alone is 0.76 us; a
->   *per-geometry* plan (ints, not tensors, in the key) took it from 5.0 to 3.4.
-> * §9.6 / round-5 "the K/V pack is cold-read-bound, 85 GB/s, and cannot be made
->   faster": called on its own the pack is 2.90 us at 128:8:64 = 181 GB/s = 88%
->   of a plain memcpy. The 6 us figure came from `bench_phases.py`'s `NO_FUSE`
->   extra fork-join.
-> * §13.1 "bf16 P@V / int8 is a maybe": int8 Q@K^T is 19% faster and misses the
->   fixed 3e-2 bf16 gate at every scaling that fits it; `tests/int8_qk_error.py`
->   has the numbers and the four adversarial input families that break it.
+>   call path is 3.4 us, of which the extension marshal alone is 1.2 us (42
+>   arguments); a per-geometry plan took the rest from 5.0 to 3.4.
+> * §9.6 "the K/V pack is cold-read-bound, 85 GB/s and cannot be made faster":
+>   the pack runs at 422-495 GB/s on 8 threads and is 0.8-6.3% of a call.
+> * §13.1 "bf16 P@V / int8 is a maybe": int8 `smmla` is 3x `bfmmla`'s MAC rate on
+>   Neoverse-V3 but misses the fixed 3e-2 gate at every scaling;
+>   `tests/int8_qk_error.py` has the numbers and four adversarial families.
 > * §14 "AMX from Mojo is the only route" stands, but fp16 matrix multiply
->   (`fmmla`) does **not** exist on any shipping core, so there is no fp16 path.
-> * §4b/§9.10's ARM "the remainder is the softmax block" is right in size (the
->   exp is 23-24% of a D=64 call) but the fix is not overlap: every P@V d-chunk
->   needs every key group's probability, so the merged form needs 128 resident
->   accumulators against 32 registers.
+>   (`fmmla`) does not exist on any shipping core, so there is no fp16 path.
+> * §4b/§9.10's ARM "the remainder is the softmax block": the exp is 15% of a
+>   D=128 call and 29% of a D=64 one, and after the degree-2 change that block is
+>   close to its floor. The residue on the D=128 long rows is the operand loads
+>   that halve `bfmmla` (208 -> 105 MAC/ns/core) and the pack we are charged for.
 
 
 ## 0. Conventions (read this first)
