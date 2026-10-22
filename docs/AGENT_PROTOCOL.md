@@ -51,6 +51,28 @@ Build alone is `PATH=$PWD/.venv/bin:$PATH .venv/bin/python scripts/build.py`
 (`db3b0f0`); `csrc/cpu/cpu_attn_neon.hpp` is the fp32 kernel and
 `cpu_attn_neon_bfmmla.hpp` the bf16 one. Read them; they are the bar to beat.
 
+## How to measure — the rules that came out of the third campaign
+
+These are not preferences; each one cost a session of wrong conclusions.
+
+1. **The box must be idle.** A foreign `mojo build` inflated a row by 1.7x and a
+   foreign python by 25%. `scripts/verify.sh` waits for a 1-minute load average
+   under 0.3 and prints it; do the same before your own runs
+   (`cut -d' ' -f1 /proc/loadavg`).
+2. **Rotate the arm order, and use a control.** Whichever arm runs first in a
+   round is 1-3% slower: two arms running *identical* code measured 3.4% apart.
+   `tests/bench_vs_refs.py` and `tests/ab_two_trees.py` rotate now, and
+   `bench_vs_refs --control` adds a duplicate `ours` arm whose ratio is the run's
+   noise floor (0.99-1.01). **Any claim under 3% needs a control reading.**
+3. **Judge on the minimum, not the median.** Interference can only slow a sample
+   down. Both are printed; `scripts/band.py` and `scorecard.py` use the min.
+4. **Plan-level knobs must be toggled inside one process** (they key the call
+   plan). Toggling one inside a timing loop costs up to 19% by itself.
+5. **Build on x86 before every handover.** An ARM-only file without
+   `comptime if BFMMLA` breaks the x86 build at codegen.
+6. **Do not cache K/V across calls**, however tempting: the benchmark reuses its
+   tensors, so it would look like a large win while breaking SDPA semantics.
+
 ## How to measure
 
 * `tests/bench_vs_refs.py` is the scorecard: interleaved in one process,
