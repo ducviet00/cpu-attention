@@ -113,6 +113,10 @@ relative error -- the same order as the bf16 rounding it replaces. Measured
 
 comptime NEG_INF = -3.4028234663852886e38
 
+comptime RESCALE_SLACK = 8.0
+# How far a tile row max must beat the running max before the P@V accumulator
+# is rescaled (FA4 rule). Affects only the offset the softmax is relative to.
+
 
 @inline(.always)
 def _smmla(
@@ -944,9 +948,11 @@ def _exp2_fast(y: SIMD[DType.float32, 4]) -> SIMD[DType.float32, 4]:
         "llvm.roundeven.v4f32", SIMD[DType.float32, 4], has_side_effect=False
     ](yc)
     var f = yc - n
-    # Degree-3 minimax on [-0.5, 0.5]: 7.5e-5 relative. Degree 2 (1.7e-3) is
-    # only 1% faster and doubles the output error (7.8e-3 -> 1.6e-2 against a
-    # 3e-2 tolerance), so it is not worth the margin.
+    # Degree-3 minimax on [-0.5, 0.5]: 7.5e-5 relative. Degree 2 (1.7e-3)
+    # doubles the output error (7.8e-3 -> 1.6e-2 against a 3e-2 tolerance), and
+    # an Estrin form of the same degree measured *slower* here (5.80 vs 5.59
+    # cycles/row-key): the extra `f*f` and the wider register footprint cost more
+    # than the two cycles of chain depth it saves. Horner stays.
     var p = SIMD[DType.float32, 4](5.5172628285e-2)
     p = p * f + SIMD[DType.float32, 4](2.4261366164e-1)
     p = p * f + SIMD[DType.float32, 4](6.9326095397e-1)
@@ -1511,8 +1517,8 @@ def _dense_rows_tile[
     var t0 = 0
     while t0 < loop_end:
         var kt_tile = kt_base.unsafe_offset(
-            (t0 // job.kt_blk) * (DG * job.kt_stride_d)
-            + ((t0 % job.kt_blk) // 2) * 8
+            (t0 // KS_STRIDE) * (DG * job.kt_stride_d)
+            + ((t0 % KS_STRIDE) // 2) * 8
         )
         # (recomputed per sub-block below: a tile wider than ``kt_blk`` would
         # step out of its key-pair run into the next head-dim group.)
@@ -1528,14 +1534,23 @@ def _dense_rows_tile[
         # (Up to the *causal* limit of the block's last row, not seq_k: past
         # ``loop_end`` every row of the block is masked anyway.)
         var jn = min(ks, loop_end - t0)
-        var nkp = min(NKP, (jn + 2 * nsq - 1) // (2 * nsq) * nsq)
+        # Rounded up to 8 key pairs (16 keys) so that ``nkg`` below is a
+        # multiple of four: the exp loop consumes four key groups per
+        # iteration, and a tail of stale key groups would otherwise enter the
+        # row sum. The extra sub-block is masked by the causal limit, so its
+        # probabilities are exactly zero and the sum is unchanged.
+        var nkp = min(NKP, (jn + 15) // 16 * 8)
         # K^T is blocked by ``kt_blk`` (= the tile size here), so the whole
         # tile's K is one contiguous run and a sub-block reads it linearly.
         var sb = 0
         while sb < nkp:
+            # `KS_STRIDE`, not `job.kt_blk`: both are 64 for every fast path, but
+            # the job's copy is a *runtime* value and this line sits inside the
+            # sub-block loop, so it cost an `sdiv`+`msub` per sub-block (~30
+            # cycles per 8 keys). With the comptime stride they are shifts.
             var kt_sub = kt_base.unsafe_offset(
-                ((t0 + 2 * sb) // job.kt_blk) * (DG * job.kt_stride_d)
-                + (((t0 + 2 * sb) % job.kt_blk) // 2) * 8
+                ((t0 + 2 * sb) // KS_STRIDE) * (DG * job.kt_stride_d)
+                + (((t0 + 2 * sb) % KS_STRIDE) // 2) * 8
             )
             var accs = Array[SIMD[DType.float32, 4], RP * nsq](
                 uninitialized=True
@@ -1549,8 +1564,8 @@ def _dense_rows_tile[
                 # exp pass is one add per logit rather than one FMA.
                 var kt8 = _ptr[Int8](job.kt).unsafe_offset(
                     (batch * job.num_kv_heads + kv_head) * job.kt_stride_bh
-                    + ((t0 + 2 * sb) // job.kt_blk) * (DG8 * job.kt_stride_d)
-                    + (((t0 + 2 * sb) % job.kt_blk) // 2) * 16
+                    + ((t0 + 2 * sb) // KS_STRIDE) * (DG8 * job.kt_stride_d)
+                    + (((t0 + 2 * sb) % KS_STRIDE) // 2) * 16
                 )
                 var acci = Array[SIMD[DType.int32, 4], RP * nsq](
                     uninitialized=True
@@ -1656,14 +1671,22 @@ def _dense_rows_tile[
         # Key groups that exist, rounded up to a multiple of two (the exp loop
         # consumes two per iteration) and never past the sub-blocks the QK pass
         # actually filled.
-        var nkg = min(NKG, (jn + 7) // 8 * 2)
+        var nkg = min(NKG, nkp // 2)
         comptime for rp in range(RP):
             # Does this tile show this row pair anything at all? False only in
             # the last tile of a block whose early rows' window ends earlier.
             var has = mt[rp].reduce_max() > Scalar[DType.float32](NEG_INF)
             var m_new = m_v[rp]
             var alpha = SIMD[DType.float32, 4](1.0)
-            if has:
+            # ... and the running max only moves when the tile beats it by more
+            # than RESCALE_SLACK. The rescale is RP*DP load/multiply/store
+            # triples (128 of each per tile at head_dim 64 = 0.375 instructions
+            # per row-key at a 128-key tile, twice that at the 64-key tiles a
+            # short sequence gets), and for random data the max of tile 1 is
+            # within ~1.5 of the max over the whole row, so after the first tile
+            # it never fires. A stale max only scales the probabilities by up to
+            # 2^8, which fp32 and the bf16 panel both hold; FA4 uses the same -8.
+            if has and (mt[rp] - m_v[rp]).reduce_max() > RESCALE_SLACK:
                 m_new = _vmax(m_v[rp], mt[rp])
                 # Degree-5 exp2, four lanes: an error in `alpha` does not cancel
                 # between the accumulator and the row sum (the terms added
@@ -1695,9 +1718,11 @@ def _dense_rows_tile[
             # One partial sum per key group of the two the loop consumes, folded
             # once: a single `sumv` is a 16-long serial `fadd` chain per row pair
             # per tile, and it showed up as 5% of the backend stalls.
-            var sumv = Array[SIMD[DType.float32, 4], 2](uninitialized=True)
+            var sumv = Array[SIMD[DType.float32, 4], 4](uninitialized=True)
             sumv[0] = SIMD[DType.float32, 4](0.0)
             sumv[1] = SIMD[DType.float32, 4](0.0)
+            sumv[2] = SIMD[DType.float32, 4](0.0)
+            sumv[3] = SIMD[DType.float32, 4](0.0)
             # Nothing visible yet anywhere: the panels have to be exactly zero,
             # because -inf * -c1 is +inf and would exponentiate to 1, not 0.
             var blind = m_new.reduce_max() == Scalar[DType.float32](NEG_INF)
@@ -1709,12 +1734,14 @@ def _dense_rows_tile[
                     )
                     kg += 1
             else:
-                # Two key groups per iteration: the polynomial is a ~10-deep
-                # dependency chain and two of them per iteration (32 cycles of
-                # latency against ~20 instructions of work) does not fill the
-                # pipeline; four in flight does.
+                # Four key groups per iteration. The polynomial is a ~10-deep
+                # dependency chain and the *phase* is latency-bound, not
+                # issue-bound: measured with perf, this loop costs 1.4-1.8
+                # cycles/row-key for 2.5 instructions, and going from 2 to 4
+                # groups in flight is worth 2.3% of the whole kernel at the same
+                # instruction count (5.72 -> 5.59 cycles/row-key).
                 while kg < nkg:
-                    comptime for u in range(2):
+                    comptime for u in range(4):
                         var l0 = logits.unsafe_load[width=4](
                             (kg + u) * (2 * RP) * 4 + rp * 4
                         )
@@ -1744,8 +1771,8 @@ def _dense_rows_tile[
                                 z1.cast[DType.bfloat16]()
                             ),
                         )
-                    kg += 2
-            var st = sumv[0] + sumv[1]
+                    kg += 4
+            var st = (sumv[0] + sumv[1]) + (sumv[2] + sumv[3])
             s_v[rp] = s_v[rp] + _swap_pairs(st) + st
 
         # ---- 3. P@V over the tile, dcp dim pairs at a time. Only the key
@@ -1936,8 +1963,8 @@ def _dense_rows_tile_f32[
         while sb < nkb:
             var ko = sb * kb
             var kt_sub = kt_base.unsafe_offset(
-                ((t0 + ko) // job.kt_blk) * (head_dim * job.kt_blk)
-                + ((t0 + ko) % job.kt_blk)
+                ((t0 + ko) // KS_STRIDE) * (head_dim * KS_STRIDE)
+                + ((t0 + ko) % KS_STRIDE)
             )
             var accs = Array[SIMD[DType.float32, LANES], qt * KV](
                 uninitialized=True
@@ -2889,6 +2916,11 @@ def _dense_arm_rows[
 ](job: DenseJob, batch: Int, head: Int, kv_head: Int, q0: Int):
     """The v2 tile kernel for this dtype (bf16 ``bfmmla`` or fp32)."""
     comptime if dtype == DType.bfloat16:
+        # `dcp` = head-dim pairs per P@V chunk: the panels are reloaded RP times
+        # per key group per chunk, so a wider chunk halves that -- but `dcp = 8`
+        # at head_dim 128 is 32 accumulator registers beside 8 V and 4 panel
+        # registers and spills: measured 12.39 cycles/row-key against 9.58 for
+        # `dcp = 4` at 1024:16:128 (46.3 instructions against 33.1). It stays 4.
         _dense_rows_tile[head_dim, qt, TILE_KS, 4, TILE_NSQ](
             job, batch, head, kv_head, q0
         )
