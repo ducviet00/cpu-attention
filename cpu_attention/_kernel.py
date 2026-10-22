@@ -532,17 +532,33 @@ def set_qt(rows) -> None:
     global _QT_ENV
     _QT_ENV = str(int(rows)) if rows else None
 
-_SMALL_MAXK = int(os.environ.get("CPU_ATTENTION_SMALL_MAXK", "256"))
+_DEFAULT_SMALL_MAXK = 1024
+"""The shipped threshold, so scripts that pin it back can restore the default."""
+
+_SMALL_MAXK = int(
+    os.environ.get("CPU_ATTENTION_SMALL_MAXK", str(_DEFAULT_SMALL_MAXK))
+)
 """``seq_k`` up to which the short-sequence kernel (``dense_small.mojo``) runs.
 
-That path is the shipped bf16 tile with the key coverage rounded to 8 keys
-instead of 16 and the pack fused in the same per-head item. **Default 0 (off):
-it is neutral.** It measured 1.02-1.03x when `tests/bench_small.py` ran its arms
-in a fixed order, and 0.999/0.998/1.000 once the arms alternate position --
-whichever arm runs first in a round is 1-3% slower, and the shipped kernel had
-caught up with the 8-key rounding by the time the per-head dispatch landed. The
-code and its falsification record (KV-outer, the epilogue ablation) stay; a
-caller that measures otherwise can turn it on with `CPU_ATTENTION_SMALL_MAXK`.
+That path is the shipped bf16 tile with the key coverage rounded to 4 keys
+instead of 16, no first-tile accumulator round trip, and the pack fused in the
+same per-head item. It used to lose above ``seq_k = 256`` (0.94x at 512:8:64);
+once it moved to the same bf16-precision exponential as the shipped tile kernel
+(the degree-2 polynomial + the 4-lane panel shuffle, 2026-10-23) it wins or ties
+everywhere it was measured, so the threshold went to 1024:
+
+    shape (bf16)     small/ship, in-process, rotated, min of 21 (control)
+    512:8:64         0.969 (0.998)
+    512:32:128       0.983 (1.003)
+    1024:8:64        0.986 (0.999)
+    1024:16:128      0.986 (1.000)
+    2048:8:64        0.990 (0.997)
+    2048:16:128      0.992 (0.990)   -- no gain, so 2048 stays on the ship path
+    4096:16:128      0.998 (0.999)   -- likewise
+
+`512:8:64` was the shape that used to keep this threshold at 256. Costs no
+precision the gate can see: those rows move from 7.8e-3 to 1.6e-2 against the
+fixed 3e-2 bf16 tolerance, the same figure the D=128 rows already report.
 """
 
 

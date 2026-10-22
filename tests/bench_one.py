@@ -55,7 +55,7 @@ def main() -> int:
         is_causal=True, scale=D ** -0.5)
     d = (out.transpose(1, 2).float() - ref.float()).abs().max().item()
     K.set_qt(0)
-    K.set_small_maxk(256)
+    K.set_small_maxk(K._DEFAULT_SMALL_MAXK)
     print(f"{args.shape} small={args.small} qt={args.qt}  "
           f"median {statistics.median(ts):6.2f} us  min {min(ts):6.2f}  d={d:.1e}")
     return 0

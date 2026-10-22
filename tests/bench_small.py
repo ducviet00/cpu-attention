@@ -110,7 +110,7 @@ def main() -> int:
             if d["small"] > tol:
                 line += " PARITY-FAIL"
             print(line, flush=True)
-    K.set_small_maxk(256)
+    K.set_small_maxk(K._DEFAULT_SMALL_MAXK)
     return 0
 
 

@@ -105,7 +105,7 @@ def main() -> int:
             line += f" {n} {mn[n]:7.1f}/{md[n]:7.1f} ({mn[n]/mn[first]:5.3f})"
         print(line, flush=True)
     K.set_qt(0)
-    K.set_small_maxk(256)
+    K.set_small_maxk(K._DEFAULT_SMALL_MAXK)
     return 0
 
 
