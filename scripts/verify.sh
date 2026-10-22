@@ -9,9 +9,14 @@
 #   label   name for the JSON files (default: the tree's directory name)
 #   RUNS    how many times to run the matrix (default 1). Rows at 1.00-1.04
 #           answer differently on consecutive runs -- this campaign published one
-#           0.98 that re-measured at 1.14-1.21 -- so a claim about a row near the
-#           line needs RUNS=2 and `scripts/band.py`. Both runs happen in the same
-#           process image and box, back to back, so they share the drift.
+#           0.98 that re-measured at 1.14-1.21 -- so a claim about a row near
+#           the line needs RUNS=2 and `scripts/band.py`. Both runs happen in the
+#           same process image and box, back to back, so they share the drift.
+#   REMOTE_DIR  where the tree lands on the box (default cpu-attention). Set it
+#           per agent: the box is shared, and only one thing may time at a time.
+#
+# Every remote step takes the box flock (~/bench.lock): a build or a parity run
+# from another agent beside a timing run moves rows by 1.7x.
 #
 # Writes ~/verify-<label>-<isa>.json on the box and prints the scorecard. On x86
 # it also builds and times vLLM's AMX variant, because that is the ISA vLLM
@@ -22,7 +27,7 @@
 # a stale build cannot pass for a fresh one.
 set -euo pipefail
 
-ARCH="${1:?usage: verify.sh <arm64|x86_64> <host> <tree> [label]}"
+ARCH="${1:?usage: verify.sh <arch64|x86_64> <host> <tree> [label]}"
 HOST="${2:?host required}"
 TREE="${3:?tree required}"
 LABEL="${4:-$(basename "$TREE")}"
@@ -30,22 +35,45 @@ SSH_KEY="${SSH_KEY:-$HOME/.ssh/id_ed25519}"
 REMOTE_DIR="${REMOTE_DIR:-cpu-attention}"
 SSH=(ssh -o StrictHostKeyChecking=no -o ServerAliveInterval=20 -i "$SSH_KEY" "$HOST")
 
+# Run a shell script on the box under the measurement lock. The script arrives
+# on stdin, so no quoting survives into the remote shell.
+remote_locked() {
+  "${SSH[@]}" "flock ~/bench.lock -c 'bash -s'"
+}
+
 echo "== sync =="
-scripts/box_sync.sh "$ARCH" "$HOST" "$TREE"
+REMOTE_DIR="$REMOTE_DIR" scripts/box_sync.sh "$ARCH" "$HOST" "$TREE"
 
 echo "== clean build =="
-"${SSH[@]}" "flock ~/bench.lock -c \"bash -lc 'cd ~/$REMOTE_DIR && rm -rf cpu_attention/_mojo/build cpu_attention/_C.so && PATH=\$PWD/.venv/bin:\$PATH .venv/bin/python scripts/build.py 2>&1 | tail -1'"
+remote_locked <<EOS
+set -eo pipefail
+cd ~/$REMOTE_DIR
+rm -rf cpu_attention/_mojo/build cpu_attention/_C.so
+PATH=\$PWD/.venv/bin:\$PATH .venv/bin/python scripts/build.py 2>&1 | tail -1
+EOS
 
 echo "== parity =="
-"${SSH[@]}" "flock ~/bench.lock -c \"bash -lc 'cd ~/$REMOTE_DIR && .venv/bin/python tests/test_dense.py 2>&1 | tail -1 && .venv/bin/python tests/test_flash_api.py 2>&1 | tail -1'"
+remote_locked <<EOS
+set -e
+cd ~/$REMOTE_DIR
+.venv/bin/python tests/test_dense.py 2>&1 | tail -1
+.venv/bin/python tests/test_flash_api.py 2>&1 | tail -1
+EOS
 # Randomised parity, including the plan cache's hit/invalidate paths: a fixed
 # shape list cannot cover the per-dtype and per-head-dim weight layouts crossed
 # with GQA, odd lengths and strided inputs, and a stale plan corrupts silently.
-"${SSH[@]}" "flock ~/bench.lock -c \"bash -lc 'cd ~/$REMOTE_DIR && .venv/bin/python tests/fuzz_dense.py --cases 40 --max-seq 700 2>&1 | tail -1'"
+remote_locked <<EOS
+set -e
+cd ~/$REMOTE_DIR
+.venv/bin/python tests/fuzz_dense.py --cases 40 --max-seq 700 2>&1 | tail -1
+EOS
 # The AMX kernel has its own parity harness (shape grid, both causal modes,
 # compared against SDPA *and* against the Mojo kernel) plus a byte-level pack
 # self-test; it reports "skipped" on a host without AMX.
-"${SSH[@]}" "bash -lc 'cd ~/$REMOTE_DIR && .venv/bin/python tests/test_amx.py 2>&1 | tail -2'"
+remote_locked <<EOS
+cd ~/$REMOTE_DIR
+.venv/bin/python tests/test_amx.py 2>&1 | tail -2
+EOS
 
 if [ "$ARCH" = "arm64" ]; then
   ISAS="neon"
@@ -62,7 +90,7 @@ g++ -O3 -fPIC -shared -std=c++20 -fopenmp \
   -DCPU_CAPABILITY_AMXBF16 -mamx-tile -mamx-bf16 -mamx-int8 \
   -DVLLM_NUMA_DISABLED -DTORCH_EXTENSION_NAME=vllm_cpu_attn_bench_amx -Icsrc \
   -I"$T/include" -I"$T/include/torch/csrc/api/include" -I"$PY" \
-  csrc/cpu/cpu_attn.cpp csrc/cpu/cpu_isa.cpp csrc/cpu/utils.cpp minimal_binding.cpp \
+  csrc/cpu/cpu_attn.cpp csrc/cpu/cpu_isa.cpp csrc/utils.cpp minimal_binding.cpp \
   -o vllm_cpu_attn_bench_amx.so -L"$T/lib" -ltorch -ltorch_cpu -lc10 -ltorch_python \
   2>/dev/null || echo "WARNING: AMX reference build failed"
 ls -la vllm_cpu_attn_bench_amx.so 2>/dev/null | awk '{print "amx ref:", $5, "bytes"}'
@@ -72,9 +100,8 @@ fi
 
 RUNS="${RUNS:-1}"
 for ISA in $ISAS; do
-  # Single-quoted: the tilde must reach the remote shell unexpanded.
-  REF='~/vllm_cpu_build/vllm_cpu_attn_bench.so'
-  [ "$ISA" = "amx" ] && REF='~/vllm_cpu_build/vllm_cpu_attn_bench_amx.so'
+  REF="~/vllm_cpu_build/vllm_cpu_attn_bench.so"
+  [ "$ISA" = "amx" ] && REF="~/vllm_cpu_build/vllm_cpu_attn_bench_amx.so"
   # vLLM's AMX path is bf16-only (`TileGemm224` is specialised for a BFloat16
   # query; an fp32 query trips TORCH_CHECK and aborts the process), so the amx
   # matrix runs bf16 only. fp32 has no AMX kernel anywhere, which is why VEC is
@@ -84,7 +111,10 @@ for ISA in $ISAS; do
   for R in $(seq 1 "$RUNS"); do
     SUF="$ISA"; [ "$RUNS" -gt 1 ] && SUF="$ISA-r$R"
     echo "== matrix, isa=$ISA$DT run $R/$RUNS =="
-    "${SSH[@]}" "flock ~/bench.lock -c \"bash -lc 'cd ~/$REMOTE_DIR && .venv/bin/python tests/bench_vs_refs.py --vllm $REF --isa $ISA $DT --rounds ${ROUNDS:-9} --json ~/verify-$LABEL-$SUF.json 2>/dev/null | tail -3'"
+    remote_locked <<EOS
+cd ~/$REMOTE_DIR
+.venv/bin/python tests/bench_vs_refs.py --vllm $REF --isa $ISA $DT --rounds ${ROUNDS:-9} --json ~/verify-$LABEL-$SUF.json 2>/dev/null | tail -3
+EOS
   done
 done
 
@@ -104,6 +134,6 @@ for ISA in $ISAS; do
     scp -q -i "$SSH_KEY" "$HOST:~/verify-$LABEL-$ISA.json" \
       "/tmp/verify/$LABEL-$ISA.json"
     python3 "$(dirname "${BASH_SOURCE[0]}")/scorecard.py" \
-      /tmp/verify/"$LABEL"-"$ISA".json
+      /tmp/verify/$LABEL-$ISA.json
   fi
 done
