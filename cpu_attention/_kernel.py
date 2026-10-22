@@ -744,9 +744,15 @@ def _dense_plan(key, q, k, v, causal):
     #   S=4096 H=16 D=128 bf16 (V 16.8 MB): 0.94x
     #
     # so it is gated on fp32 (whose P@V is V-bandwidth-bound; bf16 spends its
-    # P@V instructions widening V instead) and on V being at least half the LLC.
+    # P@V instructions widening V instead) and on V being at least a third of
+    # the LLC. The gate was `2 * V >= LLC` (half) when it was measured on a
+    # 32 MB-L3 laptop; on this box (48 MB) that left 2048:16:128 fp32 (V =
+    # 16.8 MB) *without* the copy, and forcing it there measured 1.02-1.07x in
+    # three interleaved runs while every smaller shape stayed within noise
+    # (`tests/bench_f32_vpack.py`). A third of the LLC fires at exactly the
+    # shapes the half rule did on the laptop, plus that one.
     vpack = (dt == torch.float32
-             and v.numel() * v.element_size() * 2 >= _llc_bytes())
+             and v.numel() * v.element_size() * 3 >= _llc_bytes())
     # The P@V loops work on 4-key groups, and the last tile's key range is only
     # known at runtime, so a kernel that rounds that range up to a whole group
     # reads up to three V rows past the end of the tensor. With V read in place
@@ -915,7 +921,10 @@ def _dense(q, k, v, scale: float, causal: bool, geom=None):
     # here is silent and expensive -- it would keep running 4 workers after the
     # caller asked for 1 and look like a 3x regression in a sweep.
     key = (geom[0], geom[1], geom[2], geom[3], geom[4], causal, _QT_ENV,
-           _OVERRIDE or torch.get_num_threads(), _HEAD_MAXK)
+           _OVERRIDE or torch.get_num_threads(), _HEAD_MAXK, _llc_bytes())
+    # ... and the LLC size, because it decides whether V gets copied: a box
+    # whose cache size is reported differently (or a test that patches the gate)
+    # must not keep the other layout's plan.
     plan = _plans().get(key)
     if plan is None:
         plan = _dense_plan(key, q, k, v, causal)
