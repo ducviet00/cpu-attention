@@ -1,122 +1,155 @@
-# Next steps, in order
+# What is left, and how to pick it up
 
-**Closing report: `docs/CAMPAIGN.md`.** The campaign ended with 22/22 vs SDPA on
-ARM, 5 robust wins + 6 rows within ±3% vs vLLM, and the residue proven to be an
-IPC wall (`docs/CEILINGS.md`). Everything below is what a *next* session needs,
-in the order that unblocks the deliverable.
+Written at the end of the third campaign (ARM/Graviton, 2026-10-23) as the
+handover. `docs/STATUS.md` is the scoreboard and the falsification ledger,
+`docs/FINDINGS.md` is the machine data and the harness rules, this file is the
+*plan*. **Every number below was measured on one spot box and must be
+re-measured on the box you are given before you trust it** — that is the first
+task, not a formality (see "Re-measurement" at the end).
 
-## 0. AWS access is the blocker (needs a human)
+## The state you inherit
 
-The CLI's login refresh token is rejected at the signin endpoint
-(`TOKEN_EXPIRED` from `POST https://ap-southeast-2.signin.aws.amazon.com/v1/token`,
-seen with `aws sts get-caller-identity --debug`), so no box can be launched or
-stopped from here. The only fix is an interactive `aws login` on a machine with
-a browser; there is no credential path in this checkout that survives it.
+`ours / baseline` (below 1 wins), min-based, two clean-rebuild matrix runs,
+interleaved, arm order rotated, box idle at load < 0.3:
 
-The m9g.xlarge at `13.210.162.215` is still running and is what every number in
-`docs/STATUS.md` was measured on. It costs ~$0.10/hr and holds nothing that is
-not in git.
+| | value |
+|---|---|
+| rows beating **torch SDPA** | 22/22, by 1.1–3.3x (`o/sdpa` 0.29–0.88) |
+| rows beating **vLLM csrc/cpu** | 19/22 |
+| remaining rows | `128:8:64` bf16 1.00–1.02, `256:16:128` bf16 1.01–1.02, `4096:16:128` bf16 1.01–1.02 |
+| parity | bf16 `max|diff|` 1.6e-2 against a 3e-2 gate, fp32 1.5e-6 against 2e-4, green on every row |
 
-## 1. Re-verify x86 (never done since the shared-code changes)
+All three remaining rows are inside the box's 1–3% run-to-run drift, i.e. they
+are at parity and the verdict flips between runs. That is the honest reading and
+it is why they are 1.01 rather than 1.10.
 
-The last x86 verification was at `164e8e6`, **before** the second ARM campaign
-and before the host-path rewrite. Both are shared code:
+## Why they are at parity (measured, not argued)
 
-* `cpu_attention/_kernel.py` — the whole dense call path was restructured
-  (`_dense_plan`, per-geometry cache). The AMX path is entered from `_dense`
-  through `_amx_dense`, whose arguments come from a different branch, and the
-  Python `_dense` path is what runs when AMX is unavailable.
-* `cpu_attention/flash_attn_interface.py` — argument checks restructured.
-* `cpu_attention/_mojo/src/dense.mojo` — the ARM kernels, plus shared
-  constants; the x86 AVX-512 path in the same file is untouched but must still
-  compile and pass.
+Per-row accounting from phase ablation, two runs each, closing to ±0.3%:
 
-```
-scripts/verify.sh x86_64 ubuntu@<m8i ip> "$PWD" x86-after-arm2
-```
+| shape (bf16) | matmul | exp (not overlapped) | pack | per-item | unexplained |
+|---|---:|---:|---:|---:|---:|
+| 512:32:128 | 86% | 15% | 6.3% | 5.7% | 0.0% |
+| 1024:16:128 | 77% | 15% | 3.7% | 8% | 0.3% |
+| 2048:16:128 | 85% | 16% | 1.8% | 1.5–6.7% | 0.1% |
+| 4096:16:128 | 80% | 15% | 0.8% | 1.5–3.9% | 0.1% |
 
-That runs the VEC matrix and also builds and times vLLM's AMX variant (bf16
-only). Expectation from `164e8e6` is 21-22/22 against VEC, with `128:8:64 fp32`
-the known-weak row; the point is to confirm the shared changes did not move it.
+The matmul is at a hardware wall, and it is the *load* that sets it: `bfmmla`
+retires at **208 MAC/ns/core with no loads and 105 with the eight loads per 16
+instructions this kernel emits** (measured with a hand-written asm loop on 8
+cores at once; the operand loads halve it). We run at 94% of that, which is where
+vLLM sits too. Two things are then charged to us and not to vLLM:
 
-## 2. Re-verify ARM on the *target* slice
+* **the K/V pack** (0.8–6.3%): their cache is staged before the scorecard's timer
+  and ours is inside it. That is the contract, not a bug.
+* **the Python call path** (~2.6 µs after the seven-argument entry; theirs is
+  ~1.0 through pybind). At 128:8:64 that is 12% of the call.
 
-Every ARM number so far is `m9g.xlarge` (4 cores). The scorecard's target is
-`m9g.2xlarge` (8 cores), where bandwidth per core is roughly halved — and we are
-the side that pays a K+V repack per call and re-reads V at long S, so if the
-ratio moves it likely moves against us. `docs/CEILINGS.md` has the per-row
-efficiency table that the 8-core numbers should be compared against.
+## Ranked next steps
 
-```
-scripts/verify.sh arm64 ubuntu@<m9g.2xlarge ip> "$PWD" arm-8core
-ROUNDS=21
-```
+### 1. The exp block, hidden instead of shrunk (biggest prize, three failures so far)
+The exp is 15% of a D=128 call and 29% of a D=64 one, it does not overlap the
+matmul, and the polynomial is already degree-2. What is left is to overlap it:
+`bfmmla` takes 2 issue slots/cycle and the core issues ~4, so the other two slots
+are free in principle. Three attempts lost — fusing the exp into the Q@K^T body
+(12–25% slower, the per-sub-block max/rescale state spills the 16 accumulators),
+software pipelining the tile (11% slower), and interleaving P@V with the next
+tile's exp (register wall at 34–36 against 32). The untried version is vLLM's own
+shape: keep the logits in memory and run **one straight-line softmax pass** over
+the whole 384-key tile, so the max/exp/sum has a long dependence-free body. Our
+`s=384` tile is now big enough for that to be worth more than it was when this
+was rejected.
 
-## 3. The open technical items (all measured; none is a quick win)
+### 2. The pack, made to disappear from the timed call for the mid rows
+6.3% at `512:32:128`, 3.7% at `1024:16:128`. Fusion of the K^T and V passes is
+worth only 0.2–0.5% (measured); the pack is already at 422–495 GB/s ≈ 90% of
+memcpy. The only real escape is to stop repacking: agent B's operand probe says
+reading K/V in their native layout costs ~10 instructions per row-key (against
+2.4 µs of pack for a whole 128-key call), which is why the pack stays. A
+*partial* escape is untried: keep the V pack (which the P@V operand layout really
+needs) and read K natively through a K-side minipack per tile — K's native layout
+costs +0.8 instructions per bfmmla against V's +1.8.
 
-1. **Per-work-item cost, ~780 cycles** (`b = 0.24 us` from `tests/bench_scale.py`,
-   37% of a 128-key item). The item is ~580 instructions = ~165 cycles, so ~600
-   of the 780 is **stall, not arithmetic** -- do not attack the prologue's
-   instruction count. The two candidates left are the Q-load -> panel build ->
-   first Q@K^T chain (test: prefetch `task + threads`' Q rows, known one item
-   ahead) and load imbalance across the 16-block causal spread. `qt` is already
-   best at 8 (`tests/bench_qt.py`), and the S=128 row cannot be won even with a
-   perfect per-item cost and a free pack (~1.06 floor).
-2. ~~**The K^T pack layout**: swap the two middle axes so one sub-block's K read
-   is contiguous~~ -- **tried and falsified** (NOTES-ARM, fourth campaign): with
-   `[tile][key pair][dim group][8]` and parity green, `l1d_cache_lmiss_rd` is
-   unchanged (0.2749 -> 0.2789 at 2048:8:64, 0.6252 -> 0.6261 at 1024:16:128)
-   and the whole call is 1.00-1.02x. The misses are not the K stride.
+### 3. `qt=16` with a *smaller* key tile (the register wall may be movable)
+Every `qt` sweep this campaign lost, but they all held `nsq`/`dcp` fixed. At
+`qt=16/nsq=2/dcp=2` the QK tile is 16 accumulators — the same count as `qt=8/nsq=4`
+— so the failure was something else (measured 9–12% slower). Re-run it as a
+2x2 sweep of (qt, ks) with `RP*nsq = 16` held, on the D=128 rows only.
 
-   What the counters say at **1024:16:128 bf16**, ours against vLLM: cycles/
-   row-key 9.2 vs **8.58**, instructions 32.4 vs **35.7**, IPC 3.5 vs **4.16**,
-   `l1d_cache_lmiss_rd` 0.87 vs **0.167**, `stall_backend` 2.2-2.5 vs **1.60**,
-   `stall_backend_mem` ~0.4 vs **0.04**. vLLM executes *ten percent more
-   instructions* at D=128 and wins on IPC alone, so no instruction-count change
-   reaches those rows. The memory fourth of the gap is **V**: the P@V loop walks
-   `dcp = 4` dim pairs per key group with the d-chunk loop outermost, so at
-   head_dim 128 it makes 16 passes over the tile touching 64 B of every 1 KB key
-   group. A `[d-chunk][key group][dim pair][8]` V layout makes each pass
-   contiguous; the kernel must derive the d-chunk stride from `seq_k_pad`
-   (`((seq_k+63)//64)*16*32` for the shipped scratch shape) because the host owns
-   the allocation.
-3. ~~The K/V pack throughput at short S~~ **closed**: called on its own the
-   pack is 2.90 us at 128:8:64 (181 GB/s) against a 206 GB/s plain-copy floor,
-   and 88% of that floor at every size. The "6 us" figure came from
-   `bench_phases.py`'s `NO_FUSE` extra fork-join. `tests/pack_only.py`.
-4. ~~`qt` per shape~~ **closed**: an interleaved sweep of 4/6/8/10/12 has qt=8
-   best at S=128 and qt=10/12 +2% at 512:32:128; the per-item cost does not scale
-   with `qt` because the Q panel is O(qt) too. `tests/bench_qt.py` is the sweep,
-   `_kernel.set_qt()` the hook (it is in the plan key, so sweeps stay honest).
-5. **The register-lean single-loop softmax** is the only structural route left.
-   The prize is real (patching the exp out of a D=64 call is 1.23-1.24x) and the
-   tax is now measured: every P@V d-chunk needs every key group's probability, so
-   a merged loop must stage the accumulator per d-chunk *inside* the key loop,
-   +2 instructions/row-key, against 128 resident accumulators that do not fit in
-   32 registers. Build it only with an abandon criterion of 3% whole-call on two
-   D=64 shapes.
+### 4. The three rows inside the drift band
+Do not spend a day here. Run five separate processes with `--control` and publish
+the band. If a row reads 1.01 ± 0.01 it is parity and the scorecard should say so.
 
-## 3b. One untried overlap that is *not* the falsified one
+## x86 / Xeon: what to leverage
 
-The campaign falsified "software-pipeline the softmax into the matmul" twice
-(-11%, -8%): that version needed ~40 live registers because it kept tile *i*'s
-exp alive beside tile *i+1*'s Q@K^T. The *within-tile* version has a much
-shorter distance and needs almost nothing: the exp pass currently writes the
-whole tile's probabilities and only then does P@V start, but both walk the same
-key groups in order, so group *g+1*'s exp could run beside group *g*'s P@V with
-`RP*dcp + 8` live registers instead of 40. That is a different experiment from
-the one that lost, and it targets the term the agent has measured twice (1.4-1.75
-cycles/row-key of exp, 26% at D=64).
+Nothing on x86 has been re-measured since this campaign's ISA-independent changes
+landed (per-head dispatch, work-item ordering, the plan-buffer entry, the
+workspace budget, the min-based harness). **That is the first x86 task** — the
+tree is very likely faster there for free, and the recorded Xeon baselines are
+stale.
 
-## 4. Closed — do not reopen without new hardware
+Then, in order:
 
-* **int8 Q@K^T** (`smmla`): 19% faster, misses the 3e-2 bf16 gate at every
-  scaling that fits it; `tests/int8_qk_error.py` has the numbers including four
-  adversarial input families, and the shipped bf16 kernel is itself at 2.6-7.4e-2
-  on those. `comptime INT8_QK` stays False.
-* **fp16 MMA** (`fmmla`): the `f32mm` extension is not implemented on any
-  shipping core; LLVM has no instruction-selection pattern for the intrinsic.
-* **Wider SIMD**: SVE on Neoverse-V3 is 128-bit
-  (`/proc/sys/abi/sve_default_vector_length` = 16).
-* **A bf16 schedule rewrite for the long-S D=128 rows**: vLLM is at 95% of the
-  measured `bfmmla` ceiling there, so parity is the best a bf16 kernel can do.
+* **AMX for bf16 is the one big x86-only lever** and it already exists:
+  `dense_amx.mojo` (+ `_csrc/dense_amx.c` as the reference), gated on
+  `amxbf16`, worth 4–9.6x on bf16 in the second campaign. The scorecard's honest
+  bar for bf16 on an AMX machine is vLLM's AMX build (`verify.sh x86_64` builds
+  it), not VEC. fp32 has no AMX kernel in vLLM either, so VEC is that column's
+  bar — and our fp32 AMX path is the hi/lo bf16 split, three products, measured
+  5.5–7.6e-5 against the 2e-4 gate.
+* **The fp32 rows are the weak column on x86**: the AVX-512 fp32 path with no
+  AMX ran 1.09–1.90 against VEC. The ARM answer (a per-head dispatch so a thread
+  reuses one head's K/V, plus the plan-buffer call path) should port directly and
+  is worth measuring before anything new is written.
+* **`_qt_for`'s x86 branch is from the second campaign** (`qt=8` at head_dim
+  64/128 fp32, 4 at 32; bf16 8 at 128, 4 at 64). It was swept on a 4-physical-core
+  m8i; re-sweep it on whatever box you get, with the rotated-order harness.
+* **Do not port the ARM tile kernel to x86.** AVX-512 has 32 zmm registers and a
+  different load:store ratio; the second campaign's attempts to transplant
+  structure between ISAs (and `_dense_rows_gemm`) both lost 20–26%.
+* **The pack is cheaper per byte on x86** (fewer, faster cores) but there are
+  fewer cores to hide it: measure `pack_only.py` before assuming the 0.8–6.3%
+  shares transfer.
+
+## Measurement protocol (non-negotiable, this cost the campaign two sessions)
+
+1. **The box must be idle.** `scripts/verify.sh` waits for a 1-minute load
+   average under 0.3 before it times anything and prints the load; a foreign
+   `mojo build` inflated a row by 1.7x and a foreign python by 25%.
+2. **Rotate the arm order.** Whichever arm runs first in a round is 1–3% slower —
+   two arms running *identical* code measured 3.4% apart. `bench_vs_refs.py` and
+   `ab_two_trees.py` rotate; `--control` adds a duplicate arm and its ratio is the
+   run's noise floor (should read 0.99–1.01). Any claim under 3% needs a control.
+3. **Judge on the minimum**, not the median: interference can only slow a sample
+   down. `scripts/band.py` and `scorecard.py` do.
+4. **Plan-level knobs must be toggled in one process**; a knob that invalidates
+   the call plan inside a timing loop costs up to 19% by itself.
+5. **Build on x86 before every handover.** Merging an ARM-only file without
+   `comptime if BFMMLA` broke the x86 build with
+   `LLVM ERROR: Cannot select: intrinsic %llvm.aarch64.neon.bfmmla`.
+
+## Re-measurement checklist for the fresh box
+
+Provisioning: `scripts/box_sync.sh arm64 ubuntu@<ip> . --full` (venv + kernel +
+the pinned vLLM reference `.so`, ~12 min), then `ln -sfn ~/cpu-attention/.venv
+~/<dir>/.venv` for any extra tree.
+
+Then reproduce, in this order, and correct the docs where they disagree:
+
+1. `scripts/verify.sh arm64 ubuntu@<ip> . r1` with `RUNS=2` → the 22-row table.
+   Expected: 19/22 vs vLLM, all rows `o/sdpa` 0.29–0.89. **Absolute µs will
+   differ from the numbers in `STATUS.md`** (different physical host, and these
+   boxes vary 5–10%); the *ratios* are what the docs claim.
+2. `tests/bench_phases.py --shapes 128:8:64,256:16:128,512:8:64` → the pack share.
+3. `perf stat -e cycles,instructions taskset -c 3 python tests/prof_one.py …`:
+   the PMU on this instance inflates absolute cycles ~2.2x (a 27 ms call cannot
+   retire 4 GHz-cycles), so use ratios only, or drop the counter entirely.
+4. `python scripts/band.py` on the two JSONs; note the worst-run min per row.
+5. `tests/fuzz_dense.py --cases 80 --max-seq 900` (parity, odd lengths, non-causal).
+6. The ceiling probes if you plan to touch the matmul: a hand-written asm loop is
+   the only trustworthy way to measure `bfmmla`/`fmla`/`smmla` throughput here;
+   `tests/bench_amx_ablate.py`-style in-process probes are fine for phases.
+
+Anything in `docs/` that does not reproduce: fix the doc, not the number, and
+write the discrepancy down with the measurement that killed it — that ledger is
+what stops the next campaign repeating a dead end.
