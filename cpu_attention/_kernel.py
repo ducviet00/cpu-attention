@@ -409,13 +409,15 @@ def _scratch_strides(kt, vt):
     return got[1], got[2]
 
 
-_SCRATCH_BYTES = 48 << 20
-"""Bytes of packed-K/V workspace kept alive across geometries (see ``_scratch``).
+_SCRATCH_BYTES = 24 << 20
+"""Bytes of packed-K/V workspace kept alive for *other* geometries.
 
-Bounded by *bytes*, not by the number of geometries: a workload with many small
-shapes keeps all of them, and one with a few large shapes keeps one. The budget
-is a little over a single 4096x16x128 bf16 geometry (K^T + V = 32 MB), which is
-exactly the case where holding two of them is what costs.
+Bounded by bytes rather than by the number of geometries, so a workload with
+many small shapes keeps all of them and one with a few large shapes keeps one
+generation. Charged at the start of a plan build (see :func:`_dense_plan`), when
+nothing is half-built, and only against workspace that belongs to *other*
+geometries -- a single geometry is never evicted to make room for itself, which
+is what would turn this into a per-call reallocation.
 """
 
 
@@ -451,16 +453,6 @@ def _scratch(kind, shape, dtype):
     key = (kind, shape, dtype)
     buf = bufs.get(key)
     if buf is None:
-        # Bound the workspace by bytes. A caller looping over shapes would
-        # otherwise grow it without limit, and the *large* shapes are the ones
-        # whose leftovers cost. `len(bufs) > 1` keeps a single geometry from
-        # evicting itself: the budget is per generation, not per buffer.
-        nbytes = 1
-        for d in shape:
-            nbytes *= d
-        if len(bufs) > 1 and _workspace_bytes(bufs) + nbytes > _SCRATCH_BYTES:
-            _drop_workspace()
-            bufs = _SCRATCH.bufs
         buf = torch.empty(shape, dtype=dtype)
         bufs[key] = buf
     return buf
@@ -792,6 +784,18 @@ def _dense_plan(key, q, k, v, causal):
     the pointers inside it stay valid for as long as the entry does.
     """
     qs, q_st, k_st, v_st, dt = key[0], key[1], key[2], key[3], key[4]
+    # Bound the packed-K/V workspace by bytes before building anything: a sweep
+    # over large shapes would otherwise keep every geometry's scratch alive at
+    # once (a 22-row bench_vs_refs run reaches several hundred MB, and the rows
+    # it measures late are 5-15% slower than the same rows run on their own --
+    # medians of 9 on the Graviton box, and the fingerprint is positional, not
+    # shape-dependent). Done here rather than inside `_scratch` so it can never
+    # fire in the middle of a build.
+    # (This runs only on a plan *miss*, so a geometry that is already planned
+    # never reaches it and cannot evict itself.)
+    _live = getattr(_SCRATCH, "bufs", None)
+    if _live and _plans() and _workspace_bytes(_live) > _SCRATCH_BYTES:
+        _drop_workspace()
     batch, seq_q, num_heads, head_dim = qs
     seq_k, num_kv_heads = k.shape[1], k.shape[2]
     bfmmla = dt == torch.bfloat16 and _bfmmla()

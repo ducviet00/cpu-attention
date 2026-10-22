@@ -16,24 +16,26 @@ are not). `o/vllm` < 1 = we win.
 
 | shape | bf16 | fp32 |
 |---|---:|---:|
-| S=128 H=8 D=64 | 1.13 | **0.94** |
-| S=512 H=8 D=64 | **0.94** | **0.89** |
-| S=1024 H=8 D=64 | **0.96** | **0.93** |
-| S=2048 H=8 D=64 | **0.98** | **0.93** |
-| S=4096 H=8 D=64 | **0.97** | **0.98** |
-| S=256 H=16 D=128 | **0.99** | **0.80** |
-| S=1024 H=16 D=128 | 1.01 | **0.85** |
-| S=2048 H=16 D=128 | 1.04 | **0.87** |
-| S=4096 H=16 D=128 | 1.04 | **0.98** |
-| S=512 H=32 D=128 | 1.03 | **0.84** |
-| S=1024 H=8 D=32 | **0.96** | **0.90** |
+| S=128 H=8 D=64 | 1.12 | **0.95** |
+| S=512 H=8 D=64 | **0.93** | **0.90** |
+| S=1024 H=8 D=64 | **0.92** | **0.93** |
+| S=2048 H=8 D=64 | **0.94** | **0.94** |
+| S=4096 H=8 D=64 | **0.93** | **0.99** |
+| S=256 H=16 D=128 | 1.01 | **0.80** |
+| S=1024 H=16 D=128 | **1.00** | **0.84** |
+| S=2048 H=16 D=128 | **1.00** | **0.87** |
+| S=4096 H=16 D=128 | 1.02 | **0.99** |
+| S=512 H=32 D=128 | 1.01 | **0.85** |
+| S=1024 H=8 D=32 | **0.90** | **0.91** |
 
-(`min o/vllm` from the same run, which is what `main` now judges on: every row is
-within 1% of the median-based ratio above.)
+(`min o/vllm`, which is what `main` now judges on; medians agree within 1-2%.)
 
-**17/22** -- all 11 fp32 rows and 6 of the 11 bf16 ones. Four of the five
-remaining bf16 rows are inside 1.01-1.04, i.e. inside this box's noise band; only
-`128:8:64` (1.13) is reproducibly above 1.05.
+**17/22 outright and 19/22 at or inside 1.02**, measured on `main` + this branch's
+two commits -- i.e. after `d13dafe`'s bf16 exponential, which is what moved the
+D=64 rows from 0.96-0.99 to 0.92-0.94. All 11 fp32 rows win (0.80-0.99) and 6 of
+11 bf16 rows do, with two more at exactly 1.00. The one row still outside the
+noise band is `128:8:64` bf16 at 1.12, which is per-call cost and not kernel rate
+(see the last section).
 
 ## What this branch actually changed (and what it is worth)
 
