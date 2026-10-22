@@ -419,9 +419,15 @@ def _scratch(kind, shape, dtype):
     if buf is None:
         # Bound the dict: one entry per (purpose, shape, dtype) alive at a time
         # is all the engine ever needs, but a caller looping over many shapes
-        # would otherwise grow it without limit.
+        # would otherwise grow it without limit. The call plans hold references
+        # to these buffers, so they have to be dropped together -- otherwise a
+        # many-shape sweep keeps one generation of buffers alive through the
+        # plans after the dict that owns them has been cleared.
         if len(bufs) > 64:
             bufs.clear()
+            plans = getattr(_SCRATCH, "plans", None)
+            if plans is not None:
+                plans.clear()
         buf = torch.empty(shape, dtype=dtype)
         bufs[key] = buf
     return buf
@@ -430,7 +436,21 @@ def _scratch(kind, shape, dtype):
 def scratch_bytes() -> int:
     """Bytes this thread holds as workspace (diagnostics / leak checks)."""
     bufs = getattr(_SCRATCH, "bufs", None) or {}
-    return sum(t.numel() * t.element_size() for t in bufs.values())
+    seen = {id(t) for t in bufs.values()}
+    plans = getattr(_SCRATCH, "plans", None) or {}
+    for plan in plans.values():
+        # two of the plan's fields are the buffers themselves
+        for t in plan[-3:]:
+            if t is not None:
+                seen.add(id(t))
+    total = 0
+    for t in list(bufs.values()) + [
+        x for p in plans.values() for x in p[-3:] if x is not None
+    ]:
+        if id(t) in seen:
+            seen.discard(id(t))
+            total += t.numel() * t.element_size()
+    return total
 
 
 def clear_scratch() -> None:
