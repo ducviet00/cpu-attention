@@ -109,3 +109,48 @@ and why co-issuing the exp with the next tile's Q@K^T lost (that body is 26
 instructions per 16 bfmmla, i.e. 3.25 IPC against a machine that sustains 3.5:
 there are no spare issue slots to hide it in).
 
+
+## Second ARM campaign (2026-10-22, m9g.xlarge): pack, epilogue, and the int8 wall
+
+Three changes, all measured on the 4-core m9g slice with `bench_vs_refs.py`
+(one process, round-robin, medians) and, for the tree-level claims,
+`tests/ab_two_trees.py --old <base> --new <tree>` (alternating short processes).
+
+1. **The K/V pack is now vector.** The K transpose (mode 2) and the V repack were
+   per-lane inserts, ~20 instructions per 16-byte unit, with a division by a
+   *runtime* `kt_blk` in the inner loop. They are now `zip1/zip2.2d` and 16-bit
+   transposes with every address folded out, plus an unguarded full-tile path.
+   Pack time 9 -> 6 us at 128:8:64 bf16 and 286 -> 176 us at 4096:8:64; the pass
+   is memory-bound now (~73 GB/s at S=128, ~97 GB/s at S=4096) instead of
+   instruction-bound. Worth 0.98-1.07x on the whole call for S <= 512.
+2. **The output epilogue is vector.** The `bfmmla` 2x2 accumulator
+   `[row pair][dim pair][4]` was de-interleaved with per-lane scalar picks,
+   ~1600 instructions per work item (8% of the kernel at S=128, 0.5% at S=2048);
+   it is now `zip1.2d`/`zip2.2d` between adjacent dim pairs with one reciprocal
+   vector per row pair.
+3. **The fp32 Q@K^T dim loop is unrolled over `head_dim`** (was a runtime loop
+   spending 3 of 22 instructions on the counter and two pointer bumps, and
+   serialising each iteration behind its operand loads -- `perf annotate` put a
+   single `ldp` at 15% of that kernel's cycles). 1.03-1.05x interleaved.
+
+**The int8 Q@K^T result is the interesting one.** `smmla` (i8mm) with int8 Q and
+K is *the* lever this kernel was missing: half the matrix instructions and half
+the operand loads of the Q@K^T phase, 12-15% overall, `o/vllm` 0.92-0.98 at
+S >= 1024 and 873 GFLOP/s at 4096:16:128 (from 708). It is **off** because 127
+symmetric levels on *both* operands is a 0.8% logit error, and a peaked causal
+row (3 visible keys) turns that into a ~1% output error = 2-4 bf16 ulp at the
+largest magnitudes, which is where the whole `max|diff|` gate lives: measured
+3.1e-2 (3.9e-2 at head_dim 128) against a 3e-2 tolerance. Per-key K scales buy
+1.35x and hi/lo splitting doubles the matmul back to `bfmmla`'s cost, so it
+needs ~2.5 more bits per operand than the ISA offers. It is kept behind
+`comptime INT8_QK` with the numbers in its docstring.
+
+**Where that leaves the objective.** bf16 is still 1.04-1.28 of vLLM and fp32
+0.91-1.08. With the instruction budget the ISA allows -- 8 `bfmmla` per row-key =
+4.0 cycles at the measured 2.0/cycle ceiling, plus ~9-12 for the softmax and
+loads -- the kernel is at 5.6 cycles/row-key against vLLM's 5.13, i.e. 71% of the
+matmul floor against their 78%, and the separation is schedule (IPC 3.56 vs
+4.07), not instructions. Beating them on every row needs either a precision
+budget that admits int8 or a different instruction set; the fixed costs we pay
+and they do not (K/V staging inside the timed call, ~3.6 us of Python) then
+decide every row at S <= 512.

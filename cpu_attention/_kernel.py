@@ -319,6 +319,24 @@ def _bf16_dot() -> bool:
     return _BF16_DOT
 
 
+_INT8_QK = None
+
+
+def _int8_qk() -> bool:
+    """True when the build runs bf16 Q@K^T on i8mm with int8 operands.
+
+    That path reads a different K layout *and* dtype (int8 blocks plus a
+    per-64-key dequant scale), so the caller has to allocate both scratch
+    buffers and select pack mode 3.
+    """
+    global _INT8_QK
+    if _INT8_QK is None:
+        mod = module()
+        gate = getattr(mod, "dense_int8_qk", None) if mod else None
+        _INT8_QK = bool(gate()) if gate is not None else False
+    return _INT8_QK
+
+
 _BFMMLA = None
 
 
@@ -662,11 +680,25 @@ def _dense(q, k, v, scale: float, causal: bool):
     # Every fast path blocks K^T by 64 keys, and the tile kernels take that as a
     # *compile-time* stride (a runtime stride turned each address into a `madd`).
     kt_blk = 64
-    if bfmmla:
+    ks = None
+    if bfmmla and _int8_qk():
+        mode = 3
+        # int8 K for i8mm: [tile][head-dim group of 8][key pair][16 int8], plus
+        # one dequant scale per 64-key tile. Half the bytes of the bf16 layout
+        # and the same block structure, so the Q@K^T sweep still walks each
+        # tile's K linearly.
+        kt_blk = 64
+        kt = _scratch("kt3", (batch, num_kv_heads, seq_k_pad // kt_blk,
+                              head_dim // 8, kt_blk // 2, 16), torch.int8)
+        ks = _scratch("ks3", (batch, num_kv_heads, seq_k_pad // kt_blk),
+                      torch.float32)
+        vt = _scratch("vt2", (batch, num_kv_heads, seq_k_pad // 4, head_dim // 2, 8),
+                      k.dtype)
+    elif bfmmla:
         mode = 2
         # K blocked by key tile (64 keys): one tile's K for every head-dim group
         # is then one contiguous run, so the Q@K^T sweep walks it linearly
-        # instead of jumping seq_k/2*16 bytes per group.
+        # instead of jumping seq_k/2*16 bytes per head-dim group.
         kt_blk = 64
         kt = _scratch("kt2", (batch, num_kv_heads, seq_k_pad // kt_blk,
                               head_dim // 4, kt_blk // 2, 8), k.dtype)
@@ -696,6 +728,8 @@ def _dense(q, k, v, scale: float, causal: bool):
     kt_bh, kt_d = kt_st[1], kt_st[3]
     vt_bh = vt_st[1] if vt is not None else 0
     vt_d = vt_st[2] if vt is not None else 0
+    ks_stride_bh = (seq_k_pad // kt_blk) if ks is not None else 0
+    ks_ptr = ks.data_ptr() if ks is not None else 0
     out = torch.empty_like(q, memory_format=torch.contiguous_format)
     q_st, k_st, v_st, o_st = q.stride(), k.stride(), v.stride(), out.stride()
     qb, qtok, qh = q_st[0], q_st[1], q_st[2]
@@ -769,6 +803,8 @@ def _dense(q, k, v, scale: float, causal: bool):
             kt_blk,
             qt,
             workers,
+            ks_ptr,
+            ks_stride_bh,
         )
         return out
     _transpose_attention()(
@@ -794,6 +830,8 @@ def _dense(q, k, v, scale: float, causal: bool):
         _DTYPE_CODES[k.dtype],
         mode,
         _workers(batch * num_kv_heads, seq_k // 8),
+        ks_ptr,
+        ks_stride_bh,
     )
     _dense_attention()(
         q.data_ptr(),
@@ -824,5 +862,7 @@ def _dense(q, k, v, scale: float, causal: bool):
         _DTYPE_CODES[q.dtype],
         qt,
         workers,
+        ks_ptr,
+        ks_stride_bh,
     )
     return out
