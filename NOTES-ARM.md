@@ -689,7 +689,18 @@ the host cost to go away. (`tests/bench_phases.py` plus the H sweep is the way t
 re-measure this.)
 
 **What is left.** 4.0 of the 5.36 cycles is the bfmmla pipe and ~1.4 is the
-unhidden exp. The only routes below ~5.0 are (a) overlapping the exp with a
-matmul phase, which needs the exp of tile i to run beside the P@V of tile i-1 and
-that needs ~40 live registers, or (b) int8 Q@K^T (12-19% faster, parity-gated,
-see `hybrid-wip`). The L1 miss rate (0.35/row-key) is worth at most 3%.
+unhidden exp. The only way below ~5.0 is overlapping the exp with a matmul
+phase: the exp of tile i would have to run beside the P@V of tile i-1, and that
+union needs ~40 live registers (RP*dcp accumulators + panels + V + the exp's
+eight lanes), which is 8-10 too many. Every cheap version of it has now lost
+(see the falsified list above and `docs/STATUS.md`).
+
+int8 Q@K^T is **closed**, not gated: `docs/CEILINGS.md` simulates the
+instruction on adversarial families and finds the shipped *bf16* kernel itself at
+2.6-7.4e-2 there, so a quantiser 2.5-3x coarser than bf16 cannot be made safe
+against the same gate. `hybrid-wip` stays as the measurement it is.
+
+The L1 read-miss rate (0.348/row-key against vLLM's 0.086, ~70% of the K/V
+stream refilling from L2 because our K^T and V packs are read 16-strided where
+their page layout is linear) is worth at most 3% and needs a layout change, not
+a prefetch.
