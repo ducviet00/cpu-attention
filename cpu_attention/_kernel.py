@@ -409,6 +409,28 @@ def _scratch_strides(kt, vt):
     return got[1], got[2]
 
 
+_SCRATCH_MAX = 8
+"""Geometries whose packed-K/V workspace stays alive (see :func:`_scratch`)."""
+
+
+def _drop_workspace() -> None:
+    """Release every packed-K/V buffer and the call plans that point at them.
+
+    One generation is all an engine needs, but a sweep over many shapes would
+    otherwise keep every geometry's K^T/V scratch alive at once -- a 22-row
+    ``tests/bench_vs_refs.py`` run reaches several hundred MB, and the rows it
+    measures late are 3-10% slower than the same rows run on their own (measured
+    on the Graviton box, medians of 9).
+    """
+    bufs = getattr(_SCRATCH, "bufs", None)
+    if bufs is not None:
+        bufs.clear()
+    _SCRATCH_STRIDES.clear()
+    plans = getattr(_SCRATCH, "plans", None)
+    if plans is not None:
+        plans.clear()
+
+
 def _scratch(kind, shape, dtype):
     """A workspace tensor of ``shape``/``dtype``, reused across calls."""
     bufs = getattr(_SCRATCH, "bufs", None)
@@ -423,11 +445,9 @@ def _scratch(kind, shape, dtype):
         # to these buffers, so they have to be dropped together -- otherwise a
         # many-shape sweep keeps one generation of buffers alive through the
         # plans after the dict that owns them has been cleared.
-        if len(bufs) > 64:
-            bufs.clear()
-            plans = getattr(_SCRATCH, "plans", None)
-            if plans is not None:
-                plans.clear()
+        if len(bufs) > _SCRATCH_MAX:
+            _drop_workspace()
+            bufs = _SCRATCH.bufs
         buf = torch.empty(shape, dtype=dtype)
         bufs[key] = buf
     return buf
@@ -455,13 +475,7 @@ def scratch_bytes() -> int:
 
 def clear_scratch() -> None:
     """Drop this thread's workspace buffers (tests, or after a shape sweep)."""
-    bufs = getattr(_SCRATCH, "bufs", None)
-    if bufs is not None:
-        bufs.clear()
-    _SCRATCH_STRIDES.clear()
-    plans = getattr(_SCRATCH, "plans", None)
-    if plans is not None:
-        plans.clear()
+    _drop_workspace()
 
 
 _QT_ENV = os.environ.get("CPU_ATTENTION_QT")
@@ -956,8 +970,14 @@ def _dense_plan(key, q, k, v, causal):
         kt, vt, ks,
     )
     plans = _plans()
-    if len(plans) > 64:
-        plans.clear()
+    if len(plans) > _SCRATCH_MAX:
+        # One generation of workspace is what an engine needs; a *sweep* over
+        # many shapes would otherwise hold every geometry's K^T/V scratch alive
+        # at once (a 22-row bench_vs_refs sweep reaches several hundred MB, and
+        # the rows measured after it are 3-10% slower than the same rows run on
+        # their own -- measured on the Graviton box). Dropping the plans drops
+        # the buffers with them.
+        _drop_workspace()
     plans[key] = plan
     return plan
 
