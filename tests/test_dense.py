@@ -115,9 +115,70 @@ def main() -> int:
         fails += 1
         print(f"[FAIL] fully masked rows are zero: got {leading}")
 
+    # --- the per-geometry call plan (`_kernel._plans`) ---------------------
+    # A plan caches the kernel path, `qt`, the worker count and the *scratch
+    # buffer pointers* for a geometry, so the two ways it can go wrong are a
+    # stale entry (same geometry, reallocated buffers) and a plan reused for a
+    # different geometry. Both are silent numeric corruption, so they are tested
+    # rather than argued about.
+    import cpu_attention._kernel as K
+
+    for dtype, tol in ((torch.float32, 2e-4), (torch.bfloat16, 3e-2)):
+        a = [torch.randn(1, 300, 4, 64, dtype=dtype) for _ in range(3)]
+        b = [torch.randn(1, 130, 4, 64, dtype=dtype) for _ in range(3)]
+        want_a = _reference(*a, True, 0.125)
+        want_b = _reference(*b, True, 0.125)
+        tag = "bf16" if dtype is torch.bfloat16 else "fp32"
+        # interleaved geometries, twice, so the second round hits the cache
+        for round_ in range(2):
+            check(f"{tag} plan A round {round_}",
+                  attn.flash_attn_func(*a, causal=True), want_a, tol)
+            check(f"{tag} plan B round {round_}",
+                  attn.flash_attn_func(*b, causal=True), want_b, tol)
+        # fresh tensors with the same geometry (new data pointers)
+        a2 = [t.clone() for t in a]
+        check(f"{tag} plan reused with new pointers",
+              attn.flash_attn_func(*a2, causal=True),
+              _reference(*a2, True, 0.125), tol)
+        # causal is part of the key: same geometry, other mask
+        check(f"{tag} plan causal=False after causal=True",
+              attn.flash_attn_func(*a, causal=False),
+              _reference(*a, False, 0.125), tol)
+        # dropping the workspace must drop the plans with it
+        K.clear_scratch()
+        check(f"{tag} plan rebuilt after clear_scratch",
+              attn.flash_attn_func(*a, causal=True), want_a, tol)
+
+    # Two threads with the same geometry: the plans and the buffers are
+    # per-thread, so neither may scribble on the other's K/V pack.
+    import threading
+
+    errs = []
+
+    def _worker(seed):
+        g = torch.Generator().manual_seed(seed)
+        q = torch.randn(1, 256, 4, 64, generator=g)
+        k = torch.randn(1, 256, 4, 64, generator=g)
+        v = torch.randn(1, 256, 4, 64, generator=g)
+        want = _reference(q, k, v, True, 0.125)
+        for _ in range(20):
+            got = attn.flash_attn_func(q, k, v, causal=True)
+            errs.append((got - want).abs().max().item())
+
+    threads = [threading.Thread(target=_worker, args=(s,)) for s in (1, 2, 3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    checks += 1
+    if errs and max(errs) <= 2e-4:
+        print(f"[OK] threads share no plan state: max|diff|={max(errs):.1e}")
+    else:
+        fails += 1
+        print(f"[FAIL] threads share no plan state: max|diff|={max(errs):.1e}")
+
     # Rejections the kernel really cannot do.
-    for name, fn in (
-        (
+    for name, fn in (        (
             "window_size is gone from the signature",
             lambda: attn.flash_attn_func(q, k, v, window_size=(-1, -1)),
         ),
