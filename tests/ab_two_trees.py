@@ -95,9 +95,18 @@ def main() -> int:
     for dtype in dtypes:
         for shape in shapes:
             samples = {"old": [], "new": []}
-            for _ in range(args.rounds):
-                samples["old"].append(run(old, dtype, threads, shape, causal))
-                samples["new"].append(run(new, dtype, threads, shape, causal))
+            for r in range(args.rounds):
+                # Alternate which tree runs first *within* a round. Whichever
+                # arm runs first after the other process exits is systematically
+                # slower -- two arms running identical code measured 3.4% apart
+                # (`tests/bench_small.py`, fixed-order rounds). Running old
+                # first every round would charge that bias to old and invent a
+                # win for new on every ~1-3% row, which is most of what this
+                # campaign has been deciding on.
+                order = ("old", "new") if r % 2 == 0 else ("new", "old")
+                for name in order:
+                    tree = old if name == "old" else new
+                    samples[name].append(run(tree, dtype, threads, shape, causal))
             med = {n: statistics.median(s["ours"] for s in v) for n, v in samples.items()}
             gf = {n: statistics.median(s["gflops"] for s in v) for n, v in samples.items()}
             sdpa = statistics.median(s["sdpa"] for s in samples["new"])

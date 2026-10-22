@@ -83,7 +83,7 @@ def paged_case(seq, heads, dim, dtype, block=128):
     return q, k, v, kc, vc, bt, slots, qsl, lens
 
 
-def time_rounds(variants, rounds, full=False):
+def time_rounds(variants, rounds, full=False, rotate=True):
     """Median of `rounds` interleaved samples per variant (and the min).
 
     The median is the published number, but on a shared box a burst of load
@@ -98,8 +98,16 @@ def time_rounds(variants, rounds, full=False):
         for _ in range(2):
             fn()
     samples = {name: [] for name in variants}
-    for _ in range(rounds):
-        for name, fn in variants.items():
+    names = list(variants)
+    for r in range(rounds):
+        # Rotate the arm order every round. Whichever arm runs first in a round
+        # is systematically slower -- two arms running *identical* code measured
+        # 3.4% apart on an idle box (`tests/bench_small.py`, which used to run
+        # `ship` first every round). Since `ours` is always registered first,
+        # that bias was charged to us on every row.
+        order = names[r % len(names):] + names[:r % len(names)] if rotate else names
+        for name in order:
+            fn = variants[name]
             t0 = time.perf_counter()
             fn()
             samples[name].append((time.perf_counter() - t0) * 1e6)
@@ -139,6 +147,9 @@ def main() -> int:
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--shapes", default="", help="filter, e.g. 1024:16:128,512:32:128")
     ap.add_argument("--json", default="", help="write the table as JSON here")
+    ap.add_argument("--control", action="store_true",
+                    help="add a duplicate `ours` arm named ctrl: the ctrl/ours "
+                         "ratio is the residual order/pairing bias of this run")
     ap.add_argument("--no-parity", action="store_true",
                     help="skip the max|diff| vs SDPA column (faster)")
     args = ap.parse_args()
@@ -188,6 +199,8 @@ def main() -> int:
                     "ours": ours,
                     "sdpa": lambda: sdpa(q3, k3, v3, causal),
                 }
+                if args.control:
+                    variants["ctrl"] = ours
                 if vllm is not None:
                     vllm.cpu_attn_reshape_and_cache(k, v, kc, vc, slots, args.isa)
                     meta = vllm.get_scheduler_metadata(
@@ -217,6 +230,9 @@ def main() -> int:
                 # min-based ratios: interference can only slow a sample down,
                 # so these are the honest ones on a shared box (see time_rounds)
                 line += f"  min o/vllm {mmin['ours']/mmin['vllm']:5.2f}" if "vllm" in mmin else f"  min o/sdpa {mmin['ours']/mmin['sdpa']:5.2f}"
+                if "ctrl" in m:
+                    # identical code, different slot: this is the noise floor
+                    line += f"  ctrl {m['ctrl']/m['ours']:5.2f}"
                 if not args.no_parity:
                     line += f"  d={d_ours:.1e}{'' if ok_ours else ' PARITY-FAIL'}"
                 print(line, flush=True)

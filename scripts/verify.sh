@@ -112,16 +112,28 @@ for ISA in $ISAS; do
     SUF="$ISA"; [ "$RUNS" -gt 1 ] && SUF="$ISA-r$R"
     echo "== matrix, isa=$ISA$DT run $R/$RUNS =="
     remote_locked <<EOS
-# The box is shared: wait for it to go quiet before timing. Whoever runs the
-# matrix without this reports bands like 1.17..1.52 for a row that is 1.02.
-for _ in \$(seq 1 120); do
-  L=\$(cut -d' ' -f1 /proc/loadavg)
-  awk "BEGIN{exit !(\$L <= 0.8)}" && break
-  sleep 5
-done
+# The box must be *idle*, not merely ours: a foreign build inflates a row by
+# 1.7x and a foreign python by 25%. Wait for a load average under 0.3 (a
+# single-threaded parent costs ~0.1), then refuse to publish if something else
+# was running while we timed.
+wait_idle() {
+  for _ in \$(seq 1 240); do
+    L=\$(cut -d' ' -f1 /proc/loadavg)
+    awk "BEGIN{exit !(\$L <= 0.3)}" && return 0
+    sleep 5
+  done
+  echo "!! box still loaded (\$L) after 20 min" >&2
+  return 1
+}
+foreign_hogs() {
+  ps -eo pcpu,comm --sort=-pcpu --no-headers | head -3
+}
+wait_idle || exit 1
+echo "box idle: load \$(cut -d' ' -f1 /proc/loadavg)"
 cd ~/$REMOTE_DIR
 .venv/bin/python tests/bench_vs_refs.py --vllm $REF --isa $ISA $DT --rounds ${ROUNDS:-9} --json ~/verify-$LABEL-$SUF.json 2>/dev/null | tail -3
 EOS
+    echo "load after run $R: $(ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" "$HOST" "cut -d' ' -f1-3 /proc/loadavg; ps -eo pcpu,comm --sort=-pcpu --no-headers | head -3 | tr '\n' ' '")"
   done
 done
 
