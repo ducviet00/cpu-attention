@@ -2076,7 +2076,15 @@ def _dense_rows_tile_f32[
         # keys at a time. Only the key groups that exist: the masked lanes'
         # probability is exactly 0, but their V may be past the end of the
         # tensor and 0 * garbage is not 0.
-        var kgroups = (jn + 3) // 4
+        #
+        # Full groups first, then a partial one: ``jn`` is only known at runtime,
+        # and rounding it *up* to a whole group (which is what this loop used to
+        # do) reads up to three keys past the end of the caller's V whenever the
+        # last tile's key range is not a multiple of four. That is out of bounds
+        # -- `tests/fuzz_dense.py` finds it as a NaN on fp32 with seq_q != seq_k
+        # (`0 * NaN`), and it is a page-fault away from crashing.
+        var kgroups = jn // 4
+        var krem = jn - kgroups * 4
         comptime for c in range(NCH):
             var accv = Array[SIMD[DType.float32, LANES], qt * DV](
                 uninitialized=True
@@ -2115,6 +2123,34 @@ def _dense_rows_tile_f32[
                                 pv[r][kgi]
                             )
                 kg += 1
+            if krem > 0:
+                # The keys that did not fill a group. Their probabilities are in
+                # lanes 0..krem-1 and are exactly zero beyond that, so the V rows
+                # for those lanes can be anything that is *inside* the tensor --
+                # the last real key's row is the cheapest such thing.
+                var pp = probs.unsafe_offset(kgroups * 4)
+                var pvr = Array[SIMD[DType.float32, LANES], qt](
+                    uninitialized=True
+                )
+                comptime for r in range(qt):
+                    pvr[r] = pp.unsafe_load[width=LANES](r * ks)
+                comptime for kgi in range(4):
+                    var kk = t0 + kgroups * 4 + kgi
+                    if kk >= seq_k:
+                        kk = seq_k - 1
+                    var vg = v_base.unsafe_offset(
+                        kk * job.v_stride_t + c * dc
+                    )
+                    var vv = Array[SIMD[DType.float32, LANES], DV](
+                        uninitialized=True
+                    )
+                    comptime for v in range(DV):
+                        vv[v] = vg.unsafe_load[width=LANES](v * LANES)
+                    comptime for r in range(qt):
+                        comptime for v in range(DV):
+                            accv[r * DV + v] += vv[v] * SIMD[DType.float32, LANES](
+                                pvr[r][kgi]
+                            )
             comptime for r in range(qt):
                 comptime for v in range(DV):
                     acc.unsafe_store[width=LANES](

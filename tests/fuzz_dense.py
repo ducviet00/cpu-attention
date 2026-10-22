@@ -17,6 +17,13 @@ shapes and with `clear_scratch()` (the plan cache is invalidated and rebuilt).
 
 Tolerances are the project's: fp32 2e-4, bf16 3e-2 against SDPA. A case that
 exceeds it is printed with its shape and seed so it can be reproduced.
+
+It leads with a deterministic probe rather than random cases, because the most
+valuable thing it has found so far was not a tolerance miss but a *stray read*:
+the fp32 tile kernel read up to three V rows past the end of the caller's tensor
+on the last tile (a NaN in the neighbouring allocation came back as NaN, a page
+boundary away from a fault). Random shapes found it only sometimes; the probe
+below makes it deterministic by putting NaN in the padding.
 """
 
 import argparse
@@ -82,6 +89,37 @@ def make_case(rng, max_seq, dtype):
     return q, k, v, causal, scale, kind
 
 
+def stray_read_probe():
+    """Every dtype/path must leave V's bytes past `seq_k` alone.
+
+    Found a real bug (fp32, `seq_q != seq_k`): the fp32 tile kernel rounded its
+    key loop *up* to a whole 4-key group, so on the last tile it read up to three
+    V rows past the end of the caller's tensor. `0 * NaN` is NaN, so a NaN in a
+    neighbouring allocation came out as a NaN the caller saw; a page boundary
+    away it would have been a fault. V here is a slice of a larger buffer whose
+    tail is NaN, which makes any stray read deterministic instead of dependent on
+    what the allocator happened to leave there.
+    """
+    fails = 0
+    for dtype in (torch.float32, torch.bfloat16):
+        for seq_k in (5, 21, 37, 45, 63, 65):
+            for q_len in (17, 45):
+                vbuf = torch.randn(1, seq_k + 16, 4, 64, dtype=dtype)
+                vbuf[:, seq_k:] = float("nan")
+                v = vbuf[:, :seq_k]
+                q = torch.randn(1, q_len, 4, 64, dtype=dtype)
+                k = torch.randn(1, seq_k, 4, 64, dtype=dtype)
+                for causal in (True, False):
+                    out = attn.flash_attn_func(q, k, v, causal=causal)
+                    n = int(torch.isnan(out.float()).sum())
+                    if n:
+                        fails += 1
+                        print(f"[FAIL] stray V read: {str(dtype)[6:]} seq_k={seq_k} "
+                              f"q={q_len} causal={int(causal)}: {n} NaN elements")
+    print(f"stray-read probe: {24 - fails}/24 clean")
+    return fails
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cases", type=int, default=200)
@@ -93,7 +131,7 @@ def main() -> int:
     if args.threads:
         torch.set_num_threads(args.threads)
     rng = random.Random(args.seed)
-    fails = 0
+    fails = stray_read_probe()
     worst = 0.0
     for i in range(args.cases):
         dtype = rng.choice([torch.float32, torch.bfloat16])
