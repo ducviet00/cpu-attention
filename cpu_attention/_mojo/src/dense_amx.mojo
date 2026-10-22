@@ -574,8 +574,11 @@ def _amx_dense_item[
         qstride = D * 2
     elif fp32:
         # The A operand needs no transpose, so splitting Q is a straight
-        # conversion into a per-work-item hi/lo panel (zero padded past nrows).
-        for i in range(QROWS * D):
+        # conversion into a per-work-item hi/lo panel. Only the rows past
+        # `nrows` need zeroing -- a full block needs none, and zeroing all
+        # QROWS*D first and then overwriting it was 2048-4096 stores per work
+        # item, i.e. ~10% of an fp32 call at 256:16:128.
+        for i in range(nrows * D, QROWS * D):
             qpad.unsafe_store(i, Scalar[DType.bfloat16](0))
             qpad_lo.unsafe_store(i, Scalar[DType.bfloat16](0))
         for r in range(nrows):
