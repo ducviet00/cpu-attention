@@ -3000,7 +3000,7 @@ def _dense_arm_rows[
                 job, batch, head, kv_head, q0
             )
         elif head_dim >= 128:
-            _dense_rows_tile[head_dim, qt, 256, 4, TILE_NSQ](
+            _dense_rows_tile[head_dim, qt, 128, 4, TILE_NSQ](
                 job, batch, head, kv_head, q0
             )
         else:
