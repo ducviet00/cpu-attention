@@ -887,14 +887,45 @@ struct AmxDispatch(Copyable, ImplicitlyCopyable, Movable):
     var job: AmxJob
     var pack_items: Int
     var items: Int
+    var workers: Int
 
     def __init__(
-        out self, pack: PackJob, job: AmxJob, pack_items: Int, items: Int
+        out self,
+        pack: PackJob,
+        job: AmxJob,
+        pack_items: Int,
+        items: Int,
+        workers: Int,
     ):
         self.pack = pack
         self.job = job
         self.pack_items = pack_items
         self.items = items
+        self.workers = workers
+
+
+@inline(.always)
+def _attend[
+    fp32: Bool
+](
+    job: AmxJob,
+    lp: Pointer[Float32, MutUntrackedOrigin],
+    pp: Pointer[BFloat16, MutUntrackedOrigin],
+    ap: Pointer[Float32, MutUntrackedOrigin],
+    qp: Pointer[BFloat16, MutUntrackedOrigin],
+    qplo: Pointer[BFloat16, MutUntrackedOrigin],
+    pplo: Pointer[BFloat16, MutUntrackedOrigin],
+    batch: Int,
+    head: Int,
+    q0: Int,
+) -> None:
+    """One work item, with head_dim turned into a compile-time constant."""
+    if job.head_dim == 128:
+        _amx_dense_item[fp32, 128](job, lp, pp, ap, qp, qplo, pplo, batch, head, q0)
+    elif job.head_dim == 64:
+        _amx_dense_item[fp32, 64](job, lp, pp, ap, qp, qplo, pplo, batch, head, q0)
+    else:
+        _amx_dense_item[fp32, 32](job, lp, pp, ap, qp, qplo, pplo, batch, head, q0)
 
 
 @inline(.always)
@@ -908,9 +939,19 @@ def _amx_worker[
     var nbh = state.pack.batch * state.pack.num_kv_heads
     var kinds = state.pack.kb16 * nbh  # K tasks first, then V
     var task = tid
-    if (state.job.mode & 1) != 0:
-        task = state.pack_items  # profiling: skip the pack
-    while task < state.pack_items:
+    # Phase-split dispatch (pack everybody, barrier, attend) is only used when
+    # there are fewer (batch, kv head) pairs than workers; otherwise the
+    # per-head loop below packs one head's K/V and immediately attends every
+    # query block of it, which needs no barrier and leaves that head's 32 KB of
+    # packed operands in L1 for the blocks that read them. At 128:8:64 the
+    # head's whole packed K/V fits L1, and the barrier plus the L2 re-read are
+    # 5 us of a 42 us call.
+    # `mode & 512` forces the phase-split path, for an in-process A/B.
+    var per_head = nbh >= state.workers * 2 and (state.job.mode & 512) == 0
+    if not per_head:
+        if (state.job.mode & 1) != 0:
+            task = state.pack_items  # profiling: skip the pack
+    while (not per_head) and task < state.pack_items:
         if (state.job.mode & 4) != 0 and task < kinds:
             task += threads
             continue
@@ -934,7 +975,7 @@ def _amx_worker[
                 kb,
             )
         task += threads
-    if threads > 1:
+    if threads > 1 and (not per_head):
         external_call["GOMP_barrier", NoneType]()
     comptime nlo = 2 if fp32 else 1
     # alignment=64 is not cosmetic: the tile stores/loads and every SIMD access
@@ -953,27 +994,43 @@ def _amx_worker[
     # The hi slab is first, the lo slab right after it (MAXKT keys / D dims).
     var pplo = _ptr[BFloat16](Int(prob) + QROWS * MAXKT * 2)
     var qplo = _ptr[BFloat16](Int(qpad) + QROWS * DMAX * 2)
+    var nqg = (state.job.seq_q + QROWS - 1) // QROWS
+    if per_head:
+        # One task = one (batch, kv head): pack it, then every query head that
+        # reads it, every query block of each.
+        var qpg = 1
+        if state.job.num_heads != state.job.num_kv_heads:
+            qpg = state.job.num_heads // state.job.num_kv_heads
+        task = tid
+        while task < nbh:
+            var kvh = task % state.job.num_kv_heads
+            var b = task // state.job.num_kv_heads
+            if (state.job.mode & 1) == 0:
+                if (state.job.mode & 4) == 0:
+                    for kb in range(state.pack.kb16):
+                        _pack_k_slab[fp32](state.pack, b, kvh, kb)
+                if (state.job.mode & 8) == 0:
+                    for kb in range(state.pack.kb32):
+                        _pack_v_slab[fp32](state.pack, b, kvh, kb)
+            if (state.job.mode & 2) == 0:
+                for hh in range(qpg):
+                    var head = kvh * qpg + hh
+                    for g in range(nqg):
+                        _attend[fp32](state.job, lp, pp, ap, qp, qplo, pplo,
+                                      b, head, g * QROWS)
+            task += threads
+        tile_release()
+        return
     task = tid
     if (state.job.mode & 2) != 0:
         task = state.items  # profiling: skip the attention
-    var nqg = (state.job.seq_q + QROWS - 1) // QROWS
     while task < state.items:
         var g = task % nqg
         var rest = task // nqg
         var head = rest % state.job.num_heads
         var batch = rest // state.job.num_heads
-        if state.job.head_dim == 128:
-            _amx_dense_item[fp32, 128](
-                state.job, lp, pp, ap, qp, qplo, pplo, batch, head, g * QROWS
-            )
-        elif state.job.head_dim == 64:
-            _amx_dense_item[fp32, 64](
-                state.job, lp, pp, ap, qp, qplo, pplo, batch, head, g * QROWS
-            )
-        else:
-            _amx_dense_item[fp32, 32](
-                state.job, lp, pp, ap, qp, qplo, pplo, batch, head, g * QROWS
-            )
+        _attend[fp32](state.job, lp, pp, ap, qp, qplo, pplo, batch, head,
+                      g * QROWS)
         task += threads
     tile_release()
 
@@ -1010,7 +1067,7 @@ def run_dense_amx(
     var pack_items = pack.batch * pack.num_kv_heads * (pack.kb16 + pack.kb32)
     var workers = min(num_workers, max(items, max(pack_items, 1)))
     var state = stack_allocation[1, AmxDispatch]()
-    state[] = AmxDispatch(pack, job, pack_items, items)
+    state[] = AmxDispatch(pack, job, pack_items, items, workers)
     if workers <= 1:
         if job.fp32:
             _amx_worker[True](state[], 0, 1)
