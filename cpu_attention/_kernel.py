@@ -106,7 +106,11 @@ _OVERRIDE = os.environ.get("CPU_ATTENTION_WORKERS")
 
 
 def set_num_workers(workers: int) -> None:
-    """Pin the worker count for every call (0 restores the automatic rule)."""
+    """Pin the worker count for every call (0 restores the automatic rule).
+
+    It is part of the plan key, so cached plans are not invalidated here; a
+    caller that changes it gets a fresh plan on the next call.
+    """
     global _OVERRIDE
     _OVERRIDE = str(workers) if workers else None
 
@@ -828,10 +832,14 @@ def _dense(q, k, v, scale: float, causal: bool, geom=None):
         return out
     if geom is None:
         geom = (q.shape, q.stride(), k.stride(), v.stride(), q.dtype)
-    # `_QT_ENV` is in the key on purpose: profiling sweeps flip it between calls
-    # in one process (that is how the `qt` table in `_qt_for` was measured), and
-    # a plan cached under one `qt` must not be served for another.
-    key = (geom[0], geom[1], geom[2], geom[3], geom[4], causal, _QT_ENV)
+    # Two knobs that are not part of the geometry but do change the plan, so
+    # they belong in the key: `_QT_ENV` is flipped between calls by the `qt`
+    # sweeps (that is how the table in `_qt_for` was measured), and the worker
+    # count follows `torch.set_num_threads` and `set_num_workers`. A stale plan
+    # here is silent and expensive -- it would keep running 4 workers after the
+    # caller asked for 1 and look like a 3x regression in a sweep.
+    key = (geom[0], geom[1], geom[2], geom[3], geom[4], causal, _QT_ENV,
+           _OVERRIDE or torch.get_num_threads())
     plan = _plans().get(key)
     if plan is None:
         plan = _dense_plan(key, q, k, v, causal)
