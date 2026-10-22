@@ -280,7 +280,85 @@ this one, after the shared dev venv was recreated today; `ab_two_trees` runs fin
 on the same build. Not a regression from this work, but the x86 verification in
 `docs/NEXT.md` §1 has to run on a server box, not here.
 
-## 7. What I would do next (in order)
+## 8. The S<=256 kernel (`dense_small.mojo`), and why the pack stays
+
+The integrator's brief: 128:8:64 bf16 is 1.17-1.19, our whole call is 26.5 us =
+host 4.5 + region 22, and the region contains a **pack of 2.4 us** that vLLM does
+not pay inside its timer. Attention-only we already win (19.6 vs their 21).
+
+### 8.1 Falsified: dropping the pack and reading k/v natively
+
+Measured with an asm probe (`/tmp/opencode/operands.mojo`, one loop with one
+operand source swapped):
+
+| loop | instructions | bfmmla | per bfmmla |
+|---|---:|---:|---:|
+| P@V, packed V (`ldr q` per (4 keys x 2 dims)) | 41 | 16 | 2.6 |
+| P@V, native V (4 keys x 2 dims, rows `v_st` apart) | 70 | 16 | **4.4** |
+| Q@K^T, packed K^T (one 16-byte load per operand) | 588 | 256 | 2.3 |
+| Q@K^T, native K (two 8-byte loads + join) | 794 | 256 | **3.1** |
+
+So a native-layout operand costs +0.8 (K) and +1.8 (V) instructions per bfmmla,
+i.e. ~10 instructions per row-key against a 2.4 us pack for the whole 128-key
+call. The layouts the pack produces are exactly what makes every bfmmla operand a
+single load; that is the trade, and the pack wins. (A `bfdot` kernel reads both
+k/v natively, but bfdot is 21.6 MAC/cycle against bfmmla's 32 and the matmul is
+already ~10 us of the 19.6 us kernel at this size, so it loses by more.)
+
+### 8.2 What the per-query-block cost actually is (ablation, 128:8:64 bf16)
+
+| removed | us | delta |
+|---|---:|---:|
+| nothing (shipped) | 24.05 | - |
+| Q panel build | 22.47 | **-6.6%** |
+| accumulator zeroing | 23.42 | -2.6% |
+| output epilogue | 12.07 | degenerate (kills the accumulator's live-out) |
+
+A non-causal run needs no work rounding -- every block scores exactly 128 keys --
+and it costs 35.0 us for 131072 row-keys against the causal 24.4 us for 66048, so
+fitting `F + keys * 8 * m` gives **m = 5.6 cycles/row-key (the long-S rate) and
+F = 1391 cycles of fixed cost per query block**: 28% of a 128-key call. Of that,
+the Q panel is ~6.6% of the call and the accumulator zeroing 2.6%; the rest is
+drain/latency at 16 blocks per head, not instructions.
+
+### 8.3 Shipped: round the key coverage to 8 keys, not 16
+
+`nkp` was rounded to 8 key *pairs* because the exp pass consumes four key groups
+per iteration. At S=128 the average block only has 68 keys, so 12 of the 80 it
+scored were keys no row may see. A two-group tail loop in the exp pass lets the
+tile cover `ceil(jn/8)*8` instead. `tests/bench_small.py`, in-process, 21 rounds,
+min of the per-round times, two sessions:
+
+| shape | shipped | small | ratio | o/vllm shipped -> small |
+|---|---:|---:|---:|---|
+| 128:8:64 bf16 | 24.6, 24.7 | 23.3, 24.5 | **1.051, 1.008** | 1.12 -> 1.07 |
+| 256:16:128 bf16 (path off by default) | 208.7 | 201.5 | **1.068** | 1.01 -> 0.95 |
+| 512:8:64 bf16 (path off) | 226.4 | — | 1.000 | — |
+| 1024:16:128 bf16 | 2897.8 | 2849.8 | 1.017 | — |
+
+Same-code control arms in the same harness differ by 0.4-1.7% (min-based), so
+1.05 is a real win and the 1.017 at 1024 is at the noise floor. Output is
+bit-identical (`bench_small.py` asserts equality, not tolerance). Caveat from the
+shared box: one session's identical arms differed by 6.6%, so quote the min and
+re-run.
+
+It is in a new file because the bf16 D=128 tile is being rewritten in
+`dense.mojo`; the path is `seq_k <= 256`, MHA, bf16 `bfmmla`, **head_dim < 128**
+(the D=128 rows are the other agent's -- the 256:16:128 gain above is measured
+but deliberately not enabled). `CPU_ATTENTION_SMALL_MAXK` / `set_small_maxk()`
+raise or lower the threshold; `0` disables the path.
+
+**The 16-key rounding is not the row's problem, though**: at 128 keys the fixed
+cost per query block is 28% of the kernel (§8.2), and the only way to collect
+that is a kernel that keeps a *head* resident and overlaps block g+1's prologue
+with block g's epilogue -- a restructure, not a bound. That is what I would do
+next, together with the Q panel's 6.6%.
+
+Skipping the first tile's accumulator zeroing (the other obvious per-block win)
+measured **4% slower**: the `t0 == 0` test lands inside the unrolled P@V chunk
+loop. Not done.
+
+
 
 1. **The V d-chunk layout** (`[d-chunk][key][dc]`): the P@V sweep makes
    `NCH = head_dim/dc` passes over the tile and touches 32 B of every 256 B (D=64)

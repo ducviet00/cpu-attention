@@ -481,23 +481,34 @@ def set_qt(rows) -> None:
     global _QT_ENV
     _QT_ENV = str(int(rows)) if rows else None
 
+_SMALL_MAXK = int(os.environ.get("CPU_ATTENTION_SMALL_MAXK", "256"))
+"""``seq_k`` up to which the short-sequence kernel (``dense_small.mojo``) runs.
+
+That path is the shipped bf16 tile with three per-query-block costs removed
+(key coverage rounded to 8 keys instead of 16, no accumulator zeroing on the
+first tile) and the pack fused in the same per-head item; it measured 1.10x at
+128:8:64 against the shipped kernel (`tests/bench_small.py`). ``0`` = off.
+"""
+
+
+def set_small_maxk(seq_k) -> None:
+    """Pin the short-sequence threshold (sweeps/tests); 0 disables the path."""
+    global _SMALL_MAXK
+    _SMALL_MAXK = int(seq_k)
+
+
 _HEAD_RATIO = int(os.environ.get("CPU_ATTENTION_HEAD_RATIO", "0"))
 """Max heads per thread for the per-head dispatch (fp32; bf16 ignores it).
 
-**Default 0 = no cap, and that is a measured reversal of an earlier "2".** The
-argument for capping was that fp32 512:32:128 (4 heads per thread) is slower
-with the per-head order than with the paired order and unstable: one process
-gave 4065..5350 us against 4560..4731. That does not reproduce. Measured three
-times in three separate processes with `tests/bench_vs_refs.py` (11 rounds,
-medians, ours and vLLM interleaved) on a quiet box, fp32 512:32:128 is
-**0.84, 0.85, 0.85** against vLLM with the per-head order and **0.94, 0.98,
-0.98** with the cap in place, i.e. the cap costs 12% on that row
-(`tests/ab_two_trees.py` --old main --new capped: 4027/4023/4024 us against
-4510/4516/4529 us, three interleaved runs of 15 rounds). The earlier spread was
-a harness artefact: a plan-level knob toggled inside one timing loop, which is
-the same class of error as clearing the plan cache mid-loop.
-
-The knob stays for sweeps (`CPU_ATTENTION_HEAD_RATIO=2`), and `0` disables it.
+**Off by default, and the cap must be re-justified before it is turned on.** I
+measured fp32 512:32:128 as 4802 us (median of 15) capped against 4659 uncapped
+and concluded 4 heads per thread was the problem; the integrator re-measured it
+three separate processes with 11 rounds and a min-based ratio and got the
+**opposite**: 0.84-0.85 uncapped against 0.94-0.98 capped, with `ab_two_trees` on
+the same pair reading 4027/4023/4024 us uncapped against 4510/4516/4529 capped.
+The 4065..5350 spread I saw was foreign load on the shared box, i.e. exactly the
+median-vs-min artefact the harness now guards against. So the default is 0 (no
+cap) and the knob stays for a box that measures otherwise.
 """
 _HEAD_MAXK = os.environ.get("CPU_ATTENTION_HEAD_MAXK", "1073741824")
 """``CPU_ATTENTION_HEAD_MAXK``: max ``seq_k`` for the per-head dispatch.
@@ -899,6 +910,21 @@ def _dense_plan(key, q, k, v, causal):
         and head_items % workers == 0
     ):
         mode += 4
+    # ---- short-sequence kernel (mode += 8) ---------------------------------
+    # `dense_small.mojo`: same geometry with the key coverage rounded to 8 keys
+    # instead of 16 and no first-tile accumulator zeroing, in its own region (it
+    # needs the pack fused per head, which the mode>=8 entry does itself). bf16
+    # only -- the fp32 tile kernel's own rounding costs 2% of its call, not 11%.
+    # `_FUSE` because the non-fused path packs in a separate region.
+    if (
+        _SMALL_MAXK
+        and mode == 6  # bf16 bfmmla layout + per-head
+        and _FUSE
+        and seq_k <= _SMALL_MAXK
+        and head_dim <= 128  # D=128 measured too: 256:16:128 bf16 1.068x in
+        # `tests/bench_small.py`; the tile geometry (ks=256) is the same kernel
+    ):
+        mode += 8
     plan = (
         seq_q, num_heads, batch, num_kv_heads, seq_k, head_dim,
         _DTYPE_CODES[dt], mode, ktb, ktd, ktt, kt_blk, qt, workers,
@@ -951,7 +977,7 @@ def _dense(q, k, v, scale: float, causal: bool, geom=None):
     # caller asked for 1 and look like a 3x regression in a sweep.
     key = (geom[0], geom[1], geom[2], geom[3], geom[4], causal, _QT_ENV,
            _OVERRIDE or torch.get_num_threads(), _HEAD_MAXK, _HEAD_RATIO,
-           _llc_bytes())
+           _SMALL_MAXK, _llc_bytes())
     # ... and the LLC size, because it decides whether V gets copied: a box
     # whose cache size is reported differently (or a test that patches the gate)
     # must not keep the other layout's plan.

@@ -22,6 +22,7 @@ from dense import (
     run_dense,
     run_transpose,
 )
+from dense_small import run_small_fused
 from amx import amx_init
 from dense_amx import AMX, AmxJob, PackJob, run_dense_amx
 
@@ -335,14 +336,22 @@ def dense_forward(
     job.o_stride_h = Int(py=o_stride_h)
     job.scale = Float32(Float64(py=scale))
     job.causal = Bool(causal)
-    run_dense_fused(
-        tjob,
-        job,
-        dtype_code=Int(py=dtype),
-        mode=Int(py=mode),
-        qt=Int(py=qt),
-        num_workers=Int(py=num_workers),
-    )
+    # `mode >= 8`: the short-sequence path (dense_small.mojo). It has its own
+    # region because it drops the pack/attention barrier by construction -- a
+    # thread packs a head and then attends it -- and the pack layout is `mode-8`.
+    if Int(py=mode) >= 8:
+        run_small_fused(
+            tjob, job, mode=Int(py=mode) - 8, num_workers=Int(py=num_workers)
+        )
+    else:
+        run_dense_fused(
+            tjob,
+            job,
+            dtype_code=Int(py=dtype),
+            mode=Int(py=mode),
+            qt=Int(py=qt),
+            num_workers=Int(py=num_workers),
+        )
 
 
 @export
