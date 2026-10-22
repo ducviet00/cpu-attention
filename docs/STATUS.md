@@ -10,32 +10,45 @@ and the log of what actually moved.
 `ours / baseline < 1`, for both baselines (`torch SDPA` and vLLM `csrc/cpu`), on
 both platforms, for all 22 rows of `tests/bench_vs_refs.py`. Below 1 is a win.
 
-## Where it stands, 2026-10-22 (`main` at `cacc785`, m9g.xlarge, 4 cores)
+## Where it stands, final for this campaign (m9g.xlarge, 4 cores)
 
-Verified by the integrator: clean rebuild from scratch, `ROUNDS=21`, one
-process, all variants interleaved. **22/22 against SDPA, 8/22 against vLLM.**
+`main` at `7055cfb`. Two clean rebuilds, `RUNS=2 ROUNDS=15`, bands from
+`scripts/band.py`. **22/22 against SDPA. Against vLLM: 5 wins, 6 rows within
+±3% (they flip between runs), 11 losses.**
+
+Bands are the union over the two verification sessions of the final tree, plus
+the session before it where the machines' clock differed by ~5% (an in-box
+`ab_two_trees` on the same pair of trees reads 0.97-1.02x, i.e. the sessions are
+not comparable to each other — quote the band, not one run).
 
 | shape | bf16 o/sdpa | bf16 **o/vllm** | fp32 o/sdpa | fp32 **o/vllm** |
 |---|---:|---:|---:|---:|
-| S=128 H=8 D=64 | 0.58 | **1.26** | 0.35 | **1.07** |
-| S=512 H=8 D=64 | 0.46 | **1.09** | 0.33 | 1.00 |
-| S=1024 H=8 D=64 | 0.62 | 1.00 | 0.48 | 0.99 |
-| S=2048 H=8 D=64 | 0.73 | **1.02** | 0.60 | 0.98 |
-| S=4096 H=8 D=64 | 0.79 | **1.01** | 0.71 | **1.01** |
-| S=256 H=16 D=128 | 0.51 | **1.20** | 0.45 | 0.93 |
-| S=1024 H=16 D=128 | 0.64 | **1.06** | 0.59 | 0.90 |
-| S=2048 H=16 D=128 | 0.73 | **1.09** | 0.72 | 0.92 |
-| S=4096 H=16 D=128 | 0.82 | **1.09** | 0.92 | **1.03** |
-| S=512 H=32 D=128 | 0.46 | **1.15** | 0.43 | 0.96 |
-| S=1024 H=8 D=32 | 0.62 | 0.99 | 0.48 | **1.02** |
+| S=128 H=8 D=64 | 0.57 | 1.24-1.27 | 0.34 | 1.02-1.09 |
+| S=512 H=8 D=64 | 0.45 | 1.04-1.09 | 0.34 | **1.00-1.03** |
+| S=1024 H=8 D=64 | 0.62 | **1.00-1.01** | 0.49 | **0.97-1.01** |
+| S=2048 H=8 D=64 | 0.72 | **1.00-1.02** | 0.61 | **0.99-1.02** |
+| S=4096 H=8 D=64 | 0.79 | 1.01-1.03 | 0.72 | 1.01-1.04 |
+| S=256 H=16 D=128 | 0.50 | 1.17-1.20 | 0.44 | **0.92-0.94** |
+| S=1024 H=16 D=128 | 0.63 | 1.05-1.07 | 0.58 | **0.87-0.89** |
+| S=2048 H=16 D=128 | 0.72 | 1.06-1.09 | 0.74 | **0.92-0.96** |
+| S=4096 H=16 D=128 | 0.81 | 1.07-1.09 | 0.92 | 1.03-1.04 |
+| S=512 H=32 D=128 | 0.45 | 1.13-1.17 | 0.43 | **0.95-0.96** |
+| S=1024 H=8 D=32 | 0.62 | **0.99** | 0.47 | **0.98-1.02** |
 
-The tail that has to move, in the order it is worth attacking:
+Robust wins (below 1 in every run of every session): the four fp32 D=128 rows at
+256/1024/2048/512x32 and bf16 `1024:8:32`. Six more are within 3% and change
+verdict with the clock.
 
-| group | rows | needs |
-|---|---|---|
-| 1.00-1.03 | 1024:8:64 bf16, 2048/4096:8:64 bf16, 512:8:64 fp32, 4096:8:64 fp32, 4096:16:128 fp32, 1024:8:32 fp32 | 2-4% |
-| 1.06-1.09 | 1024/2048/4096:16:128 bf16, 512:8:64 bf16 | 6-9% |
-| 1.15-1.26 | 128:8:64 bf16+fp32, 256:16:128 bf16, 512:32:128 bf16 | 13-26% |
+**Why the rest are not a schedule tweak.** `docs/CEILINGS.md` has the per-row
+perfect-kernel bound (instruction floor / vLLM's measured cycles per row-key) and
+the IPC arithmetic: vLLM runs IPC 4.07-4.16 where we run 3.50 at the *same or a
+higher* instruction count, so the remainder is instruction efficiency, not the
+matmul. Four independent measurements now say the same thing from different
+directions — the D=128 long-S rows need 96%+ of the `bfmmla` ceiling (parity at
+best), the pack is at 88% of a memcpy, both K and V layout reorderings leave the
+L1 miss count unchanged (they are compulsory stream misses), and the one
+structural route left (a single-loop softmax with the accumulator staged per
+d-chunk) needs `RP*DP` = 128 resident accumulators against 32 registers.
 
 ### x86 without AMX (laptop Ryzen, VEC path) — a current data point, not the target
 
