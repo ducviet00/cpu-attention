@@ -17,9 +17,11 @@ sys.path.insert(0, ".")
 import cpu_attention._kernel as K
 torch.set_num_threads(8)
 
-for S, H, D, dt in ((128, 8, 64, torch.bfloat16), (512, 8, 64, torch.bfloat16),
-                    (256, 16, 128, torch.bfloat16), (512, 32, 128, torch.bfloat16),
-                    (2048, 8, 64, torch.bfloat16), (128, 8, 64, torch.float32),
+for S, H, D, dt in ((256, 16, 128, torch.bfloat16),
+                    (512, 32, 128, torch.bfloat16),
+                    (1024, 16, 128, torch.bfloat16),
+                    (2048, 16, 128, torch.bfloat16),
+                    (4096, 16, 128, torch.bfloat16),
                     (4096, 8, 64, torch.bfloat16)):
     q = torch.randn(1, S, H, D, dtype=dt)
     # run one real call so the scratch buffers exist and the plan is built
@@ -35,9 +37,12 @@ for S, H, D, dt in ((128, 8, 64, torch.bfloat16), (512, 8, 64, torch.bfloat16),
      vtok, vh, ob, otok, oh, pack_workers, _kt, _vt, _ks) = plan
     kp, vp, qp = q.data_ptr(), q.data_ptr(), q.data_ptr()
     tp = K._transpose_attention()
+    # `mode >= 4` is the per-head dispatch encoding, not a layout: the
+    # standalone entry takes the layout only.
+    pmode = mode - 4 if mode >= 4 else mode
     args = (kp, kt_ptr, vp if not vt_ptr else qp, vt_ptr, batch, num_kv_heads,
             seq_k, head_dim, k0, k1, k2, kt_bh, kt_d, kt_blk, v0, v1, v2,
-            vt_bh, vt_d, dtc, mode, pack_workers, ks_ptr, ks_bh)
+            vt_bh, vt_d, dtc, pmode, pack_workers, ks_ptr, ks_bh)
     f = lambda: tp(*args)
     for _ in range(5):
         f()
