@@ -388,22 +388,30 @@ def _rows_small[
 
         t0 += ks
 
-    # Output: one row of `head_dim` bf16 per query row.
+    # Output: one row of `head_dim` bf16 per query row. The reciprocals for
+    # *all* row pairs are computed first so the divides are independent and
+    # issue together, instead of each row pair's 8 de-interleave chains waiting
+    # on its own scalar divide. Measured: 21.68-21.71 us against 21.67-21.83 for
+    # the per-pair form at 128:8:64, i.e. no change -- kept because it is free
+    # and reads better, not because it bought anything.
+    var inv4s = Array[SIMD[DType.float32, 4], RP](uninitialized=True)
     comptime for rp in range(RP):
-        var vis0 = seq_k > 0
-        var vis1 = vis0
+        var vv0 = seq_k > 0
+        var vv1 = vv0
         if job.causal:
-            vis0 = q0 + 2 * rp + diag + 1 > 0
-            vis1 = q0 + 2 * rp + 1 + diag + 1 > 0
-        var i0 = Scalar[DType.float32](0.0)
-        var i1 = Scalar[DType.float32](0.0)
-        var sp0 = s_v[rp][0]
-        var sp1 = s_v[rp][2]
-        if vis0 and sp0 > Scalar[DType.float32](0.0):
-            i0 = Scalar[DType.float32](1.0) / sp0
-        if vis1 and sp1 > Scalar[DType.float32](0.0):
-            i1 = Scalar[DType.float32](1.0) / sp1
-        var inv4 = SIMD[DType.float32, 4](i0, i0, i1, i1)
+            vv0 = q0 + 2 * rp + diag + 1 > 0
+            vv1 = q0 + 2 * rp + 1 + diag + 1 > 0
+        var j0 = Scalar[DType.float32](0.0)
+        var j1 = Scalar[DType.float32](0.0)
+        var q0s = s_v[rp][0]
+        var q1s = s_v[rp][2]
+        if vv0 and q0s > Scalar[DType.float32](0.0):
+            j0 = Scalar[DType.float32](1.0) / q0s
+        if vv1 and q1s > Scalar[DType.float32](0.0):
+            j1 = Scalar[DType.float32](1.0) / q1s
+        inv4s[rp] = SIMD[DType.float32, 4](j0, j0, j1, j1)
+    comptime for rp in range(RP):
+        var inv4 = inv4s[rp]
         comptime for h in range(DP // 4):
             var a0 = acc.unsafe_load[width=4]((rp * DP + 4 * h) * 4) * inv4
             var a1 = acc.unsafe_load[width=4]((rp * DP + 4 * h + 1) * 4) * inv4
