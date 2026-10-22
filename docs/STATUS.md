@@ -91,6 +91,24 @@ a causal flip, `clear_scratch`, and two threads (64 checks).
   (halves the P@V panel reloads): 12.39 against 9.58, `RP*dcp = 32` accumulators
   spill.
 
+
+## The falsification ledger, with the number that killed each idea
+
+Every one of these cost a session somewhere, so they are written down with the
+measurement that closed them. `docs/CEILINGS.md` has the ceiling arithmetic
+behind the last two.
+
+| idea | why it looked good | what killed it |
+|---|---|---|
+| int8 Q@K^T (`smmla`, 2x the MACs) | 19% faster, and the ARM agent measured it | misses the fixed 3e-2 bf16 gate at every scaling that fits: 2.0-3.5e-2 on the benchmark shapes, per-key K scales (1.4x better than per-tile) still fail at D=128, and all four adversarial input families fail — including for the *shipped* bf16 kernel, which is itself at 2.6-7.4e-2 on them (`tests/int8_qk_error.py`) |
+| fp16 matrix multiply (`fmmla`) | same 16 MACs as bfmmla, 3 more mantissa bits | the extension does not exist on any shipping core: LLVM has no instruction-selection pattern for the intrinsic (`Cannot select: intrinsic %llvm.aarch64.neon.fmmla`) |
+| wider vectors (SVE) | Neoverse-V3 has SVE2 | `sve_default_vector_length` = 16 bytes: 128-bit, same as NEON |
+| K^T layout, then V layout | `l1d_cache_lmiss_rd` 0.348 vs vLLM's 0.086 per row-key | both reorderings leave the miss count unchanged: the misses are *compulsory* stream misses, 55-62% of them already covered by the prefetcher |
+| more rows per work item (`qt`) at short S | the per-work-item cost is ~780 cycles | qt=8 is already optimal (interleaved sweep 4/6/8/10/12) and forcing qt=4 on the tile kernel is +22% cycles/row-key, because rows are the only K/V reuse axis |
+| the K/V pack | `bench_phases` says 6 us at S=128 | `bench_phases` runs `NO_FUSE`, which adds a fork-join to that column; called alone the pack is 2.90 us = 88% of a plain memcpy, at every size up to 16 MB |
+| a fused pack+attention pass | would skip a write+read of the packed copy | there is nothing to skip: the pack is 6% of the call at S=128 and 0.3% at S=4096 |
+| three-phase split (pack / QK+softmax / V pack + P@V) | hides the V pack behind the softmax | deferring P@V makes every item's probabilities survive; the buffer costs 2-8x the phase it hides |
+
 ## Two rules that keep paying for themselves
 
 **Show spare *issue* slots, not spare matmul cycles.** A microbenchmark of pure
