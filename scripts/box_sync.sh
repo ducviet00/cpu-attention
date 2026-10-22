@@ -40,12 +40,12 @@ fi
 $HOME/.local/bin/uv --version
 EOS
   echo "== venv =="
-  "${SSH[@]}" "bash -lc 'cd ~/$REMOTE_DIR && ~/.local/bin/uv sync --extra build 2>&1 | tail -3'"
+  "${SSH[@]}" "flock ~/bench.lock -c \"bash -lc 'cd ~/$REMOTE_DIR && ~/.local/bin/uv sync --extra build 2>&1 | tail -3'\""
 fi
 
 echo "== build =="
 # `set -o pipefail` so a failed build is not hidden by `tail`'s exit status.
-"${SSH[@]}" "bash -lc 'set -o pipefail; cd ~/$REMOTE_DIR && PATH=\$PWD/.venv/bin:\$PATH .venv/bin/python scripts/build.py 2>&1 | tail -2'"
+"${SSH[@]}" "flock ~/bench.lock -c \"bash -lc 'set -o pipefail; cd ~/$REMOTE_DIR && PATH=\$PWD/.venv/bin:\$PATH .venv/bin/python scripts/build.py 2>&1 | tail -2'\""
 
 if [ "$FULL" = "--full" ]; then
   echo "== vllm reference =="
@@ -81,4 +81,4 @@ EOS
 fi
 
 echo "== parity =="
-"${SSH[@]}" "bash -lc 'cd ~/$REMOTE_DIR && .venv/bin/python tests/test_dense.py 2>&1 | tail -2; .venv/bin/python tests/test_flash_api.py 2>&1 | tail -2'"
+"${SSH[@]}" "flock ~/bench.lock -c \"bash -lc 'cd ~/$REMOTE_DIR && .venv/bin/python tests/test_dense.py 2>&1 | tail -2; .venv/bin/python tests/test_flash_api.py 2>&1 | tail -2'\""

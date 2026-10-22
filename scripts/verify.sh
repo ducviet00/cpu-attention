@@ -34,14 +34,14 @@ echo "== sync =="
 scripts/box_sync.sh "$ARCH" "$HOST" "$TREE"
 
 echo "== clean build =="
-"${SSH[@]}" "bash -lc 'cd ~/$REMOTE_DIR && rm -rf cpu_attention/_mojo/build cpu_attention/_C.so && PATH=\$PWD/.venv/bin:\$PATH .venv/bin/python scripts/build.py 2>&1 | tail -1'"
+"${SSH[@]}" "flock ~/bench.lock -c \"bash -lc 'cd ~/$REMOTE_DIR && rm -rf cpu_attention/_mojo/build cpu_attention/_C.so && PATH=\$PWD/.venv/bin:\$PATH .venv/bin/python scripts/build.py 2>&1 | tail -1'"
 
 echo "== parity =="
-"${SSH[@]}" "bash -lc 'cd ~/$REMOTE_DIR && .venv/bin/python tests/test_dense.py 2>&1 | tail -1 && .venv/bin/python tests/test_flash_api.py 2>&1 | tail -1'"
+"${SSH[@]}" "flock ~/bench.lock -c \"bash -lc 'cd ~/$REMOTE_DIR && .venv/bin/python tests/test_dense.py 2>&1 | tail -1 && .venv/bin/python tests/test_flash_api.py 2>&1 | tail -1'"
 # Randomised parity, including the plan cache's hit/invalidate paths: a fixed
 # shape list cannot cover the per-dtype and per-head-dim weight layouts crossed
 # with GQA, odd lengths and strided inputs, and a stale plan corrupts silently.
-"${SSH[@]}" "bash -lc 'cd ~/$REMOTE_DIR && .venv/bin/python tests/fuzz_dense.py --cases 40 --max-seq 700 2>&1 | tail -1'"
+"${SSH[@]}" "flock ~/bench.lock -c \"bash -lc 'cd ~/$REMOTE_DIR && .venv/bin/python tests/fuzz_dense.py --cases 40 --max-seq 700 2>&1 | tail -1'"
 # The AMX kernel has its own parity harness (shape grid, both causal modes,
 # compared against SDPA *and* against the Mojo kernel) plus a byte-level pack
 # self-test; it reports "skipped" on a host without AMX.
@@ -84,7 +84,7 @@ for ISA in $ISAS; do
   for R in $(seq 1 "$RUNS"); do
     SUF="$ISA"; [ "$RUNS" -gt 1 ] && SUF="$ISA-r$R"
     echo "== matrix, isa=$ISA$DT run $R/$RUNS =="
-    "${SSH[@]}" "bash -lc 'cd ~/$REMOTE_DIR && .venv/bin/python tests/bench_vs_refs.py --vllm $REF --isa $ISA $DT --rounds ${ROUNDS:-9} --json ~/verify-$LABEL-$SUF.json 2>/dev/null | tail -3'"
+    "${SSH[@]}" "flock ~/bench.lock -c \"bash -lc 'cd ~/$REMOTE_DIR && .venv/bin/python tests/bench_vs_refs.py --vllm $REF --isa $ISA $DT --rounds ${ROUNDS:-9} --json ~/verify-$LABEL-$SUF.json 2>/dev/null | tail -3'"
   done
 done
 
