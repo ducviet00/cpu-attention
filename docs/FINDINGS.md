@@ -119,7 +119,7 @@ Measured by wrapping the extension entry with a no-op:
 
 | item | us |
 |---|---|
-| `flash_attn_func` total | 4.47 |
+| `flash_attn_func` total | 4.47 (now **2.6** with the seven-argument entry, `10c18a7`) |
 | Python side without the extension call | 3.25 |
 | of which the extension call itself (42 args) | 1.22 |
 | `torch.empty` (the output) | 0.56 |
@@ -132,6 +132,16 @@ cache), and a plan-buffer ABI (5 args instead of 42) saves ~1 us but needs 49
 hand-mapped fields — its two bugs were silent (raw instead of packed V strides)
 until they segfaulted, and it was abandoned. The route to that row is to move the
 call path out of Python, not to tune it.
+
+### 6a. Update: the marshal was collected, the rest was not
+
+The seven-argument entry (geometry in an int64 plan buffer the call plan owns)
+took the call path from 4.47 us to ~2.6 us, worth 5% of a 24 us call at
+128:8:64. What is left is the output allocation (0.56 us), six `.shape`/
+`.stride()` reads (0.9 us, unavoidable -- they are the cache key) and the
+`torch` call overhead. Caching the *validation* was worth 0.26 us and was not
+kept. The remaining route would be to leave Python entirely, which is an engine
+change, not a kernel change.
 
 ## 7. Where the *rest* of the 128:8:64 budget goes
 

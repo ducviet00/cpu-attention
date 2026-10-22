@@ -10,7 +10,18 @@ right, its conclusions about *where* the headroom is are not — see below).
 `ours / baseline < 1`, for both baselines (`torch SDPA` and vLLM `csrc/cpu`), on
 all 22 rows of `tests/bench_vs_refs.py`. Below 1 is a win.
 
-## Current state — `main` @ 19018ac, m9g.2xlarge (8 cores, Neoverse-V3)
+## Current state — m9g.2xlarge (8 cores, Neoverse-V3)
+
+> **The table below is from `19f10b0`.** Three commits since then move the three
+> contested rows and are not in it: the seven-argument extension entry
+> (`10c18a7`, 128:8:64 1.11 → 1.04 in the full matrix), the last-tile store out
+> of the P@V registers (`ca26a10`, 2–2.5% at 128:8:64 and ~3% at 256:16:128 in
+> isolated A/B), and the short-sequence path back on (`_SMALL_MAXK=256`, 1–2%
+> on the two rows it covers with the arm order rotated). With those, the matrix
+> reads **19/22 vs vLLM** with `128:8:64` 1.00-1.02, `256:16:128` 1.01-1.02 and
+> `4096:16:128` 1.01-1.02 — i.e. parity inside this box's 1-3% drift. These rows
+> are being re-measured on a fresh instance; replace this note with the number
+> you measure.
 
 Two `scripts/verify.sh` runs, `--rounds 9`, clean rebuild, **min-based** ratios
 (`scripts/band.py`; the minimum cannot be inflated by foreign load, the median
