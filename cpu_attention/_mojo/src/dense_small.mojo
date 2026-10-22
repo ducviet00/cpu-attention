@@ -16,6 +16,26 @@ key groups per iteration; the two-group tail loop here removes that requirement.
 (The obvious companion -- skipping the first tile's accumulator zeroing -- is
 *not* done: a `t0 == 0` test inside the P@V chunk loop measured 4% slower.)
 
+Tried and rejected (measured, in this file's history): making the *head* the work
+item -- one call per (batch, head) with the Q panels built for 8 blocks at a time
+and the block loop inside that one call -- so the per-block prologue and the
+call boundary would be amortised. 128:8:64 bf16: 1.009x against the shipped
+kernel where the per-block form is 1.020x, i.e. the ~1400 cycles per block that
+a causal/non-causal fit attributes to fixed cost are **not** the Q panel and
+**not** the call boundary. What is left is the epilogue (an `acc` load -> scale ->
+shuffle -> store chain, 32 store groups, plus 8 scalar reciprocals) and the
+pipeline drain at each block boundary; that needs a non-degenerate ablation
+before anyone rewrites it -- the obvious "remove the epilogue" ablation is
+degenerate because it kills the accumulator's live-out and reads 50% of the call.
+
+A trap worth knowing: the K^T addressing here must match ``_rows_small`` (and
+dense.mojo's mode-2 pack) exactly -- within a 64-key tile it is
+``[key pair][dim group][8]``, so the dim-group stride is 8 and the key-pair
+stride is ``DG * 8``. Using the older ``KT_PAIR_STRIDE`` constant reads the
+packed buffer at the wrong offsets, which produces wrong logits for every row
+except the first (a one-key row is just ``v[0]``) and is invisible in a
+uniform-probability test.
+
 Everything is the *same* tile geometry, the same bfmmla sequence and
 the same operand layouts as the shipped kernel, so the result is bit-identical
 (tests/bench_small.py asserts that against the default path). This file is
@@ -40,6 +60,7 @@ from dense import (
     DenseJob,
     DenseTaskFn,
     KS_STRIDE,
+    KT_PAIR_STRIDE,
     NEG_INF,
     RESCALE_SLACK,
     TILE_KS,
@@ -486,12 +507,12 @@ def _small_fused[
 ](tjob: TransposeJob, djob: DenseJob, num_workers: Int):
     comptime qt = 8
     comptime TASK_PACK = _transpose_task[DType.bfloat16, head_dim, mode]
-    comptime TASK_ROWS = _task_small[head_dim, qt, ks]
     var items = djob.batch * djob.num_heads
     if items == 0 or djob.seq_q <= 0:
         return
     var qgroups = (djob.seq_q + qt - 1) // qt
     var t_fn: TransposeTaskFn = TASK_PACK
+    comptime TASK_ROWS = _task_small[head_dim, qt, ks]
     var d_fn: DenseTaskFn = TASK_ROWS
     var workers = min(num_workers, items)
     if workers <= 1:
