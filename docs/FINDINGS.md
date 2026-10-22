@@ -91,3 +91,51 @@ scripts/box_run.sh ubuntu@52.77.215.13 'cd ~/cpu-attention && .venv/bin/python t
 scripts/box_run.sh ubuntu@52.77.215.13 'NT=1 perf stat -x, -e cycles,instructions,inst_retired,l1d_cache_refill taskset -c 3 ~/cpu-attention/.venv/bin/python ~/prof_one.py 2048 8 64 bf16 ours 20'
 scripts/box_run.sh ubuntu@52.77.215.13 'perf record -q -g -o /tmp/p.data -- .venv/bin/python /tmp/prof128.py; perf report -i /tmp/p.data --sort symbol'
 ```
+
+## 5. The harness rules that came out of this session
+
+1. **Judge on the minimum, not the median.** On a shared box a burst of foreign
+   load lands inside one variant's sample and moves a median 15%: bf16
+   2048:16:128 read median 1.15 / min 1.04 in the *same* matrix run, and fp32
+   512:32:128 read 0.85 twice then 1.01 twice while an in-process probe of the
+   same binary read 4046 us both times. `tests/bench_vs_refs.py` now prints
+   `min o/vllm` beside the median, and `scripts/band.py` / `scripts/scorecard.py`
+   judge on it (interference can only make a sample slower).
+2. **Wait for the box.** `scripts/verify.sh` blocks until `/proc/loadavg` < 0.8
+   before timing. Every build, test and timing run takes `~/bench.lock`
+   (`scripts/box_run.sh`, `scripts/box_sync.sh`, `scripts/verify.sh`).
+3. **Toggle plan-level knobs in one process.** A knob that invalidates the call
+   plan inside a timing loop costs up to 19% by itself — that artefact produced
+   one false "0.22x regression" and one false "12% instability" this session.
+   `tests/ab_two_trees.py` (two trees, alternating processes) is for code that
+   cannot be toggled at runtime; everything else should be interleaved in one
+   process.
+4. **Rebuild clean for a verdict.** `verify.sh` deletes `_mojo/build` and
+   `_C.so` first, so a stale `.so` cannot pass for a fresh kernel.
+
+## 6. Call-path anatomy at 128:8:64 bf16 (25 us total)
+
+Measured by wrapping the extension entry with a no-op:
+
+| item | us |
+|---|---|
+| `flash_attn_func` total | 4.47 |
+| Python side without the extension call | 3.25 |
+| of which the extension call itself (42 args) | 1.22 |
+| `torch.empty` (the output) | 0.56 |
+| geometry + plan key + dict lookup | 0.5 |
+| the 40 argument checks | ~0.3 |
+
+vLLM reaches its kernel through pybind for ~1.5 us, so ~3 us of a 25 us call is
+our Python. Two attempts: caching the validation saves 0.26 us (not worth a
+cache), and a plan-buffer ABI (5 args instead of 42) saves ~1 us but needs 49
+hand-mapped fields — its two bugs were silent (raw instead of packed V strides)
+until they segfaulted, and it was abandoned. The route to that row is to move the
+call path out of Python, not to tune it.
+
+## 7. Where the *rest* of the 128:8:64 budget goes
+
+25 us = kernel 19.6 + pack 2.4 + Python 4.5 (overlapping a little). vLLM's 22 =
+attention 21 + ~1.5 Python, with its cache staged **outside** the timer. So on
+that row we win the kernel by 6% and lose 2.4 us of pack (charged to us by the
+scorecard's contract) and ~3 us of Python.
