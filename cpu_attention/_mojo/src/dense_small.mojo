@@ -39,7 +39,6 @@ from dense import (
     DenseJob,
     DenseTaskFn,
     KS_STRIDE,
-    KT_PAIR_STRIDE,
     NEG_INF,
     RESCALE_SLACK,
     TILE_KS,
@@ -166,8 +165,8 @@ def _rows_small[
         var sb = 0
         while sb < nkp:
             var kt_sub = kt_base.unsafe_offset(
-                ((t0 + 2 * sb) // KS_STRIDE) * (DG * job.kt_stride_d)
-                + (((t0 + 2 * sb) % KS_STRIDE) // 2) * 8
+                ((t0 + 2 * sb) // KS_STRIDE) * (KS_STRIDE * head_dim)
+                + (((t0 + 2 * sb) % KS_STRIDE) // 2) * (DG * 8)
             )
             var accs = Array[SIMD[DType.float32, 4], RP * nsq](
                 uninitialized=True
@@ -178,7 +177,7 @@ def _rows_small[
                 var a0 = q_pan.unsafe_load[width=8]((0 * RP + rp) * 8)
                 comptime for v in range(nsq):
                     accs[rp * nsq + v] = _bfmmla(
-                        zero, a0, kt_sub.unsafe_load[width=8](v * 8)
+                        zero, a0, kt_sub.unsafe_load[width=8](v * (DG * 8))
                     )
             var g = 1
             while g < DG:
@@ -189,7 +188,7 @@ def _rows_small[
                             accs[rp * nsq + v],
                             a,
                             kt_sub.unsafe_load[width=8](
-                                g * KT_PAIR_STRIDE + v * 8
+                                v * (DG * 8) + g * 8
                             ),
                         )
                 g += 1

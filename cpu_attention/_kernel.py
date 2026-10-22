@@ -409,6 +409,40 @@ def _scratch_strides(kt, vt):
     return got[1], got[2]
 
 
+_SCRATCH_BYTES = 48 << 20
+"""Bytes of packed-K/V workspace kept alive across geometries (see ``_scratch``).
+
+Bounded by *bytes*, not by the number of geometries: a workload with many small
+shapes keeps all of them, and one with a few large shapes keeps one. The budget
+is a little over a single 4096x16x128 bf16 geometry (K^T + V = 32 MB), which is
+exactly the case where holding two of them is what costs.
+"""
+
+
+def _workspace_bytes(bufs) -> int:
+    return sum(t.numel() * t.element_size() for t in bufs.values())
+
+
+def _drop_workspace() -> None:
+    """Release every packed-K/V buffer and the call plans that point at them.
+
+    One generation is all an engine needs, but a sweep over many *large* shapes
+    would otherwise keep every geometry's K^T/V scratch alive at once -- a 22-row
+    ``tests/bench_vs_refs.py`` run reaches several hundred MB, and the rows it
+    measures late are 5-15% slower than the same rows run on their own (measured
+    on the Graviton box, medians of 9; the fingerprint is positional, not
+    shape-dependent). The plans hold references to the buffers, so the two have
+    to be dropped together.
+    """
+    bufs = getattr(_SCRATCH, "bufs", None)
+    if bufs is not None:
+        bufs.clear()
+    _SCRATCH_STRIDES.clear()
+    plans = getattr(_SCRATCH, "plans", None)
+    if plans is not None:
+        plans.clear()
+
+
 def _scratch(kind, shape, dtype):
     """A workspace tensor of ``shape``/``dtype``, reused across calls."""
     bufs = getattr(_SCRATCH, "bufs", None)
@@ -417,17 +451,16 @@ def _scratch(kind, shape, dtype):
     key = (kind, shape, dtype)
     buf = bufs.get(key)
     if buf is None:
-        # Bound the dict: one entry per (purpose, shape, dtype) alive at a time
-        # is all the engine ever needs, but a caller looping over many shapes
-        # would otherwise grow it without limit. The call plans hold references
-        # to these buffers, so they have to be dropped together -- otherwise a
-        # many-shape sweep keeps one generation of buffers alive through the
-        # plans after the dict that owns them has been cleared.
-        if len(bufs) > 64:
-            bufs.clear()
-            plans = getattr(_SCRATCH, "plans", None)
-            if plans is not None:
-                plans.clear()
+        # Bound the workspace by bytes. A caller looping over shapes would
+        # otherwise grow it without limit, and the *large* shapes are the ones
+        # whose leftovers cost. `len(bufs) > 1` keeps a single geometry from
+        # evicting itself: the budget is per generation, not per buffer.
+        nbytes = 1
+        for d in shape:
+            nbytes *= d
+        if len(bufs) > 1 and _workspace_bytes(bufs) + nbytes > _SCRATCH_BYTES:
+            _drop_workspace()
+            bufs = _SCRATCH.bufs
         buf = torch.empty(shape, dtype=dtype)
         bufs[key] = buf
     return buf
@@ -455,13 +488,7 @@ def scratch_bytes() -> int:
 
 def clear_scratch() -> None:
     """Drop this thread's workspace buffers (tests, or after a shape sweep)."""
-    bufs = getattr(_SCRATCH, "bufs", None)
-    if bufs is not None:
-        bufs.clear()
-    _SCRATCH_STRIDES.clear()
-    plans = getattr(_SCRATCH, "plans", None)
-    if plans is not None:
-        plans.clear()
+    _drop_workspace()
 
 
 _QT_ENV = os.environ.get("CPU_ATTENTION_QT")
@@ -578,6 +605,23 @@ def _qt_for(
         # default at every head dim (rows are what the K/V read is amortised
         # over). ``CPU_ATTENTION_QT=4`` still selects the v1 register kernel for
         # an A/B.
+        #
+        # 12 and 16 rows are reachable (`CPU_ATTENTION_QT`) and the kernel has
+        # the geometry for them, but they are not selected: an interleaved
+        # 6/8/12/16 sweep at 8 threads on the per-head dispatch measures qt8
+        # best at *every* shape, including the short ones
+        #
+        #     shape            qt6   **qt8**  qt12   qt16
+        #     128:8:64          25   **23**    26     24
+        #     256:16:128       231  **207**   229    214
+        #     512:8:64         249  **226**   239    235
+        #     512:32:128      1682 **1524**  1615   1561
+        #     1024:16:128     3145 **2876**  3014   2944
+        #
+        # (16 rows *was* the right answer for 128:8:64 under the older
+        # round-robin dispatch, by 10%, because that dispatch wasted a third of
+        # the call at the barrier -- `ca0a85e` removed that, and the extra rows
+        # then cost more than the per-item overhead they save.)
         return 8
     if lanes < 16:
         # fp32 v2 (tile logits in L1) wants 8 rows at every head dim: rows are
@@ -826,8 +870,10 @@ def _dense_plan(key, q, k, v, causal):
         # K blocked by key tile (64 keys): one tile's K for every head-dim group
         # is then one contiguous run, so the Q@K^T sweep walks it linearly
         # instead of jumping seq_k/2*16 bytes per head-dim group.
+        # [tile][key pair][head-dim group][8]: one key pair's whole head dim
+        # is a single linear run, which is the order the Q@K^T sweep reads.
         kt = _scratch("kt2", (batch, num_kv_heads, seq_k_pad // kt_blk,
-                              head_dim // 4, kt_blk // 2, 8), dt)
+                              kt_blk // 2, head_dim // 4, 8), dt)
         # V: [key group of 4][head-dim pair][8], so P@V's inner loop walks one
         # key group's dim pairs as a contiguous run (512 B at head_dim 64).
         vt = _scratch("vt2", (batch, num_kv_heads, seq_k_pad // 4, head_dim // 2, 8),
@@ -873,9 +919,10 @@ def _dense_plan(key, q, k, v, causal):
     ob, otok, oh = seq_q * num_heads * head_dim, num_heads * head_dim, head_dim
     ktb = kt_st[1]
     if mode == 2 or mode == 3:
-        # [tile][dim group][key pair][8]: stride(3) is one head-dim group
-        # inside a tile, 8 is one key pair. (The tile stride is derived in the
-        # kernel from the dim-group count.)
+        # mode 2 [tile][key pair][dim group][8]: stride(3) is one key pair, 8 a
+        # head-dim group; mode 3 [tile][dim group][key pair][16]: stride(3) is
+        # one head-dim group. The kernel derives the tile stride from the
+        # dim-group count.
         ktd, ktt = kt_st[3], 8
     else:
         ktd = kt_st[3]                          # dim stride within a block
@@ -937,7 +984,9 @@ def _dense_plan(key, q, k, v, causal):
     )
     plans = _plans()
     if len(plans) > 64:
-        plans.clear()
+        # The scratch budget in :func:`_scratch` is the bound that matters; this
+        # one only stops the dict itself growing without limit.
+        _drop_workspace()
     plans[key] = plan
     return plan
 
