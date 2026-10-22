@@ -704,3 +704,52 @@ The L1 read-miss rate (0.348/row-key against vLLM's 0.086, ~70% of the K/V
 stream refilling from L2 because our K^T and V packs are read 16-strided where
 their page layout is linear) is worth at most 3% and needs a layout change, not
 a prefetch.
+
+## Fourth campaign: tile size at D=128, and the K-layout theory falsified
+
+**Measurement discipline, learned the hard way again.** Differential `perf stat`
+(cycles and instructions per row-key) is precise *within* a build -- ablation
+deltas reproduce to 0.4% -- but across two builds of the same source it moves
+**5%**: `arm-old` at 1024:16:128 measured 9.74 and then 9.24 cycles/row-key in
+consecutive runs, and a "5.8% win" from a tile-size change turned out to be
+1.01x in the interleaved whole-call A/B. Cross-build decisions need
+`tests/ab_two_trees.py`; perf is for phase attribution inside one build.
+
+**Keys per tile at head_dim 128: 128 -> 256.** The per-tile cost (running max,
+`alpha`, the P@V accumulator round trip, prologue) amortises over `qt * ks`
+row-keys, and at D=128 the matmul per key is twice as large, so a 256-key tile
+costs half as much per row-key. Interleaved whole-call A/B (7 rounds, main vs
+branch): **1.01x at 1024:16:128, 1.01x at 2048:16:128, 1.01x at 4096:16:128,
+1.02x at 512:32:128**. 512 keys is worse (9.52 vs 9.18 cycles/row-key at
+1024:16:128) and at head_dim 64 the wider tile loses outright (5.31 vs 5.08 at
+2048:8:64), so it is `head_dim >= 128` only. `TILE_KS = 64` is 5.53 against 5.08.
+
+**The K^T layout swap is falsified: it does not change the miss rate.** The
+theory was ours: `[tile][dim group][key pair][8]` makes a sub-block read 16
+chunks of 16 B spread 512 B apart, so swapping to `[tile][key pair][dim group][8]`
+(one contiguous 1 KB run per sub-block, four streams instead of sixteen) should
+cut `l1d_cache_lmiss_rd`. Built it, verified parity, measured:
+
+| | before | after |
+|---|---:|---:|
+| 2048:8:64 lmiss/row-key | 0.2749 | 0.2789 |
+| 1024:16:128 lmiss/row-key | 0.6252 | 0.6261 |
+| whole call (4 shapes, interleaved) | 1.00x | 1.02x |
+
+So the 0.35 misses/row-key are **not** the K stride. They are the *staging
+buffers*: per tile the stream (K 16 KB + V 16 KB at a 128-key tile) evicts the
+logits/probs/accumulator set (9 KB) between the write and the re-read, and no K
+reordering changes that. The layout is reverted (it was 1.00-1.02x, i.e. inside
+the noise, and it doubled the number of layouts to document).
+
+**Per-work-item cost, sized but not yet ablated.** From the heads-scaling fit
+(`tests/bench_scale.py`: `a = 2.58` cycles/row-key, `b ~ 1000` cycles/item) and
+the code's own instruction count, a work item is ~580 instructions (Q panel 256,
+accumulator init 128, epilogue 144, setup ~50) = ~165 cycles at IPC 3.5, against
+~1000-2000 cycles measured: **the per-item cost is ~90% stall, not arithmetic.**
+That points at the dependency chain through the Q load -> panel -> first Q@K^T and
+the cold output store, not at the guards on the Q-panel loads. The cheap fixes
+are therefore (a) fewer work items at short S (one task per head, or `qt = 16`
+with `nsq = 2`), and (b) prefetching the *next* task's Q rows -- the GOMP worker
+advances `task += threads`, so the next task's Q address is known one item ahead.
+Neither is done; do not spend the time on the prologue's instruction count.
