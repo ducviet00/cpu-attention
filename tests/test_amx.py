@@ -38,6 +38,24 @@ def run(q, k, v, causal, amx):
         K._AMX_ENV = prev
 
 
+def run_entry(q, k, v, causal, plan):
+    """One AMX call through the 5-argument plan entry or the 36-argument one.
+
+    The plan buffer carries ~30 geometry fields that used to cross the boundary
+    as Python arguments; a wrong slot in it is silent (the kernel reads a
+    plausible integer and writes the wrong place), so both entries must agree
+    bit for bit.
+    """
+    prev = K._AMX_PLAN
+    K._AMX_PLAN = K._AMX_PLAN if plan else None
+    K.clear_scratch()
+    try:
+        return attn.flash_attn_func(q, k, v, causal=causal)
+    finally:
+        K._AMX_PLAN = prev
+        K.clear_scratch()
+
+
 def bench(fns, rounds=5):
     for f in fns.values():
         for _ in range(2):
@@ -81,16 +99,19 @@ def main() -> int:
             k = torch.randn(1, seq, heads, dim, dtype=dt)
             v = torch.randn(1, seq, heads, dim, dtype=dt)
             ref = sdpa(q, k, v, causal).transpose(1, 2).contiguous()
-            got = run(q, k, v, causal, True)
+            got = run_entry(q, k, v, causal, True)
+            alt = run_entry(q, k, v, causal, False)
             mojo = run(q, k, v, causal, False)
             d_amx = (got.float() - ref.float()).abs().max().item()
             d_mojo = (mojo.float() - ref.float()).abs().max().item()
+            d_plan = (got.float() - alt.float()).abs().max().item()
             ok = d_amx <= (3e-2 if dt == torch.bfloat16 else 2e-4)
+            ok = ok and d_plan == 0.0
             bad += 0 if ok else 1
             tag = "bf16" if dt == torch.bfloat16 else "fp32"
             print(f"  S={seq:5d} H={heads:2d} D={dim:3d} {tag} causal={int(causal)}: "
                   f"amx max|d|={d_amx:.2e} mojo={d_mojo:.2e} "
-                  f"{'OK' if ok else 'FAIL'}")
+                  f"plan-vs-36arg={d_plan:.1e} {'OK' if ok else 'FAIL'}")
             if not ok:
                 # where does it go wrong?
                 diff = (got.float() - ref.float()).abs()
