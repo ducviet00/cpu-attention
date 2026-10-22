@@ -589,3 +589,38 @@ artefact -- IPC 4.8 reported for a serial loop -- but sampling is usable).
 `tests/ab_two_trees.py --old ~/arm-old --new ~/arm-work` is the only honest
 tree-vs-tree comparison; `bench_vs_refs.py` between runs moves 3% on this box
 and cannot settle anything smaller.
+
+### The next thing to try: the hybrid int8/bf16 Q@K^T (branch `hybrid-wip`)
+
+The int8 error is **not uniform in the sequence**, and that is the opening:
+
+```
+S=2048 H=8 D=64, int8 Q@K^T, error vs SDPA by row block
+  rows     0-  127 (<=128 visible keys): max 3.12e-02
+  rows   128-  255 (<=256 visible keys): max 1.17e-02
+  rows   256-  383                    : max 6.5e-03
+  rows   512+                         : max <=4.9e-03
+```
+
+Only the peaked early rows fail the gate, and they hold <2% of the work at
+S>=2048. So: bf16 operands for row blocks under ~256 visible keys, i8mm for the
+rest. At S=4096 the int8 kernel is 19% faster than the bf16 one (78731 vs
+97331 us at 16:128), so even 95% of the work on int8 is +15%, which would put
+6-8 of the 11 bf16 rows under 1.00.
+
+Branch `hybrid-wip` (commit `93c9f69`) has pack mode 4 (both K layouts), the
+`kt2`/`i8_min` ABI, the per-work-item `i8` switch and the Python dispatch, and
+the 49 dense parity checks pass -- but a mode-4 call at S>=512 **hangs** (>=120 s)
+with either path forced, so the fault is in the pack or in the two-path kernel
+body (the bf16-only path in that build is also 1.7x slow, which smells like the
+two paths' register demands being unioned). Start by timing the mode-4 pack
+alone; `_transpose_head_i8` is the new code and the first suspect.
+
+### Trap (cost me a set of measurements)
+
+`timeout 900 ssh host 'cd ... && python tests/bench_vs_refs.py ...'` kills the
+*ssh client*, not the remote python: the benchmark kept running at 323% CPU for
+30+ minutes, and every measurement in that window read 2-8x slow (one shape read
+17.9 ms against 51 us). Kill with `pkill -f bench_vs_refs` and check `uptime`
+before believing anything. The old note about "one run at a time" is not enough
+-- a timed-out ssh leaves the run alive.
