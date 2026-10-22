@@ -149,21 +149,32 @@ cheapest way to re-run that sweep, but nothing selects it.
 either way, where before the layout change 128 keys was 9% better at 256:16:128.
 The layout change removed the reason the tile size mattered.
 
-## The one row that is still 16%: 128:8:64 bf16
+## The one row outside the noise band: 128:8:64 bf16
 
-26 us against vLLM's 22-23. Split measured in-process at 8 threads:
+`bench_vs_refs` calls it 1.10-1.13 (24-25 us against vLLM's 22), but in a tight
+loop with no interleaved variant in between the same call measures **22.8 us**
+against vLLM's 22.0 -- i.e. the row is borderline, and what is left of it is
+fixed cost, not kernel rate. The H-scaling fit at S=128/D=64 (`fixed_cost.py`,
+8 threads) separates the two terms:
 
-| term | us |
-|---|---:|
-| kernel (the raw `dense_forward` call) | 21.0 |
-| Python: 8 tensor attribute reads, plan key + dict get, 42-tuple unpack, `torch.empty`, 4 `data_ptr`, 42-argument marshal | 4.1 |
-| vLLM's whole call | 22.0 |
+| heads | ours us | vLLM us | ratio |
+|---|---:|---:|---:|
+| 4 | 16.9 | 13.1 | 1.28 |
+| 8 | 24.1 | 22.0 | 1.09 |
+| 16 | 42.0 | 40.0 | 1.05 |
+| 32 | 79.0 | 78.8 | 1.00 |
 
-and at *one* thread we are at parity (7.09 vs 7.14 cycles/row-key), so the row
-is fixed cost, not kernel rate: the kernel is 0.9 us of it and the Python path
-2.5. `_dense_plan` already caches everything that is a pure function of the
-geometry; what is left is ~1.1 us of `.shape`/`.stride()`/`.dtype` reads in
-`flash_attn_func`, 0.87 us of output allocation and 0.88 us of marshalling 42
-arguments into the extension. Cutting the argument count to ~6 (hand the
-geometry to the kernel once, keep the struct's address on the Python side) is
-the only remaining route and it is worth ~2 us on this row and ~0 on every other.
+so our *marginal* cost per head is better than theirs (2.29 vs 2.37 us) and the
+whole difference is the intercept: **5.8 us of per-call cost against their 3.0**.
+Of our 5.8, about 4.1 is the Python path (8 tensor attribute reads in
+`flash_attn_func`, the plan key + dict get, the 42-tuple unpack, `torch.empty`,
+four `data_ptr`, and 0.88 us of marshalling 42 arguments into the extension) and
+~1.7 is the OpenMP region. Every item was measured separately; the largest is
+the output allocation at 0.87 us, which cannot go. Cutting the extension's
+argument list from 42 to ~6 (hand the geometry to the kernel once and keep the
+struct's address on the Python side) is the only remaining route, it is worth
+~1.5 us, and it would move this row to ~1.04.
+
+At one thread the same row is at parity (7.09 vs 7.14 cycles/row-key), so this is
+not a kernel problem: at S=128 both kernels are at 57% of the 4-cycle `bfmmla`
+floor at D=64 and the per-call costs are what is left.
