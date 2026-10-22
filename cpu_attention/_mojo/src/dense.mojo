@@ -2546,7 +2546,7 @@ def _transpose_head[
             # (key pair, dim group), which cost more than the shuffles.
             comptime KP_STRIDE = (head_dim // 4) * 8
             var k_blk_base = (
-                (t0 // job.kt_blk) * ((head_dim // 4) * job.kt_stride_d)
+                (t0 // job.kt_blk) * (KS_STRIDE * head_dim)
                 + ((t0 % job.kt_blk) // 2) * KP_STRIDE
             )
             var k_src = src.unsafe_offset(t0 * job.k_stride_t)
