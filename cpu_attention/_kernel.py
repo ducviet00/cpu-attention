@@ -409,18 +409,30 @@ def _scratch_strides(kt, vt):
     return got[1], got[2]
 
 
-_SCRATCH_MAX = 8
-"""Geometries whose packed-K/V workspace stays alive (see :func:`_scratch`)."""
+_SCRATCH_BYTES = 48 << 20
+"""Bytes of packed-K/V workspace kept alive across geometries (see ``_scratch``).
+
+Bounded by *bytes*, not by the number of geometries: a workload with many small
+shapes keeps all of them, and one with a few large shapes keeps one. The budget
+is a little over a single 4096x16x128 bf16 geometry (K^T + V = 32 MB), which is
+exactly the case where holding two of them is what costs.
+"""
+
+
+def _workspace_bytes(bufs) -> int:
+    return sum(t.numel() * t.element_size() for t in bufs.values())
 
 
 def _drop_workspace() -> None:
     """Release every packed-K/V buffer and the call plans that point at them.
 
-    One generation is all an engine needs, but a sweep over many shapes would
-    otherwise keep every geometry's K^T/V scratch alive at once -- a 22-row
+    One generation is all an engine needs, but a sweep over many *large* shapes
+    would otherwise keep every geometry's K^T/V scratch alive at once -- a 22-row
     ``tests/bench_vs_refs.py`` run reaches several hundred MB, and the rows it
-    measures late are 3-10% slower than the same rows run on their own (measured
-    on the Graviton box, medians of 9).
+    measures late are 5-15% slower than the same rows run on their own (measured
+    on the Graviton box, medians of 9; the fingerprint is positional, not
+    shape-dependent). The plans hold references to the buffers, so the two have
+    to be dropped together.
     """
     bufs = getattr(_SCRATCH, "bufs", None)
     if bufs is not None:
@@ -439,13 +451,14 @@ def _scratch(kind, shape, dtype):
     key = (kind, shape, dtype)
     buf = bufs.get(key)
     if buf is None:
-        # Bound the dict: one entry per (purpose, shape, dtype) alive at a time
-        # is all the engine ever needs, but a caller looping over many shapes
-        # would otherwise grow it without limit. The call plans hold references
-        # to these buffers, so they have to be dropped together -- otherwise a
-        # many-shape sweep keeps one generation of buffers alive through the
-        # plans after the dict that owns them has been cleared.
-        if len(bufs) > _SCRATCH_MAX:
+        # Bound the workspace by bytes. A caller looping over shapes would
+        # otherwise grow it without limit, and the *large* shapes are the ones
+        # whose leftovers cost. `len(bufs) > 1` keeps a single geometry from
+        # evicting itself: the budget is per generation, not per buffer.
+        nbytes = 1
+        for d in shape:
+            nbytes *= d
+        if len(bufs) > 1 and _workspace_bytes(bufs) + nbytes > _SCRATCH_BYTES:
             _drop_workspace()
             bufs = _SCRATCH.bufs
         buf = torch.empty(shape, dtype=dtype)
@@ -970,13 +983,9 @@ def _dense_plan(key, q, k, v, causal):
         kt, vt, ks,
     )
     plans = _plans()
-    if len(plans) > _SCRATCH_MAX:
-        # One generation of workspace is what an engine needs; a *sweep* over
-        # many shapes would otherwise hold every geometry's K^T/V scratch alive
-        # at once (a 22-row bench_vs_refs sweep reaches several hundred MB, and
-        # the rows measured after it are 3-10% slower than the same rows run on
-        # their own -- measured on the Graviton box). Dropping the plans drops
-        # the buffers with them.
+    if len(plans) > 64:
+        # The scratch budget in :func:`_scratch` is the bound that matters; this
+        # one only stops the dict itself growing without limit.
         _drop_workspace()
     plans[key] = plan
     return plan
