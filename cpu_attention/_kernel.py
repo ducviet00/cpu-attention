@@ -274,6 +274,23 @@ def _transpose_attention():
 _FORWARD = None
 
 
+_FORWARD_PLAN = None
+
+
+def _forward_plan():
+    """The fused entry that takes a plan buffer instead of 42 arguments."""
+    global _FORWARD_PLAN
+    if _FORWARD_PLAN is None:
+        entry = getattr(require(), "dense_forward_plan", None)
+        if entry is None:
+            raise RuntimeError(
+                "cpu_attention: _C.so has no dense_forward_plan; rebuild it "
+                "with scripts/build.py"
+            )
+        _FORWARD_PLAN = entry
+    return _FORWARD_PLAN
+
+
 def _forward():
     """Return the extension's fused pack+attention entry point, bound once."""
     global _FORWARD
@@ -386,6 +403,17 @@ it). Per-thread, because two threads packing into one buffer would corrupt each
 other's K.
 """
 
+
+_PLAN_ABI_FIELDS = [18, 19, 2, 3, 4, 5, 23, 24, 25, 8, 9, 11, 26, 27, 28, 16, 17, 21, 22, 18, 21, 22, 2, 0, 4, 1, 3, 5, 29, 30, 31, 8, 9, 10, 11, 32, 33, 34, 35, 36, 37, 6, 7, 12, 13]
+"""Plan-tuple indices carried in the call buffer, in the order ``_C`` reads them.
+
+Mirrors the field order in ``_C.dense_forward_plan``; both were generated from
+one table. ``job.causal`` follows them as the last entry.
+"""
+
+_PLAN_ABI = os.environ.get("CPU_ATTENTION_PLAN_ABI", "1") != "0"
+"""Use the seven-argument entry. ``0`` forces the 42-argument one, for the A/B in
+``tests/test_dense.py``, which requires bit-identical output from both."""
 
 _SCRATCH_STRIDES = {}
 
@@ -500,13 +528,17 @@ def set_qt(rows) -> None:
     global _QT_ENV
     _QT_ENV = str(int(rows)) if rows else None
 
-_SMALL_MAXK = int(os.environ.get("CPU_ATTENTION_SMALL_MAXK", "256"))
+_SMALL_MAXK = int(os.environ.get("CPU_ATTENTION_SMALL_MAXK", "0"))
 """``seq_k`` up to which the short-sequence kernel (``dense_small.mojo``) runs.
 
-That path is the shipped bf16 tile with three per-query-block costs removed
-(key coverage rounded to 8 keys instead of 16, no accumulator zeroing on the
-first tile) and the pack fused in the same per-head item; it measured 1.10x at
-128:8:64 against the shipped kernel (`tests/bench_small.py`). ``0`` = off.
+That path is the shipped bf16 tile with the key coverage rounded to 8 keys
+instead of 16 and the pack fused in the same per-head item. **Default 0 (off):
+it is neutral.** It measured 1.02-1.03x when `tests/bench_small.py` ran its arms
+in a fixed order, and 0.999/0.998/1.000 once the arms alternate position --
+whichever arm runs first in a round is 1-3% slower, and the shipped kernel had
+caught up with the 8-key rounding by the time the per-head dispatch landed. The
+code and its falsification record (KV-outer, the epilogue ablation) stay; a
+caller that measures otherwise can turn it on with `CPU_ATTENTION_SMALL_MAXK`.
 """
 
 
@@ -988,6 +1020,15 @@ def _dense_plan(key, q, k, v, causal):
         # held for their lifetimes, so the pointers above stay valid
         kt, vt, ks,
     )
+    # The geometry as an int64 buffer, so a call passes seven arguments to the
+    # extension instead of 42 (see `_C.dense_forward_plan`). Indices are into
+    # the `plan` tuple above -- no names, so this cannot pick up the wrong
+    # local. `tests/test_dense.py` requires bit-identical output from both
+    # entries, which is the check the first attempt at this change lacked.
+    pbuf = torch.tensor(
+        [plan[i] for i in _PLAN_ABI_FIELDS] + [int(causal)], dtype=torch.int64
+    )
+    plan = plan + (pbuf,)
     plans = _plans()
     if len(plans) > 64:
         # The scratch budget in :func:`_scratch` is the bound that matters; this
@@ -1043,7 +1084,7 @@ def _dense(q, k, v, scale: float, causal: bool, geom=None):
      ktb, ktd, ktt, kt_blk, qt, workers, kt_bh, kt_d, vt_bh, vt_d, kt_ptr,
      vt_ptr, v_ptr_packed, ks_ptr, ks_bh, k0, k1, k2, v0, v1, v2,
      qb, qtok, qh, vb, vtok, vh, ob, otok, oh, pack_workers,
-     _kt, _vt, _ks) = plan
+     _kt, _vt, _ks, _pbuf) = plan
     out = torch.empty(geom[0], dtype=geom[4])
     q_ptr = q.data_ptr()
     k_ptr = k.data_ptr()
@@ -1055,6 +1096,13 @@ def _dense(q, k, v, scale: float, causal: bool, geom=None):
         # barrier was 14% of the process by perf. `CPU_ATTENTION_NO_FUSE=1`
         # restores the two-call form, which is what `tests/bench_phases.py`
         # instruments to split pack from kernel.
+        if _PLAN_ABI:
+            # Six arguments instead of 42: the geometry rides in `_pbuf`.
+            _forward_plan()(
+                _pbuf.data_ptr(), k_ptr,
+                q_ptr, v_ptr if not vt_ptr else v.data_ptr(), v_ptr, o_ptr, scale,
+            )
+            return out
         _forward()(
             k_ptr, kt_ptr, v_ptr if not vt_ptr else v.data_ptr(), vt_ptr, v_ptr,
             batch, num_kv_heads, seq_k, head_dim, k0, k1, k2, vt_bh, vt_d,

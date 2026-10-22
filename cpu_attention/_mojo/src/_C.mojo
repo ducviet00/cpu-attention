@@ -354,6 +354,93 @@ def dense_forward(
         )
 
 
+def dense_forward_plan(
+    plan: PythonObject,
+    k: PythonObject,
+    q: PythonObject,
+    vsrc: PythonObject,
+    vkern: PythonObject,
+    dst: PythonObject,
+    scale: PythonObject,
+) raises:
+    """Pack K/V and run dense attention with the geometry in an int64 buffer.
+
+    ``dense_forward`` marshals 42 Python objects per call: measured 1.22 us of a
+    24 us call at 128:8:64, against the ~0.3 us a pybind entry costs vLLM.
+    Everything that only changes with the geometry rides in an int64 buffer the
+    call plan owns (``plan`` is its address), so a call passes seven arguments.
+    The field order is generated from the same table as
+    ``_kernel._PLAN_ABI_FIELDS``, and `tests/test_dense.py` additionally requires
+    bit-identical output from both entries on every shape it covers -- which is
+    the check the first attempt at this change (two silent field mismatches)
+    lacked.
+    """
+    var pb = MutPointer[Int64, MutUntrackedOrigin](
+        unsafe_from_address=Int(py=plan)
+    )
+    var tjob = TransposeJob()
+    var job = DenseJob()
+    tjob.kt = Int(pb.unsafe_load(0))
+    tjob.vt = Int(pb.unsafe_load(1))
+    tjob.batch = Int(pb.unsafe_load(2))
+    tjob.num_kv_heads = Int(pb.unsafe_load(3))
+    tjob.seq_k = Int(pb.unsafe_load(4))
+    tjob.head_dim = Int(pb.unsafe_load(5))
+    tjob.k_stride_b = Int(pb.unsafe_load(6))
+    tjob.k_stride_t = Int(pb.unsafe_load(7))
+    tjob.k_stride_h = Int(pb.unsafe_load(8))
+    tjob.kt_stride_bh = Int(pb.unsafe_load(9))
+    tjob.kt_stride_d = Int(pb.unsafe_load(10))
+    tjob.kt_blk = Int(pb.unsafe_load(11))
+    tjob.v_stride_b = Int(pb.unsafe_load(12))
+    tjob.v_stride_t = Int(pb.unsafe_load(13))
+    tjob.v_stride_h = Int(pb.unsafe_load(14))
+    tjob.vt_stride_bh = Int(pb.unsafe_load(15))
+    tjob.vt_stride_d = Int(pb.unsafe_load(16))
+    tjob.ks = Int(pb.unsafe_load(17))
+    tjob.ks_stride_bh = Int(pb.unsafe_load(18))
+    job.kt = Int(pb.unsafe_load(19))
+    job.ks = Int(pb.unsafe_load(20))
+    job.ks_stride_bh = Int(pb.unsafe_load(21))
+    job.batch = Int(pb.unsafe_load(22))
+    job.seq_q = Int(pb.unsafe_load(23))
+    job.seq_k = Int(pb.unsafe_load(24))
+    job.num_heads = Int(pb.unsafe_load(25))
+    job.num_kv_heads = Int(pb.unsafe_load(26))
+    job.head_dim = Int(pb.unsafe_load(27))
+    job.q_stride_b = Int(pb.unsafe_load(28))
+    job.q_stride_t = Int(pb.unsafe_load(29))
+    job.q_stride_h = Int(pb.unsafe_load(30))
+    job.kt_stride_bh = Int(pb.unsafe_load(31))
+    job.kt_stride_d = Int(pb.unsafe_load(32))
+    job.kt_stride_t = Int(pb.unsafe_load(33))
+    job.kt_blk = Int(pb.unsafe_load(34))
+    job.v_stride_b = Int(pb.unsafe_load(35))
+    job.v_stride_t = Int(pb.unsafe_load(36))
+    job.v_stride_h = Int(pb.unsafe_load(37))
+    job.o_stride_b = Int(pb.unsafe_load(38))
+    job.o_stride_t = Int(pb.unsafe_load(39))
+    job.o_stride_h = Int(pb.unsafe_load(40))
+    var d_dtype = Int(pb.unsafe_load(41))
+    var d_mode = Int(pb.unsafe_load(42))
+    var d_qt = Int(pb.unsafe_load(43))
+    var d_workers = Int(pb.unsafe_load(44))
+    job.causal = Bool(Int(pb.unsafe_load(45)))
+    tjob.k = Int(py=k)
+    job.q = Int(py=q)
+    job.dst = Int(py=dst)
+    job.v = Int(py=vkern)
+    tjob.v = Int(py=vsrc)
+    job.scale = Float32(Float64(py=scale))
+    if d_mode >= 8:
+        run_small_fused(tjob, job, mode=d_mode - 8, num_workers=d_workers)
+    else:
+        run_dense_fused(
+            tjob, job, dtype_code=d_dtype, mode=d_mode, qt=d_qt,
+            num_workers=d_workers,
+        )
+
+
 @export
 def PyInit__C() abi("C") -> PythonObject:
     try:
@@ -361,6 +448,7 @@ def PyInit__C() abi("C") -> PythonObject:
         m.def_function[attention]("attention")
         m.def_function[dense_attention]("dense_attention")
         m.def_function[dense_forward]("dense_forward")
+        m.def_function[dense_forward_plan]("dense_forward_plan")
         m.def_function[dense_transpose]("dense_transpose")
         m.def_function[dense_bf16_dot]("dense_bf16_dot")
         m.def_function[dense_bfmmla]("dense_bfmmla")

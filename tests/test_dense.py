@@ -198,6 +198,39 @@ def main() -> int:
             fails += 1
             print(f"[FAIL] {name}")
 
+    # The extension has two entries for the fused dense call: the 42-argument
+    # `dense_forward` and the 7-argument `dense_forward_plan`, which reads the
+    # geometry out of an int64 buffer the call plan owns. They must agree bit for
+    # bit -- a wrong index in that buffer is silent in the shapes it happens to
+    # get right and a segfault in the ones it does not, which is exactly how the
+    # first cut of it failed.
+    import cpu_attention._kernel as K
+
+    abi_bad = 0
+    abi_cases = 0
+    for dt in (torch.bfloat16, torch.float32):
+        for (s_, h_, d_) in ((64, 4, 64), (130, 8, 64), (192, 16, 128),
+                             (250, 16, 128), (512, 8, 64), (512, 32, 128)):
+            for causal in (True, False):
+                qq = torch.randn(1, s_, h_, d_, dtype=dt)
+                kk = torch.randn_like(qq)
+                vv = torch.randn_like(qq)
+                K._PLAN_ABI = True
+                aa = attn.flash_attn_func(qq, kk, vv, causal=causal)
+                K._PLAN_ABI = False
+                bb = attn.flash_attn_func(qq, kk, vv, causal=causal)
+                K._PLAN_ABI = True
+                abi_cases += 1
+                if (aa.float() - bb.float()).abs().max().item() != 0.0:
+                    abi_bad += 1
+    checks += 1
+    if abi_bad:
+        fails += 1
+        print(f"[FAIL] plan-buffer entry differs from the 42-argument entry "
+              f"on {abi_bad}/{abi_cases} cases")
+    else:
+        print(f"[OK] plan-buffer entry is bit-identical on {abi_cases} cases")
+
     print(f"cpu_attention dense: {checks - fails}/{checks} checks passed")
     return fails
 
