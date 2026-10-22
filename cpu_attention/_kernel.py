@@ -579,20 +579,22 @@ def _qt_for(
         # over). ``CPU_ATTENTION_QT=4`` still selects the v1 register kernel for
         # an A/B.
         #
-        # At a short key range the per-work-item cost dominates instead and 16
-        # rows wins: interleaved sweep on m9g at 8 threads (us, medians of 11),
-        # best arm in bold::
+        # 12 and 16 rows are reachable (`CPU_ATTENTION_QT`) and the kernel has
+        # the geometry for them, but they are not selected: an interleaved
+        # 6/8/12/16 sweep at 8 threads on the per-head dispatch measures qt8
+        # best at *every* shape, including the short ones
         #
-        #     shape            qt4   qt6   qt8   qt12  qt16
-        #     128:8:64         40    35    33    35    **30**
-        #     256:16:128      350   305   274   294    **268**
-        #     512:8:64        346   276  **262** 276    265
-        #     512:32:128     2264  1865  1728  1789    1720
-        #     1024:16:128    3979  3329 **3099** 3210  3131
+        #     shape            qt6   **qt8**  qt12   qt16
+        #     128:8:64          25   **23**    26     24
+        #     256:16:128       231  **207**   229    214
+        #     512:8:64         249  **226**   239    235
+        #     512:32:128      1682 **1524**  1615   1561
+        #     1024:16:128     3145 **2876**  3014   2944
         #
-        # so 16 below 512 keys and 8 from there up.
-        if seq_k <= 256:
-            return 16
+        # (16 rows *was* the right answer for 128:8:64 under the older
+        # round-robin dispatch, by 10%, because that dispatch wasted a third of
+        # the call at the barrier -- `ca0a85e` removed that, and the extra rows
+        # then cost more than the per-item overhead they save.)
         return 8
     if lanes < 16:
         # fp32 v2 (tile logits in L1) wants 8 rows at every head dim: rows are
