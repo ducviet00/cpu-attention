@@ -9,6 +9,7 @@ every entry point raises ``RuntimeError``.
 
 import importlib.util
 import os
+import struct
 import threading
 
 import torch
@@ -509,6 +510,9 @@ def scratch_bytes() -> int:
 def clear_scratch() -> None:
     """Drop this thread's workspace buffers (tests, or after a shape sweep)."""
     _drop_workspace()
+    # The AMX call plans hold the workspace addresses; a stale plan would feed
+    # the kernel a freed buffer.
+    _AMX_PLANS.__dict__.pop("p", None)
 
 
 _QT_ENV = os.environ.get("CPU_ATTENTION_QT")
@@ -723,11 +727,69 @@ def amx_available() -> bool:
         mod = module()
         gate = getattr(mod, "dense_has_amx", None) if mod else None
         init = getattr(mod, "dense_amx_init", None) if mod else None
+        global _AMX_PLAN
         if gate is None or init is None or not gate() or not init():
             _AMX_ENTRY = False
         else:
             _AMX_ENTRY = mod.dense_amx_attention
+            _AMX_PLAN = getattr(mod, "dense_amx_plan", None)
     return _AMX_ENTRY is not False and _AMX_ENTRY is not None and _AMX_ENV
+
+
+_AMX_PLAN = None
+"""``dense_amx_plan``: the 5-argument entry (see ``_amx_plan_buffer``)."""
+
+_AMX_PLANS = threading.local()
+"""Geometry -> the int64 buffer that entry reads, per thread.
+
+The AMX call marshalled 36 Python objects and rebuilt twelve derived ints on
+every call. Rebuilding them is 3.7 us of a 43 us call at 128:8:64 -- the row
+where the kernel is already faster than vLLM's, so the call path *is* the
+margin there. Everything in the buffer changes only with the geometry and the
+tensor strides; the four tensor addresses still cross per call.
+
+Bounded by entry count and dropped by `clear_scratch`, like the other
+workspace. The buffer holds the two packed-K/V workspace addresses, so a
+cleared workspace must not leave a stale plan behind.
+"""
+
+AMX_PLAN_MAGIC = 0x414D58504C414E31
+"""Mirrors ``_C.AMX_PLAN_MAGIC``: the kernel rejects a buffer without it."""
+
+_AMX_KT = int(os.environ.get("CPU_ATTENTION_AMX_KT") or 256)
+
+
+def _amx_plan_key(q, k, v, fp32: bool, causal: bool):
+    return (q.shape, k.shape, q.stride(), k.stride(), v.stride(), fp32,
+            causal, _AMX_KT, _AMX_MODE_V, torch.get_num_threads())
+
+
+def _amx_plan_buffer(q, k, v, fp32, causal, kp, vp, kp_bh, vp_bh, kb16, kb32,
+                     dc32, dc16, scale, kt, workers):
+    """Pack one AMX call's geometry into an int64 buffer for ``dense_amx_plan``.
+
+    Field order is fixed and mirrored in ``_C.dense_amx_plan``; slot 32 is a
+    magic word so a stale buffer is refused rather than misread. The strides
+    are the caller's element strides (the kernel scales by the element size),
+    and the output strides are derived, not read: the output is a fresh
+    contiguous tensor.
+    """
+    batch, seq_q, num_heads, head_dim = q.shape
+    seq_k, num_kv_heads = k.shape[1], k.shape[2]
+    qs, ks, vs = q.stride(), k.stride(), v.stride()
+    scale_bits = struct.unpack("<i", struct.pack("<f", float(scale)))[0]
+    plan = torch.tensor([
+        kp.data_ptr(), vp.data_ptr(),
+        batch, num_heads, num_kv_heads, seq_k, seq_q, head_dim,
+        ks[0], ks[1], ks[2],
+        vs[0], vs[1], vs[2],
+        qs[0], qs[1], qs[2],
+        seq_q * num_heads * head_dim, num_heads * head_dim, head_dim,
+        kp_bh, vp_bh, kb16, kb32, dc32, dc16,
+        scale_bits, int(bool(causal)), kt, workers, int(fp32),
+        int(_AMX_MODE_V), AMX_PLAN_MAGIC,
+    ], dtype=torch.int64)
+    return plan
 
 
 def _amx_dense(q, k, v, scale: float, causal: bool):
@@ -744,6 +806,17 @@ def _amx_dense(q, k, v, scale: float, causal: bool):
     if q.shape[-1] not in (32, 64, 128) or q.dtype not in _DTYPE_CODES:
         return None
     fp32 = q.dtype == torch.float32
+    plans = _AMX_PLANS.__dict__.get("p")
+    if plans:
+        plan = plans.get(
+            (q.shape, k.shape, q.stride(), k.stride(), v.stride(), fp32,
+             causal, _AMX_KT, _AMX_MODE_V, torch.get_num_threads())
+        )
+        if plan is not None:
+            out = torch.empty_like(q, memory_format=torch.contiguous_format)
+            _AMX_PLAN(plan.data_ptr(), q.data_ptr(), k.data_ptr(),
+                      v.data_ptr(), out.data_ptr())
+            return out
     if fp32 and not _AMX_FP32_ENV:
         return None
     batch, seq_q, num_heads, head_dim = q.shape
@@ -764,8 +837,9 @@ def _amx_dense(q, k, v, scale: float, causal: bool):
     qs, ks, vs, os_ = q.stride(), k.stride(), v.stride(), out.stride()
     # 256-key super-tiles measured best on the Xeon (128 is 6% slower, 384/512
     # lose the logits+prob+acc working set out of L1).
-    kt = int(os.environ.get("CPU_ATTENTION_AMX_KT") or 256)
+    kt = _AMX_KT
     tasks = batch * num_heads * (-(-seq_q // 32))
+    workers = _workers(tasks, 8)
     _AMX_ENTRY(
         q.data_ptr(), kp.data_ptr(), vp.data_ptr(), out.data_ptr(),
         k.data_ptr(), v.data_ptr(),
@@ -776,8 +850,18 @@ def _amx_dense(q, k, v, scale: float, causal: bool):
         os_[0], os_[1], os_[2],
         kp_bh, vp_bh, kb16, kb32, dc32, dc16,
         float(scale), int(bool(causal)), kt,
-        _workers(tasks, 8), int(fp32), int(_AMX_MODE_V),
+        workers, int(fp32), int(_AMX_MODE_V),
     )
+    if _AMX_PLAN is not None:
+        plans = _AMX_PLANS.__dict__.get("p")
+        if plans is None:
+            plans = _AMX_PLANS.p = {}
+        if len(plans) > 64:
+            plans.clear()
+        plans[_amx_plan_key(q, k, v, fp32, causal)] = _amx_plan_buffer(
+            q, k, v, fp32, causal, kp, vp, kp_bh, vp_bh, kb16, kb32, dc32,
+            dc16, scale, kt, workers,
+        )
     return out
 
 

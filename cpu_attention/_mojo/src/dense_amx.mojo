@@ -512,7 +512,7 @@ struct AmxJob(Copyable, ImplicitlyCopyable, Movable):
 
 @inline(.always)
 def _amx_dense_item[
-    fp32: Bool
+    fp32: Bool, D: Int
 ](
     job: AmxJob,
     logits: MutPointer[Float32, MutUntrackedOrigin],
@@ -528,7 +528,13 @@ def _amx_dense_item[
     """Attend ``QROWS`` query rows of one (batch, head) over the key range."""
     comptime V16 = SIMD[DType.float32, 16]
     comptime I16 = SIMD[DType.int32, 16]
-    var D = job.head_dim
+    # `D` is a compile-time parameter: every offset, loop bound and tile index
+    # below then folds to a constant. The kernel used to read head_dim out of
+    # the job, which left a dynamic multiply in each tile-load address and a
+    # dynamic bound on the dim-chunk loop.
+    comptime DC32 = D // 32
+    comptime DC16 = D // 16
+    comptime ASTRIDE = D * 4
     var kt = job.kt
     var seq_k = job.seq_k
     var nrows = min(QROWS, job.seq_q - q0)
@@ -613,7 +619,7 @@ def _amx_dense_item[
 
     var lstride = kt * 4
     var pstride = kt * 2
-    var astride = D * 4
+    comptime astride = ASTRIDE
     # Running max and sum per row, as two 16-lane vectors (rows 0-15, 16-31).
     # The max starts at 0, not -inf: scaled logits are O(10), so exp2 cannot
     # overflow, and a row that sees no key at all has every logit at -3e38,
@@ -650,18 +656,18 @@ def _amx_dense_item[
             # chunk), so the pitch doubles. Getting this wrong is invisible for
             # key block 0 and wrong for every later one (it showed up only at
             # seq_k > 32, and only in fp32).
-            var kb = (k0 // 16) * job.dc32 * kstride
+            var kb = (k0 // 16) * DC32 * kstride
             tile_zero[4]()
             tile_zero[5]()
             tile_zero[6]()
             tile_zero[7]()
-            for dc in range(job.dc32):
+            comptime for dc in range(DC32):
                 var kt_hi = Int(kbase) + (kb + dc * kstride) * 2
                 if (job.mode & 128) == 0:
                     tile_load[0](Int(qptr) + dc * 64, qstride)
                     tile_load[1](Int(qptr) + dc * 64 + 16 * qstride, qstride)
                 tile_load[2](kt_hi, 64)
-                tile_load[3](kt_hi + job.dc32 * kstride * 2, 64)
+                tile_load[3](kt_hi + DC32 * kstride * 2, 64)
                 tile_dpbf16ps[4, 0, 2]()
                 tile_dpbf16ps[5, 0, 3]()
                 tile_dpbf16ps[6, 1, 2]()
@@ -669,7 +675,7 @@ def _amx_dense_item[
                 if fp32:
                     # Q_hi@K_lo, then Q_lo@K_hi (K_hi reloads from L1).
                     tile_load[2](kt_hi + 1024, 64)
-                    tile_load[3](kt_hi + job.dc32 * kstride * 2 + 1024, 64)
+                    tile_load[3](kt_hi + DC32 * kstride * 2 + 1024, 64)
                     tile_dpbf16ps[4, 0, 2]()
                     tile_dpbf16ps[5, 0, 3]()
                     tile_dpbf16ps[6, 1, 2]()
@@ -677,7 +683,7 @@ def _amx_dense_item[
                     tile_load[0](Int(qptr_lo) + dc * 64, qstride)
                     tile_load[1](Int(qptr_lo) + dc * 64 + 16 * qstride, qstride)
                     tile_load[2](kt_hi, 64)
-                    tile_load[3](kt_hi + job.dc32 * kstride * 2, 64)
+                    tile_load[3](kt_hi + DC32 * kstride * 2, 64)
                     tile_dpbf16ps[4, 0, 2]()
                     tile_dpbf16ps[5, 0, 3]()
                     tile_dpbf16ps[6, 1, 2]()
@@ -777,7 +783,7 @@ def _amx_dense_item[
         var nks = nk // 32 if (job.mode & 64) != 0 else (nk + 31) // 32
         var first = t0 == 0
         var dc = 0
-        while dc < D // 16:
+        while dc < DC16:
             # Nothing has accumulated before the first super-tile, so zero the
             # tiles instead of loading 32*head_dim floats of fresh memory.
             if first:
@@ -791,7 +797,7 @@ def _amx_dense_item[
                 tile_load[6](Int(acc) + (16 * D + dc * 16) * 4, astride)
                 tile_load[7](Int(acc) + (16 * D + (dc + 1) * 16) * 4, astride)
             for ks in range(nks):
-                var vb = ((t0 // 32) + ks) * job.dc16 * vstride
+                var vb = ((t0 // 32) + ks) * DC16 * vstride
                 var vt_hi = Int(vbase) + (vb + dc * vstride) * 2
                 tile_load[0](Int(prob) + (ks * 32) * 2, pstride)
                 tile_load[1](Int(prob) + (16 * kt + ks * 32) * 2, pstride)
@@ -956,9 +962,18 @@ def _amx_worker[
         var rest = task // nqg
         var head = rest % state.job.num_heads
         var batch = rest // state.job.num_heads
-        _amx_dense_item[fp32](
-            state.job, lp, pp, ap, qp, qplo, pplo, batch, head, g * QROWS
-        )
+        if state.job.head_dim == 128:
+            _amx_dense_item[fp32, 128](
+                state.job, lp, pp, ap, qp, qplo, pplo, batch, head, g * QROWS
+            )
+        elif state.job.head_dim == 64:
+            _amx_dense_item[fp32, 64](
+                state.job, lp, pp, ap, qp, qplo, pplo, batch, head, g * QROWS
+            )
+        else:
+            _amx_dense_item[fp32, 32](
+                state.job, lp, pp, ap, qp, qplo, pplo, batch, head, g * QROWS
+            )
         task += threads
     tile_release()
 

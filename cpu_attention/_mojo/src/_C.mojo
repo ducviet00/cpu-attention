@@ -8,6 +8,7 @@ Build with:  pixi run build        (from ``cpu_attention/_mojo``)
 """
 
 from std.os import abort
+from std.memory import bitcast
 from std.python import PythonObject
 from std.python.bindings import PythonModuleBuilder
 from attention import Job, run
@@ -113,6 +114,10 @@ def dense_int8_qk() -> PythonObject:
     if INT8_QK:
         return PythonObject(True)
     return PythonObject(False)
+
+
+comptime AMX_PLAN_MAGIC = 0x414D58504C414E31
+"""'AMXPLAN1' as an int64: identifies a dense_amx plan buffer's layout."""
 
 
 def dense_amx_init() -> PythonObject:
@@ -231,6 +236,82 @@ def dense_amx_attention(
     job.fp32 = Bool(fp32)
     job.mode = Int(py=mode)
     run_dense_amx(pack, job, num_workers=Int(py=num_workers), kt=Int(py=kt))
+
+
+def dense_amx_plan(
+    plan: PythonObject,
+    q: PythonObject,
+    k: PythonObject,
+    v: PythonObject,
+    dst: PythonObject,
+) raises:
+    """AMX pack + attention with the geometry in an int64 buffer (5 arguments).
+
+    ``dense_amx_attention`` marshals 36 Python objects per call, which is 1.2 us
+    of a 43 us call at 128:8:64 -- the row where we lose to vLLM and where the
+    kernel itself is already faster than theirs, so the call path is the whole
+    margin. Everything that changes only with the geometry (strides, tile
+    counts, the packed-K/V workspace addresses, kt, the worker count) rides in
+    the buffer; only the four tensor addresses and the buffer address cross the
+    boundary. The field order below is mirrored by
+    ``_kernel._AMX_PLAN_FIELDS`` and the last slot is a magic word, so a stale
+    or mismatched plan is rejected instead of silently misread.
+    """
+    var pb = MutPointer[Int64, MutUntrackedOrigin](
+        unsafe_from_address=Int(py=plan)
+    )
+    if Int(pb.unsafe_load(32)) != AMX_PLAN_MAGIC:
+        raise Error("cpu_attention: stale dense_amx plan buffer")
+    var pack = PackJob()
+    pack.k = Int(py=k)
+    pack.v = Int(py=v)
+    pack.kp = Int(pb.unsafe_load(0))
+    pack.vp = Int(pb.unsafe_load(1))
+    pack.batch = Int(pb.unsafe_load(2))
+    pack.num_kv_heads = Int(pb.unsafe_load(4))
+    pack.seq_k = Int(pb.unsafe_load(5))
+    pack.head_dim = Int(pb.unsafe_load(7))
+    pack.k_stride_b = Int(pb.unsafe_load(8))
+    pack.k_stride_t = Int(pb.unsafe_load(9))
+    pack.k_stride_h = Int(pb.unsafe_load(10))
+    pack.v_stride_b = Int(pb.unsafe_load(11))
+    pack.v_stride_t = Int(pb.unsafe_load(12))
+    pack.v_stride_h = Int(pb.unsafe_load(13))
+    pack.kp_bh = Int(pb.unsafe_load(20))
+    pack.vp_bh = Int(pb.unsafe_load(21))
+    pack.kb16 = Int(pb.unsafe_load(22))
+    pack.kb32 = Int(pb.unsafe_load(23))
+    pack.dc32 = Int(pb.unsafe_load(24))
+    pack.dc16 = Int(pb.unsafe_load(25))
+    var job = AmxJob()
+    job.q = Int(py=q)
+    job.kp = pack.kp
+    job.vp = pack.vp
+    job.dst = Int(py=dst)
+    job.batch = pack.batch
+    job.seq_q = Int(pb.unsafe_load(6))
+    job.seq_k = pack.seq_k
+    job.num_heads = Int(pb.unsafe_load(3))
+    job.num_kv_heads = pack.num_kv_heads
+    job.head_dim = pack.head_dim
+    job.q_stride_b = Int(pb.unsafe_load(14))
+    job.q_stride_t = Int(pb.unsafe_load(15))
+    job.q_stride_h = Int(pb.unsafe_load(16))
+    job.kp_bh = pack.kp_bh
+    job.vp_bh = pack.vp_bh
+    job.o_stride_b = Int(pb.unsafe_load(17))
+    job.o_stride_t = Int(pb.unsafe_load(18))
+    job.o_stride_h = Int(pb.unsafe_load(19))
+    job.scale = Float32(bitcast[DType.float32](Int32(Int(pb.unsafe_load(26)))))
+    job.causal = Bool(Int(pb.unsafe_load(27)))
+    job.kt = Int(pb.unsafe_load(28))
+    job.dc32 = pack.dc32
+    job.dc16 = pack.dc16
+    job.fp32 = Bool(Int(pb.unsafe_load(30)))
+    job.mode = Int(pb.unsafe_load(31))
+    run_dense_amx(
+        pack, job, num_workers=Int(pb.unsafe_load(29)), kt=job.kt
+    )
 
 
 def dense_forward(
@@ -457,6 +538,7 @@ def PyInit__C() abi("C") -> PythonObject:
         m.def_function[dense_has_amx]("dense_has_amx")
         m.def_function[dense_amx_init]("dense_amx_init")
         m.def_function[dense_amx_attention]("dense_amx_attention")
+        m.def_function[dense_amx_plan]("dense_amx_plan")
         return m.finalize()
     except e:
         abort(String("error creating cpu_attention._C: ", e))
