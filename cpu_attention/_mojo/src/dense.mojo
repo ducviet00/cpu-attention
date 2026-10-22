@@ -2993,8 +2993,40 @@ def _dense_task_pair[
     """
     var qgroups = (job.seq_q + qt - 1) // qt
     var gpairs = (qgroups + 1) // 2
-    var gp = task % gpairs
-    var rest = task // gpairs
+    # Work-item ORDER. Both orders are balanced (each item is still one cheap q
+    # block plus one expensive one); they differ in *which* (head, q block)
+    # pairs a thread walks in sequence, i.e. in the K/V working set per thread:
+    #
+    #   head-first: thread t walks every q block of (mostly) one head, so the
+    #     head's packed K/V (2 * seq_k * head_dim * elt bytes) is read once and
+    #     then hit in L1/L2 by the next 7..31 items.
+    #   q-first (was the only order): item order varies the q block fastest, so
+    #     consecutive items are *different heads* and every item re-reads its
+    #     head's K/V from L3.
+    #
+    # Measured interleaved, 8 threads, medians of 7 (`tests/ab_two_trees.py`),
+    # head-first over q-first: 128:8:64 bf16 1.19x, 256:16:128 bf16 1.20x,
+    # 512:8:64 1.12x, 1024:8:64 1.07x, 2048:8:64 1.03x, 512:32:128 1.12x,
+    # 1024:8:32 1.04x; and *slower* once a thread's working set leaves L2:
+    # 2048:16:128 bf16 0.93x, 4096:16:128 bf16 0.89x, 2048:16:128 fp32 0.86x,
+    # 1024:16:128 fp32 0.93x. The per-thread working set is
+    # head_bytes * ceil(heads / threads), and 1 MiB is where the sign flips
+    # (fp32 2048:8:64 = 1 MiB still gains 3%, fp32 512:32:128 = 2 MiB loses 2%).
+    # At long S q-first also wins for a second reason: eight threads on one
+    # head share that head's tiles in L3 while they work.
+    var nthreads = Int(external_call["omp_get_num_threads", Int32]())
+    comptime HEAD_ELT = 2 if dtype == DType.bfloat16 else 4
+    var head_bytes = 2 * job.seq_k * job.head_dim * HEAD_ELT
+    var per_thread = (job.num_heads + nthreads - 1) // nthreads
+    var head_first = head_bytes * per_thread <= 1048576
+    var gp = 0
+    var rest = 0
+    if head_first:
+        gp = (task // job.num_heads) % gpairs
+        rest = task // (gpairs * job.num_heads) * job.num_heads + task % job.num_heads
+    else:
+        gp = task % gpairs
+        rest = task // gpairs
     var head = rest % job.num_heads
     var batch = rest // job.num_heads
     var kv_head = head
