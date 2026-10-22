@@ -962,11 +962,13 @@ def _dense_plan(key, q, k, v, causal):
     ):
         mode += 4
     # ---- short-sequence kernel (mode += 8) ---------------------------------
-    # `dense_small.mojo`: same geometry with the key coverage rounded to 8 keys
-    # instead of 16 and no first-tile accumulator zeroing, in its own region (it
-    # needs the pack fused per head, which the mode>=8 entry does itself). bf16
-    # only -- the fp32 tile kernel's own rounding costs 2% of its call, not 11%.
-    # `_FUSE` because the non-fused path packs in a separate region.
+    # `dense_small.mojo`: the same geometry with the key coverage rounded to 8
+    # keys instead of 16, in its own region (it needs the pack fused per head,
+    # which the mode>=8 entry does itself). bf16 only -- the fp32 tile kernel's
+    # own rounding costs 2% of its call, not 11%. `_FUSE` because the non-fused
+    # path packs in a separate region. Measured (in-process, 21 rounds, min):
+    # 128:8:64 1.020x, 256:16:128 1.042-1.068x; 512:8:64 is 0.94x, which is why
+    # the threshold is 256 and not higher.
     if (
         _SMALL_MAXK
         and mode == 6  # bf16 bfmmla layout + per-head
