@@ -49,8 +49,11 @@ except the first (a one-key row is just ``v[0]``) and is invisible in a
 uniform-probability test.
 
 Everything is the *same* tile geometry, the same bfmmla sequence and
-the same operand layouts as the shipped kernel, so the result is bit-identical
-(tests/bench_small.py asserts that against the default path). This file is
+the same operand layouts as the shipped kernel. It was bit-identical while it
+shared the shipped kernel's degree-3 exponential; it now uses the bf16-precision
+degree-2 one (`_exp2_bf16`, the form `dense.mojo`'s tile kernel uses), so the
+two paths differ by ~1 bf16 ulp and `tests/bench_small.py` checks both against
+SDPA inside the fixed bf16 tolerance rather than against each other. This file is
 separate from ``dense.mojo`` on purpose: the bf16 D=128 tile is being rewritten
 there, and this path only serves ``seq_k <= 256``.
 
@@ -64,6 +67,7 @@ against 2.4 us of pack for the whole call: the packed layouts are what make
 every operand a single load, so the pack stays.
 """
 
+from std.math import fma
 from std.memory import stack_allocation
 from std.ffi import external_call
 
@@ -80,7 +84,7 @@ from dense import (
     TransposeJob,
     TransposeTaskFn,
     _bfmmla,
-    _exp2_fast,
+    _exp2_bf16,
     _exp2_g,
     _ptr,
     _swap_pairs,
@@ -105,8 +109,14 @@ def _rows_small[
     first-tile accumulator zeroing.
 
     Every operand layout, the bfmmla order and the tile size are the shipped
-    ones; only the loop bounds and the accumulator's initial value differ, which
-    is why the output is bit-identical.
+    ones; the loop bounds, the accumulator's initial value and the exponential
+    differ. The exponential is `_exp2_bf16` (degree 2, the form `dense.mojo`'s
+    tile kernel uses) instead of `_exp2_fast`, and the panel shuffle is a 4-lane
+    `shuffle` instead of a lane constructor: measured 1.05x at 128:8:64 and
+    1.04x at 256:16:128, interleaved, alternating processes. Precision moves
+    from 7.8e-3 to 1.6e-2 worst-case against the fixed 3e-2 bf16 gate (the
+    shipped D=128 rows read the same), so both paths are checked against SDPA
+    inside the tolerance rather than against each other.
     """
     comptime RP = qt // 2  # row pairs
     comptime DG = head_dim // 4  # Q@K^T contraction groups (4 head dims each)
@@ -303,17 +313,22 @@ def _rows_small[
                         var l1 = logits.unsafe_load[width=4](
                             ((kg + u) * 2 + 1) * RP * 4 + rp * 4
                         )
-                        l0 = l0 * c1
-                        l1 = l1 * c1
-                        var p0 = _exp2_fast(l0 + off)
-                        var p1 = _exp2_fast(l1 + off)
+                        # Scale, max offset and log2 base in one fma, with the
+                        # bf16-precision polynomial (`_exp2_bf16`): the
+                        # probabilities are rounded to bf16 two instructions
+                        # later, so degree 2 is inside that rounding. The
+                        # separate `l * c1` multiply this replaces was one
+                        # instruction per vector, and `_exp2_fast`'s degree-3
+                        # polynomial two more.
+                        var p0 = _exp2_bf16(fma(l0, c1, off))
+                        var p1 = _exp2_bf16(fma(l1, c1, off))
                         sumv[u] += p0 + p1
-                        var z0 = SIMD[DType.float32, 4](
-                            p0[0], p0[1], p1[0], p1[1]
-                        )
-                        var z1 = SIMD[DType.float32, 4](
-                            p0[2], p0[3], p1[2], p1[3]
-                        )
+                        # Row 0's four keys are lanes 0,1 of both exponentials
+                        # and row 1's are lanes 2,3: a panel is two 4-lane
+                        # half-shuffles (`zip1/zip2.2d`) and a join. The
+                        # lane-constructor spelling emits a `mov` per lane.
+                        var z0 = p0.shuffle[0, 1, 4, 5](p1)
+                        var z1 = p0.shuffle[2, 3, 6, 7](p1)
                         probs.unsafe_store[width=8](
                             ((kg + u) * RP + rp) * 8,
                             z0.cast[DType.bfloat16]().join(
@@ -329,17 +344,11 @@ def _rows_small[
                         var l1 = logits.unsafe_load[width=4](
                             ((kg + u) * 2 + 1) * RP * 4 + rp * 4
                         )
-                        l0 = l0 * c1
-                        l1 = l1 * c1
-                        var p0 = _exp2_fast(l0 + off)
-                        var p1 = _exp2_fast(l1 + off)
+                        var p0 = _exp2_bf16(fma(l0, c1, off))
+                        var p1 = _exp2_bf16(fma(l1, c1, off))
                         sumv[u] += p0 + p1
-                        var z0 = SIMD[DType.float32, 4](
-                            p0[0], p0[1], p1[0], p1[1]
-                        )
-                        var z1 = SIMD[DType.float32, 4](
-                            p0[2], p0[3], p1[2], p1[3]
-                        )
+                        var z0 = p0.shuffle[0, 1, 4, 5](p1)
+                        var z1 = p0.shuffle[2, 3, 6, 7](p1)
                         probs.unsafe_store[width=8](
                             ((kg + u) * RP + rp) * 8,
                             z0.cast[DType.bfloat16]().join(

@@ -2,9 +2,10 @@
 
 Both are the same built library; only `_SMALL_MAXK` changes, so they can be
 interleaved inside one process (the only fair comparison on these boxes). The
-short path must be **bit-identical** to the shipped one -- it changes loop bounds
-and an initial value, not arithmetic -- so `d_shipped == d_small` is asserted,
-not merely tolerated.
+two paths used to be bit-identical; since the short path moved to the
+bf16-precision degree-2 exponential (`_exp2_bf16`) they differ by ~1 bf16 ulp,
+so each is checked against SDPA inside the fixed bf16 tolerance and the
+`ship/small` column is the one that decides.
 
     .venv/bin/python tests/bench_small.py --shapes 128:8:64,256:16:128 --rounds 15
 """
@@ -105,7 +106,7 @@ def main() -> int:
                          f"{med['small'] / med['vllm']:8.2f}")
             line += f" {min(s['ship']):9.1f} {min(s['small']):10.1f}"
             line += f"  {d['ship']:.1e}/{d['small']:.1e}"
-            line += " IDENTICAL" if d["ship"] == d["small"] else " DIFFERS!"
+            line += " SAME-EXP" if d["ship"] == d["small"] else " diff-exp"
             if d["small"] > tol:
                 line += " PARITY-FAIL"
             print(line, flush=True)
