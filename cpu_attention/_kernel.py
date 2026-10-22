@@ -921,7 +921,8 @@ def _dense_plan(key, q, k, v, causal):
         and mode == 6  # bf16 bfmmla layout + per-head
         and _FUSE
         and seq_k <= _SMALL_MAXK
-        and head_dim < 128  # the D=128 bf16 tile is another agent's, mid-rewrite
+        and head_dim <= 128  # D=128 measured too: 256:16:128 bf16 1.068x in
+        # `tests/bench_small.py`; the tile geometry (ks=256) is the same kernel
     ):
         mode += 8
     plan = (
