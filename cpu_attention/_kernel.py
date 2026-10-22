@@ -441,6 +441,21 @@ def clear_scratch() -> None:
 
 
 _QT_ENV = os.environ.get("CPU_ATTENTION_QT")
+"""``CPU_ATTENTION_QT``: pin the query rows per work item (``None`` = the table).
+
+Read per call by :func:`_dense` (it is part of the plan key), so a sweep can
+monkeypatch this global between calls in one process -- which is how the `qt`
+table in :func:`_qt_for` was measured.
+"""
+
+
+def set_qt(rows) -> None:
+    """Pin ``qt`` for every later call (``0``/``None`` restores the table).
+
+    The plan cache keys on it, so no invalidation is needed here.
+    """
+    global _QT_ENV
+    _QT_ENV = str(int(rows)) if rows else None
 
 def _qt_for(
     lanes: int, is_bf16: bool, head_dim: int, seq_k: int, bfmmla: bool
@@ -809,7 +824,10 @@ def _dense(q, k, v, scale: float, causal: bool, geom=None):
         return out
     if geom is None:
         geom = (q.shape, q.stride(), k.stride(), v.stride(), q.dtype)
-    key = (geom[0], geom[1], geom[2], geom[3], geom[4], causal)
+    # `_QT_ENV` is in the key on purpose: profiling sweeps flip it between calls
+    # in one process (that is how the `qt` table in `_qt_for` was measured), and
+    # a plan cached under one `qt` must not be served for another.
+    key = (geom[0], geom[1], geom[2], geom[3], geom[4], causal, _QT_ENV)
     plan = _plans().get(key)
     if plan is None:
         plan = _dense_plan(key, q, k, v, causal)
