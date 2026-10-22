@@ -109,6 +109,20 @@ behind the last two.
 | a fused pack+attention pass | would skip a write+read of the packed copy | there is nothing to skip: the pack is 6% of the call at S=128 and 0.3% at S=4096 |
 | three-phase split (pack / QK+softmax / V pack + P@V) | hides the V pack behind the softmax | deferring P@V makes every item's probabilities survive; the buffer costs 2-8x the phase it hides |
 
+## Correctness: one real bug found and fixed this campaign
+
+`tests/fuzz_dense.py`'s deterministic stray-read probe (V as a slice of a larger
+NaN-filled buffer) found that the **fp32 P@V loop read up to three V rows past
+the end of the caller's tensor** whenever `seq_q != seq_k` and the last tile's key
+range was not a multiple of four: the loops work on 4-key groups and rounded the
+runtime key range *up*. A NaN in the neighbouring allocation came back as a NaN
+the caller saw; a page boundary away it would have been a fault. Before: 24 NaN
+cases in the probe and 1-7 of 200 random cases per seed. After: probe 24/24 clean,
+600/600 random cases over three seeds, verified on the box against the pre-fix
+tree. The fix is in the caller, not the inner loop — the scratch V gets one extra
+group, zeroed once per geometry — because clamping the key index inside P@V cost
+1-5% of the fp32 rows.
+
 ## Two rules that keep paying for themselves
 
 **Show spare *issue* slots, not spare matmul cycles.** A microbenchmark of pure
