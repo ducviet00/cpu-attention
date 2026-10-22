@@ -12,6 +12,7 @@ from std.python import PythonObject
 from std.python.bindings import PythonModuleBuilder
 from attention import Job, run
 from dense import (
+    INT8_QK,
     DenseJob,
     TransposeJob,
     run_dense_fused,
@@ -48,6 +49,8 @@ def dense_transpose(
     dtype: PythonObject,
     mode: PythonObject,
     num_workers: PythonObject,
+    ks: PythonObject,
+    ks_stride_bh: PythonObject,
 ) raises:
     """Pack K (and, in mode 2, V) into the layout the dense kernel reads."""
     var job = TransposeJob()
@@ -70,6 +73,8 @@ def dense_transpose(
     job.v_stride_h = Int(py=v_stride_h)
     job.vt_stride_bh = Int(py=vt_stride_bh)
     job.vt_stride_d = Int(py=vt_stride_d)
+    job.ks = Int(py=ks)
+    job.ks_stride_bh = Int(py=ks_stride_bh)
     run_transpose(
         job,
         dtype_code=Int(py=dtype),
@@ -94,6 +99,17 @@ def dense_bfmmla() -> PythonObject:
     """True when the bf16 path runs on NEON ``bfmmla`` (K and V both repacked).
     """
     if has_bfmmla():
+        return PythonObject(True)
+    return PythonObject(False)
+
+
+def dense_int8_qk() -> PythonObject:
+    """True when bf16 Q@K^T runs on i8mm ``smmla`` with int8 K and Q operands.
+
+    The Python side picks pack mode 3 (int8 K plus a per-64-key dequant scale)
+    only when this is true, so a build without i8mm keeps the bf16 layout.
+    """
+    if INT8_QK:
         return PythonObject(True)
     return PythonObject(False)
 
@@ -257,6 +273,8 @@ def dense_forward(
     kt_blk: PythonObject,
     qt: PythonObject,
     num_workers: PythonObject,
+    ks: PythonObject,
+    ks_stride_bh: PythonObject,
 ) raises:
     """Pack K/V and run dense attention in one OpenMP region.
 
@@ -286,12 +304,16 @@ def dense_forward(
     tjob.v_stride_h = Int(py=vs_h)
     tjob.vt_stride_bh = Int(py=vt_stride_bh)
     tjob.vt_stride_d = Int(py=vt_stride_d)
+    tjob.ks = Int(py=ks)
+    tjob.ks_stride_bh = Int(py=ks_stride_bh)
 
     var job = DenseJob()
     job.q = Int(py=q)
     job.kt = Int(py=kt)
     job.v = Int(py=vk)
     job.dst = Int(py=dst)
+    job.ks = Int(py=ks)
+    job.ks_stride_bh = Int(py=ks_stride_bh)
     job.batch = Int(py=batch)
     job.seq_q = Int(py=seq_q)
     job.seq_k = Int(py=seq_k)
@@ -333,6 +355,7 @@ def PyInit__C() abi("C") -> PythonObject:
         m.def_function[dense_transpose]("dense_transpose")
         m.def_function[dense_bf16_dot]("dense_bf16_dot")
         m.def_function[dense_bfmmla]("dense_bfmmla")
+        m.def_function[dense_int8_qk]("dense_int8_qk")
         m.def_function[dense_lanes]("dense_lanes")
         m.def_function[dense_has_amx]("dense_has_amx")
         m.def_function[dense_amx_init]("dense_amx_init")
@@ -430,6 +453,8 @@ def dense_attention(
     dtype: PythonObject,
     qt: PythonObject,
     num_workers: PythonObject,
+    ks: PythonObject,
+    ks_stride_bh: PythonObject,
 ) raises:
     """Run the dense (non-paged) attention kernel.
 
@@ -460,6 +485,8 @@ def dense_attention(
     job.o_stride_b = Int(py=o_stride_b)
     job.o_stride_t = Int(py=o_stride_t)
     job.o_stride_h = Int(py=o_stride_h)
+    job.ks = Int(py=ks)
+    job.ks_stride_bh = Int(py=ks_stride_bh)
     job.scale = Float32(Float64(py=scale))
     job.causal = Bool(causal)
     run_dense(

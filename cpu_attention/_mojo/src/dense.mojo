@@ -79,7 +79,88 @@ runs on this instruction and not on ``bfdot`` (their ``.so`` has 9436 ``bfmmla``
 and 0 ``bfdot``). ARM-only: AVX-512's ``dpbf16ps`` already does 2x2 by itself.
 """
 
+comptime INT8_QK = False
+"""Whether bf16 Q@K^T runs on i8mm ``smmla`` with int8 operands.
+
+**Off: it is 12-15% faster and misses the bf16 parity gate.** Measured on the
+m9g box, ``bench_vs_refs.py --dtype bf16``: ``o/vllm`` 0.92-0.98 at S>=1024
+(from 1.03-1.13) and 873 GFLOP/s at 4096:16:128 (from 708), but ``max|diff|``
+against SDPA 3.1e-2 (3.9e-2 at head_dim 128) against a 3e-2 tolerance. The
+mechanism is not a bug: 127 symmetric levels on both operands is a 0.8% relative
+error on the logits, which is a 0.8% weight error, and a peaked causal row (3
+visible keys) turns that into a ~1% output error -- 2-4 bf16 ulp at the largest
+magnitudes, where the whole gate lives (the bf16 *output* rounding alone is
+7.8e-3). Fixing it needs ~2.5 more bits per operand; hi/lo splitting doubles the
+matmul back to ``bfmmla``'s cost, and per-key K scales only buy 1.35x.
+
+Kept behind this flag because it is the fastest Q@K^T this repo has measured and
+everything else about it (pack mode 3, the per-row scale, the layout) is
+verified: flip it to ``NEON_DOT`` to reproduce the numbers above.
+
+``smmla`` contracts eight head dims per instruction (against four for
+``bfmmla``) at roughly the same issue cost, so the Q@K^T phase executes half the
+matrix instructions *and* half the operand loads; the kernel is issue-bound, so
+that is the whole point. The cost is one ``fcvtzs`` per four logits (int32
+accumulator to fp32) and the quantisation in the pack, which is O(S*H*D) against
+the kernel's O(S^2*H*D) and measured at a fraction of a percent.
+
+Precision: Q is quantised per row and K per 16-key block (both symmetric, 127
+levels, round-to-nearest), and the two dequant scales are folded into the one
+per-lane multiply the exp pass already does, so the logits carry a ~0.4%
+relative error -- the same order as the bf16 rounding it replaces. Measured
+``max|diff|`` against SDPA stays at the bf16 output-rounding floor.
+"""
+
 comptime NEG_INF = -3.4028234663852886e38
+
+
+@inline(.always)
+def _smmla(
+    acc: SIMD[DType.int32, 4],
+    a: SIMD[DType.int8, 16],
+    b: SIMD[DType.int8, 16],
+) -> SIMD[DType.int32, 4]:
+    """``acc += a @ b`` as a 2x2 int32 tile, contracted over eight int8 lanes.
+
+    ``acc = (row0 col0, row0 col1, row1 col0, row1 col1)``; ``a`` holds the two
+    rows in its two 8-lane halves and ``b`` the two columns the same way -- the
+    same arrangement ``bfmmla`` uses, verified against a scalar reference on the
+    box (``smmla``'s second operand is the 8x2 matrix in *column* order).
+    """
+    return llvm_intrinsic[
+        "llvm.aarch64.neon.smmla", SIMD[DType.int32, 4], has_side_effect=False
+    ](acc, a, b)
+
+
+@inline(.always)
+def _vmax8(
+    a: SIMD[DType.float32, 8], b: SIMD[DType.float32, 8]
+) -> SIMD[DType.float32, 8]:
+    """Elementwise ``fmaxnm`` over eight lanes (see ``_vmax`` for four)."""
+    return llvm_intrinsic[
+        "llvm.maxnum.v8f32", SIMD[DType.float32, 8], has_side_effect=False
+    ](a, b)
+
+
+@inline(.always)
+def _vabs8(v: SIMD[DType.float32, 8]) -> SIMD[DType.float32, 8]:
+    """``|v|`` over eight lanes (``fabs``; ``SIMD`` has no ``.abs`` here)."""
+    return llvm_intrinsic[
+        "llvm.fabs.v8f32", SIMD[DType.float32, 8], has_side_effect=False
+    ](v)
+
+
+@inline(.always)
+def _round_i8(v: SIMD[DType.float32, 8]) -> SIMD[DType.int8, 8]:
+    """Round to nearest (even) and truncate to int8, for the quantiser.
+
+    ``cast`` alone truncates toward zero, which biases every value by half a
+    step in the direction of zero and roughly doubles the quantisation error.
+    Callers guarantee ``|v| <= 127``.
+    """
+    return llvm_intrinsic[
+        "llvm.roundeven.v8f32", SIMD[DType.float32, 8], has_side_effect=False
+    ](v).cast[DType.int8]()
 
 
 @inline(.always)
@@ -126,6 +207,9 @@ struct DenseJob(Copyable, ImplicitlyCopyable, Movable):
     var kt: Int
     var v: Int
     var dst: Int
+    var ks: Int
+    """int8 Q@K^T only: per-(batch, kv head, 16-key block) K dequant scale."""
+    var ks_stride_bh: Int
     var batch: Int
     var seq_q: Int
     var seq_k: Int
@@ -157,6 +241,8 @@ struct DenseJob(Copyable, ImplicitlyCopyable, Movable):
         self.kt = 0
         self.v = 0
         self.dst = 0
+        self.ks = 0
+        self.ks_stride_bh = 0
         self.batch = 0
         self.seq_q = 0
         self.seq_k = 0
@@ -1246,6 +1332,10 @@ comptime KT_PAIR_STRIDE = (KS_STRIDE // 2) * 8
 """Elements between head-dim groups in the bf16 K^T layout
 (``[tile][dim group][key pair][8]``): 32 key pairs x 8 bf16."""
 
+comptime KT_PAIR_STRIDE8 = (KS_STRIDE // 2) * 16
+"""The same stride in the int8 layout: 16 int8 per key pair (8 head dims of each
+of the two keys), so a 64-key block's one dim group is 512 bytes."""
+
 comptime KS_STRIDE = 64
 """Keys per contiguous K^T block, as a *compile-time* stride.
 
@@ -1292,6 +1382,7 @@ def _dense_rows_tile[
 
     comptime RP = qt // 2  # row pairs
     comptime DG = head_dim // 4  # Q@K^T contraction groups (4 head dims each)
+    comptime DG8 = head_dim // 8  # the same in int8 (8 head dims per smmla)
     comptime DP = head_dim // 2  # P@V output dim pairs
     comptime NKP = ks // 2  # key pairs per tile
     comptime NKG = ks // 4  # key groups (4 keys) per tile
@@ -1312,22 +1403,90 @@ def _dense_rows_tile[
         batch * job.o_stride_b + head * job.o_stride_h
     )
 
-    # Q A panels: [row pair][head-dim group of 4][8] -- four head dims of the
-    # even row then four of the odd row, built once per work item.
+    # inclusive Q@K^T scale: exp(scale*x) = 2^(c1*x)
+    var c1 = Scalar[DType.float32](job.scale) * Scalar[DType.float32](
+        1.4426950408889634
+    )
+    # Q A panels. bf16: [row pair][head-dim group of 4][8] -- four head dims of
+    # the even row then four of the odd row. int8 (``smmla``): [row pair][group
+    # of 8][16], eight dims of each row, plus one dequant factor per row folded
+    # with c1 so the kernel has a single per-row vector to multiply by.
     var q_pan = stack_allocation[RP * DG * 8, BFloat16]()
+    var q_i8 = stack_allocation[RP * DG8 * 16, Int8]()
+    var sq = Array[SIMD[DType.float32, 4], RP](uninitialized=True)
     comptime for rp in range(RP):
-        comptime for g in range(DG):
-            var lo = SIMD[DType.bfloat16, 4](0.0)
-            var hi = SIMD[DType.bfloat16, 4](0.0)
-            if 2 * rp < nrows:
-                lo = q_base.unsafe_offset(
-                    (q0 + 2 * rp) * job.q_stride_t + 4 * g
-                ).unsafe_load[width=4]()
-            if 2 * rp + 1 < nrows:
-                hi = q_base.unsafe_offset(
-                    (q0 + 2 * rp + 1) * job.q_stride_t + 4 * g
-                ).unsafe_load[width=4]()
-            q_pan.unsafe_store[width=8]((g * RP + rp) * 8, lo.join(hi))
+        sq[rp] = SIMD[DType.float32, 4](c1)
+    comptime if INT8_QK:
+        comptime for rp in range(RP):
+            var mx0 = SIMD[DType.float32, 8](0.0)
+            var mx1 = SIMD[DType.float32, 8](0.0)
+            comptime for h in range(DG8):
+                if 2 * rp < nrows:
+                    mx0 = _vmax8(
+                        mx0,
+                        _vabs8(
+                            q_base.unsafe_offset(
+                                (q0 + 2 * rp) * job.q_stride_t + 8 * h
+                            ).unsafe_load[width=8]().cast[DType.float32]()
+                        ),
+                    )
+                if 2 * rp + 1 < nrows:
+                    mx1 = _vmax8(
+                        mx1,
+                        _vabs8(
+                            q_base.unsafe_offset(
+                                (q0 + 2 * rp + 1) * job.q_stride_t + 8 * h
+                            ).unsafe_load[width=8]().cast[DType.float32]()
+                        ),
+                    )
+            # Per-row symmetric scale: 127/max, dequant max/127. A row of zeros
+            # (or one past `nrows`) quantises to zero and dequantises to zero.
+            var d0 = mx0.reduce_max()
+            var d1 = mx1.reduce_max()
+            var i0 = Scalar[DType.float32](0.0)
+            var i1 = Scalar[DType.float32](0.0)
+            if d0 > 1e-30:
+                i0 = Scalar[DType.float32](127.0) / d0
+                sq[rp][0] = d0 * Scalar[DType.float32](0.007874015748031496) * c1
+                sq[rp][1] = sq[rp][0]
+            if d1 > 1e-30:
+                i1 = Scalar[DType.float32](127.0) / d1
+                sq[rp][2] = d1 * Scalar[DType.float32](0.007874015748031496) * c1
+                sq[rp][3] = sq[rp][2]
+            comptime for g in range(DG8):
+                var a = SIMD[DType.bfloat16, 8](0.0)
+                var b = SIMD[DType.bfloat16, 8](0.0)
+                if 2 * rp < nrows:
+                    a = q_base.unsafe_offset(
+                        (q0 + 2 * rp) * job.q_stride_t + 8 * g
+                    ).unsafe_load[width=8]()
+                if 2 * rp + 1 < nrows:
+                    b = q_base.unsafe_offset(
+                        (q0 + 2 * rp + 1) * job.q_stride_t + 8 * g
+                    ).unsafe_load[width=8]()
+                q_i8.unsafe_store[width=16](
+                    (g * RP + rp) * 16,
+                    _round_i8(a.cast[DType.float32]() * SIMD[DType.float32, 8](i0))
+                    .join(
+                        _round_i8(
+                            b.cast[DType.float32]() * SIMD[DType.float32, 8](i1)
+                        )
+                    ),
+                )
+    else:
+        comptime for rp in range(RP):
+            comptime for g in range(DG):
+                var lo = SIMD[DType.bfloat16, 4](0.0)
+                var hi = SIMD[DType.bfloat16, 4](0.0)
+                if 2 * rp < nrows:
+                    lo = q_base.unsafe_offset(
+                        (q0 + 2 * rp) * job.q_stride_t + 4 * g
+                    ).unsafe_load[width=4]()
+                if 2 * rp + 1 < nrows:
+                    hi = q_base.unsafe_offset(
+                        (q0 + 2 * rp + 1) * job.q_stride_t + 4 * g
+                    ).unsafe_load[width=4]()
+                q_pan.unsafe_store[width=8]((g * RP + rp) * 8, lo.join(hi))
 
     # Output accumulator: [row pair][dim pair][4], in L1 like v1's.
     var acc = stack_allocation[RP * DP * 4, DType.float32]()
@@ -1344,11 +1503,6 @@ def _dense_rows_tile[
     comptime for rp in range(RP):
         m_v[rp] = SIMD[DType.float32, 4](NEG_INF)
         s_v[rp] = SIMD[DType.float32, 4](0.0)
-
-    # exp(scale*x - m) = 2^(c1*x - c1*m); logits stay in raw Q@K^T units.
-    var c1 = Scalar[DType.float32](job.scale) * Scalar[DType.float32](
-        1.4426950408889634
-    )
 
     var loop_end = seq_k
     if job.causal:
@@ -1386,31 +1540,77 @@ def _dense_rows_tile[
             var accs = Array[SIMD[DType.float32, 4], RP * nsq](
                 uninitialized=True
             )
-            # Peel g=0 so the zero accumulator is one shared register: the
-            # obvious `accs[i] = 0` loop emitted RP*nsq separate `movi`s per
-            # sub-block.
-            var zero = SIMD[DType.float32, 4](0.0)
-            comptime for rp in range(RP):
-                var a0 = q_pan.unsafe_load[width=8]((0 * RP + rp) * 8)
-                comptime for v in range(nsq):
-                    accs[rp * nsq + v] = _bfmmla(
-                        zero,
-                        a0,
-                        kt_sub.unsafe_load[width=8](v * 8),
-                    )
-            var g = 1
-            while g < DG:
+            comptime if INT8_QK:
+                # smmla: eight head dims per instruction, both operands int8, so
+                # the phase runs half the matrix instructions and half the operand
+                # loads of the bfmmla form. The int32 accumulators are converted
+                # and scaled once per sub-block; the stored logits are then in
+                # c1 units, whichever 64-key block their keys came from, so the
+                # exp pass is one add per logit rather than one FMA.
+                var kt8 = _ptr[Int8](job.kt).unsafe_offset(
+                    (batch * job.num_kv_heads + kv_head) * job.kt_stride_bh
+                    + ((t0 + 2 * sb) // job.kt_blk) * (DG8 * job.kt_stride_d)
+                    + (((t0 + 2 * sb) % job.kt_blk) // 2) * 16
+                )
+                var acci = Array[SIMD[DType.int32, 4], RP * nsq](
+                    uninitialized=True
+                )
+                var zero_i = SIMD[DType.int32, 4](0)
                 comptime for rp in range(RP):
-                    var a = q_pan.unsafe_load[width=8]((g * RP + rp) * 8)
+                    var a0 = q_i8.unsafe_load[width=16]((0 * RP + rp) * 16)
+                    comptime for v in range(nsq):
+                        acci[rp * nsq + v] = _smmla(
+                            zero_i, a0, kt8.unsafe_load[width=16](v * 16)
+                        )
+                var gi = 1
+                while gi < DG8:
+                    comptime for rp in range(RP):
+                        var a = q_i8.unsafe_load[width=16]((gi * RP + rp) * 16)
+                        comptime for v in range(nsq):
+                            acci[rp * nsq + v] = _smmla(
+                                acci[rp * nsq + v],
+                                a,
+                                kt8.unsafe_load[width=16](
+                                    gi * KT_PAIR_STRIDE8 + v * 16
+                                ),
+                            )
+                    gi += 1
+                var dqk = _ptr[Float32](job.ks).unsafe_offset(
+                    (batch * job.num_kv_heads + kv_head) * job.ks_stride_bh
+                    + (t0 + 2 * sb) // KS_STRIDE
+                ).unsafe_load()
+                comptime for rp in range(RP):
+                    var cs = sq[rp] * SIMD[DType.float32, 4](dqk)
+                    comptime for v in range(nsq):
+                        accs[rp * nsq + v] = (
+                            acci[rp * nsq + v].cast[DType.float32]() * cs
+                        )
+            else:
+                # Peel g=0 so the zero accumulator is one shared register: the
+                # obvious `accs[i] = 0` loop emitted RP*nsq separate `movi`s per
+                # sub-block.
+                var zero = SIMD[DType.float32, 4](0.0)
+                comptime for rp in range(RP):
+                    var a0 = q_pan.unsafe_load[width=8]((0 * RP + rp) * 8)
                     comptime for v in range(nsq):
                         accs[rp * nsq + v] = _bfmmla(
-                            accs[rp * nsq + v],
-                            a,
-                            kt_sub.unsafe_load[width=8](
-                                g * KT_PAIR_STRIDE + v * 8
-                            ),
+                            zero,
+                            a0,
+                            kt_sub.unsafe_load[width=8](v * 8),
                         )
-                g += 1
+                var g = 1
+                while g < DG:
+                    comptime for rp in range(RP):
+                        var a = q_pan.unsafe_load[width=8]((g * RP + rp) * 8)
+                        comptime for v in range(nsq):
+                            accs[rp * nsq + v] = _bfmmla(
+                                accs[rp * nsq + v],
+                                a,
+                                kt_sub.unsafe_load[width=8](
+                                    g * KT_PAIR_STRIDE + v * 8
+                                ),
+                            )
+                    g += 1
 
             # Causal tail: kill the lanes no row may see, in the accumulators so
             # the tile max and the exp pass both see NEG_INF (exp2 of which is
@@ -1470,7 +1670,10 @@ def _dense_rows_tile[
                 # afterwards are not scaled), so it accumulates over tiles -- and
                 # the two rows of the pair have their own max, so this has to stay
                 # a vector.
-                alpha = _exp2_g[4]((m_v[rp] - m_new) * c1)
+                comptime if INT8_QK:
+                    alpha = _exp2_g[4](m_v[rp] - m_new)
+                else:
+                    alpha = _exp2_g[4]((m_v[rp] - m_new) * c1)
                 m_v[rp] = m_new
                 # The accumulator (and the row sum) are relative to the old max.
                 if s_v[rp].reduce_max() > Scalar[DType.float32](0.0):
@@ -1485,6 +1688,10 @@ def _dense_rows_tile[
             # tile body that spilled (the compiler interleaved the chains) and
             # did not fit the I-cache.
             var off = m_new * (-c1)
+            comptime if INT8_QK:
+                # The QK store already applied c1 (and the int8 dequant), so the
+                # exp pass is one add per logit instead of one FMA.
+                off = -m_new
             # One partial sum per key group of the two the loop consumes, folded
             # once: a single `sumv` is a 16-long serial `fadd` chain per row pair
             # per tile, and it showed up as 5% of the backend stalls.
@@ -1508,20 +1715,17 @@ def _dense_rows_tile[
                 # pipeline; four in flight does.
                 while kg < nkg:
                     comptime for u in range(2):
-                        var p0 = _exp2_fast(
-                            logits.unsafe_load[width=4](
-                                (kg + u) * (2 * RP) * 4 + rp * 4
-                            )
-                            * c1
-                            + off
+                        var l0 = logits.unsafe_load[width=4](
+                            (kg + u) * (2 * RP) * 4 + rp * 4
                         )
-                        var p1 = _exp2_fast(
-                            logits.unsafe_load[width=4](
-                                ((kg + u) * 2 + 1) * RP * 4 + rp * 4
-                            )
-                            * c1
-                            + off
+                        var l1 = logits.unsafe_load[width=4](
+                            ((kg + u) * 2 + 1) * RP * 4 + rp * 4
                         )
+                        comptime if not INT8_QK:
+                            l0 = l0 * c1
+                            l1 = l1 * c1
+                        var p0 = _exp2_fast(l0 + off)
+                        var p1 = _exp2_fast(l1 + off)
                         sumv[u] += p0 + p1
                         # Row 0's four keys are lanes 0,1 of both exponentials
                         # and row 1's are lanes 2,3, so a panel is two 4-lane
@@ -1583,36 +1787,54 @@ def _dense_rows_tile[
 
         t0 += ks
 
+    # Output: one row of `head_dim` bf16 per query row. The accumulator holds
+    # `[row pair][dim pair][4]`, where lanes 0-1 are row 0's two head dims of one
+    # pair and lanes 2-3 row 1's, so the de-interleave is `zip1.2d`/`zip2.2d`
+    # between two adjacent dim pairs -- four lanes per instruction instead of the
+    # scalar lane picks this used to do (which cost ~1600 instructions per work
+    # item, i.e. 8% of the kernel at S=128 and 0.5% at S=2048).
     comptime for rp in range(RP):
-        comptime for c in range(2):
-            var r = 2 * rp + c
-            if r < nrows:
-                var out = o_base.unsafe_offset((q0 + r) * job.o_stride_t)
-                var vis = seq_k > 0
-                if job.causal:
-                    vis = q0 + r + diag + 1 > 0
-                var s = s_v[rp][2 * c]
-                if vis and s > Scalar[DType.float32](0.0):
-                    var inv = SIMD[DType.float32, 4](
-                        Scalar[DType.float32](1.0) / s
-                    )
-                    comptime for d4 in range(DP // 4):
-                        var o8 = SIMD[DType.bfloat16, 8](0.0)
-                        comptime for i in range(4):
-                            var t = (
-                                acc.unsafe_load[width=4](
-                                    (rp * DP + d4 * 4 + i) * 4
-                                )
-                                * inv
-                            )
-                            o8[2 * i] = Scalar[DType.bfloat16](t[2 * c])
-                            o8[2 * i + 1] = Scalar[DType.bfloat16](t[2 * c + 1])
-                        out.unsafe_store[width=8](d4 * 8, o8)
-                else:
-                    comptime for d8 in range(DP // 4):
-                        out.unsafe_store[width=8](
-                            d8 * 8, SIMD[DType.bfloat16, 8](0.0)
-                        )
+        var vis0 = seq_k > 0
+        var vis1 = vis0
+        if job.causal:
+            vis0 = q0 + 2 * rp + diag + 1 > 0
+            vis1 = q0 + 2 * rp + 1 + diag + 1 > 0
+        var i0 = Scalar[DType.float32](0.0)
+        var i1 = Scalar[DType.float32](0.0)
+        var sp0 = s_v[rp][0]
+        var sp1 = s_v[rp][2]
+        if vis0 and sp0 > Scalar[DType.float32](0.0):
+            i0 = Scalar[DType.float32](1.0) / sp0
+        if vis1 and sp1 > Scalar[DType.float32](0.0):
+            i1 = Scalar[DType.float32](1.0) / sp1
+        # Per-row reciprocal in the accumulator's lane order: lanes 0,1 scale
+        # row 0 and lanes 2,3 row 1, so a whole accumulator vector can be scaled
+        # before the de-interleave. A row with nothing visible gets 0, which
+        # leaves its (all-zero) accumulator zero.
+        var inv4 = SIMD[DType.float32, 4](i0, i0, i1, i1)
+        comptime for h in range(DP // 4):
+            var a0 = acc.unsafe_load[width=4]((rp * DP + 4 * h) * 4) * inv4
+            var a1 = acc.unsafe_load[width=4]((rp * DP + 4 * h + 1) * 4) * inv4
+            var a2 = acc.unsafe_load[width=4]((rp * DP + 4 * h + 2) * 4) * inv4
+            var a3 = acc.unsafe_load[width=4]((rp * DP + 4 * h + 3) * 4) * inv4
+            if 2 * rp < nrows:
+                o_base.unsafe_offset(
+                    (q0 + 2 * rp) * job.o_stride_t
+                ).unsafe_store[width=8](
+                    h * 8,
+                    a0.shuffle[0, 1, 4, 5](a1)
+                    .cast[DType.bfloat16]()
+                    .join(a2.shuffle[0, 1, 4, 5](a3).cast[DType.bfloat16]()),
+                )
+            if 2 * rp + 1 < nrows:
+                o_base.unsafe_offset(
+                    (q0 + 2 * rp + 1) * job.o_stride_t
+                ).unsafe_store[width=8](
+                    h * 8,
+                    a0.shuffle[2, 3, 6, 7](a1)
+                    .cast[DType.bfloat16]()
+                    .join(a2.shuffle[2, 3, 6, 7](a3).cast[DType.bfloat16]()),
+                )
 
 
 @inline(.always)
@@ -2022,6 +2244,9 @@ struct TransposeJob(Copyable, ImplicitlyCopyable, Movable):
     var v_stride_h: Int
     var vt_stride_bh: Int
     var vt_stride_d: Int
+    var ks: Int
+    """Mode 3 only: destination of the per-16-key-block K dequant scales."""
+    var ks_stride_bh: Int
 
     def __init__(out self):
         self.k = 0
@@ -2043,6 +2268,8 @@ struct TransposeJob(Copyable, ImplicitlyCopyable, Movable):
         self.v_stride_h = 0
         self.vt_stride_bh = 0
         self.vt_stride_d = 0
+        self.ks = 0
+        self.ks_stride_bh = 0
 
 
 @inline(.always)
@@ -2162,12 +2389,124 @@ def _transpose_head[
                         + (t0 % job.kt_blk) * 2,
                         v,
                     )
+        elif mode == 3:
+            # int8 K for the i8mm Q@K^T. Layout per 64-key block:
+            # ``[dim group of 8][key pair][16]``, sixteen int8 = eight head dims
+            # of key 2p then eight of key 2p+1 (``smmla``'s two columns, the same
+            # arrangement ``bfmmla`` uses with four dims). One symmetric
+            # round-to-nearest scale per 64-key block, so a whole tile shares one
+            # dequant factor and the kernel can fold it into the per-row
+            # multiply the exp pass already does.
+            #
+            # The tile is staged in L1 first: the scale has to be known before the
+            # values are quantised, and staging costs less than a second read of
+            # the source (the int8 destination is half the bf16 one, so the pass
+            # still moves less memory than mode 2).
+            var buf = stack_allocation[KS_STRIDE * head_dim, dtype]()
+            var ntile = min(KS_STRIDE, job.seq_k - t0)
+            var mx = SIMD[DType.float32, 8](0.0)
+            comptime for i in range(KS_STRIDE):
+                if i < ntile:
+                    comptime for h in range(head_dim // 8):
+                        var v = src.unsafe_load[width=8](
+                            (t0 + i) * job.k_stride_t + 8 * h
+                        )
+                        buf.unsafe_store[width=8](i * head_dim + 8 * h, v)
+                        mx = _vmax8(mx, _vabs8(v.cast[DType.float32]()))
+                else:
+                    comptime for h in range(head_dim // 8):
+                        buf.unsafe_store[width=8](
+                            i * head_dim + 8 * h, SIMD[dtype, 8](Scalar[dtype](0))
+                        )
+            var mm = mx.reduce_max()
+            var sk = Scalar[DType.float32](0.0)
+            if mm > 1e-30:
+                sk = Scalar[DType.float32](127.0) / mm
+            _ptr[Float32](job.ks).unsafe_offset(
+                (batch * job.num_kv_heads + head) * job.ks_stride_bh + t0 // KS_STRIDE
+            ).unsafe_store(mm / Scalar[DType.float32](127.0))
+            var dst8 = _ptr[Int8](job.kt).unsafe_offset(
+                (batch * job.num_kv_heads + head) * job.kt_stride_bh
+                + (t0 // job.kt_blk) * (head_dim // 8) * job.kt_stride_d
+                + ((t0 % job.kt_blk) // 2) * 16
+            )
+            comptime for jp in range(KS_STRIDE // 2):
+                comptime for g in range(head_dim // 8):
+                    var a = buf.unsafe_load[width=8](
+                        (2 * jp) * head_dim + 8 * g
+                    ).cast[DType.float32]()
+                    var b = buf.unsafe_load[width=8](
+                        (2 * jp + 1) * head_dim + 8 * g
+                    ).cast[DType.float32]()
+                    var skv = SIMD[DType.float32, 8](sk)
+                    dst8.unsafe_store[width=16](
+                        g * job.kt_stride_d + jp * 16,
+                        _round_i8(a * skv).join(_round_i8(b * skv)),
+                    )
+        elif mode == 2 and dtype == DType.bfloat16:
+            # 16 tokens = 8 key pairs per head-dim group, blocked by key tile:
+            # ``[tile][dim group][key pair][8]``, so one tile's K for every dim
+            # group is contiguous (16 allocations instead of 16 strided runs when
+            # the QK sweep walks the groups).
+            #
+            # One key pair's 8 bf16 are the first four of key 2p then the first
+            # four of key 2p+1, so a 16-byte load of *eight* head dims from each
+            # of the two keys feeds *two* units: `zip1.2d` takes the low four
+            # dims of both, `zip2.2d` the high four. That is 2 loads + 2 shuffles
+            # + 2 stores per 32 bytes against the per-lane insert form's ~20.
+            # Every address except the loop step is folded out of the inner loop:
+            # the block offset used to be a division by a *runtime* `kt_blk` per
+            # (key pair, dim group), which cost more than the shuffles.
+            var k_blk_base = (
+                (t0 // job.kt_blk) * ((head_dim // 4) * job.kt_stride_d)
+                + ((t0 % job.kt_blk) // 2) * 8
+            )
+            var k_src = src.unsafe_offset(t0 * job.k_stride_t)
+            if n == TBLK:
+                comptime for jp in range(TBLK // 2):
+                    var pa = k_src.unsafe_offset((2 * jp) * job.k_stride_t)
+                    var pb = pa.unsafe_offset(job.k_stride_t)
+                    comptime for h in range(head_dim // 8):
+                        var a = pa.unsafe_load[width=8](8 * h)
+                        var b = pb.unsafe_load[width=8](8 * h)
+                        var base = (
+                            k_blk_base + (2 * h) * job.kt_stride_d + jp * 8
+                        )
+                        dst.unsafe_store[width=8](
+                            base, a.shuffle[0, 1, 2, 3, 8, 9, 10, 11](b)
+                        )
+                        dst.unsafe_store[width=8](
+                            base + job.kt_stride_d,
+                            a.shuffle[4, 5, 6, 7, 12, 13, 14, 15](b),
+                        )
+            else:
+                comptime for jp in range(TBLK // 2):
+                    var t = t0 + 2 * jp
+                    var ok0 = 2 * jp < n
+                    var ok1 = 2 * jp + 1 < n
+                    comptime for h in range(head_dim // 8):
+                        var a = SIMD[dtype, 8](Scalar[dtype](0))
+                        var b = SIMD[dtype, 8](Scalar[dtype](0))
+                        if ok0:
+                            a = src.unsafe_offset(
+                                t * job.k_stride_t + 8 * h
+                            ).unsafe_load[width=8]()
+                        if ok1:
+                            b = src.unsafe_offset(
+                                (t + 1) * job.k_stride_t + 8 * h
+                            ).unsafe_load[width=8]()
+                        var base = (
+                            k_blk_base + (2 * h) * job.kt_stride_d + jp * 8
+                        )
+                        dst.unsafe_store[width=8](
+                            base, a.shuffle[0, 1, 2, 3, 8, 9, 10, 11](b)
+                        )
+                        dst.unsafe_store[width=8](
+                            base + job.kt_stride_d,
+                            a.shuffle[4, 5, 6, 7, 12, 13, 14, 15](b),
+                        )
         else:
-            # 16 tokens = 8 key pairs = 64 bf16 per head-dim group: one 128-byte
-            # store, 4 head dims of one key per 8-byte load. Blocked by key
-            # tile: ``[tile][dim group][key pair][8]``, so one tile's K for every
-            # dim group is contiguous (16 allocations instead of 16 strided runs
-            # when the QK sweep walks the groups).
+            # Non-bf16 (x86 never selects mode 2, but it has to compile).
             comptime for g in range(head_dim // 4):
                 var v = SIMD[dtype, 4 * TBLK](0.0)
                 comptime for i in range(TBLK):
@@ -2183,7 +2522,10 @@ def _transpose_head[
                     + (t0 % job.kt_blk) * 4,
                     v,
                 )
-        t0 += TBLK
+        comptime if mode == 3:
+            t0 += KS_STRIDE
+        else:
+            t0 += TBLK
 
 
 @inline(.always)
@@ -2252,22 +2594,128 @@ def _vpack_head[
         (batch * job.num_kv_heads + head) * job.vt_stride_bh
     )
     var t0 = 0
+    comptime VEC = dtype == DType.bfloat16 and head_dim % 8 == 0
     while t0 < job.seq_k:
         var n = min(TBLK, job.seq_k - t0)
-        # 16 tokens = 4 key groups; one 8-element store per (group, dim pair).
-        comptime for dp in range(head_dim // 2):
-            comptime for j in range(TBLK // 4):
-                var w = SIMD[dtype, 8](0.0)
-                comptime for i4 in range(4):
-                    if 4 * j + i4 < n:
-                        var pair = src.unsafe_offset(
-                            (t0 + 4 * j + i4) * job.v_stride_t + 2 * dp
-                        ).unsafe_load[width=2]()
-                        w[i4] = pair[0]
-                        w[4 + i4] = pair[1]
-                dst.unsafe_store[width=8](
-                    (t0 // 4 + j) * job.vt_stride_d + dp * 8, w
-                )
+        comptime if VEC:
+            # 16 tokens = 4 key groups. A unit of the destination is eight bf16:
+            # one head-dim *pair* across four keys (four of dim 2d, then four of
+            # dim 2d+1). Four 16-byte loads (8 head dims of each of the four
+            # keys) therefore feed four units, and two of them are contiguous in
+            # the destination, so each step is 4 loads + 3 shuffles + 2 stores
+            # instead of a per-lane insert per element.
+            var vg_base = (t0 // 4) * job.vt_stride_d
+            var v_src = src.unsafe_offset(t0 * job.v_stride_t)
+            if n == TBLK:
+                comptime for j in range(TBLK // 4):
+                    var pa = v_src.unsafe_offset((4 * j) * job.v_stride_t)
+                    var pb = pa.unsafe_offset(job.v_stride_t)
+                    var pc = pb.unsafe_offset(job.v_stride_t)
+                    var pd = pc.unsafe_offset(job.v_stride_t)
+                    comptime for h in range(head_dim // 8):
+                        var a = pa.unsafe_load[width=8](8 * h)
+                        var b = pb.unsafe_load[width=8](8 * h)
+                        var c = pc.unsafe_load[width=8](8 * h)
+                        var d = pd.unsafe_load[width=8](8 * h)
+                        var out_base = vg_base + j * job.vt_stride_d
+                        comptime for pp in range(0, 4, 2):
+                            var x = a.shuffle[
+                                2 * pp,
+                                2 * pp + 1,
+                                8 + 2 * pp,
+                                8 + 2 * pp + 1,
+                                2 * pp + 2,
+                                2 * pp + 3,
+                                8 + 2 * pp + 2,
+                                8 + 2 * pp + 3,
+                            ](b)
+                            var y = c.shuffle[
+                                2 * pp,
+                                2 * pp + 1,
+                                8 + 2 * pp,
+                                8 + 2 * pp + 1,
+                                2 * pp + 2,
+                                2 * pp + 3,
+                                8 + 2 * pp + 2,
+                                8 + 2 * pp + 3,
+                            ](d)
+                            dst.unsafe_store[width=8](
+                                out_base + (4 * h + pp) * 8,
+                                x.shuffle[0, 2, 8, 10, 1, 3, 9, 11](y),
+                            )
+                            dst.unsafe_store[width=8](
+                                out_base + (4 * h + pp + 1) * 8,
+                                x.shuffle[4, 6, 12, 14, 5, 7, 13, 15](y),
+                            )
+            else:
+                comptime for j in range(TBLK // 4):
+                    var base = t0 + 4 * j
+                    comptime for h in range(head_dim // 8):
+                        var a = SIMD[dtype, 8](Scalar[dtype](0))
+                        var b = SIMD[dtype, 8](Scalar[dtype](0))
+                        var c = SIMD[dtype, 8](Scalar[dtype](0))
+                        var d = SIMD[dtype, 8](Scalar[dtype](0))
+                        if 4 * j < n:
+                            a = src.unsafe_offset(
+                                base * job.v_stride_t + 8 * h
+                            ).unsafe_load[width=8]()
+                        if 4 * j + 1 < n:
+                            b = src.unsafe_offset(
+                                (base + 1) * job.v_stride_t + 8 * h
+                            ).unsafe_load[width=8]()
+                        if 4 * j + 2 < n:
+                            c = src.unsafe_offset(
+                                (base + 2) * job.v_stride_t + 8 * h
+                            ).unsafe_load[width=8]()
+                        if 4 * j + 3 < n:
+                            d = src.unsafe_offset(
+                                (base + 3) * job.v_stride_t + 8 * h
+                            ).unsafe_load[width=8]()
+                        var out_base = vg_base + j * job.vt_stride_d
+                        comptime for pp in range(0, 4, 2):
+                            var x = a.shuffle[
+                                2 * pp,
+                                2 * pp + 1,
+                                8 + 2 * pp,
+                                8 + 2 * pp + 1,
+                                2 * pp + 2,
+                                2 * pp + 3,
+                                8 + 2 * pp + 2,
+                                8 + 2 * pp + 3,
+                            ](b)
+                            var y = c.shuffle[
+                                2 * pp,
+                                2 * pp + 1,
+                                8 + 2 * pp,
+                                8 + 2 * pp + 1,
+                                2 * pp + 2,
+                                2 * pp + 3,
+                                8 + 2 * pp + 2,
+                                8 + 2 * pp + 3,
+                            ](d)
+                            dst.unsafe_store[width=8](
+                                out_base + (4 * h + pp) * 8,
+                                x.shuffle[0, 2, 8, 10, 1, 3, 9, 11](y),
+                            )
+                            dst.unsafe_store[width=8](
+                                out_base + (4 * h + pp + 1) * 8,
+                                x.shuffle[4, 6, 12, 14, 5, 7, 13, 15](y),
+                            )
+        else:
+            # 16 tokens = 4 key groups; one 8-element store per (group, dim pair).
+            comptime for dp in range(head_dim // 2):
+                comptime for j in range(TBLK // 4):
+                    var w = SIMD[dtype, 8](0.0)
+                    comptime for i4 in range(4):
+                        if 4 * j + i4 < n:
+                            var pair = src.unsafe_offset(
+                                (t0 + 4 * j + i4) * job.v_stride_t + 2 * dp
+                            ).unsafe_load[width=2]()
+                            w[i4] = pair[0]
+                            w[4 + i4] = pair[1]
+                    dst.unsafe_store[width=8](
+                        (t0 // 4 + j) * job.vt_stride_d + dp * 8, w
+                    )
         t0 += TBLK
 
 
@@ -2308,7 +2756,10 @@ def _transpose_task[
     var batch = task // job.num_kv_heads
     var head = task % job.num_kv_heads
     _transpose_head[dtype, head_dim, mode](job, batch, head)
-    comptime if mode == 2:
+    comptime if mode == 3:
+        # int8 K, bf16 V in the bfmmla layout: the same pack shape as mode 2.
+        _vpack_head[dtype, head_dim](job, batch, head)
+    elif mode == 2:
         # The bfmmla path needs V position-major too; pack both in one pass so
         # the call pays a single fork-join.
         _vpack_head[dtype, head_dim](job, batch, head)
@@ -2349,6 +2800,8 @@ def _transpose_shape[
         _transpose_dispatch[dtype, head_dim, 1](job, num_workers)
     elif mode == 2:
         _transpose_dispatch[dtype, head_dim, 2](job, num_workers)
+    elif mode == 3:
+        _transpose_dispatch[dtype, head_dim, 3](job, num_workers)
     else:
         raise Error("cpu_attention dense: unknown K/V layout mode")
 
@@ -2733,11 +3186,14 @@ def _dense_fused[
     comptime T0 = _transpose_task[dtype, head_dim, 0]
     comptime T1 = _transpose_task[dtype, head_dim, 1]
     comptime T2 = _transpose_task[dtype, head_dim, 2]
+    comptime T3 = _transpose_task[dtype, head_dim, 3]
     var t_fn: TransposeTaskFn = T2
     if mode == 0:
         t_fn = T0
     elif mode == 1:
         t_fn = T1
+    elif mode == 3:
+        t_fn = T3
     comptime paired = (
         LANES < 16
         and qt > 4
