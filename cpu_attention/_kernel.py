@@ -578,6 +578,21 @@ def _qt_for(
         # default at every head dim (rows are what the K/V read is amortised
         # over). ``CPU_ATTENTION_QT=4`` still selects the v1 register kernel for
         # an A/B.
+        #
+        # At a short key range the per-work-item cost dominates instead and 16
+        # rows wins: interleaved sweep on m9g at 8 threads (us, medians of 11),
+        # best arm in bold::
+        #
+        #     shape            qt4   qt6   qt8   qt12  qt16
+        #     128:8:64         40    35    33    35    **30**
+        #     256:16:128      350   305   274   294    **268**
+        #     512:8:64        346   276  **262** 276    265
+        #     512:32:128     2264  1865  1728  1789    1720
+        #     1024:16:128    3979  3329 **3099** 3210  3131
+        #
+        # so 16 below 512 keys and 8 from there up.
+        if seq_k <= 256:
+            return 16
         return 8
     if lanes < 16:
         # fp32 v2 (tile logits in L1) wants 8 rows at every head dim: rows are
