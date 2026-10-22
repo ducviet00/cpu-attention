@@ -1945,8 +1945,13 @@ def _dense_rows_tile_f32[
             var zero = SIMD[DType.float32, LANES](0.0)
             comptime for i in range(qt * KV):
                 accs[i] = zero
-            var d = 0
-            while d < head_dim:
+            # Unrolled over the head dim: the runtime loop spent 3 of its 22
+            # instructions on the counter and the two pointer bumps, and it
+            # serialised each iteration behind its two operand loads (perf put a
+            # single `ldp` at 15% of this kernel's cycles). With the dim folded
+            # to a comptime constant the loads of several dims are independent
+            # and the scheduler can hoist them.
+            comptime for d in range(head_dim):
                 var kp = kt_sub.unsafe_offset(d * KS_STRIDE)
                 var kv = Array[SIMD[DType.float32, LANES], KV](
                     uninitialized=True
@@ -1961,7 +1966,6 @@ def _dense_rows_tile_f32[
                             accs[(h * LANES + i) * KV + v] += (
                                 kv[v] * SIMD[DType.float32, LANES](qv[i])
                             )
-                d += 1
 
             # Causal tail: NEG_INF in the lanes no row may see (exp of it is 0).
             var boundary = t0 + ko + kb > seq_k
