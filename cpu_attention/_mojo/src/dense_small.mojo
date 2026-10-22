@@ -36,6 +36,7 @@ from std.memory import stack_allocation
 from std.ffi import external_call
 
 from dense import (
+    BFMMLA,
     DenseJob,
     DenseTaskFn,
     KS_STRIDE,
@@ -516,14 +517,24 @@ def run_small_fused(
     bf16 ``bfmmla`` only, ``qt = 8``, tile size as the shipped path picks it
     (``TILE_KS`` below head_dim 128, 256 at 128); anything else is the caller's
     bug, and ``can_small`` plus ``_kernel.py``'s mode selection keep it out.
+
+    The ``comptime if BFMMLA`` is load-bearing on non-ARM builds: Mojo
+    instantiates this function (and therefore this file's kernel, which emits
+    the ``llvm.aarch64.neon.bfmmla`` intrinsic) even where nothing calls it, so
+    without the guard an x86 build dies at codegen with
+    ``LLVM ERROR: Cannot select: intrinsic %llvm.aarch64.neon.bfmmla`` -- which
+    is exactly what merging this file without the guard did to ``main``.
     """
-    if not can_small(djob):
-        raise Error("cpu_attention dense: small path cannot take this call")
-    if djob.head_dim == 64:
-        _small_fused[64, TILE_KS, 2](tjob, djob, num_workers)
-    elif djob.head_dim == 128:
-        _small_fused[128, 256, 2](tjob, djob, num_workers)
-    elif djob.head_dim == 32:
-        _small_fused[32, TILE_KS, 2](tjob, djob, num_workers)
+    comptime if not BFMMLA:
+        raise Error("cpu_attention dense: the small path is ARM bf16 only")
     else:
-        raise Error("cpu_attention dense: unsupported head_dim")
+        if not can_small(djob):
+            raise Error("cpu_attention dense: small path cannot take this call")
+        if djob.head_dim == 64:
+            _small_fused[64, TILE_KS, 2](tjob, djob, num_workers)
+        elif djob.head_dim == 128:
+            _small_fused[128, 256, 2](tjob, djob, num_workers)
+        elif djob.head_dim == 32:
+            _small_fused[32, TILE_KS, 2](tjob, djob, num_workers)
+        else:
+            raise Error("cpu_attention dense: unsupported head_dim")
