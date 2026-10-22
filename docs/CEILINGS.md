@@ -117,6 +117,51 @@ reads V twice at long S, so if anything the 8-core box penalises us more than
 vLLM — every conclusion pointing at "parity at best" should be re-checked there
 before it is treated as final.
 
+
+## Per-row upper bounds: which rows can be won at all
+
+For each row, the ratio a *perfect* kernel would achieve is
+`floor / vLLM's measured cycles-per-row-key`, where the floor is the instruction
+ceiling from the table above (bf16: `2*head_dim/16` bfmmla at 2/cycle; fp32:
+`2*head_dim/4` fma at 3.3/cycle) and vLLM's cycles/row-key are measured on the
+same interleaved run. Below 1 means the row is winnable; how far below is how
+much room there is.
+
+| shape | dtype | ours now | vLLM cyc/rk | floor | **perfect-kernel ratio** |
+|---|---|---:|---:|---:|---:|
+| S=128 H=8 D=64 | bf16 | 1.26 | 7.92 | 4.0 | 0.51 |
+| | fp32 | 1.07 | 17.89 | 9.7 | 0.54 |
+| S=512 H=8 D=64 | bf16 | 1.09 | 5.66 | 4.0 | 0.71 |
+| | fp32 | 1.00 | 14.24 | 9.7 | 0.68 |
+| S=1024 H=8 D=64 | bf16 | 1.00 | 5.57 | 4.0 | 0.72 |
+| S=2048 H=8 D=64 | bf16 | 1.02 | 5.26 | 4.0 | 0.76 |
+| S=4096 H=8 D=64 | bf16 | 1.01 | 5.25 | 4.0 | 0.76 |
+| S=256 H=16 D=128 | bf16 | 1.20 | 10.20 | 8.0 | 0.78 |
+| S=1024 H=16 D=128 | bf16 | 1.06 | 9.00 | 8.0 | 0.89 |
+| S=2048 H=16 D=128 | bf16 | 1.09 | 8.46 | 8.0 | 0.95 |
+| S=4096 H=16 D=128 | bf16 | 1.09 | 8.34 | 8.0 | 0.96 |
+| S=512 H=32 D=128 | bf16 | 1.15 | 9.24 | 8.0 | 0.87 |
+| S=1024 H=8 D=32 | bf16 | 0.99 | 3.92 | 2.0 | 0.51 |
+| all fp32 D=128 rows | fp32 | 0.90-1.03 | 27.9-31.7 | 19.4 | 0.61-0.70 |
+
+Two conclusions that change where effort goes:
+
+* **The D=128 long-S bf16 rows are winnable only by a kernel at 96%+ of the
+  bfmmla ceiling** (bound 0.95-0.96 against vLLM's 94-96%). Treat them as parity.
+* **Everything at D=64 and D=32 has 25-50% of theoretical room**, and we are *at
+  parity* there today — so the entire remaining ARM bf16 opportunity is
+  instruction efficiency, not the matmul. vLLM runs IPC 4.07-4.16 against our
+  3.50 at the same or a *higher* instruction count (32.4 vs 35.7 per row-key at
+  1024:16:128). Closing that gap alone is worth 13-16% on every row: at
+  1024:16:128 our 32.4 instructions at their 4.16 IPC would be 7.8 cycles
+  against their 9.0, i.e. **0.87**.
+* The stall is not arithmetic: `stall_backend` is 1.41 against their 1.01 per
+  row-key at D=64, and 2.2-2.5 against 1.60 at D=128, with `l1d_cache_lmiss_rd`
+  0.348 vs 0.086. L1D is **64 KB, 4-way** on this core, so the K/V stream can
+  evict the reused staging buffers; the P@V sweep's V access is 16 strided
+  passes over a 64 KB tile at D=128 (8 at D=64), touching 64 B of each 1 KB
+  block per pass.
+
 ## What this rules out (do not spend a day on it)
 
 * A `bf16` schedule rewrite for the long-S D=128 rows: capped at parity.
