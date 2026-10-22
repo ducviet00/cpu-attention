@@ -1538,19 +1538,37 @@ def _dense_rows_tile[
                     ),
                 )
     else:
+        # One 16-byte load per row covers *two* head-dim groups, and the two
+        # panels they make are one `zip1.2d`/`zip2.2d` each: a panel is four
+        # head dims of row 2p followed by four of row 2p+1, i.e. the 64-bit
+        # halves of the two loads. No widen, no scale (the scale is folded into
+        # the exp pass's `fma(l, c1, off)` -- the panel is a pure permute) and
+        # no per-panel branch: a row past `nrows` is clamped to the last valid
+        # row once per item instead of being tested DG times, so the DG*RP
+        # guard pairs this replaces (256 of them per work item at D=128) are
+        # gone. Rows past `nrows` load a duplicate of the last row; their logits
+        # are finite and their output is never stored (`nrows` guards the
+        # epilogue), so the duplicate is harmless.
         comptime for rp in range(RP):
-            comptime for g in range(DG):
-                var lo = SIMD[DType.bfloat16, 4](0.0)
-                var hi = SIMD[DType.bfloat16, 4](0.0)
-                if 2 * rp < nrows:
-                    lo = q_base.unsafe_offset(
-                        (q0 + 2 * rp) * job.q_stride_t + 4 * g
-                    ).unsafe_load[width=4]()
-                if 2 * rp + 1 < nrows:
-                    hi = q_base.unsafe_offset(
-                        (q0 + 2 * rp + 1) * job.q_stride_t + 4 * g
-                    ).unsafe_load[width=4]()
-                q_pan.unsafe_store[width=8]((g * RP + rp) * 8, lo.join(hi))
+            var r0 = q0 + 2 * rp
+            var r1 = q0 + 2 * rp + 1
+            if r0 >= q0 + nrows:
+                r0 = q0 + nrows - 1
+            if r1 >= q0 + nrows:
+                r1 = q0 + nrows - 1
+            var p0 = q_base.unsafe_offset(r0 * job.q_stride_t)
+            var p1 = q_base.unsafe_offset(r1 * job.q_stride_t)
+            comptime for g2 in range(DG // 2):
+                var a = p0.unsafe_load[width=8](8 * g2)
+                var b = p1.unsafe_load[width=8](8 * g2)
+                q_pan.unsafe_store[width=8](
+                    ((2 * g2) * RP + rp) * 8,
+                    a.shuffle[0, 1, 2, 3, 8, 9, 10, 11](b),
+                )
+                q_pan.unsafe_store[width=8](
+                    ((2 * g2 + 1) * RP + rp) * 8,
+                    a.shuffle[4, 5, 6, 7, 12, 13, 14, 15](b),
+                )
 
     # Output accumulator: [row pair][dim pair][4], in L1 like v1's.
     var acc = stack_allocation[RP * DP * 4, DType.float32]()
