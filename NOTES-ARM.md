@@ -787,3 +787,41 @@ because the host owns the allocation. Not attempted yet.
 `ldp` (the full unroll had split them, and `ldr` was 26% of that kernel's cycles)
 measures 1.00x at 512:8:64, 1.01x at 4096:16:128 and 1.00x at 1024:8:32 --
 neutral, so the loads are not what binds fp32 either. Reverted.
+
+## Sixth campaign: both intra-tile layout changes are neutral, and qt=4 is not the register route
+
+**The V layout is neutral too, and for the same reason as K.** Implemented
+`[d-chunk][key group][dim pair][8]` (d-chunk = the kernel's `dcp = 4` dim pairs)
+in the pack and in both readers, so the P@V loop's walk over key groups is one
+contiguous run per d-chunk instead of touching 64 B of every 1 KB key-group block
+`DP/4` times. Parity green, and then:
+
+| | before | after |
+|---|---:|---:|
+| 1024:8:64 `l1d_cache_lmiss_rd`/row-key | 0.3378 | 0.3554 |
+| 2048:16:128 `l1d_cache_lmiss_rd`/row-key | 0.6213 | 0.6252 |
+| whole call, 4 shapes, interleaved | 1.00x | 1.00x |
+
+With K (fourth campaign) and V (here) both invariant to access *order*, the
+misses are **compulsory stream misses**: each K/V line is read exactly once per
+work item, so the count is `bytes/64` and only the prefetcher's coverage moves
+it (we sit at 55-62% of compulsory, i.e. the prefetcher already covers a third to
+a half). vLLM's 0.086/row-key is not a layout win -- it is that their work item
+sweeps **more query rows per K/V read**, which is register-bound on our side.
+The whole memory stall is 0.16 cycles/row-key at D=64 and ~0.4 at D=128 (3-4% of
+the kernel), so even a perfect L1 hit rate does not reach the IPC gap.
+
+**qt=4 does not free registers cheaply enough for the exp overlap.** Forcing the
+tile kernel at qt=4 (the v1 path previously took that row count) halves every
+RP-scaled array -- QK accumulators 16->8, P@V 16->8, `m_v`/`s_v`/`sumv` -- which
+is exactly what the exp-over-P@V overlap needs. Measured inside one build (so no
+cross-build noise), 2048:8:64 bf16: **qt=4 is 6.502 cycles and 23.30 instructions
+per row-key against qt=8's 5.322 and 19.37, i.e. +22%** -- `qt` is the only axis
+K/V is reused over, so halving it doubles the traffic (2 extra loads per
+row-key). The overlap can recover at most the exp itself, 1.4-1.75 cycles/row-key
+(8%), so it cannot pay for +22%. That closes "free the registers by lowering qt".
+
+What is left for the exp-overlap idea is therefore a **register-lean softmax
+redesign** (logits staged in L1 with one row pair live at a time, Vec16-style
+single loop) rather than borrowing registers from the row count -- 200-300 lines,
+and the third time it would be attempted.
