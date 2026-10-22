@@ -16,7 +16,19 @@ key groups per iteration; the two-group tail loop here removes that requirement.
 (The obvious companion -- skipping the first tile's accumulator zeroing -- is
 *not* done: a `t0 == 0` test inside the P@V chunk loop measured 4% slower.)
 
-Tried and rejected (measured, in this file's history): making the *head* the work
+Tried and rejected (measured, in this file's history): **KV-outer**. Hold a row
+chunk's accumulator in L1 and put the key tile outermost, so the row panels of a
+tile are independent chains and the drain happens once per tile per chunk instead
+of once per query block (the fit's F = 1391 cycles/block). At 128:8:64 bf16,
+21 rounds, min: RB=64 24.3 -> 24.7 us (0.979x), RB=128 24.2 -> 24.9 (0.960x),
+against 1.020x for the per-block form. The reorder costs the registers: the
+per-chunk accumulator and the running max/sum become memory (`stack_allocation`)
+round trips per (panel, tile) instead of registers, and the panel body is too big
+for the out-of-order window to overlap anyway. So the per-block fixed cost is not
+a loop-order artefact, and the missing cycles are not the *drain* a reorder can
+collect.
+
+Tried and rejected (measured, earlier in this file's history): making the *head* the work
 item -- one call per (batch, head) with the Q panels built for 8 blocks at a time
 and the block loop inside that one call -- so the per-block prologue and the
 call boundary would be amortised. 128:8:64 bf16: 1.009x against the shipped
