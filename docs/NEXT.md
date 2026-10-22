@@ -85,6 +85,18 @@ ROUNDS=21
    `scripts/prof/arm/qt_sweep.py` interleave every `qt` in one process;
    `_kernel.set_qt()` is the hook.
 
+## 3b. One untried overlap that is *not* the falsified one
+
+The campaign falsified "software-pipeline the softmax into the matmul" twice
+(-11%, -8%): that version needed ~40 live registers because it kept tile *i*'s
+exp alive beside tile *i+1*'s Q@K^T. The *within-tile* version has a much
+shorter distance and needs almost nothing: the exp pass currently writes the
+whole tile's probabilities and only then does P@V start, but both walk the same
+key groups in order, so group *g+1*'s exp could run beside group *g*'s P@V with
+`RP*dcp + 8` live registers instead of 40. That is a different experiment from
+the one that lost, and it targets the term the agent has measured twice (1.4-1.75
+cycles/row-key of exp, 26% at D=64).
+
 ## 4. Closed — do not reopen without new hardware
 
 * **int8 Q@K^T** (`smmla`): 19% faster, misses the 3e-2 bf16 gate at every
