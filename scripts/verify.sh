@@ -32,6 +32,10 @@ echo "== clean build =="
 
 echo "== parity =="
 "${SSH[@]}" 'bash -lc "cd ~/cpu-attention && .venv/bin/python tests/test_dense.py 2>&1 | tail -1 && .venv/bin/python tests/test_flash_api.py 2>&1 | tail -1"'
+# Randomised parity, including the plan cache's hit/invalidate paths: a fixed
+# shape list cannot cover the per-dtype and per-head-dim weight layouts crossed
+# with GQA, odd lengths and strided inputs, and a stale plan corrupts silently.
+"${SSH[@]}" 'bash -lc "cd ~/cpu-attention && .venv/bin/python tests/fuzz_dense.py --cases 40 --max-seq 700 2>&1 | tail -1"'
 # The AMX kernel has its own parity harness (shape grid, both causal modes,
 # compared against SDPA *and* against the Mojo kernel) plus a byte-level pack
 # self-test; it reports "skipped" on a host without AMX.
