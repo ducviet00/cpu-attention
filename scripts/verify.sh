@@ -112,6 +112,13 @@ for ISA in $ISAS; do
     SUF="$ISA"; [ "$RUNS" -gt 1 ] && SUF="$ISA-r$R"
     echo "== matrix, isa=$ISA$DT run $R/$RUNS =="
     remote_locked <<EOS
+# The box is shared: wait for it to go quiet before timing. Whoever runs the
+# matrix without this reports bands like 1.17..1.52 for a row that is 1.02.
+for _ in \$(seq 1 120); do
+  L=\$(cut -d' ' -f1 /proc/loadavg)
+  awk "BEGIN{exit !(\$L <= 0.8)}" && break
+  sleep 5
+done
 cd ~/$REMOTE_DIR
 .venv/bin/python tests/bench_vs_refs.py --vllm $REF --isa $ISA $DT --rounds ${ROUNDS:-9} --json ~/verify-$LABEL-$SUF.json 2>/dev/null | tail -3
 EOS
