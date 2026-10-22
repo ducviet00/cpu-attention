@@ -964,6 +964,45 @@ def _exp2_fast(y: SIMD[DType.float32, 4]) -> SIMD[DType.float32, 4]:
 
 
 @inline(.always)
+def _exp2_bf16(y: SIMD[DType.float32, 4]) -> SIMD[DType.float32, 4]:
+    """``2^y`` for ``y <= 0`` in seven instructions, for bf16 probabilities.
+
+    A degree-2 minimax on [-0.5, 0.5] (2.3e-3 relative, against degree 3's
+    7.5e-5) is far inside the bf16 rounding the caller applies two instructions
+    later (~4e-3 relative), so the polynomial is the one place the bf16 path can
+    spend precision for speed. The ``2^n`` scale is an *integer add* on the
+    exponent field of the polynomial instead of ``(n + 127) << 23`` followed by
+    a multiply: adding ``n << 23`` to the bit pattern of any normal float
+    multiplies it by ``2^n`` exactly, whatever its own exponent is. Two
+    instructions per vector less, which is 16 of the ~160 in the exp pass -- and
+    that pass is 19% of the call at head_dim 128 and 29% at 64. With both it is
+    ~9 instructions per vector against ``_exp2_fast``'s ~11.
+
+    The clamp is -126, not -127, so that ``p * 2^n`` keeps a valid exponent
+    field. A fully-masked lane therefore comes out as ~6e-39 rather than exactly
+    0; it is multiplied by a finite V and accumulated in fp32, where that is
+    below the rounding threshold of any non-zero term. The all-masked *row* case
+    is handled separately (the caller writes zeros), so nothing depends on the
+    underflow being exact.
+    """
+    var yc = _vmax(y, SIMD[DType.float32, 4](-126.0))
+    var n = llvm_intrinsic[
+        "llvm.roundeven.v4f32", SIMD[DType.float32, 4], has_side_effect=False
+    ](yc)
+    var f = yc - n
+    # Degree-2 minimax on [-0.5, 0.5]: 2.3e-3 relative, against the degree-3
+    # form's 7.5e-5. The caller stores these probabilities as bf16 two
+    # instructions later, i.e. rounds them to ~4e-3 relative, so the extra
+    # 2.3e-3 is inside the rounding it is about to do -- and it is one fma per
+    # exponential less. Only ever used on the bf16 path: the fp32 gate is 2e-4.
+    var p = SIMD[DType.float32, 4](2.3984000000e-1)
+    p = p * f + SIMD[DType.float32, 4](7.0402000000e-1)
+    p = p * f + SIMD[DType.float32, 4](9.9999990000e-1)
+    var e = n.cast[DType.int32]() << SIMD[DType.int32, 4](23)
+    return bitcast[DType.float32](bitcast[DType.int32](p) + e)
+
+
+@inline(.always)
 def _vmax(
     a: SIMD[DType.float32, 4], b: SIMD[DType.float32, 4]
 ) -> SIMD[DType.float32, 4]:
@@ -1748,23 +1787,29 @@ def _dense_rows_tile[
                         var l1 = logits.unsafe_load[width=4](
                             ((kg + u) * 2 + 1) * RP * 4 + rp * 4
                         )
-                        comptime if not INT8_QK:
-                            l0 = l0 * c1
-                            l1 = l1 * c1
-                        var p0 = _exp2_fast(l0 + off)
-                        var p1 = _exp2_fast(l1 + off)
+                        var p0 = SIMD[DType.float32, 4](0.0)
+                        var p1 = SIMD[DType.float32, 4](0.0)
+                        comptime if INT8_QK:
+                            # The QK store already applied c1, so the exponent
+                            # is one add and the scale is not a polynomial term.
+                            p0 = _exp2_fast(l0 + off)
+                            p1 = _exp2_fast(l1 + off)
+                        else:
+                            # scale, max offset and log2 base in one fma, and the
+                            # bf16-precision polynomial (`_exp2_bf16`): the
+                            # probabilities are rounded to bf16 two instructions
+                            # later, so degree 2 is inside that rounding.
+                            p0 = _exp2_bf16(fma(l0, c1, off))
+                            p1 = _exp2_bf16(fma(l1, c1, off))
                         sumv[u] += p0 + p1
                         # Row 0's four keys are lanes 0,1 of both exponentials
                         # and row 1's are lanes 2,3, so a panel is two 4-lane
                         # half-shuffles, two truncating converts and a join.
-                        # The 8-lane constructor this replaces compiled to zip2
-                        # plus a scalar lane insert (`mov v.h[7]`) per group.
-                        var z0 = SIMD[DType.float32, 4](
-                            p0[0], p0[1], p1[0], p1[1]
-                        )
-                        var z1 = SIMD[DType.float32, 4](
-                            p0[2], p0[3], p1[2], p1[3]
-                        )
+                        # `shuffle` over 64-bit lane pairs is one `zip1/zip2.2d`;
+                        # the lane-constructor spelling emitted ~5 `mov`s per
+                        # group (36 in the loop body).
+                        var z0 = p0.shuffle[0, 1, 4, 5](p1)
+                        var z1 = p0.shuffle[2, 3, 6, 7](p1)
                         probs.unsafe_store[width=8](
                             ((kg + u) * RP + rp) * 8,
                             z0.cast[DType.bfloat16]().join(
