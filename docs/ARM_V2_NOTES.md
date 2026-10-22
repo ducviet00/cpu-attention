@@ -16,32 +16,33 @@ are not). `o/vllm` < 1 = we win.
 
 | shape | bf16 | fp32 |
 |---|---:|---:|
-| S=128 H=8 D=64 | 1.13 | **0.95** |
-| S=512 H=8 D=64 | **0.94** | **0.91** |
-| S=1024 H=8 D=64 | **0.96** | **0.91** |
-| S=2048 H=8 D=64 | **0.99** | **0.99** |
-| S=4096 H=8 D=64 | **0.98** | **0.98** |
-| S=256 H=16 D=128 | 1.05 | **0.80** |
-| S=1024 H=16 D=128 | **1.01** | **0.95** |
-| S=2048 H=16 D=128 | 1.05 | **0.88** |
-| S=4096 H=16 D=128 | 1.04 | **0.99** |
-| S=512 H=32 D=128 | 1.04 | **0.99** |
-| S=1024 H=8 D=32 | **0.96** | **0.91** |
+| S=128 H=8 D=64 | 1.13 | **0.94** |
+| S=512 H=8 D=64 | **0.94** | **0.89** |
+| S=1024 H=8 D=64 | **0.96** | **0.93** |
+| S=2048 H=8 D=64 | **0.98** | **0.93** |
+| S=4096 H=8 D=64 | **0.97** | **0.98** |
+| S=256 H=16 D=128 | **0.99** | **0.80** |
+| S=1024 H=16 D=128 | 1.01 | **0.85** |
+| S=2048 H=16 D=128 | 1.04 | **0.87** |
+| S=4096 H=16 D=128 | 1.04 | **0.98** |
+| S=512 H=32 D=128 | 1.03 | **0.84** |
+| S=1024 H=8 D=32 | **0.96** | **0.90** |
 
-**16/22** (one bf16 row, 1024:16:128, sits exactly on 1.00-1.01), all 11 fp32
-rows and 5 of the 11 bf16 ones. Five of the six remaining bf16 rows are inside
-1.04-1.05 -- the noise band of this box -- and one (128:8:64) is 13%.
+(`min o/vllm` from the same run, which is what `main` now judges on: every row is
+within 1% of the median-based ratio above.)
 
-Rows measured late in a long sweep move 3-15% between runs on this box while the
-*same row* run on its own is stable (a second agent shares it and does not take
-`~/bench.lock` for its builds). Every row above that is 1.03-1.05 was also
-measured in isolation at the same value; the 1.13 row is the only one that is
-reproducibly above 1.05.
+**17/22** -- all 11 fp32 rows and 6 of the 11 bf16 ones. Four of the five
+remaining bf16 rows are inside 1.01-1.04, i.e. inside this box's noise band; only
+`128:8:64` (1.13) is reproducibly above 1.05.
 
 ## What this branch actually changed (and what it is worth)
 
 Measured with `tests/ab_two_trees.py` (one short process per tree, alternating
-rounds), current tree vs `main`:
+rounds), current tree vs `main` at `2cb0e82`, 8 threads, 16 shapes x 2 dtypes:
+**1.00x on thirteen of them, 1.01-1.02x on the rest.** In other words the kernel
+work in this branch is worth about a percent on top of `main`; the table below
+is what each piece is, and the only one with a large number attached is the
+workspace bound, which that harness cannot see (it runs one shape per process).
 
 | change | worth |
 |---|---|
