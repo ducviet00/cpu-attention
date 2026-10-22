@@ -2,11 +2,16 @@
 # Authoritative verification of one tree on one box: sync, build from scratch,
 # parity, then the full 22-row matrix against both vLLM references.
 #
-#   scripts/verify.sh <arch> <host> <local_tree> [label]
+#   RUNS=2 scripts/verify.sh <arch> <host> <local_tree> [label]
 #
 #   arch    arm64 | x86_64   (picks --isa neon / the vLLM AMX build)
 #   host    ubuntu@<ip>
 #   label   name for the JSON files (default: the tree's directory name)
+#   RUNS    how many times to run the matrix (default 1). Rows at 1.00-1.04
+#           answer differently on consecutive runs -- this campaign published one
+#           0.98 that re-measured at 1.14-1.21 -- so a claim about a row near the
+#           line needs RUNS=2 and `scripts/band.py`. Both runs happen in the same
+#           process image and box, back to back, so they share the drift.
 #
 # Writes ~/verify-<label>-<isa>.json on the box and prints the scorecard. On x86
 # it also builds and times vLLM's AMX variant, because that is the ISA vLLM
@@ -64,6 +69,7 @@ EOS
   ISAS="vec amx"
 fi
 
+RUNS="${RUNS:-1}"
 for ISA in $ISAS; do
   # Single-quoted: the tilde must reach the remote shell unexpanded.
   REF='~/vllm_cpu_build/vllm_cpu_attn_bench.so'
@@ -74,15 +80,29 @@ for ISA in $ISAS; do
   # that column's honest baseline.
   DT=""
   [ "$ISA" = "amx" ] && DT="--dtype bf16"
-  echo "== matrix, isa=$ISA$DT =="
-  "${SSH[@]}" "bash -lc 'cd ~/cpu-attention && .venv/bin/python tests/bench_vs_refs.py --vllm $REF --isa $ISA $DT --rounds ${ROUNDS:-9} --json ~/verify-$LABEL-$ISA.json 2>/dev/null | tail -3'"
+  for R in $(seq 1 "$RUNS"); do
+    SUF="$ISA"; [ "$RUNS" -gt 1 ] && SUF="$ISA-r$R"
+    echo "== matrix, isa=$ISA$DT run $R/$RUNS =="
+    "${SSH[@]}" "bash -lc 'cd ~/cpu-attention && .venv/bin/python tests/bench_vs_refs.py --vllm $REF --isa $ISA $DT --rounds ${ROUNDS:-9} --json ~/verify-$LABEL-$SUF.json 2>/dev/null | tail -3'"
+  done
 done
 
 echo "== scorecard (local) =="
 mkdir -p /tmp/verify
 for ISA in $ISAS; do
-  scp -q -i "$SSH_KEY" "$HOST:~/verify-$LABEL-$ISA.json" "/tmp/verify/$LABEL-$ISA.json"
+  if [ "$RUNS" -gt 1 ]; then
+    for R in $(seq 1 "$RUNS"); do
+      scp -q -i "$SSH_KEY" "$HOST:~/verify-$LABEL-$ISA-r$R.json" \
+        "/tmp/verify/$LABEL-$ISA-r$R.json"
+    done
+    # band: per-row min..max over the runs, and count a row as a win only if it
+    # is below 1 in every one of them
+    python3 "$(dirname "${BASH_SOURCE[0]}")/band.py" \
+      /tmp/verify/"$LABEL"-"$ISA"-r*.json
+  else
+    scp -q -i "$SSH_KEY" "$HOST:~/verify-$LABEL-$ISA.json" \
+      "/tmp/verify/$LABEL-$ISA.json"
+    python3 "$(dirname "${BASH_SOURCE[0]}")/scorecard.py" \
+      /tmp/verify/"$LABEL"-"$ISA".json
+  fi
 done
-# scorecard.py is stdlib-only and this script is often run from a worktree that
-# has no .venv of its own.
-ls /tmp/verify/"$LABEL"-*.json | xargs python3 "$(dirname "${BASH_SOURCE[0]}")/scorecard.py"
