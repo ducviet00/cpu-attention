@@ -5,6 +5,38 @@ path of `csrc/` (the vendored vLLM CPU attention kernel), wired into the engine
 as `attn_backend="mojo"`. Read this before touching the kernel; the root
 `AGENTS.md` covers the engine side.
 
+> **Status of this file (2026-10-23, fourth campaign: Intel Xeon).**
+> `docs/STATUS.md` is the scoreboard and this session's falsification ledger.
+> What the x86 fourth campaign changed, and where the kernel now stands:
+>
+> * **The AMX work item is one (batch, kv head)**: a thread packs that head's
+>   K/V and then attends every query block of it, so there is no phase barrier
+>   and the head's 32 KB of packed operands stay in L1 (`dense_amx.mojo`,
+>   `per_head`). Worth 1.47x at 128:8:64, 1.29x at 512:8:64, 1.16x at
+>   256:16:128. `mode & 512` forces the old phase-split order for an in-process
+>   A/B -- use it before touching dispatch.
+> * **The AMX call entry takes five arguments**, not 36: `dense_amx_plan` reads
+>   the geometry out of an int64 buffer that `_kernel._amx_plan_buffer` builds
+>   once per (shapes, strides, dtype, causal, kt, workers) and caches per thread.
+>   43.1 -> 37.0 us at 128:8:64. `tests/test_amx.py` requires the plan entry and
+>   the 36-argument one to agree bit for bit.
+> * **AMX machine facts**, measured three ways (`bench_amx_mma.mojo`,
+>   `bench_amx_ceiling.mojo`, `prof_amx_pack.py`): a `tdpbf16ps` is 4.9-5.5 ns
+>   (3.0-3.4 TFLOP/s/core, i.e. ~11 cycles), tile loads are free behind dots, and
+>   **AMX and the vector pipes do overlap** -- a loop of 4 dots + 96 FMAs takes
+>   the same time as the 4 dots. The item is 0.32 (Q@K^T) + 0.54 (softmax) +
+>   0.30 (P@V) cycles/logit at D=128. The softmax runs 0.176 ns/logit isolated
+>   and 0.265 in situ; that gap is the remaining 1.3x.
+> * **Two restructuring attempts lost** and are recorded in the kernel and in
+>   `docs/STATUS.md`: pipelining the softmax under the dots (0.73-0.91x) and a
+>   cheaper exponential (`llvm.ldexp`/`vscalefps`, `round()`, degree-3) which was
+>   8% faster in a single-threaded probe and 10-27% slower with four threads.
+>   A probe that runs one thread cannot settle an inner-loop change here.
+> * **vLLM's AMX build is the bf16 bar** on an AMX box; VEC is the fp32 bar.
+>   `CPU_ATTENTION_AMX2=1` selects a second kernel (`dense_amx_v2.mojo`, agent A)
+>   that is 0.93-0.99 against v1 as v1 was before the per-head item, and 1.46x
+>   slower than v1 as it is now.
+>
 > **Status of this file (2026-10-22, after the third dense-attention
 > campaign, ARM/Graviton).** `docs/STATUS.md` is the current scoreboard and the
 > falsification ledger; `docs/FINDINGS.md` is this session's independent machine
