@@ -180,3 +180,107 @@ struct's address on the Python side) is the only remaining route, it is worth
 At one thread the same row is at parity (7.09 vs 7.14 cycles/row-key), so this is
 not a kernel problem: at S=128 both kernels are at 57% of the 4-cycle `bfmmla`
 floor at D=64 and the per-call costs are what is left.
+
+---
+
+# Addendum: the floor of the D=128 rows, and the 384-key tile (arm-tile)
+
+Written by the bf16 agent after the merge of `arm-v2` + `d13dafe` (main
+`078c79d`), answering "how much is left on the four remaining bf16 rows". All
+numbers measured on the same box under `scripts/box_run.sh` after the 1-minute
+load average dropped below 0.8 (`scripts/quiet.sh`, added here); the load is
+printed on both sides of every run.
+
+## 1. The floor, measured rather than argued
+
+Three measurements, then arithmetic that closes to within 1%.
+
+**(a) `bfmmla` throughput** (`cpu_attention/_mojo/tests/bfmmla_peak.mojo`,
+extended here: 8 copies pinned to the 8 cores at once, so it is the all-core
+sustained rate, not a single-core burst):
+
+| loop shape | ns/instr | MAC/ns/core | implied |
+|---|---:|---:|---|
+| 16 accumulators, **no loads** | 0.0769 | **208** | 4 instr/cycle |
+| 16 accumulators, 8 loads/iter (the kernel's Q@K^T body) | 0.1527 | **105** | 2 instr/cycle |
+| 16 accumulators, 8 loads from a rotating address | 0.1521 | **105** | same |
+
+So the MMA itself is not the limit -- the *operand loads* halve it, and 105
+MAC/ns/core = 840 MAC/ns over 8 cores is the ceiling for the loop shape both we
+and vLLM write. (The kernel actually runs slightly *above* this, because it
+emits `ldp` pairs: 4 load instructions per 16 `bfmmla`, where the probe issues
+8.)
+
+**(b) The phase split**, `tests/bench_ablate.py` (a runtime phase-ablation
+selector added for this, on the `arm-floor` branch only -- the guards cost 2-3%
+of a D=128 call so nothing below is judged on that build), `qt=8`, two runs,
+medians agreeing within 1%, `oh_only` = pack + work-item prologue/epilogue:
+
+| shape | full | Q@K^T | exp | P@V | pack + prologue |
+|---|---:|---:|---:|---:|---:|
+| 512:32:128 | 1485 µs | 538 (36%) | 220 (15%) | 556 (37%) | 177 (12%) |
+| 1024:16:128 | 2800 | 1064 (38%) | 425 (15%) | 1093 (39%) | 214 (8%) |
+| 2048:16:128 | 10981 | 4234 (39%) | 1749 (16%) | 5086 (46%) | 734 (6.7%) |
+| 4096:16:128 | 44224 | 16887 (38%) | 6776 (15%) | 18617 (42%) | 2086 (4.7%) |
+
+**(c) The pack alone**: 180 GB/s, so 4·S·H·D·2 bytes of K/V traffic costs
+93 µs at 512:32:128 (6.3% of the call), 190 µs at 1024:16:128 (3.7%), 370 µs at
+2048:16:128 (1.8%) and 745 µs at 4096:16:128 (0.8%). The rest of `oh_only` is
+the per-work-item cost, ~690 cycles at 4096:16:128 over 8192 items.
+
+**The arithmetic, at 4096:16:128** (256 MACs/row-key, 134.2 M row-keys = 34.36 G
+MACs, floor 40.9 ms): matmul 92.5% + exp *not* hidden 2.9% + pack 0.8% +
+per-item 3.9% = **100.1%**. At 2048:16:128: 93.2 + 1.8 + 4.9 + ~0 = 99.9%. At
+1024:16:128: 91.3 + 3.7 + 4.3 + ~1 = 100.3%. At 512:32:128: 86.3 + 6.3 + 5.7 +
+1.7 = 100.0%.
+
+So on long-S D=128 **there is ≤1% not accounted for**, and vLLM's own 1579
+GFLOP/s against the same 1680 GFLOP/s ceiling (94%) is the same story from the
+other side: they carry no pack and a smaller per-item cost, we carry 0.8% pack
+and ~3% per-item, and that difference *is* the 1-2% the scorecard shows. At
+512:32:128 the matmul share drops to 86% because the per-tile work per row-key
+is 2.5x higher and the pack is 6.3% -- that row is fixed-cost-bound, not
+matmul-bound.
+
+## 2. The 384-key tile (shipped here, +1-2%)
+
+`TILE_KS` was 128 with a comment saying 256 lost because "the two logit buffers
+start competing with the K/V streams for L1". That measurement predates the K^T
+scratch becoming `[tile][key pair][dim group][8]`; with one Q@K^T sub-block now
+a linear run, the tile no longer has to be L1-resident to stream. Re-measured
+with a temporary in-process `ks` selector (9 rounds, two runs, min of the two,
+parity against SDPA checked per variant, all ok):
+
+| shape | ks128 | ks192 | ks256 | ks384 | ks512 |
+|---|---:|---:|---:|---:|---:|
+| 512:8:64 | 221 | 216 | 216 | **215** | 221 |
+| 2048:8:64 | 3316 | 3264 | 3239 | **3220** | 3301 |
+| 4096:8:64 | 13076 | 12672 | 12856 | **12563** | 13021 |
+| 512:32:128 | 1498 | 1471 | 1463 | 1464 | **1459** |
+| 1024:16:128 | 2823 | 2772 | 2770 | 2764 | **2750** |
+| 2048:16:128 | 11135 | 11027 | 10984 | **10903** | 10966 |
+| 4096:16:128 | 44776 | 43973 | 43953 | **43744** | 43686 |
+
+384 is the best or within 0.6% of it on six of seven shapes and 2.1-4.1% below
+128 on all of them; the mechanism is amortising the per-tile row max/sum/
+rescale, the P@V accumulator round trip and the tile prologue over 3x more keys.
+On a **clean build** (no ablation guards) against main, `ab_two_trees`, 7
+rounds, two runs: 512:32:128 1.01x, 1024:16:128 1.01x, 2048:16:128 1.01x,
+4096:16:128 1.01x, 2048:8:64 1.01-1.02x, 4096:8:64 1.01-1.02x. Parity:
+`test_dense` 64/64, `test_flash_api` green, `fuzz_dense` 200/200 on the box
+(the odd `seq_k` / partial-last-tile cases are the ones this kernel has broken
+on before, so they are the gate).
+
+## 3. Under 1% each, left alone
+
+* **Q-panel build**: RP·DG = 128 iterations of two 8-byte loads + a join + a
+  16-byte store (~640 instructions per work item, ~0.3-0.6% of a call). Halving
+  it with 16-byte loads + `zip1/zip2` is worth <0.5%.
+* **Skipping the P@V accumulator init and the first tile's reload** (vLLM's
+  `accum_c`): worth ~1000 memory ops per item, but the `if t0 > 0` branch turns
+  `accv` into a phi and LLVM spills all 16 accumulators -- measured **26%
+  slower**, reverted. Do not retry without restructuring the loop.
+* **Contiguous K^T layout** (the pre-arm-v2 "k_seq" probe): 2-6% when probed,
+  but arm-v2 already took it via the layout change; the L1-resident probes
+  (`k_hot`/`v_hot`) put *all* K/V memory cost at 2-3%, so there is nothing left
+  in the access pattern.
