@@ -3175,6 +3175,21 @@ def _dense_dispatch[
 def _run_shape[
     dtype: DType, head_dim: Int
 ](job: DenseJob, num_workers: Int, qt: Int) raises:
+    # The ARM tile kernels walk query rows in `LANES`-wide (fp32) or row-pair
+    # (bf16) steps, so a row count that is not a multiple of the step silently
+    # drops the last rows -- they keep whatever was in the scratch, which
+    # measures *faster* and is garbage. `_qt_for` never asks for one, but
+    # `CPU_ATTENTION_QT` exists for sweeps and this is the only place that can
+    # see both the request and the compiled width.
+    comptime if LANES < 16:
+        if dtype == DType.float32 and qt % LANES != 0:
+            raise Error(
+                "cpu_attention dense: fp32 qt must be a multiple of the vector"
+                " width (4 on NEON); got",
+                qt,
+            )
+        if dtype == DType.bfloat16 and qt % 2 != 0:
+            raise Error("cpu_attention dense: bf16 qt must be even; got", qt)
     if qt == 2:
         _dense_dispatch[dtype, head_dim, 2](job, num_workers)
     elif qt == 4:
@@ -3468,6 +3483,17 @@ def _fused_shape[
     num_workers: Int,
     dtype_code_t: Int,
 ) raises:
+    # See `_run_shape`: the tile kernels' row step is `LANES` (fp32) or a row
+    # pair (bf16), and a qt that is not a multiple of it drops the last rows.
+    comptime if LANES < 16:
+        if dtype == DType.float32 and qt % LANES != 0:
+            raise Error(
+                "cpu_attention dense: fp32 qt must be a multiple of the vector"
+                " width (4 on NEON); got",
+                qt,
+            )
+        if dtype == DType.bfloat16 and qt % 2 != 0:
+            raise Error("cpu_attention dense: bf16 qt must be even; got", qt)
     if qt == 2:
         _dense_fused[dtype, head_dim, 2](
             tjob, djob, mode, num_workers, dtype_code_t
