@@ -126,17 +126,51 @@ before it is treated as final.
 
 ## Open questions that a 10-minute microbenchmark answers
 
-`cpu_attention/_mojo/tests/mma_peak.mojo` measures these in-process on the box
-and none of them has been measured yet on this part:
+`cpu_attention/_mojo/tests/mma_peak.mojo` measures these in-process on the box.
 
-* `fmmla` (FP16 MMA): if it is also 2/cycle it is *free precision* (10-bit
-  mantissa) — which does not speed up bf16 but would give a 2-term fp16 split
-  for the fp32 rows 21% more MACs than `fmla`; if it is 4/cycle it is 2x.
-* `smmla` (int8 MMA): the "2x bfmmla" payoff above is an assumption. If the
-  real rate is 4/cycle then a *two-level* int8 split (2-3 products) becomes
-  cheaper than one bf16 product with 14-16 bits per operand, which would be both
-  faster and more accurate than bf16.
-* `bfmmla` + `fmla` co-issue in one loop: if 8 fmla fit inside 8 bfmmla's 4
-  cycles, up to 25% of the MACs can move off the MMA port — but only in a loop
-  with spare issue slots, and a real Q@K^T body has none (26 instructions per
-  16 bfmmla = 3.25 IPC against a 4.0-4.1 sustained ceiling).
+**Answered on the box (2026-10-22):**
+
+* `fmmla` (FP16 MMA) **does not exist**. It is the `f32mm` extension, which no
+  shipping core implements; `mojo run` dies with `Cannot select: intrinsic
+  %llvm.aarch64.neon.fmmla` with and without `--target-cpu neoverse-v3`. So
+  there is no fp16 matrix path: an fp16 operand pays `bfmmla`'s rate at best.
+* `bfmmla` re-measured at **207.6 GFLOP/s/core** (0.154 ns/instr), i.e. exactly
+  2.0/cycle at 3.25 GHz. The ceiling in the table above stands.
+* `smmla` (int8, 32 MACs/instr) measured at 0.043 ns/instr, which would be
+  7 instructions/cycle — impossible, so the probe is being strength-reduced even
+  with memory-derived operands. **The int8 rate is unmeasured**; do not quote it.
+  Its only remaining use would be a 2-term split for the fp32 rows, which needs
+  3 products (16-bit operands, ~1e-4 relative error against a 2e-4 gate) and
+  comes out at 21 effective MACs/cycle against `fmla`'s 13.2 — worth ~1.5x on the
+  matmul in the best case, with an accuracy margin too thin to ship.
+* co-issue: the loop reported 1223962 "cycles/iter" because the clock probe was
+  folded; re-measure with a fixed clock before drawing any conclusion.
+
+## Where short S actually goes (measured, both boxes)
+
+`tests/bench_scale.py` raises the head count at fixed seq: work scales, the key
+range and every per-call cost do not, so the split falls out. m9g, 4 threads,
+bf16, round-robin medians:
+
+| S | H | us | %ceil | cycles/row-key |
+|---|---|---|---|---|
+| 128 | 8 | 75.3 | 27% | 7.44 |
+| 128 | 32 | 190.9 | 42% | 4.71 |
+| 128 | 64 | 368.9 | 44% | 4.55 |
+| 512 | 8 | 495.0 | 65% | 3.07 |
+| 2048 | 8 | 6945.5 | 74% | 2.70 |
+
+Two separate things, and only one of them is dispatch:
+
+1. **A 128-key range caps the kernel at 44%** however many heads are in flight
+   (`4.55` cycles/row-key against `2.70` at 2048 keys). Fitting
+   `cost = a*rowkeys + b` gives `a = 2.58` cycles/row-key and **b ~ 1000 cycles
+   per work item** — a prologue/epilogue cost that is 3% of a long-S work item
+   and ~40% of a 128-key one. That is the thing to attack for S<=512.
+2. The rest is per-call: at S=128/H=8 the call is 75 us of which ~10 us is the
+   per-work-item term above, ~6 us the pack and ~3.5 us the host path.
+
+At S=128 vLLM is at 50% of the ceiling *including* their per-call costs, i.e.
+above our best measured short-range rate. So that row needs the per-work-item
+cost cut, not a faster matmul.
+
