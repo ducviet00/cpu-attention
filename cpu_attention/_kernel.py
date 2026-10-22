@@ -435,6 +435,9 @@ def clear_scratch() -> None:
     if bufs is not None:
         bufs.clear()
     _SCRATCH_STRIDES.clear()
+    plans = getattr(_SCRATCH, "plans", None)
+    if plans is not None:
+        plans.clear()
 
 
 _QT_ENV = os.environ.get("CPU_ATTENTION_QT")
@@ -618,27 +621,47 @@ def _amx_dense(q, k, v, scale: float, causal: bool):
 
 
 
-def _dense(q, k, v, scale: float, causal: bool):
-    """Run the dense kernel over contiguous-``head_dim`` q/k/v (already checked).
+def _plans():
+    """This thread's dense call plans, built on first use.
 
-    The Python side of this is not free: measured in isolation (the extension
-    entries replaced by no-ops) it was 5.2 us at 128:8:64, 13% of the call, of
-    which nineteen `Tensor.stride(i)` calls were the largest single item --
-    `stride(i)` is a Python call, ~0.18 us each. It is 3.6 us now, with one
-    `stride()` per tensor and the pack buffers' tuples cached; a whole-plan cache
-    was tried too and measured worse than that, at the cost of holding the
-    caller's tensors alive.
+    A dense call's *geometry* -- which kernel path, ``qt``, the worker count, the
+    scratch buffer and its strides, and the ~30 constant arguments the extension
+    takes -- is a pure function of ``(q.shape, q.stride(), k.stride(),
+    v.stride(), dtype, causal)``; only the data pointers, ``scale`` and the
+    freshly allocated output change between calls. Rebuilding it measured 2.0 us
+    of a 5.0 us Python path (laptop, 4 threads), i.e. 4% of a whole 52 us call
+    at S=128/8/64 and most of the fixed cost those rows are made of.
+
+    The cache holds no reference to the caller's tensors -- only ints, shape
+    tuples, and workspace buffers this module owns -- so it cannot keep a
+    caller's tensor alive, which is what made an earlier whole-call cache lose
+    when it was keyed on tensors. Each entry holds its scratch buffer, so the
+    pointers inside a plan stay valid exactly as long as those buffers do
+    (:func:`clear_scratch` clears both). Thread-local, because the buffers are.
     """
-    batch, seq_q, num_heads, head_dim = q.shape
+    plans = getattr(_SCRATCH, "plans", None)
+    if plans is None:
+        plans = _SCRATCH.plans = {}
+    return plans
+
+
+def _dense_plan(key, q, k, v, causal):
+    """Build the per-geometry call plan for :func:`_dense` (slow path).
+
+    Everything here depends only on ``(shapes, strides, dtype, causal)``, so it
+    runs once per geometry and the result is cached per thread (see
+    :func:`_plans`). The scratch buffers it allocates are *held by the plan*, so
+    the pointers inside it stay valid for as long as the entry does.
+    """
+    qs, q_st, k_st, v_st, dt = key[0], key[1], key[2], key[3], key[4]
+    batch, seq_q, num_heads, head_dim = qs
     seq_k, num_kv_heads = k.shape[1], k.shape[2]
-    out = _amx_dense(q, k, v, scale, causal)
-    if out is not None:
-        return out
-    bfmmla = k.dtype == torch.bfloat16 and _bfmmla()
+    bfmmla = dt == torch.bfloat16 and _bfmmla()
+    is_bf16 = dt == torch.bfloat16
     if _QT_ENV:
         qt = int(_QT_ENV)
     else:
-        qt = _qt_for(_lanes(), k.dtype == torch.bfloat16, head_dim, seq_k, bfmmla)
+        qt = _qt_for(_lanes(), is_bf16, head_dim, seq_k, bfmmla)
 
     # Q@K^T wants K transposed (one head dim, all positions contiguous), which a
     # dense K is not. Each bf16 path asks for its own packing: the dot pairs two
@@ -663,7 +686,7 @@ def _dense(q, k, v, scale: float, causal: bool):
     #
     # so it is gated on fp32 (whose P@V is V-bandwidth-bound; bf16 spends its
     # P@V instructions widening V instead) and on V being at least half the LLC.
-    vpack = (v.dtype == torch.float32
+    vpack = (dt == torch.float32
              and v.numel() * v.element_size() * 2 >= _llc_bytes())
     seq_k_pad = -(-seq_k // 64) * 64
     # K^T is blocked every `kt_blk` keys so one Q@K^T tile is a single linear run
@@ -672,11 +695,6 @@ def _dense(q, k, v, scale: float, causal: bool):
     # measurement: handed the blocked layout, S=4096/H=16/D=128 fp32 gains
     # 1.2-1.4x over the plain `[head_dim, seq_k]` transpose. `seq_k_pad` (i.e. no
     # blocking) keeps the 4-lane/ARM layouts byte-identical to before.
-    # Blocked for every fast path now: the ARM fp32 kernel used the unblocked
-    # layout, so its Q@K^T sweep jumped `seq_k * 4` bytes per head dim (16 KB at
-    # seq_k 4096) -- 16 scattered cache lines per key tile, which is the same
-    # defect the bf16 path had. 64 keys covers the widest key tile either kernel
-    # uses.
     # Every fast path blocks K^T by 64 keys, and the tile kernels take that as a
     # *compile-time* stride (a runtime stride turned each address into a `madd`).
     kt_blk = 64
@@ -693,60 +711,55 @@ def _dense(q, k, v, scale: float, causal: bool):
         ks = _scratch("ks3", (batch, num_kv_heads, seq_k_pad // kt_blk),
                       torch.float32)
         vt = _scratch("vt2", (batch, num_kv_heads, seq_k_pad // 4, head_dim // 2, 8),
-                      k.dtype)
+                      dt)
     elif bfmmla:
         mode = 2
         # K blocked by key tile (64 keys): one tile's K for every head-dim group
         # is then one contiguous run, so the Q@K^T sweep walks it linearly
         # instead of jumping seq_k/2*16 bytes per head-dim group.
-        kt_blk = 64
         kt = _scratch("kt2", (batch, num_kv_heads, seq_k_pad // kt_blk,
-                              head_dim // 4, kt_blk // 2, 8), k.dtype)
+                              head_dim // 4, kt_blk // 2, 8), dt)
         # V: [key group of 4][head-dim pair][8], so P@V's inner loop walks one
         # key group's dim pairs as a contiguous run (512 B at head_dim 64).
         vt = _scratch("vt2", (batch, num_kv_heads, seq_k_pad // 4, head_dim // 2, 8),
-                      v.dtype)
-    elif k.dtype == torch.bfloat16 and _bf16_dot():
+                      dt)
+    elif is_bf16 and _bf16_dot():
         mode = 1
         kt = _scratch("kt1", (batch, num_kv_heads, head_dim // 2,
-                              seq_k_pad // kt_blk, kt_blk, 2), k.dtype)
-        vt = (_scratch("vt1", (batch, num_kv_heads, seq_k, head_dim), v.dtype)
+                              seq_k_pad // kt_blk, kt_blk, 2), dt)
+        vt = (_scratch("vt1", (batch, num_kv_heads, seq_k, head_dim), dt)
               if vpack else None)
     else:
         mode = 0
         kt = _scratch("kt0", (batch, num_kv_heads, seq_k_pad // kt_blk, head_dim,
-                              kt_blk), k.dtype)
-        vt = (_scratch("vt0", (batch, num_kv_heads, seq_k, head_dim), v.dtype)
+                              kt_blk), dt)
+        vt = (_scratch("vt0", (batch, num_kv_heads, seq_k, head_dim), dt)
               if vpack else None)
     # The pack's strides: `kt_blk` keys per contiguous K^T block, and the V
-    # scratch's per-head base and per-key-group stride.
-    # One `.stride()` per tensor: `Tensor.stride(i)` is a Python call (~0.18 us)
-    # and this path used to make nineteen of them per invocation, 7% of the
-    # whole call at S=128 by cProfile. The scratch buffers' strides come from
-    # the cache with the buffer, since they only change with the shape.
+    # scratch's per-head base and per-key-group stride. Both are properties of
+    # the buffer, so they belong to the plan and not to the call.
     kt_st, vt_st = _scratch_strides(kt, vt)
     kt_bh, kt_d = kt_st[1], kt_st[3]
     vt_bh = vt_st[1] if vt is not None else 0
     vt_d = vt_st[2] if vt is not None else 0
     ks_stride_bh = (seq_k_pad // kt_blk) if ks is not None else 0
     ks_ptr = ks.data_ptr() if ks is not None else 0
-    out = torch.empty_like(q, memory_format=torch.contiguous_format)
-    q_st, k_st, v_st, o_st = q.stride(), k.stride(), v.stride(), out.stride()
     qb, qtok, qh = q_st[0], q_st[1], q_st[2]
     # In mode 2 the kernel reads the packed V (one row per head dim *pair*, one
     # column per 4-key group), so hand it those strides instead.
     if vt is not None:
-        # mode 2 packs V as [key group][dim pair][8] and the portable copy is
-        # plain [seq, head_dim]; either way dim 2 is the stride the kernel walks
-        # per key group (or per token) and dim 1 is the per-head base.
         vb, vtok, vh = vt_st[0], vt_st[2], vt_st[1]
-        v_ptr = vt.data_ptr()
+        vt_ptr = vt.data_ptr()
+        v_ptr = vt_ptr
     else:
         vb, vtok, vh = v_st[0], v_st[1], v_st[2]
-        v_ptr = v.data_ptr()
-    ob, otok, oh = o_st[0], o_st[1], o_st[2]
+        vt_ptr = 0
+        v_ptr = 0
+    # The output is always a fresh contiguous tensor of q's shape, so its
+    # strides follow from the shape -- no `.stride()` call on the hot path.
+    ob, otok, oh = seq_q * num_heads * head_dim, num_heads * head_dim, head_dim
     ktb = kt_st[1]
-    if mode == 2:
+    if mode == 2 or mode == 3:
         # [tile][dim group][key pair][8]: stride(3) is one head-dim group
         # inside a tile, 8 is one key pair. (The tile stride is derived in the
         # kernel from the dim-group count.)
@@ -756,6 +769,60 @@ def _dense(q, k, v, scale: float, causal: bool):
         ktt = kt_st[4] if mode == 1 else 1      # token stride inside a block
     tasks = batch * num_heads * (-(-seq_q // qt))
     workers = _workers(tasks, 8)
+    plan = (
+        seq_q, num_heads, batch, num_kv_heads, seq_k, head_dim,
+        _DTYPE_CODES[dt], mode, ktb, ktd, ktt, kt_blk, qt, workers,
+        kt_bh, kt_d, vt_bh, vt_d, kt.data_ptr(), vt_ptr, v_ptr, ks_ptr,
+        ks_stride_bh, k_st[0], k_st[1], k_st[2], v_st[0], v_st[1], v_st[2],
+        qb, qtok, qh, vb, vtok, vh, ob, otok, oh,
+        _workers(batch * num_kv_heads, seq_k // 8),
+        # held for their lifetimes, so the pointers above stay valid
+        kt, vt, ks,
+    )
+    plans = _plans()
+    if len(plans) > 64:
+        plans.clear()
+    plans[key] = plan
+    return plan
+
+
+def _dense(q, k, v, scale: float, causal: bool, geom=None):
+    """Run the dense kernel over contiguous-``head_dim`` q/k/v (already checked).
+
+    ``geom`` is ``(q.shape, q.stride(), k.stride(), v.stride(), q.dtype)`` when
+    the caller has already read them (``flash_attn_func`` has to, for its
+    argument checks); otherwise they are read here.
+
+    The Python side of this is not free, and it is charged to us by the
+    scorecard: at S=128/8/64 it is a tenth of the whole call. Three things keep
+    it small. One ``.shape``/``.stride()`` per tensor and no ``.stride(i)`` (each
+    is a ~0.1-0.2 us Python call, and this path once made nineteen of them).
+    Everything that depends only on the geometry -- which kernel path, ``qt``,
+    the worker count, the scratch buffer, its strides, and the ~30 constant
+    arguments the extension takes -- is built once per geometry by
+    :func:`_dense_plan` and cached, which took the path from 3.5 us to ~1.5 us.
+    What is left per call is the output allocation, four ``data_ptr()`` reads,
+    one dict lookup and the extension call itself.
+    """
+    out = _amx_dense(q, k, v, scale, causal)
+    if out is not None:
+        return out
+    if geom is None:
+        geom = (q.shape, q.stride(), k.stride(), v.stride(), q.dtype)
+    key = (geom[0], geom[1], geom[2], geom[3], geom[4], causal)
+    plan = _plans().get(key)
+    if plan is None:
+        plan = _dense_plan(key, q, k, v, causal)
+    (seq_q, num_heads, batch, num_kv_heads, seq_k, head_dim, dtc, mode,
+     ktb, ktd, ktt, kt_blk, qt, workers, kt_bh, kt_d, vt_bh, vt_d, kt_ptr,
+     vt_ptr, v_ptr_packed, ks_ptr, ks_bh, k0, k1, k2, v0, v1, v2,
+     qb, qtok, qh, vb, vtok, vh, ob, otok, oh, pack_workers,
+     _kt, _vt, _ks) = plan
+    out = torch.empty(geom[0], dtype=geom[4])
+    q_ptr = q.data_ptr()
+    k_ptr = k.data_ptr()
+    v_ptr = v_ptr_packed if v_ptr_packed else v.data_ptr()
+    o_ptr = out.data_ptr()
     if _FUSE:
         # One OpenMP region for the pack and the attention, with a barrier
         # between them: two fork-joins cost two pool wakes, and at S=128 the
@@ -763,106 +830,23 @@ def _dense(q, k, v, scale: float, causal: bool):
         # restores the two-call form, which is what `tests/bench_phases.py`
         # instruments to split pack from kernel.
         _forward()(
-            k.data_ptr(),
-            kt.data_ptr(),
-            v.data_ptr(),
-            vt.data_ptr() if vt is not None else 0,
-            v_ptr,
-            batch,
-            num_kv_heads,
-            seq_k,
-            head_dim,
-            k_st[0],
-            k_st[1],
-            k_st[2],
-            vt_bh,
-            vt_d,
-            v_st[0],
-            v_st[1],
-            v_st[2],
-            q.data_ptr(),
-            out.data_ptr(),
-            seq_q,
-            num_heads,
-            qb,
-            qtok,
-            qh,
-            vb,
-            vtok,
-            vh,
-            ob,
-            otok,
-            oh,
-            scale,
-            causal,
-            _DTYPE_CODES[q.dtype],
-            mode,
-            ktb,
-            ktd,
-            ktt,
-            kt_blk,
-            qt,
-            workers,
-            ks_ptr,
-            ks_stride_bh,
+            k_ptr, kt_ptr, v_ptr if not vt_ptr else v.data_ptr(), vt_ptr, v_ptr,
+            batch, num_kv_heads, seq_k, head_dim, k0, k1, k2, vt_bh, vt_d,
+            v0, v1, v2, q_ptr, o_ptr, seq_q, num_heads, qb, qtok, qh,
+            vb, vtok, vh, ob, otok, oh, scale, causal, dtc, mode, ktb, ktd,
+            ktt, kt_blk, qt, workers, ks_ptr, ks_bh,
         )
         return out
     _transpose_attention()(
-        k.data_ptr(),
-        kt.data_ptr(),
-        v.data_ptr() if vt is not None else 0,
-        vt.data_ptr() if vt is not None else 0,
-        batch,
-        num_kv_heads,
-        seq_k,
-        head_dim,
-        k_st[0],
-        k_st[1],
-        k_st[2],
-        kt_bh,
-        kt_d,
-        kt_blk,
-        v_st[0],
-        v_st[1],
-        v_st[2],
-        vt_bh,
-        vt_d,
-        _DTYPE_CODES[k.dtype],
-        mode,
-        _workers(batch * num_kv_heads, seq_k // 8),
-        ks_ptr,
-        ks_stride_bh,
+        k_ptr, kt_ptr, v_ptr if not vt_ptr else v.data_ptr(),
+        vt_ptr, batch, num_kv_heads, seq_k, head_dim, k0, k1, k2,
+        kt_bh, kt_d, kt_blk, v0, v1, v2, vt_bh, vt_d, dtc, mode,
+        pack_workers, ks_ptr, ks_bh,
     )
     _dense_attention()(
-        q.data_ptr(),
-        kt.data_ptr(),
-        v_ptr,
-        out.data_ptr(),
-        batch,
-        seq_q,
-        seq_k,
-        num_heads,
-        num_kv_heads,
-        head_dim,
-        qb,
-        qtok,
-        qh,
-        ktb,
-        ktd,
-        ktt,
-        kt_blk,
-        vb,
-        vtok,
-        vh,
-        ob,
-        otok,
-        oh,
-        scale,
-        causal,
-        _DTYPE_CODES[q.dtype],
-        qt,
-        workers,
-        ks_ptr,
-        ks_stride_bh,
+        q_ptr, kt_ptr, v_ptr, o_ptr, batch, seq_q, seq_k, num_heads,
+        num_kv_heads, head_dim, qb, qtok, qh, ktb, ktd, ktt, kt_blk,
+        vb, vtok, vh, ob, otok, oh, scale, causal, dtc, qt, workers,
+        ks_ptr, ks_bh,
     )
     return out

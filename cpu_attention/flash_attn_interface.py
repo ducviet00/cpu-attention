@@ -10,6 +10,10 @@ import torch
 
 from ._kernel import _DTYPE_CODES, _HEAD_DIMS, _dense, _paged, supported
 
+_SCALES = {}
+"""``head_dim ** -0.5`` per head dim: a float pow is ~20 ns and the value cannot
+change, so the default scale is looked up rather than recomputed."""
+
 
 def _lens_tensor(cache_seqlens, batch: int, device):
     """Return ``cache_seqlens`` as the int32 ``[batch]`` lengths the kernel reads."""
@@ -254,14 +258,18 @@ def flash_attn_func(q, k, v, softmax_scale=None, causal=False):
         raise ValueError(
             "cpu_attention: q/k/v must be [batch, seqlen, nheads, headdim]"
         )
-    batch, q_len, num_heads, head_dim = q.shape
-    kv_len, num_kv_heads = k.shape[1], k.shape[2]
+    # One `.shape`/`.stride()`/`.dtype` read per tensor for the whole call: each
+    # is a ~0.1 us Python call, the checks below need them anyway, and `_dense`
+    # takes them as its cache key (`geom`) instead of re-reading the tensors.
+    qs, ks, vs = q.shape, k.shape, v.shape
+    batch, q_len, num_heads, head_dim = qs
+    kv_len, num_kv_heads = ks[1], ks[2]
     if (
         kv_len < 1
         or q_len < 1
-        or k.shape[0] != batch
-        or k.shape[3] != head_dim
-        or v.shape != k.shape
+        or ks[0] != batch
+        or ks[3] != head_dim
+        or vs != ks
         or num_heads % num_kv_heads
         or k.dtype != q.dtype
         or v.dtype != q.dtype
@@ -276,17 +284,26 @@ def flash_attn_func(q, k, v, softmax_scale=None, causal=False):
         )
     if q.dtype not in _DTYPE_CODES:
         raise ValueError(f"cpu_attention cannot run dtype={q.dtype}")
-    scale = head_dim**-0.5 if softmax_scale is None else softmax_scale
+    if softmax_scale is None:
+        scale = _SCALES.get(head_dim)
+        if scale is None:
+            scale = _SCALES[head_dim] = head_dim**-0.5
+    else:
+        scale = softmax_scale
     # The kernel reads the head dim contiguously and takes every other stride
     # explicitly, so a [batch, seq, nheads*headdim] slice of a projection works
     # as is; only a strided head dim needs a copy.
-    if q.stride(-1) != 1:
+    stq, stk, stv = q.stride(), k.stride(), v.stride()
+    if stq[3] != 1:
         q = q.contiguous()
-    if k.stride(-1) != 1:
+        stq = q.stride()
+    if stk[3] != 1:
         k = k.contiguous()
-    if v.stride(-1) != 1:
+        stk = k.stride()
+    if stv[3] != 1:
         v = v.contiguous()
-    return _dense(q, k, v, scale, causal)
+        stv = v.stride()
+    return _dense(q, k, v, scale, causal, (qs, stq, stk, stv, q.dtype))
 
 
 def flash_attn_varlen_func(
