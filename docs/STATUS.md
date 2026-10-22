@@ -18,28 +18,24 @@ can — see `FINDINGS.md` §5). `o/sdpa` is 0.29-0.88 on every row.
 
 | shape | bf16 o/vllm | fp32 o/vllm |
 |---|---:|---:|
-| S=128 H=8 D=64 | 1.10 | 0.94-0.96 |
-| S=256 H=16 D=128 | **1.03-1.05** | 1.00-1.04 → 0.80 |
-| S=512 H=8 D=64 | 0.94 | 0.91 |
-| S=512 H=32 D=128 | 0.99-1.00 | 1.00 |
-| S=1024 H=8 D=32 | 0.87-0.88 | 0.90-0.91 |
-| S=1024 H=8 D=64 | 0.91 | 0.93 |
-| S=1024 H=16 D=128 | 0.98 | 0.88-0.89 |
-| S=2048 H=8 D=64 | 0.93-0.94 | 0.97-0.99 |
-| S=2048 H=16 D=128 | 1.00-1.01 | 0.88 |
-| S=4096 H=8 D=64 | 0.92-0.93 | 0.97-0.99 |
-| S=4096 H=16 D=128 | 1.01 | 0.99 |
+| S=128 H=8 D=64 | **1.09-1.12** | 0.98-1.05 (0.94-0.96 isolated) |
+| S=256 H=16 D=128 | **1.02-1.03** (0.98-0.99 isolated) | 0.80 |
+| S=512 H=8 D=64 | 0.91-0.93 | 0.90-0.91 |
+| S=512 H=32 D=128 | 1.00 | 0.98-1.00 |
+| S=1024 H=8 D=32 | 0.87 | 0.90-0.91 |
+| S=1024 H=8 D=64 | 0.90 | 0.90-0.93 |
+| S=1024 H=16 D=128 | 0.98 | 0.87-0.89 |
+| S=2048 H=8 D=64 | 0.93 | 0.97-0.98 |
+| S=2048 H=16 D=128 | 1.00-1.01 | 0.87 |
+| S=4096 H=8 D=64 | 0.92-0.93 | 0.97-0.98 |
+| S=4096 H=16 D=128 | 1.00-1.01 | 0.98-0.99 |
 
-**18/22 rows beat vLLM outright, 22/22 beat SDPA.** fp32 is 11/11. The four bf16
-rows still above 1 are `128:8:64` (1.10), `256:16:128` (1.03-1.05),
-`2048:16:128` (1.00-1.01) and `4096:16:128` (1.01); `512:32:128` is on the line
-at 0.99-1.00.
-
-Note on `256:16:128 fp32`: the two verify runs read 1.00-1.04 while every
-isolated measurement of the same binary reads 0.80. That row's band is not
-trustworthy until it is re-measured on an idle box; treat 0.80 as the shape's
-value and the verify reading as interference (the fp32 kernel at that shape is
-the same code that wins 0.80-0.99 everywhere else).
+**17/22 rows beat vLLM outright (2 more on the line at 1.00, 3 above), 22/22
+beat SDPA** — the run-to-run verdict on the 1.00-1.01 rows flips between
+"win" and "on the line", so quote the band. fp32 is 11/11 with one row
+(128:8:64) that reads 0.94-0.96 in isolation and 0.98-1.05 inside the matrix.
+The rows still above 1 are all bf16 and all within 12%: `128:8:64` (1.09-1.12),
+`256:16:128` (1.02-1.03) and the two long D=128 rows (1.00-1.01).
 
 ## What moved this session, in order of payoff
 

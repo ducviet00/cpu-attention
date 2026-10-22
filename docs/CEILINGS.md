@@ -1,10 +1,24 @@
-# How much headroom is actually left on ARM (arithmetic + measured ceilings)
+# Headroom per row (2026-10-22, third campaign) — READ `docs/STATUS.md` FIRST
 
-Written 2026-10-22 by the integrator, after the second ARM campaign. Every
-number here is either (a) a hardware ceiling measured in-process on the box, or
-(b) a ratio from `tests/bench_vs_refs.py` interleaved in one process. The point
-of the file is to answer, per row, *what would have to be true* for us to beat
-vLLM — before anyone spends another session on a schedule tweak.
+**This file's per-row bounds are from the second campaign and are superseded.**
+The measured accounting for the rows that are still above 1 is now:
+
+| shape (bf16) | matmul | exp (not overlapped) | pack | per-item | unexplained |
+|---|---:|---:|---:|---:|---:|
+| 512:32:128 | 86% | 15% | 6.3% | 5.7% | 0.0% |
+| 1024:16:128 | 38+39% | 15% | 3.7% | 8% | 0.3% |
+| 2048:16:128 | 39+46% | 16% | 1.8% | 6.7% | 0.1% |
+| 4096:16:128 | 38+42% | 15% | 0.8% | 4.7% | 0.1% |
+
+The matmul is at the hardware floor for this kernel's load shape: `bfmmla` does
+208 MAC/ns/core with no loads and **105 with the 8 loads per 16 instructions the
+kernel emits** (the operand loads halve it), i.e. 840 MAC/ns over 8 cores, and we
+measure 94% of that — the same place vLLM sits. There is no 2x in the matmul, and
+the exp block is already down to a degree-2 polynomial. The two things we pay for
+that vLLM does not are the K/V pack (0.8-6.3%, the scorecard's contract: their
+cache is staged before the timer) and a Python call path (~4.5 us against ~1.5
+through pybind, which is the whole of the `128:8:64` gap).
+
 
 ## The ceiling on bf16
 
