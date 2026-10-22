@@ -481,6 +481,17 @@ def set_qt(rows) -> None:
     global _QT_ENV
     _QT_ENV = str(int(rows)) if rows else None
 
+_HEAD_RATIO = int(os.environ.get("CPU_ATTENTION_HEAD_RATIO", "2"))
+"""Max heads per thread for the per-head dispatch (fp32; bf16 ignores it).
+
+Measured on fp32, in-process interleaved, 15 rounds: with **2** heads per thread
+the per-head order wins every shape it is used at (256:16:128 1.18x,
+1024:16:128 1.09x, 2048:16:128 1.04x, 4096:16:128 1.06x), but with **4**
+(512:32:128) it is *slower* than the paired order and unstable --
+4065..5350 us over 15 rounds per round, against 4560..4731 for the paired order,
+median 4802 vs 4659. bf16 at the same shape wants the per-head order (1.17x,
+1547..1585), so the cap is fp32-only. Overridable for a sweep; 0 disables it.
+"""
 _HEAD_MAXK = os.environ.get("CPU_ATTENTION_HEAD_MAXK", "1073741824")
 """``CPU_ATTENTION_HEAD_MAXK``: max ``seq_k`` for the per-head dispatch.
 
@@ -499,6 +510,12 @@ def set_head_maxk(seq_k) -> None:
     """Enable (or disable) the per-head dispatch above ``seq_k`` (sweeps/tests)."""
     global _HEAD_MAXK
     _HEAD_MAXK = str(int(seq_k)) if seq_k else None
+
+
+def set_head_ratio(heads) -> None:
+    """Cap heads per thread for the per-head dispatch (0 = no cap)."""
+    global _HEAD_RATIO
+    _HEAD_RATIO = int(heads)
 
 
 def _qt_for(
@@ -862,8 +879,13 @@ def _dense_plan(key, q, k, v, causal):
     # is the dispatch that removes it.
     head_items = batch * num_heads
     head_mode = int(_HEAD_MAXK or 0)
+    # Heads per thread: see `_HEAD_RATIO` -- fp32 stops paying at 2, bf16 still
+    # gains at 4.
+    head_ratio = head_items // max(workers, 1)
+    ratio_ok = is_bf16 or _HEAD_RATIO <= 0 or head_ratio <= _HEAD_RATIO
     if (
         head_mode
+        and ratio_ok
         and num_heads == num_kv_heads
         and seq_k <= head_mode
         and head_items >= workers
@@ -921,7 +943,8 @@ def _dense(q, k, v, scale: float, causal: bool, geom=None):
     # here is silent and expensive -- it would keep running 4 workers after the
     # caller asked for 1 and look like a 3x regression in a sweep.
     key = (geom[0], geom[1], geom[2], geom[3], geom[4], causal, _QT_ENV,
-           _OVERRIDE or torch.get_num_threads(), _HEAD_MAXK, _llc_bytes())
+           _OVERRIDE or torch.get_num_threads(), _HEAD_MAXK, _HEAD_RATIO,
+           _llc_bytes())
     # ... and the LLC size, because it decides whether V gets copied: a box
     # whose cache size is reported differently (or a test that patches the gate)
     # must not keep the other layout's plan.

@@ -15,7 +15,7 @@ import statistics, sys, time
 import torch
 sys.path.insert(0, ".")
 import cpu_attention._kernel as K
-torch.set_num_threads(4)
+torch.set_num_threads(8)
 
 for S, H, D, dt in ((128, 8, 64, torch.bfloat16), (512, 8, 64, torch.bfloat16),
                     (256, 16, 128, torch.bfloat16), (512, 32, 128, torch.bfloat16),
@@ -24,9 +24,11 @@ for S, H, D, dt in ((128, 8, 64, torch.bfloat16), (512, 8, 64, torch.bfloat16),
     q = torch.randn(1, S, H, D, dtype=dt)
     # run one real call so the scratch buffers exist and the plan is built
     K._dense(q, q, q, D ** -0.5, True)
-    key = (q.shape, q.stride(), q.stride(), q.stride(), q.dtype, True, K._QT_ENV,
-           K._OVERRIDE or torch.get_num_threads())
-    plan = K._plans()[key]
+    # the most recently built plan is this shape's (the key carries private
+    # knobs -- qt, the head-mode limit, the LLC size -- so rebuild it by hand at
+    # your peril)
+    plans = K._plans()
+    plan = plans[max(plans, key=lambda k: 0)] if False else list(plans.values())[-1]
     (seq_q, num_heads, batch, num_kv_heads, seq_k, head_dim, dtc, mode, ktb, ktd,
      ktt, kt_blk, qt, workers, kt_bh, kt_d, vt_bh, vt_d, kt_ptr, vt_ptr,
      v_ptr_packed, ks_ptr, ks_bh, k0, k1, k2, v0, v1, v2, qb, qtok, qh, vb,

@@ -95,6 +95,7 @@ def main() -> int:
                     fn()
                     samples[name].append((time.perf_counter() - t0) * 1e6)
             med = {n: statistics.median(v) for n, v in samples.items()}
+            spread = {n: (min(v), max(v)) for n, v in samples.items()}
             tol = 3e-2 if dtype is torch.bfloat16 else 2e-4
             d = {}
             for name in ("base", "head"):
@@ -109,6 +110,10 @@ def main() -> int:
                          f"{med['head']/med['vllm']:8.2f}")
             line += f"  {d['base']:.1e}{'' if d['base'] <= tol else '!'}"
             line += f" {d['head']:.1e}{'' if d['head'] <= tol else '!'}"
+            # min..max over the rounds: on a row where the two modes are within
+            # noise this is what tells you the band is not one mode's fault.
+            line += (f"  b={spread['base'][0]:.0f}..{spread['base'][1]:.0f}"
+                     f" h={spread['head'][0]:.0f}..{spread['head'][1]:.0f}")
             if d["base"] != d["head"]:
                 line += "  NOT-IDENTICAL"
             print(line, flush=True)
