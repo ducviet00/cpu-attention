@@ -481,6 +481,26 @@ def set_qt(rows) -> None:
     global _QT_ENV
     _QT_ENV = str(int(rows)) if rows else None
 
+_HEAD_MAXK = os.environ.get("CPU_ATTENTION_HEAD_MAXK", "1073741824")
+"""``CPU_ATTENTION_HEAD_MAXK``: max ``seq_k`` for the per-head dispatch.
+
+One thread owns a whole (batch, head): it packs that head's K/V and then runs
+every one of its query blocks, so the two phases share bytes and the region
+needs no internal barrier. It only balances when ``batch*heads % workers == 0``
+(checked in :func:`_dense_plan`), and the header cache argument only holds while
+one head's K/V stays near-resident -- but it measured faster at *every* shape in
+the matrix (1.00-1.18x, in-process interleaved, `tests/bench_head.py`), so the
+default is on and the limit is only there for A/B and for a box where one head's
+K/V no longer fits. ``0`` = off.
+"""
+
+
+def set_head_maxk(seq_k) -> None:
+    """Enable (or disable) the per-head dispatch above ``seq_k`` (sweeps/tests)."""
+    global _HEAD_MAXK
+    _HEAD_MAXK = str(int(seq_k)) if seq_k else None
+
+
 def _qt_for(
     lanes: int, is_bf16: bool, head_dim: int, seq_k: int, bfmmla: bool
 ) -> int:
@@ -821,6 +841,29 @@ def _dense_plan(key, q, k, v, causal):
         ktt = kt_st[4] if mode == 1 else 1      # token stride inside a block
     tasks = batch * num_heads * (-(-seq_q // qt))
     workers = _workers(tasks, 8)
+    # ---- per-head dispatch (mode += 4) -------------------------------------
+    # One thread packs a kv head and then runs *all* of that head's query
+    # blocks, with no barrier between the phases. Requirements:
+    #   * MHA: the pack task index and the attention item index have to be the
+    #     same (batch, head), so every query head must have its own kv head;
+    #   * perfect balance: items % workers == 0, which holds for every head
+    #     count in the benchmark matrix at 8 threads (8/16/32) and is checked
+    #     rather than assumed;
+    #   * short enough S that a thread's K/V stays in L1/L2 (the win is the
+    #     per-thread footprint and the barrier, both of which vanish when one
+    #     head's K/V no longer fits).
+    # `perf` on 128:8:64 bf16 put 29% of the call in the region's barrier; this
+    # is the dispatch that removes it.
+    head_items = batch * num_heads
+    head_mode = int(_HEAD_MAXK or 0)
+    if (
+        head_mode
+        and num_heads == num_kv_heads
+        and seq_k <= head_mode
+        and head_items >= workers
+        and head_items % workers == 0
+    ):
+        mode += 4
     plan = (
         seq_q, num_heads, batch, num_kv_heads, seq_k, head_dim,
         _DTYPE_CODES[dt], mode, ktb, ktd, ktt, kt_blk, qt, workers,
@@ -872,7 +915,7 @@ def _dense(q, k, v, scale: float, causal: bool, geom=None):
     # here is silent and expensive -- it would keep running 4 workers after the
     # caller asked for 1 and look like a 3x regression in a sweep.
     key = (geom[0], geom[1], geom[2], geom[3], geom[4], causal, _QT_ENV,
-           _OVERRIDE or torch.get_num_threads())
+           _OVERRIDE or torch.get_num_threads(), _HEAD_MAXK)
     plan = _plans().get(key)
     if plan is None:
         plan = _dense_plan(key, q, k, v, causal)

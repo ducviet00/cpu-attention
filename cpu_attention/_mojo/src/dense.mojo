@@ -2013,13 +2013,14 @@ def _dense_rows_tile_f32[
                             accs[r * KV + v], SIMD[DType.float32, LANES](NEG_INF)
                         )
 
+            # `max` (fmaxnm), not ``lt``+``select``: the portable spelling is
+            # fcmgt + bsl, i.e. two instructions on a serial chain, and this
+            # loop's max is 32 of the ~350 non-FMA instructions per sub-block.
             comptime for r in range(qt):
                 var mx = accs[r * KV]
                 comptime for v in range(1, KV):
-                    mx = mx.lt(accs[r * KV + v]).select(
-                        accs[r * KV + v], mx
-                    )
-                mvec[r] = mvec[r].lt(mx).select(mx, mvec[r])
+                    mx = max(mx, accs[r * KV + v])
+                mvec[r] = max(mvec[r], mx)
                 comptime for v in range(KV):
                     logits.unsafe_store[width=LANES](
                         r * ks + ko + v * LANES, accs[r * KV + v]
@@ -2058,17 +2059,32 @@ def _dense_rows_tile_f32[
             var sumv = Array[SIMD[DType.float32, LANES], 2](uninitialized=True)
             sumv[0] = SIMD[DType.float32, LANES](0.0)
             sumv[1] = SIMD[DType.float32, LANES](0.0)
-            var k = 0
             # Only the keys that exist, rounded up to a whole 4-key group (the
             # logits past `jn` are NEG_INF, so exp of them is exactly 0).
             var kend = min(ks, (jn + 3) // 4 * 4)
-            while k < kend:
-                var p = _exp2_g[LANES](
-                    logits.unsafe_load[width=LANES](r * ks + k)
-                    + SIMD[DType.float32, LANES](off)
+            var lp = logits.unsafe_offset(r * ks)
+            var pp = probs.unsafe_offset(r * ks)
+            var offv = SIMD[DType.float32, LANES](off)
+            var k = 0
+            # Two probability vectors per iteration. The array-indexed form this
+            # replaces (`sumv[(k // LANES) % 2]`) put the running sum in *memory*:
+            # `ldr`/`str` of the sum plus `and`/`lsl` to rebuild the index, on top
+            # of the address arithmetic and the counter, measured at 32
+            # instructions per 4 keys against 17 for the arithmetic alone.
+            while k + 2 * LANES <= kend:
+                var p0 = _exp2_g[LANES](lp.unsafe_load[width=LANES](k) + offv)
+                var p1 = _exp2_g[LANES](
+                    lp.unsafe_load[width=LANES](k + LANES) + offv
                 )
-                sumv[(k // LANES) % 2] += p
-                probs.unsafe_store[width=LANES](r * ks + k, p)
+                sumv[0] += p0
+                sumv[1] += p1
+                pp.unsafe_store[width=LANES](k, p0)
+                pp.unsafe_store[width=LANES](k + LANES, p1)
+                k += 2 * LANES
+            while k < kend:
+                var p = _exp2_g[LANES](lp.unsafe_load[width=LANES](k) + offv)
+                sumv[0] += p
+                pp.unsafe_store[width=LANES](k, p)
                 k += LANES
             row_sum[r] += sumv[0] + sumv[1]
 
@@ -2895,11 +2911,17 @@ def run_transpose(
     paired-head-dim layout, mode 2 the ``bfmmla`` layouts (K position-paired over
     4 head dims, V position-major over head-dim pairs). Parallel over
     (batch, kv head), one fork-join for both tensors in mode 2.
+
+    ``mode >= 4`` is the per-head dispatch, which the fused entry point handles
+    itself; the pack layout is ``mode - 4``.
     """
+    var m = mode
+    if m >= 4:
+        m = m - 4
     if dtype_code == 0:
-        _transpose_dtype[DType.float32](job, num_workers, mode)
+        _transpose_dtype[DType.float32](job, num_workers, m)
     elif dtype_code == 1:
-        _transpose_dtype[DType.bfloat16](job, num_workers, mode)
+        _transpose_dtype[DType.bfloat16](job, num_workers, m)
     else:
         raise Error("cpu_attention dense: unsupported dtype")
 
@@ -3271,9 +3293,11 @@ def _gomp_worker_fused(data: Int) abi("C"):
         task += threads
 
 
-def _dense_items[dtype: DType, qt: Int](job: DenseJob) -> Int:
+def _dense_items[dtype: DType, qt: Int](job: DenseJob, per_head: Bool) -> Int:
     """Work items the attention phase will run (half as many when paired)."""
     var qgroups = (job.seq_q + qt - 1) // qt
+    if per_head:
+        return job.batch * job.num_heads
     comptime paired = (
         LANES < 16
         and qt > 4
@@ -3282,6 +3306,68 @@ def _dense_items[dtype: DType, qt: Int](job: DenseJob) -> Int:
     comptime if paired:
         qgroups = (qgroups + 1) // 2
     return job.batch * job.num_heads * qgroups
+
+
+struct HeadDispatch(ImplicitlyCopyable, Movable):
+    """One ``GOMP_parallel`` region where each thread owns whole heads.
+
+    The pack and the attention are fused with **no barrier between them**: a
+    thread packs head ``t``'s K/V and then attends head ``t``'s query rows, so
+    the two phases touch the same bytes and nothing crosses threads. That is
+    only correct when every query head has its own kv head (``num_heads ==
+    num_kv_heads``, i.e. MHA -- the caller checks), and it is only balanced when
+    ``items % workers == 0``, which the caller also checks.
+
+    Why it is worth a separate dispatch: at short S the round-robin-over-(head,
+    q-pair) form makes every thread touch every head's K/V (8x the footprint)
+    and still leaves the threads waiting on each other at the region's barrier --
+    ``perf`` on ``128:8:64`` bf16 put 29% of the call in
+    ``gomp_team_barrier_wait_end``/``gomp_barrier_wait_end``. One head per thread
+    is balanced by construction (every head's causal work is identical), keeps
+    one head's K/V in L1 for the whole thread, and needs no internal barrier.
+    """
+
+    var tjob: TransposeJob
+    var djob: DenseJob
+    var t_fn: TransposeTaskFn
+    var d_fn: DenseTaskFn
+    var num_tasks: Int
+    var qgroups: Int
+
+    def __init__(
+        out self,
+        tjob: TransposeJob,
+        djob: DenseJob,
+        t_fn: TransposeTaskFn,
+        d_fn: DenseTaskFn,
+        num_tasks: Int,
+        qgroups: Int,
+    ):
+        self.tjob = tjob
+        self.djob = djob
+        self.t_fn = t_fn
+        self.d_fn = d_fn
+        self.num_tasks = num_tasks
+        self.qgroups = qgroups
+
+
+@export
+def _gomp_worker_head(data: Int) abi("C"):
+    var st = MutPointer[HeadDispatch, MutUntrackedOrigin](
+        unsafe_from_address=data
+    )
+    var state = st[]
+    var threads = Int(external_call["omp_get_num_threads", Int32]())
+    var tid = Int(external_call["omp_get_thread_num", Int32]())
+    var t = tid
+    while t < state.num_tasks:
+        state.t_fn(state.tjob, t)
+        var base = t * state.qgroups
+        var g = 0
+        while g < state.qgroups:
+            state.d_fn(state.djob, base + g)
+            g += 1
+        t += threads
 
 
 def _dense_fused[
@@ -3298,17 +3384,24 @@ def _dense_fused[
     ``dtype_code_t`` is the pack's dtype (the dense phase is dispatched on
     ``dtype``, and the two are the same tensor dtype in practice, but the pack's
     scratch has its own code path).
+
+    ``mode >= 4`` selects the per-head dispatch (``HeadDispatch``) and the pack
+    mode is ``mode - 4``.
     """
+    var per_head = mode >= 4
+    var pmode = mode
+    if per_head:
+        pmode = mode - 4
     comptime T0 = _transpose_task[dtype, head_dim, 0]
     comptime T1 = _transpose_task[dtype, head_dim, 1]
     comptime T2 = _transpose_task[dtype, head_dim, 2]
     comptime T3 = _transpose_task[dtype, head_dim, 3]
     var t_fn: TransposeTaskFn = T2
-    if mode == 0:
+    if pmode == 0:
         t_fn = T0
-    elif mode == 1:
+    elif pmode == 1:
         t_fn = T1
-    elif mode == 3:
+    elif pmode == 3:
         t_fn = T3
     comptime paired = (
         LANES < 16
@@ -3321,8 +3414,34 @@ def _dense_fused[
     comptime if paired:
         d_fn = D2
     var t_items = tjob.batch * tjob.num_kv_heads
-    var d_items = _dense_items[dtype, qt](djob)
+    var d_items = _dense_items[dtype, qt](djob, per_head)
     if d_items == 0:
+        return
+    # The fused per-head form is only correct when the pack item and the
+    # attention item are the same (batch, head): one kv head per query head.
+    # The Python side checks it; this is the belt-and-braces version, because a
+    # mismatch here would run attention over K nobody packed.
+    if per_head and (djob.num_heads != tjob.num_kv_heads or t_items != d_items):
+        per_head = False
+    var qgroups = (djob.seq_q + qt - 1) // qt
+    if per_head:
+        # One item per (batch, head): the pack task and the attention item are
+        # the same index, so no thread ever reads another thread's pack.
+        var workers_h = min(num_workers, d_items)
+        comptime Dh = _dense_task[dtype, head_dim, qt]
+        if workers_h <= 1:
+            for i in range(d_items):
+                t_fn(tjob, i)
+                var base0 = i * qgroups
+                for g0 in range(qgroups):
+                    Dh(djob, base0 + g0)
+            return
+        var hstate = stack_allocation[1, HeadDispatch]()
+        hstate[] = HeadDispatch(tjob, djob, t_fn, Dh, d_items, qgroups)
+        comptime entry_h = _gomp_worker_head
+        external_call["GOMP_parallel", NoneType](
+            entry_h, Int(hstate), Int32(workers_h), Int32(0)
+        )
         return
     var workers = min(num_workers, max(t_items, d_items))
     if workers <= 1:
