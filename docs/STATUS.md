@@ -10,8 +10,8 @@ has no AMX kernel in vLLM, so its **VEC build** is that column's bar.
 
 | | x86 bf16 vs vLLM AMX | x86 fp32 vs VEC | ARM bf16 | ARM fp32 |
 |---|---|---|---|---|
-| rows below 1 | **10/11** | **10-11/11** | 8-10/11 | 11/11 |
-| worst row | **1.02** (`256:16:128`) | 1.00 (`128:8:64`) | 1.03 (`256:16:128`) | 0.99 |
+| rows below 1 | **10/11** | **10-11/11** | **10/11** | 11/11 |
+| worst row | **1.02** (`256:16:128`) | 1.00 (`128:8:64`) | 1.01 (`2048` and `4096:16:128`) | 0.99 |
 
 Per row, x86 bf16 (three clean runs, min-based, `ours/vllm`): 128:8:64
 **0.87-0.93**, 512:8:64 **0.80-0.88**, 1024:8:64 **0.88-0.89**, 2048:8:64
@@ -21,6 +21,13 @@ Per row, x86 bf16 (three clean runs, min-based, `ours/vllm`): 128:8:64
 reads 10 of 11 below 1 with `256:16:128` at 1.02. The ranges are the run-to-run band, not a choice: on the
 row with the widest one (`512:32:128`) a duplicate arm in the same run read
 **0.77**, so that row's verdict is not resolvable on this box today.
+
+ARM per row (merged tree, min-based, `ours/vllm`): 128:8:64 0.99, 512:8:64 0.87,
+1024:8:64 0.88, 2048:8:64 0.93, 4096:8:64 0.92, 256:16:128 0.99,
+1024:16:128 0.97, 2048:16:128 **1.01**, 4096:16:128 **1.01**, 512:32:128 0.97,
+1024:8:32 0.84; fp32 0.79-0.95. The two at 1.01 are the D=128 long rows, which
+agent B's ceiling probes put at 68-85% of an `bfmmla` roofline that three probes
+disagree about by 2.4x.
 
 **Every row beats torch SDPA on both boxes**: x86 by 1.6-3.7x (`o/sdpa`
 0.27-0.63), ARM by 1.1-3.4x (0.29-0.88). Full x86 table in the commit message
