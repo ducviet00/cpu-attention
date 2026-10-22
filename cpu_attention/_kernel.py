@@ -727,6 +727,15 @@ def _dense_plan(key, q, k, v, causal):
     # P@V instructions widening V instead) and on V being at least half the LLC.
     vpack = (dt == torch.float32
              and v.numel() * v.element_size() * 2 >= _llc_bytes())
+    # The P@V loops work on 4-key groups, and the last tile's key range is only
+    # known at runtime, so a kernel that rounds that range up to a whole group
+    # reads up to three V rows past the end of the tensor. With V read in place
+    # that is out of bounds -- `tests/fuzz_dense.py`'s stray-read probe catches it
+    # as a NaN coming out of a neighbouring allocation, and it is a page fault
+    # away from crashing (it was a real fp32 bug, `seq_q != seq_k`). Padding the
+    # scratch by one group and zeroing the tail costs a copy only for the odd
+    # key counts this affects, and nothing at all for the benchmark's shapes.
+    vpad = (seq_k % 4) != 0
     seq_k_pad = -(-seq_k // 64) * 64
     # K^T is blocked every `kt_blk` keys so one Q@K^T tile is a single linear run
     # (`[tile][dim][kt_blk]`) instead of `head_dim` rows `kt_blk * elt` apart --
@@ -766,17 +775,21 @@ def _dense_plan(key, q, k, v, causal):
         mode = 1
         kt = _scratch("kt1", (batch, num_kv_heads, head_dim // 2,
                               seq_k_pad // kt_blk, kt_blk, 2), dt)
-        vt = (_scratch("vt1", (batch, num_kv_heads, seq_k, head_dim), dt)
-              if vpack else None)
+        vt = (_scratch("vt1", (batch, num_kv_heads, seq_k + 4 * int(vpad),
+                               head_dim), dt) if (vpack or vpad) else None)
     else:
         mode = 0
         kt = _scratch("kt0", (batch, num_kv_heads, seq_k_pad // kt_blk, head_dim,
                               kt_blk), dt)
-        vt = (_scratch("vt0", (batch, num_kv_heads, seq_k, head_dim), dt)
-              if vpack else None)
+        vt = (_scratch("vt0", (batch, num_kv_heads, seq_k + 4 * int(vpad),
+                               head_dim), dt) if (vpack or vpad) else None)
     # The pack's strides: `kt_blk` keys per contiguous K^T block, and the V
     # scratch's per-head base and per-key-group stride. Both are properties of
     # the buffer, so they belong to the plan and not to the call.
+    if vt is not None and vpad:
+        # Once per geometry: the pack writes rows [0, seq_k) on every call and
+        # never touches the tail, so one zeroing keeps the over-read harmless.
+        vt[:, :, seq_k:, :].zero_()
     kt_st, vt_st = _scratch_strides(kt, vt)
     kt_bh, kt_d = kt_st[1], kt_st[3]
     vt_bh = vt_st[1] if vt is not None else 0
