@@ -284,3 +284,82 @@ on before, so they are the gate).
   but arm-v2 already took it via the layout change; the L1-resident probes
   (`k_hot`/`v_hot`) put *all* K/V memory cost at 2-3%, so there is nothing left
   in the access pattern.
+
+## Round 3: the per-item cost, measured piece by piece (arm-iter)
+
+Target was the per-item cost on `256:16:128` and `4096:16:128` (both 1.01). Two
+corrections to the accounting above came out of measuring it, and one change
+shipped.
+
+**Correction 1: the per-item cost is ~500 cycles, not ~6900.** The earlier
+`oh_only`-derived figure divided the wall time by the item count and forgot that
+8 threads run items in parallel. Recomputed against the whole call rather than
+against `oh_only` (which is not a smaller version of the call -- with the matmul
+removed the pack becomes the critical path, so it over-states the prologue):
+Q panel build ~400 instructions + accumulator init ~130 cycles + epilogue ~100 +
+tile skeleton ~150 = **~500 cycles per item**, i.e. 1.5% of a `4096:16:128` call
+and ~1% of a `256:16:128` one.
+
+**Correction 2: the Q read is not the per-item cost either.** `tests/probe_q_hot.py`
+runs the whole call twice, once with `q` and once with `q.stride(1) == 0` (every
+query row aliases row 0, so the item's whole Q is 256 B and hot; wrong results by
+construction, identical instructions and strides):
+
+| shape | cold | q-hot | what the Q read costs |
+|---|---:|---:|---:|
+| 256:16:128 | 202.0 µs | 197.2 | **2.4%** |
+| 512:32:128 | 1460.6 | 1454.5 | 0.4% |
+| 1024:16:128 | 2747.0 | 2736.1 | 0.4% |
+| 4096:16:128 | 43071 | 42948 | **0.3%** |
+| 4096:8:64 | 12917 | 12436 | 3.7% |
+
+So 2.4% is the *ceiling* on any Q-side fix at `256:16:128` and 0.3% at
+`4096:16:128`. Prefetching the next item's rows is useless for the same reason
+the number is small: in the per-head dispatch the next item is 20 µs away and
+2 KB of L1 (or L2) does not survive that.
+
+### Shipped: the Q panel build (`5162e83`), +1% at 256:16:128
+
+The panel was already a pure permute -- the scale lives only in the exp pass's
+`fma(l, c1, off)`, so there is no redundant multiply to remove (the
+widen-scale-narrow form is the *int8* path, which is off). The cost was the
+shape of the build: 4 eight-byte loads, a join and a store per panel, each of
+the two loads guarded on `nrows` -- 128 panels and 256 branch pairs per item at
+D=128. Now one 16-byte load per row covers two head-dim groups and the two
+panels are one `zip1.2d`/`zip2.2d` of the loads' 64-bit halves, with rows past
+`nrows` clamped once per item. ~800 -> ~400 instructions per item.
+
+`ab_two_trees` against main, 7 rounds, two runs: **256:16:128 1.01x / 1.01x,
+512:32:128 1.00x, 4096:16:128 1.00x, 2048:16:128 1.01x**. Parity `test_dense`
+64/64, `test_flash_api` green, `fuzz_dense` 200/200 on the box.
+
+### Not worth it, with the number
+
+* **The accumulator init** (~130 cycles/item, 0.2-0.3% of a call). The
+  pointer-select version needs a *shared* zero page: a per-item one costs
+  exactly what the init costs, and Mojo has no mutable globals, so it would mean
+  a new host-allocated buffer threaded through the plan and the extension. 0.2%
+  for that plumbing is not a trade worth making; if it is ever revisited, the
+  zero page should come from `_dense_plan` and ride in on an existing unused
+  pointer slot.
+* **Fusing the pack's two passes.** The pack runs at 422-495 GB/s, i.e. ~90% of
+  a plain memcpy, and it moves four tensor passes (K read, K^T write, V read,
+  V^T write) that fusion cannot reduce -- the two loops read *different* tensors.
+  Fusion saves the loop control and improves MLP, i.e. ~5-10% of a block that is
+  4.6% of the `256:16:128` call and 0.35% of `4096:16:128`: **0.2-0.5% and
+  0.03%**, for a refactor of two 80-line vectorised loops. Not done.
+* **The pack cannot be made cheaper by moving less**: not packing V means P@V
+  reads `[seq, heads, dim]` with the dim pairs interleaved across keys, which the
+  campaign already measured at 1.9-2.0x against packing (fp32) and which the
+  bf16 P@V operand layout exists to avoid.
+
+### Where the two rows ended up
+
+`scripts/band.py` over two 9-round runs of this branch, min-based:
+`256:16:128` **1.01** (worst-run min 1.00) and `4096:16:128` **1.00**
+(min 1.00), with 9/11 bf16 rows beating vLLM and the two losses being
+`128:8:64` (1.09-1.10, `dense_small.mojo`) and `256:16:128`. The residue on both
+is now: exp not hidden behind the matmul ~2.9% at 4096 (the degree-2 polynomial
+is at its floor; hiding the rest needs the exp to issue in the matmul's spare
+slots, which the Q@K^T loop already partly does), the pack 0.35%/4.6%, and
+~1-1.5% of per-item work.
