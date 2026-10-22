@@ -5,6 +5,32 @@ path of `csrc/` (the vendored vLLM CPU attention kernel), wired into the engine
 as `attn_backend="mojo"`. Read this before touching the kernel; the root
 `AGENTS.md` covers the engine side.
 
+> **Status of this file (2026-10-22, after the second dense-attention
+> campaign).** `docs/STATUS.md` is the current scoreboard and the falsification
+> ledger; `docs/CEILINGS.md` is the per-row headroom analysis; `docs/NEXT.md` is
+> what is left. Read those three before trusting any performance claim below.
+> Specifically, the following claims in this file no longer survive
+> measurement, and the number that kills each one is in `docs/STATUS.md`:
+>
+> * §4a "qt = 4 for every head dim": the shipped rule is per (ISA, dtype,
+>   head_dim, seq_k) in `_kernel._qt_for`, and on ARM it is 8 for both dtypes.
+> * §7/§9.3 "the Python path is 3.6 us and a plan cache measured worse": the
+>   call path is 3.4 us now, of which the extension marshal alone is 0.76 us; a
+>   *per-geometry* plan (ints, not tensors, in the key) took it from 5.0 to 3.4.
+> * §9.6 / round-5 "the K/V pack is cold-read-bound, 85 GB/s, and cannot be made
+>   faster": called on its own the pack is 2.90 us at 128:8:64 = 181 GB/s = 88%
+>   of a plain memcpy. The 6 us figure came from `bench_phases.py`'s `NO_FUSE`
+>   extra fork-join.
+> * §13.1 "bf16 P@V / int8 is a maybe": int8 Q@K^T is 19% faster and misses the
+>   fixed 3e-2 bf16 gate at every scaling that fits it; `tests/int8_qk_error.py`
+>   has the numbers and the four adversarial input families that break it.
+> * §14 "AMX from Mojo is the only route" stands, but fp16 matrix multiply
+>   (`fmmla`) does **not** exist on any shipping core, so there is no fp16 path.
+> * §4b/§9.10's ARM "the remainder is the softmax block" is right in size (the
+>   exp is 23-24% of a D=64 call) but the fix is not overlap: every P@V d-chunk
+>   needs every key group's probability, so the merged form needs 128 resident
+>   accumulators against 32 registers.
+
 
 ## 0. Conventions (read this first)
 

@@ -333,7 +333,10 @@ sweep still measures different kernels.
 
 The current table, the measurement protocol and the list of what moved it live in
 `docs/STATUS.md`; it is regenerated from `tests/bench_vs_refs.py --json` with
-`scripts/scorecard.py`, never typed by hand. Headline, Ryzen 7 7840H, 8 threads,
+`scripts/scorecard.py` (or `scripts/band.py` for a per-row band over repeat runs),
+never typed by hand. The campaign's closing report is `docs/CAMPAIGN.md`, and
+`docs/CEILINGS.md` says how much headroom exists per row before anyone spends
+another session on a schedule tweak. Headline, Ryzen 7 7840H, 8 threads,
 causal, ratios `ours/baseline` (`<1` wins). On the Xeon: **21-22 of 22 rows beat
 vLLM's VEC kernel** (bf16 via AMX `tdpbf16ps`, fp32 via AMX too, by splitting
 each fp32 operand into bf16 hi/lo halves and keeping three products per phase,

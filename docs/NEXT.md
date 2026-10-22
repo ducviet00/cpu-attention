@@ -1,5 +1,10 @@
 # Next steps, in order
 
+**Closing report: `docs/CAMPAIGN.md`.** The campaign ended with 22/22 vs SDPA on
+ARM, 5 robust wins + 6 rows within ±3% vs vLLM, and the residue proven to be an
+IPC wall (`docs/CEILINGS.md`). Everything below is what a *next* session needs,
+in the order that unblocks the deliverable.
+
 ## 0. AWS access is the blocker (needs a human)
 
 The CLI's login refresh token is rejected at the signin endpoint
@@ -47,7 +52,7 @@ scripts/verify.sh arm64 ubuntu@<m9g.2xlarge ip> "$PWD" arm-8core
 ROUNDS=21
 ```
 
-## 3. The open technical items (in the order they are worth attacking)
+## 3. The open technical items (all measured; none is a quick win)
 
 1. **Per-work-item cost, ~780 cycles** (`b = 0.24 us` from `tests/bench_scale.py`,
    37% of a 128-key item). The item is ~580 instructions = ~165 cycles, so ~600
@@ -79,11 +84,17 @@ ROUNDS=21
    pack is 2.90 us at 128:8:64 (181 GB/s) against a 206 GB/s plain-copy floor,
    and 88% of that floor at every size. The "6 us" figure came from
    `bench_phases.py`'s `NO_FUSE` extra fork-join. `tests/pack_only.py`.
-4. `qt` per shape: the table in `_qt_for` was measured before the per-work-item
-   cost was understood, and a *larger* `qt` at short S is now a plausible win
-   (fewer work items, so fewer per-item costs). `tests/bench_qt.py` and
-   `scripts/prof/arm/qt_sweep.py` interleave every `qt` in one process;
-   `_kernel.set_qt()` is the hook.
+4. ~~`qt` per shape~~ **closed**: an interleaved sweep of 4/6/8/10/12 has qt=8
+   best at S=128 and qt=10/12 +2% at 512:32:128; the per-item cost does not scale
+   with `qt` because the Q panel is O(qt) too. `tests/bench_qt.py` is the sweep,
+   `_kernel.set_qt()` the hook (it is in the plan key, so sweeps stay honest).
+5. **The register-lean single-loop softmax** is the only structural route left.
+   The prize is real (patching the exp out of a D=64 call is 1.23-1.24x) and the
+   tax is now measured: every P@V d-chunk needs every key group's probability, so
+   a merged loop must stage the accumulator per d-chunk *inside* the key loop,
+   +2 instructions/row-key, against 128 resident accumulators that do not fit in
+   32 registers. Build it only with an abandon criterion of 3% whole-call on two
+   D=64 shapes.
 
 ## 3b. One untried overlap that is *not* the falsified one
 
