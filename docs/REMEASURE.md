@@ -28,7 +28,7 @@ REMOTE_DIR=cpu-attention RUNS=2 scripts/verify.sh arm64 ubuntu@54.255.175.68 . f
 
 Clean rebuild, then `tests/bench_vs_refs.py --vllm … --isa neon --rounds 9`
 twice in the same process image. Load at the start of run 1: **0.28**, run 2:
-**0.30**. `scripts/band.py` output is in `/tmp/opencode/remeasure/verify-fresh.log`
+**0.29**. `scripts/band.py` output is in `/tmp/opencode/remeasure/verify-fresh.log`
 on the driving box; the numbers:
 
 | shape | dtype | run 1 min | run 2 min | run 1 med | run 2 med | 21-round med |

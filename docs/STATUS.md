@@ -16,7 +16,7 @@ all 22 rows of `tests/bench_vs_refs.py`. Below 1 is a win.
 ## Current state — m9g.2xlarge (8 cores, Neoverse-V3), re-measured 2026-10-23
 
 Fresh spot instance (`ubuntu@54.255.175.68`), `main` @ `973cce9`, clean rebuild,
-two `scripts/verify.sh` runs (`--rounds 9`) on a box idle at load 0.28 and 0.30,
+two `scripts/verify.sh` runs (`--rounds 9`) on a box idle at load 0.28 and 0.29,
 plus one full-matrix run at `--rounds 21 --control` whose duplicate `ours` arm
 read 0.97-1.05 (the run's noise floor). Ratios are `ours/baseline` and
 **min-based** (`scripts/band.py`; the minimum cannot be inflated by foreign
