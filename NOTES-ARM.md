@@ -753,3 +753,37 @@ are therefore (a) fewer work items at short S (one task per head, or `qt = 16`
 with `nsq = 2`), and (b) prefetching the *next* task's Q rows -- the GOMP worker
 advances `task += threads`, so the next task's Q address is known one item ahead.
 Neither is done; do not spend the time on the prologue's instruction count.
+
+## Fifth campaign: D=128 counters, and what is left there
+
+**At 1024:16:128 bf16, differential perf, ours against vLLM** (two iteration
+counts per engine, divided by the difference):
+
+| | ours | vLLM |
+|---|---:|---:|
+| cycles/row-key | 9.2 | **8.58** |
+| instructions/row-key | 32.4 | 35.7 |
+| IPC | 3.50 | **4.16** |
+| l1d_cache_lmiss_rd | 0.87 | **0.167** |
+| stall_backend | 2.2-2.5 | **1.60** |
+| stall_backend_mem | ~0.4 | **0.04** |
+
+Two things follow. First, **vLLM executes ten percent MORE instructions at D=128
+and wins on IPC alone**, so no instruction-count change reaches those rows: the
+only lever is stall. Second, of our ~0.6-0.9 cycles/row-key of extra stall, about
+0.36 is memory and the rest is the unhidden exp again.
+
+The memory fourth is **V, not K**. The P@V loop walks `dcp = 4` head-dim pairs
+per key group with the *d-chunk* loop outermost, so it makes `DP/dcp` passes over
+the tile -- 16 at head_dim 128, 8 at 64 -- and each pass touches 64 B out of
+every 1 KB key-group block (the V layout is `[key group][dim pair][8]`). K was
+ruled out by measurement (see the fourth campaign: the pair-major swap leaves the
+miss count identical). A `[d-chunk][key group][dim pair][8]` V layout would make
+each pass contiguous per key group; the kernel has to derive the d-chunk stride
+from `seq_k_pad` (`((seq_k + 63)//64)*16 * 32` for the shipped scratch shape)
+because the host owns the allocation. Not attempted yet.
+
+**Falsified this round:** pairing the fp32 Q@K^T K loads back into one 32-byte
+`ldp` (the full unroll had split them, and `ldr` was 26% of that kernel's cycles)
+measures 1.00x at 512:8:64, 1.01x at 4096:16:128 and 1.00x at 1024:8:32 --
+neutral, so the loads are not what binds fp32 either. Reverted.
