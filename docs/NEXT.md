@@ -49,15 +49,32 @@ ROUNDS=21
 
 ## 3. The open technical items (in the order they are worth attacking)
 
-1. **Per-work-item cost, ~1000 cycles**, measured by `tests/bench_scale.py`
-   (heads scaling at fixed seq): the kernel's own ceiling at a 128-key range is
-   44% of the `bfmmla` ceiling however many heads are in flight, against 74% at
-   2048 keys. That is the whole S<=512 story and it is worth 13-26% on the four
-   worst rows.
-2. **The K^T pack layout** (`[tile][dim group][key pair][8]`) is read 16-strided;
-   L1 read misses are 0.348 per row-key against vLLM's 0.086. Swapping the two
-   middle axes makes one sub-block's K read contiguous. That is the D=128 rows
-   (1.06-1.09).
+1. **Per-work-item cost, ~780 cycles** (`b = 0.24 us` from `tests/bench_scale.py`,
+   37% of a 128-key item). The item is ~580 instructions = ~165 cycles, so ~600
+   of the 780 is **stall, not arithmetic** -- do not attack the prologue's
+   instruction count. The two candidates left are the Q-load -> panel build ->
+   first Q@K^T chain (test: prefetch `task + threads`' Q rows, known one item
+   ahead) and load imbalance across the 16-block causal spread. `qt` is already
+   best at 8 (`tests/bench_qt.py`), and the S=128 row cannot be won even with a
+   perfect per-item cost and a free pack (~1.06 floor).
+2. ~~**The K^T pack layout**: swap the two middle axes so one sub-block's K read
+   is contiguous~~ -- **tried and falsified** (NOTES-ARM, fourth campaign): with
+   `[tile][key pair][dim group][8]` and parity green, `l1d_cache_lmiss_rd` is
+   unchanged (0.2749 -> 0.2789 at 2048:8:64, 0.6252 -> 0.6261 at 1024:16:128)
+   and the whole call is 1.00-1.02x. The misses are not the K stride.
+
+   What the counters say at **1024:16:128 bf16**, ours against vLLM: cycles/
+   row-key 9.2 vs **8.58**, instructions 32.4 vs **35.7**, IPC 3.5 vs **4.16**,
+   `l1d_cache_lmiss_rd` 0.87 vs **0.167**, `stall_backend` 2.2-2.5 vs **1.60**,
+   `stall_backend_mem` ~0.4 vs **0.04**. vLLM executes *ten percent more
+   instructions* at D=128 and wins on IPC alone, so no instruction-count change
+   reaches those rows. The memory fourth of the gap is **V**: the P@V loop walks
+   `dcp = 4` dim pairs per key group with the d-chunk loop outermost, so at
+   head_dim 128 it makes 16 passes over the tile touching 64 B of every 1 KB key
+   group. A `[d-chunk][key group][dim pair][8]` V layout makes each pass
+   contiguous; the kernel must derive the d-chunk stride from `seq_k_pad`
+   (`((seq_k+63)//64)*16*32` for the shipped scratch shape) because the host owns
+   the allocation.
 3. ~~The K/V pack throughput at short S~~ **closed**: called on its own the
    pack is 2.90 us at 128:8:64 (181 GB/s) against a 206 GB/s plain-copy floor,
    and 88% of that floor at every size. The "6 us" figure came from
