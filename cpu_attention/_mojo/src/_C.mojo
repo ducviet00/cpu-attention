@@ -26,6 +26,12 @@ from dense import (
 from dense_small import run_small_fused
 from amx import amx_init
 from dense_amx import AMX, AmxJob, PackJob, run_dense_amx
+from dense_amx_v2 import (
+    AMX2,
+    PackJob as PackJob2,
+    V2Job,
+    run_dense_amx_v2,
+)
 
 
 def dense_transpose(
@@ -539,6 +545,8 @@ def PyInit__C() abi("C") -> PythonObject:
         m.def_function[dense_amx_init]("dense_amx_init")
         m.def_function[dense_amx_attention]("dense_amx_attention")
         m.def_function[dense_amx_plan]("dense_amx_plan")
+        m.def_function[dense_amx2_has_amx]("dense_amx2_has_amx")
+        m.def_function[dense_amx2_attention]("dense_amx2_attention")
         return m.finalize()
     except e:
         abort(String("error creating cpu_attention._C: ", e))
@@ -674,3 +682,105 @@ def dense_attention(
         num_workers=Int(py=num_workers),
         qt=Int(py=qt),
     )
+
+
+def dense_amx2_has_amx() -> PythonObject:
+    """True when this build has the v2 AMX kernel (x86 + amx-tile + amx-bf16)."""
+    if AMX2:
+        return PythonObject(True)
+    return PythonObject(False)
+
+
+def dense_amx2_attention(
+    q: PythonObject,
+    kp: PythonObject,
+    vp: PythonObject,
+    dst: PythonObject,
+    k: PythonObject,
+    v: PythonObject,
+    batch: PythonObject,
+    seq_q: PythonObject,
+    seq_k: PythonObject,
+    num_heads: PythonObject,
+    num_kv_heads: PythonObject,
+    head_dim: PythonObject,
+    q_stride_b: PythonObject,
+    q_stride_t: PythonObject,
+    q_stride_h: PythonObject,
+    k_stride_b: PythonObject,
+    k_stride_t: PythonObject,
+    k_stride_h: PythonObject,
+    v_stride_b: PythonObject,
+    v_stride_t: PythonObject,
+    v_stride_h: PythonObject,
+    o_stride_b: PythonObject,
+    o_stride_t: PythonObject,
+    o_stride_h: PythonObject,
+    kp_bh: PythonObject,
+    vp_bh: PythonObject,
+    kb16: PythonObject,
+    kb32: PythonObject,
+    dc32: PythonObject,
+    dc16: PythonObject,
+    scale: PythonObject,
+    causal: PythonObject,
+    kt: PythonObject,
+    num_workers: PythonObject,
+    fp32: PythonObject,
+    mode: PythonObject,
+) raises:
+    """v2 of the AMX dense kernel: same arguments, same packed workspace as
+    ``dense_amx_attention``, one softmax pass per logit instead of two.
+
+    Selected by ``CPU_ATTENTION_AMX2=1`` in ``cpu_attention._kernel``; v1 stays
+    the default so a regression cannot reach the engine.
+    """
+    var pack = PackJob2()
+    pack.k = Int(py=k)
+    pack.v = Int(py=v)
+    pack.kp = Int(py=kp)
+    pack.vp = Int(py=vp)
+    pack.seq_k = Int(py=seq_k)
+    pack.head_dim = Int(py=head_dim)
+    pack.k_stride_b = Int(py=k_stride_b)
+    pack.k_stride_t = Int(py=k_stride_t)
+    pack.k_stride_h = Int(py=k_stride_h)
+    pack.v_stride_b = Int(py=v_stride_b)
+    pack.v_stride_t = Int(py=v_stride_t)
+    pack.v_stride_h = Int(py=v_stride_h)
+    pack.num_kv_heads = Int(py=num_kv_heads)
+    pack.batch = Int(py=batch)
+    pack.kb16 = Int(py=kb16)
+    pack.kb32 = Int(py=kb32)
+    pack.dc32 = Int(py=dc32)
+    pack.dc16 = Int(py=dc16)
+    pack.kp_bh = Int(py=kp_bh)
+    pack.vp_bh = Int(py=vp_bh)
+
+    var job = V2Job()
+    job.q = Int(py=q)
+    job.kp = Int(py=kp)
+    job.vp = Int(py=vp)
+    job.dst = Int(py=dst)
+    job.batch = Int(py=batch)
+    job.seq_q = Int(py=seq_q)
+    job.seq_k = Int(py=seq_k)
+    job.num_heads = Int(py=num_heads)
+    job.num_kv_heads = Int(py=num_kv_heads)
+    job.head_dim = Int(py=head_dim)
+    job.q_stride_b = Int(py=q_stride_b)
+    job.q_stride_t = Int(py=q_stride_t)
+    job.q_stride_h = Int(py=q_stride_h)
+    job.kp_bh = Int(py=kp_bh)
+    job.vp_bh = Int(py=vp_bh)
+    job.o_stride_b = Int(py=o_stride_b)
+    job.o_stride_t = Int(py=o_stride_t)
+    job.o_stride_h = Int(py=o_stride_h)
+    job.scale = Float32(Float64(py=scale))
+    job.causal = Bool(causal)
+    job.kt = Int(py=kt)
+    job.dc32 = Int(py=dc32)
+    job.dc16 = Int(py=dc16)
+    job.fp32 = Bool(fp32)
+    job.mode = Int(py=mode)
+    run_dense_amx_v2(pack, job, num_workers=Int(py=num_workers))

@@ -727,6 +727,13 @@ _AMX_MODE_V = int(os.environ.get("CPU_ATTENTION_AMX_MODE", "0") or 0)
 
 _AMX_ENTRY = None
 
+# v2 of the AMX kernel (`dense_amx_v2.mojo`: one softmax pass per logit instead
+# of two). Opt-in so a regression cannot reach the engine:
+# `CPU_ATTENTION_AMX2=1` at import, or flip `_AMX_IMPL` between calls (which is
+# how tests/bench_amx_v2.py interleaves the two in one process).
+_AMX_IMPL = os.environ.get("CPU_ATTENTION_AMX2", "0") == "1" and "v2" or "v1"
+_AMX_ENTRIES = {}
+
 
 def amx_available() -> bool:
     """True when this build can run the AMX dense kernel (bf16 or fp32).
@@ -747,7 +754,11 @@ def amx_available() -> bool:
         if gate is None or init is None or not gate() or not init():
             _AMX_ENTRY = False
         else:
-            _AMX_ENTRY = mod.dense_amx_attention
+            _AMX_ENTRIES["v1"] = mod.dense_amx_attention
+            gate2 = getattr(mod, "dense_amx2_has_amx", None)
+            if gate2 is not None and gate2():
+                _AMX_ENTRIES["v2"] = mod.dense_amx2_attention
+            _AMX_ENTRY = True
             _AMX_PLAN = getattr(mod, "dense_amx_plan", None)
     return _AMX_ENTRY is not False and _AMX_ENTRY is not None and _AMX_ENV
 
@@ -822,7 +833,7 @@ def _amx_dense(q, k, v, scale: float, causal: bool):
     if q.shape[-1] not in (32, 64, 128) or q.dtype not in _DTYPE_CODES:
         return None
     fp32 = q.dtype == torch.float32
-    plans = _AMX_PLANS.__dict__.get("p")
+    plans = _AMX_PLANS.__dict__.get("p") if _AMX_IMPL == "v1" else None
     if plans:
         plan = plans.get(
             (q.shape, k.shape, q.stride(), k.stride(), v.stride(), fp32,
@@ -856,7 +867,9 @@ def _amx_dense(q, k, v, scale: float, causal: bool):
     kt = _AMX_KT
     tasks = batch * num_heads * (-(-seq_q // 32))
     workers = _workers(tasks, 8)
-    _AMX_ENTRY(
+    # The plan entry only exists for v1 (v2 has its own packed layouts but the
+    # same arguments), so a v2 call takes the 36-argument path.
+    _AMX_ENTRIES.get(_AMX_IMPL, _AMX_ENTRIES["v1"])(
         q.data_ptr(), kp.data_ptr(), vp.data_ptr(), out.data_ptr(),
         k.data_ptr(), v.data_ptr(),
         batch, seq_q, seq_k, num_heads, num_kv_heads, head_dim,
@@ -868,7 +881,7 @@ def _amx_dense(q, k, v, scale: float, causal: bool):
         float(scale), int(bool(causal)), kt,
         workers, int(fp32), int(_AMX_MODE_V),
     )
-    if _AMX_PLAN is not None:
+    if _AMX_PLAN is not None and _AMX_IMPL == "v1":
         plans = _AMX_PLANS.__dict__.get("p")
         if plans is None:
             plans = _AMX_PLANS.p = {}
