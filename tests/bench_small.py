@@ -83,8 +83,13 @@ def main() -> int:
                 fn()
                 fn()
             s = {n: [] for n in variants}
-            for _ in range(args.rounds):
-                for name, fn in variants.items():
+            items = list(variants.items())
+            for rnd in range(args.rounds):
+                # Rotate the arm order every round: with a fixed order the first
+                # arm of each round is systematically faster (two identical arms
+                # measured 3.4% apart on a quiet box), and every ratio in this
+                # file would carry that bias.
+                for name, fn in (items if rnd % 2 == 0 else items[::-1]):
                     t0 = time.perf_counter()
                     fn()
                     s[name].append((time.perf_counter() - t0) * 1e6)
