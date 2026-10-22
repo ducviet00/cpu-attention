@@ -37,6 +37,23 @@ The tail that has to move, in the order it is worth attacking:
 | 1.06-1.09 | 1024/2048/4096:16:128 bf16, 512:8:64 bf16 | 6-9% |
 | 1.15-1.26 | 128:8:64 bf16+fp32, 256:16:128 bf16, 512:32:128 bf16 | 13-26% |
 
+### x86 without AMX (laptop Ryzen, VEC path) — a current data point, not the target
+
+The Xeon table above is the one that counts and it is stale, so here is the only
+x86 number that is current: `main`, two runs, `scripts/band.py`, VEC reference,
+8 threads. It exercises the same shared call path, packs and dispatch, so it
+catches a shared-code regression even though the ISA is not the target's.
+
+| | wins vs SDPA | wins vs vLLM-VEC | notes |
+|---|---|---|---|
+| bf16 | 11/11 | **8/11** (0.74-0.97) | loses 128:8:64 (1.07-1.45) and 4096:16:128 (1.01-1.03) |
+| fp32 | 11/11 | **1/11** | 1.09-1.90; the AVX-512 fp32 path with no AMX is the weak one, and on the Xeon fp32 runs on AMX |
+
+So the VEC fallback is not competitive for fp32. That is not a regression — the
+AVX-512 fp32 path has always been the weakest of the three — but it means a
+machine with AVX-512 and no AMX should be expected to lose the fp32 rows, and
+`docs/NEXT.md` item 1 is what settles the Xeon question.
+
 ## What moved, and what it cost
 
 **Second ARM campaign (merged `cacc785`).** `o/vllm` 4/22 -> 8/22.
