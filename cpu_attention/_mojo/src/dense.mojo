@@ -2916,6 +2916,11 @@ def _dense_arm_rows[
 ](job: DenseJob, batch: Int, head: Int, kv_head: Int, q0: Int):
     """The v2 tile kernel for this dtype (bf16 ``bfmmla`` or fp32)."""
     comptime if dtype == DType.bfloat16:
+        # `dcp` = head-dim pairs per P@V chunk: the panels are reloaded RP times
+        # per key group per chunk, so a wider chunk halves that -- but `dcp = 8`
+        # at head_dim 128 is 32 accumulator registers beside 8 V and 4 panel
+        # registers and spills: measured 12.39 cycles/row-key against 9.58 for
+        # `dcp = 4` at 1024:16:128 (46.3 instructions against 33.1). It stays 4.
         _dense_rows_tile[head_dim, qt, TILE_KS, 4, TILE_NSQ](
             job, batch, head, kv_head, q0
         )

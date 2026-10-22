@@ -624,3 +624,72 @@ alone; `_transpose_head_i8` is the new code and the first suspect.
 17.9 ms against 51 us). Kill with `pkill -f bench_vs_refs` and check `uptime`
 before believing anything. The old note about "one run at a time" is not enough
 -- a timed-out ssh leaves the run alive.
+
+## Third campaign (2026-10-22): where the IPC actually goes
+
+Differential perf works on this box and is the tool that settled it: `perf stat
+-e cycles,inst_spec,op_spec,stall,stall_backend,stall_frontend,l1d_cache,
+l1d_cache_refill,l1d_cache_lmiss_rd,br_mis_pred,l2d_cache_refill,...` at two
+iteration counts (N and M, N/M >= 5) per engine, subtract, divide by
+`(M-N) * row_keys`. One run is 99% torch import; two runs cancel it. The values
+are stable to 0.4% within a build (but 2-5% between builds of the same source --
+always compare a build against its own re-build).
+
+**At 2048:8:64 bf16, merged main against vLLM:**
+
+| | ours | vLLM |
+|---|---:|---:|
+| cycles/row-key | 5.72 | 5.21 |
+| instructions/row-key | 19.83 | 20.81 |
+| IPC | 3.46 | 3.92 |
+| stall_backend/row-key | 1.41 | 1.01 |
+| ... of which memory | 0.16 | ~0 |
+| l1d_cache_lmiss_rd/row-key | **0.348** | **0.086** |
+| br_mis_pred/row-key | 0.0003 | 0.0014 |
+| stall_frontend/row-key | 0.03 | 0.03 |
+
+So the "same instructions, worse schedule" claim was right but useless: **the
+gap is stall_backend, 0.40 of the 0.51 cycles, and it is not branch prediction,
+not the frontend, and only 0.16 of it is memory** -- though we miss L1 on reads
+4x as often as they do (0.348 vs 0.086 per row-key, i.e. ~70% of the 32 B/row-key
+K+V stream refills from L2 while their paged layout streams linearly).
+
+**Ablation (patch the phase out, measure cycles/row-key):** removing the exp from
+the tile kernel takes 5.98 -> 4.23 for -4.5 instructions. The exp costs **1.75
+cycles/row-key = 29% of the kernel** for 2.5 instructions, i.e. it is
+latency-bound and it does not overlap the matmul: the tile loop is
+QK -> max -> exp -> P@V and each phase's pipe idles in the next. 4.0 of the
+5.72 is bfmmla pipe time (8 per row-key at the measured 2.0/cycle ceiling), so
+the honest budget is 4.0 matmul + 1.4-1.75 exp + ~0.3 everything else.
+
+What that bought (all precision-neutral, commit `f615345`): four key groups per
+exp iteration instead of two (+2.3%), `KS_STRIDE` instead of the runtime
+`job.kt_blk` in the sub-block address (an `sdiv`+`msub` per 8 keys, +1%), and
+FA4's -8 rescale slack so the 128-vector accumulator rescale stops firing every
+tile (+1.3% long S, +2% at 512). 5.72 -> 5.36 cycles/row-key, and the whole-call
+interleaved A/B against main is **1.04x at 512:8:64, 1.06x at 2048:8:64, 1.03x at
+1024:16:128, 1.02x at 512:32:128 bf16**, fp32 unchanged.
+
+**Falsified this round (numbers are cycles/row-key at 2048:8:64 bf16):**
+* 8 key groups in flight in the exp loop: 5.75 (was 5.36) -- register pressure.
+* Estrin instead of Horner for the same degree-3 polynomial: 5.80 -- the extra
+  `f*f` and the wider footprint cost more than the two cycles of chain depth.
+* `dcp = 8` for head_dim 128 (halves the P@V panel reloads): 12.39 against 9.58,
+  46.3 instructions against 33.1 -- RP*dcp = 32 accumulators beside 8 V and 4
+  panel registers spills.
+
+**Short S is not "19 us unaccounted".** Varying the head count separates the
+per-call fixed cost from the per-head work (`T(H) = F + H*W`): at S=128,
+F = **9.5 us** and W = 5.02 us/head. F is exactly the pack (6 us) + the Python
+and dispatch host cost (3.5 us) we charge ourselves and vLLM does not. The kernel
+work itself is 40.1 us against 33.5 us at the asymptotic rate -- 1.2x, from
+per-tile fixed costs on 64-key tiles, not 2x. A *perfect* kernel would be 43 us
+against their 40, so S=128 cannot be won inside the kernel; it needs the pack or
+the host cost to go away. (`tests/bench_phases.py` plus the H sweep is the way to
+re-measure this.)
+
+**What is left.** 4.0 of the 5.36 cycles is the bfmmla pipe and ~1.4 is the
+unhidden exp. The only routes below ~5.0 are (a) overlapping the exp with a
+matmul phase, which needs the exp of tile i to run beside the P@V of tile i-1 and
+that needs ~40 live registers, or (b) int8 Q@K^T (12-19% faster, parity-gated,
+see `hybrid-wip`). The L1 miss rate (0.35/row-key) is worth at most 3%.
