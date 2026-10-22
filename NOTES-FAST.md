@@ -232,36 +232,53 @@ kernel shape can make it so (see §7.1 for the one structural idea left).
 
 ## 6. State of the matrix after this tree (2 runs, `tests/bench_vs_refs.py`)
 
-`scripts/band.py` over the two runs: **22/22 vs SDPA, 14/22 vs vLLM** (was 5
-wins / 6 on the line / 11 losses at the start of the session), 2 on the line,
-6 losses -- and 5 of the 6 losses are bf16 D=128 rows owned by another agent.
+`scripts/band.py` over two runs of the final tree (with the 2-heads/thread cap):
+**22/22 vs SDPA, 14/22 vs vLLM, 1 on the line** (was 5 wins / 6 on the line / 11
+losses at the start of the session). The single "on the line" row is
+4096:8:64 bf16 (0.99-1.00), and 6 of the 7 losses are bf16 D=128 rows owned by
+another agent.
 
-fp32 `o/vllm`, before -> after (2-run band):
+**fp32 is 11/11 below 1 in both runs**, with 5 rows at ≤0.92:
 
 | shape | before | after |
 |---|---:|---:|
-| 128:8:64 | 1.02-1.18 | **0.91-0.94** |
-| 512:8:64 | 1.02-1.04 | **0.90-0.91** |
-| 1024:8:64 | 1.00-1.01 | **0.91-0.93** |
+| 128:8:64 | 1.02-1.18 | **0.93-0.96** |
+| 512:8:64 | 1.02-1.04 | **0.91-0.92** |
+| 1024:8:64 | 1.00-1.01 | **0.92-0.94** |
 | 2048:8:64 | 1.02-1.03 | **0.97-0.98** |
-| 4096:8:64 | 0.98-1.00 | 0.98-0.99 |
-| 256:16:128 | 0.96-0.97 | **0.80-0.81** |
-| 1024:16:128 | 0.93-0.94 | **0.94-0.95** |
-| 2048:16:128 | 0.95-1.01 | **0.88** |
-| 4096:16:128 | 1.05-1.06 | 0.99 |
-| 512:32:128 | 0.95-0.96 | 0.94-1.12 then 0.98-1.01 with the ratio cap (§5b) |
+| 4096:8:64 | 0.98-1.00 | **0.97-0.98** |
+| 256:16:128 | 0.96-0.97 | **0.80** |
+| 1024:16:128 | 0.93-0.94 | **0.95** |
+| 2048:16:128 | 0.95-1.01 | **0.88-0.89** |
+| 4096:16:128 | 1.05-1.06 | **0.99** |
+| 512:32:128 | 0.95-0.96 then 0.94-1.12 | **0.96-0.97** (paired order, §5b) |
 | 1024:8:32 | 1.00-1.01 | **0.91** |
 
-bf16 rows in my scope: 128:8:64 1.53 -> **1.15-1.18**; 256:16:128 1.25-1.30 ->
-**1.06**; 512:8:64 1.08-1.13 -> **0.96-1.02**; 512:32:128 1.22-1.23 -> **1.05**;
-1024:8:32 1.00 -> **0.97**; 1024:8:64 1.02 -> **0.97-0.98**; 2048:8:64 1.03 ->
-**0.99**; 4096:8:64 1.02 -> **0.99-1.00**.
+bf16 rows in my scope: 128:8:64 1.53 -> **1.13-1.15**; 256:16:128 1.25-1.30 ->
+**1.09**; 512:8:64 1.08-1.13 -> **1.00-1.01**; 512:32:128 1.22-1.23 -> **1.05**;
+1024:8:32 1.00 -> **0.97-0.98**; 1024:8:64 1.02 -> **0.96-0.97**; 2048:8:64 1.03
+-> **0.99**; 4096:8:64 1.02 -> **0.99-1.00**.
 
-Parity: `test_dense` 64/64 at 1/2/4/8 workers (and with the head dispatch off and
-with the ratio cap off), `test_flash_api` all passed, `fuzz_dense` 200/200 with
-the stray-read probe 24/24. Every row's `d=` column is inside its tolerance, and
-the fp32 rows improved (1.0e-6 vs 1.2e-6 before) because the exp pass now sums
-two vectors before folding.
+Parity: on the box, `test_dense` 64/64 at 1/2/4/8 workers (and with the head
+dispatch off, and with the ratio cap off), `test_flash_api` all passed,
+`fuzz_dense` 200/200 with the stray-read probe 24/24, twice. Every row's `d=`
+column is inside tolerance.
+
+### 6b. x86 is not regressed (laptop, `ab_two_trees`, 5 rounds)
+
+| shape | fp32 | bf16 |
+|---|---|---|
+| 512:8:64 | 1.05x faster | 1.00x |
+| 256:16:128 | 1.07x faster | 1.02x |
+| 1024:16:128 | 0.99x | 1.02x |
+
+The dispatch change is ISA-agnostic and helps or ties there too.
+
+**One local caveat**: `tests/test_dense.py` segfaults on this laptop (exit 139,
+before it prints anything, at 1 and at 8 workers) for **both** the base tree and
+this one, after the shared dev venv was recreated today; `ab_two_trees` runs fine
+on the same build. Not a regression from this work, but the x86 verification in
+`docs/NEXT.md` §1 has to run on a server box, not here.
 
 ## 7. What I would do next (in order)
 
