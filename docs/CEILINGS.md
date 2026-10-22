@@ -28,7 +28,10 @@ over 8 cores, and we measure 94% of that — the same place vLLM sits.
 > latency-bound, so "the loads halve the MMA" was a loop-shape artefact.
 > Consequence: the Q@K^T + P@V phases (118-124 MAC/ns/core at 4096:16:128) are
 > at **82-85%** of the measured 4-load ceiling, and the whole call at 68%, not
-> 94%. The per-row conclusions below (D=128 long-S is capped at parity, D=64 has
+> 94%. Two further probes since (a 16-accumulator no-load loop at 168 MAC/ns, and
+> the same loop with 4 `ldp` per 16 at 61) show the number moves 2.4x with the
+> loop shape, so treat *any* microbenchmark ceiling as unresolved and instrument
+> the kernel's own body instead. The per-row conclusions below (D=128 long-S is capped at parity, D=64 has
 > room) do not depend on the exact ceiling and still hold; the *reason* given
 > for the cap does not.
 

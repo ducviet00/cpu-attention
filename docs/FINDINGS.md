@@ -183,6 +183,18 @@ the part the campaign's ceiling argument used:
 | `fmla` f32 | 39-52 MAC/ns | not re-measured |
 | `bfdot` | 39 | 140 GFLOP/s/core = 35 MAC/ns (`peak.c`, reproduces) |
 
+**Two independent probes of the no-load ceiling disagree by 25%** (128-134 above,
+168 in the integrator's `peak5.s`: 16 accumulators, 2 operands, 16 `bfmmla` per
+iteration, 4.55 cycles per 16 at a 3.1 GHz clock = 3.3-3.5 `bfmmla`/cycle), and
+the *with-loads* figure is worse: the same 16-accumulator loop with 4 `ldp` per
+16 measures **61 MAC/ns** when the loads feed the next instruction pair and
+114-145 when they do not. So a microbenchmark does not settle this: the number
+moves by 2.4x with the loop shape. What is settled is that **105 was
+latency-bound and is not the ceiling**; what is not settled is what the ceiling
+is for *the kernel's* loop. The way to settle it is to instrument the kernel's own
+Q@K^T body (count `bfmmla` against cycles in a `perf stat` window at one shape),
+not to write another microbenchmark.
+
 The hand-written asm probe is `/tmp/opencode/remeasure/bfmmla_probe.c`
 (16 accumulators, 8 threads pinned one per core, per-core min). The finding: the
 documented no-load figure is 1.55x faster than this core delivers, and the

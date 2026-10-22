@@ -45,12 +45,24 @@ mis-measured and has been re-derived** (`REMEASURE.md` §4a): `bfmmla` is
 that the kernel emits** (hand-written asm, 8 cores). The old pair "208 no
 loads / 105 with 8 loads, the loads halve it" is the 8-accumulator
 latency-bound loop, not the issue limit — 105 reproduces exactly for that loop
-on `peak.c` and `bfmmla_peak.mojo`, which is why it survived. So the Q@K^T +
-P@V phases (118–124 MAC/ns core) are at **82–85%** of the measured ceiling and
-the whole call at 68%: the matmul phases have 15–18% headroom, not 6%. Nothing
-in the ranked list below becomes easier — the five restructurings that tried to
-collect it all lost — but "there is no headroom there" is not the right reason
-to skip it. Two things are charged to us and not to vLLM:
+on `peak.c` and `bfmmla_peak.mojo`, which is why it survived.
+
+**How much headroom that leaves is unresolved, and it is worth one hour to
+settle before anything else.** Three probes of the same core now disagree:
+128–134 (no loads, 16 acc), **168** (no loads, 16 acc, 2 operands, 16 `bfmmla` per
+iteration = 3.3–3.5 `bfmmla`/cycle), and **61–145** with 4 `ldp` per 16 depending
+on whether the loads feed the next instruction pair. The number moves 2.4x with
+the loop shape, so a microbenchmark cannot decide it. The Q@K^T + P@V phases
+measure 118–124 MAC/ns/core at 4096:16:128, so the matmul is at **68–85%** of the
+candidate ceilings and the whole call at 68%: somewhere between 0 and 40% of
+headroom, not the 6% this campaign assumed, and not the 15–18% a single probe
+suggests either.
+
+Settle it from inside the kernel: instrument the shipped Q@K^T body (count
+`bfmmla` retired against cycles in a `perf stat` window at one shape, both
+cached-hot and streaming) and compare against a hand-written loop with *that
+exact* load pattern. If the phases are within a few percent of it, the ranked
+list below is the whole plan; if they are 15% off, the matmul is the plan. Two things are charged to us and not to vLLM:
 
 * **the K/V pack** (0.6-1.7% for S>=512, 3.5% at 256:16:128, 10% at 128:8:64
   on the re-measured instance): their cache is staged before the scorecard's timer
@@ -60,6 +72,12 @@ to skip it. Two things are charged to us and not to vLLM:
   worth 0.40 µs of it, not the 1.9 µs originally recorded.
 
 ## Ranked next steps
+
+### 0. Settle the matmul ceiling from inside the kernel (1 hour, decides the ranking)
+See above. It is a measurement, not a rewrite: `perf stat` around one shape's
+Q@K^T phase versus a hand-written loop with the same load pattern. Publish the
+ratio. Everything below is ranked on the assumption that the answer is "near the
+ceiling"; if it is not, swap item 0's answer in for items 1–3.
 
 ### 1. The exp block, hidden instead of shrunk (biggest prize, three failures so far)
 The exp is 15% of a D=128 call and 29% of a D=64 one, it does not overlap the
