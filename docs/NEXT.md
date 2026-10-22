@@ -58,9 +58,10 @@ ROUNDS=21
    L1 read misses are 0.348 per row-key against vLLM's 0.086. Swapping the two
    middle axes makes one sub-block's K read contiguous. That is the D=128 rows
    (1.06-1.09).
-3. **The K/V pack throughput at short S** (6 us of a 51 us call at 128:8:64,
-   85 GB/s) — measure the memcpy floor for the same size and thread count before
-   spending anything on it.
+3. ~~The K/V pack throughput at short S~~ **closed**: called on its own the
+   pack is 2.90 us at 128:8:64 (181 GB/s) against a 206 GB/s plain-copy floor,
+   and 88% of that floor at every size. The "6 us" figure came from
+   `bench_phases.py`'s `NO_FUSE` extra fork-join. `tests/pack_only.py`.
 4. `qt` per shape: the table in `_qt_for` was measured before the per-work-item
    cost was understood, and a *larger* `qt` at short S is now a plausible win
    (fewer work items, so fewer per-item costs). `tests/bench_qt.py` and

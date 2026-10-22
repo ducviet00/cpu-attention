@@ -146,7 +146,7 @@ before it is treated as final.
 * co-issue: the loop reported 1223962 "cycles/iter" because the clock probe was
   folded; re-measure with a fixed clock before drawing any conclusion.
 
-## Where short S actually goes (measured, both boxes)
+## Where short S actually goes (measured)
 
 `tests/bench_scale.py` raises the head count at fixed seq: work scales, the key
 range and every per-call cost do not, so the split falls out. m9g, 4 threads,
@@ -160,17 +160,35 @@ bf16, round-robin medians:
 | 512 | 8 | 495.0 | 65% | 3.07 |
 | 2048 | 8 | 6945.5 | 74% | 2.70 |
 
-Two separate things, and only one of them is dispatch:
+Fitting `cost = a*rowkeys + b` over those rows and cross-checking against the
+head-count scaling gives **b = 0.24 us = ~780 cycles per work item** and a
+*marginal* rate that is the same at 128 keys as at 2048. So the whole short-S
+penalty is two fixed terms, and neither is the matmul:
 
-1. **A 128-key range caps the kernel at 44%** however many heads are in flight
-   (`4.55` cycles/row-key against `2.70` at 2048 keys). Fitting
-   `cost = a*rowkeys + b` gives `a = 2.58` cycles/row-key and **b ~ 1000 cycles
-   per work item** — a prologue/epilogue cost that is 3% of a long-S work item
-   and ~40% of a 128-key one. That is the thing to attack for S<=512.
-2. The rest is per-call: at S=128/H=8 the call is 75 us of which ~10 us is the
-   per-work-item term above, ~6 us the pack and ~3.5 us the host path.
+| term | S=128/8/64 bf16 | share of the 48.8 us call |
+|---|---|---|
+| K/V pack (**closed**, see below) | 2.90 us | 6% |
+| host path (Python + allocate) | 3.4 us | 7% |
+| one OpenMP region | ~1 us | 2% |
+| per-work-item cost, 64 items x 0.24 us / 4 threads | 3.8 us | 8% |
+| marginal row-kernel work | 37.7 us | 77% |
 
-At S=128 vLLM is at 50% of the ceiling *including* their per-call costs, i.e.
-above our best measured short-range rate. So that row needs the per-work-item
-cost cut, not a faster matmul.
+Consequences, both measured rather than argued:
 
+* **The pack is not a lever.** `tests/bench_phases.py` measures it with
+  `CPU_ATTENTION_NO_FUSE=1`, which puts an extra fork-join in that column; the
+  pack called on its own (`tests/pack_only.py`) is **2.90 us at 128:8:64, 181
+  GB/s**, against a **206 GB/s plain-copy floor** for the same 512 KB
+  (`tests/copy_floor.py`) and 88% of that floor at every size up to 16 MB.
+* **`qt` cannot amortise the per-item cost.** An interleaved sweep in one
+  process (`tests/bench_qt.py --qts 4,6,8,10,12`) has qt=8 best at S=128 and
+  qt=10/12 +2% at 512:32:128; the item's own instruction count is ~580 (~165
+  cycles), so ~600 of the 780 cycles are stall, not arithmetic — prefetching the
+  next item's Q is the hypothesis that follows, not more rows.
+* **The S=128 row cannot be won even with a perfect item cost and a free pack**:
+  zeroing both leaves ~41 us against vLLM's 38.7, because the marginal kernel
+  rate is already at parity there. Best case ~1.05.
+
+`tests/bench_scale.py` also rules out the occupancy story: at H=8 the per-item
+cost (0.65 us for 1032 row-keys) and at H=64 (0.67 us for the same) are equal,
+so there is no tail or imbalance to recover — only the fixed 0.24 us.
