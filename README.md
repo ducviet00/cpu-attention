@@ -307,10 +307,11 @@ block. Keys are scored `KT_TILE` at a time; for that, K is handed over
 parallel transpose pass for it, 40-70 GB/s against 11-15 GB/s for
 `torch.permute(...).contiguous()`), which is what lets one broadcast-FMA cover
 64 positions. V stays row-major, so `acc[d] += p[j] * v[j][d]` is one FMA per
-head-dim chunk shared by every row of the block. bf16 runs Q@K^T on the bf16 dot
-instruction (`dpbf16ps` / `bfdot`) with fp32 P@V, the same split as the paged
-kernel, and is therefore **faster than fp32** — the opposite of a bf16-native
-kernel on AVX-512, which has no native bf16 add/multiply.
+head-dim chunk shared by every row of the block. bf16 runs both phases on the
+2x2 matrix-multiply where one exists (`tdpbf16ps` on AMX, `bfmmla` on NEON) and
+on the bf16 dot instruction (`dpbf16ps` / `bfdot`) with fp32 P@V elsewhere, which
+is why bf16 is **faster than fp32** here — the opposite of a bf16-native kernel
+on AVX-512, which has no native bf16 add/multiply.
 
 Work items are handed out round-robin over the same libgomp pool: causal masking
 makes the last query rows ~2x more expensive than the first, and a contiguous
@@ -319,24 +320,30 @@ slice per thread leaves half the cores idle at the end of a prefill.
 Rows per work item is the only axis K and V are reused across, so traffic per
 row-key is `head_dim * sizeof(T) / qt` bytes for Q@K^T and again for P@V, while
 the register file caps `qt * head_dim` near 512 (above that the accumulator has
-to live in L1: `_dense_rows_mem`). The shipped rule (`_kernel._qt_for`) is now
-per (ISA, dtype, head_dim, seqlen): 6 rows for fp32 from 256 keys up, 4 below
-that; 6 for bf16 at head_dim 128 (its L1-accumulator dot kernel), 4 at 64.
-Measured, interleaved, on the Ryzen: 1.13x at 256x16x128 and 1.25x at
-512x32x128 for 6 rows over 4, and 1.10x at 1024x8x64 for 6 over 8.
-`CPU_ATTENTION_QT` overrides it for experiments.
+to live in L1: `_dense_rows_mem`). The shipped rule is `_kernel._qt_for`, swept
+per (ISA, dtype, head_dim, seqlen) and documented there: on ARM 8 rows for both
+dtypes (the tile kernels keep the logits in L1, so rows are free); on AVX-512
+fp32 6 rows at head_dim 64 and 8-10 at 128, bf16 4 at 64 and 6-8 at 128. Measured,
+interleaved, on the Ryzen: 1.13x at 256x16x128 and 1.25x at 512x32x128 for 6 rows
+over 4, and 1.10x at 1024x8:64 for 6 over 8. `CPU_ATTENTION_QT` overrides it for
+experiments, and it is part of the per-geometry call plan's key so a one-process
+sweep still measures different kernels.
 
 ### Against torch SDPA and vLLM
 
 The current table, the measurement protocol and the list of what moved it live in
 `docs/STATUS.md`; it is regenerated from `tests/bench_vs_refs.py --json` with
 `scripts/scorecard.py`, never typed by hand. Headline, Ryzen 7 7840H, 8 threads,
-causal, ratios `ours/baseline` (`<1` wins). On the Xeon: **22 of 22 rows beat
-SDPA and 22 of 22 beat vLLM's VEC kernel** — bf16 via AMX (`tdpbf16ps`) and fp32
-via AMX as well, by splitting each fp32 operand into bf16 hi/lo halves and
-keeping three products per phase (error 5.5-7.6e-5 against a 2e-4 gate). On the
-Graviton: 22 of 22 beat SDPA and fp32 is at parity with vLLM's NEON kernel
-(0.89-1.11 run to run), with bf16 2-32% behind it.
+causal, ratios `ours/baseline` (`<1` wins). On the Xeon: **21-22 of 22 rows beat
+vLLM's VEC kernel** (bf16 via AMX `tdpbf16ps`, fp32 via AMX too, by splitting
+each fp32 operand into bf16 hi/lo halves and keeping three products per phase,
+error 5.5-7.6e-5 against a 2e-4 gate), with `128:8:64 fp32` the open row; that
+table has not been re-verified since the shared call-path and ARM changes, see
+`docs/NEXT.md`. On the Graviton (4-core slice): 22 of 22 beat SDPA, **8 of 22
+beat vLLM's NEON kernel** — fp32 wins 7 of 11, bf16 is 1.00-1.26 — and
+`docs/CEILINGS.md` shows why the residue is not a schedule tweak: vLLM spends 95%
+of the measured `bfmmla` ceiling at S=4096/D=128, so those rows are parity at
+best.
 
 The three moves that mattered most, in order, were: **reusing the K/V pack
 workspace** instead of `torch.empty` per call (1.4-1.7x -- the pack was writing
