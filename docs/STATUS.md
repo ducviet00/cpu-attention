@@ -18,24 +18,23 @@ can — see `FINDINGS.md` §5). `o/sdpa` is 0.29-0.88 on every row.
 
 | shape | bf16 o/vllm | fp32 o/vllm |
 |---|---:|---:|
-| S=128 H=8 D=64 | **1.09-1.12** | 0.98-1.05 (0.94-0.96 isolated) |
-| S=256 H=16 D=128 | **1.02-1.03** (0.98-0.99 isolated) | 0.80 |
-| S=512 H=8 D=64 | 0.91-0.93 | 0.90-0.91 |
-| S=512 H=32 D=128 | 1.00 | 0.98-1.00 |
-| S=1024 H=8 D=32 | 0.87 | 0.90-0.91 |
-| S=1024 H=8 D=64 | 0.90 | 0.90-0.93 |
-| S=1024 H=16 D=128 | 0.98 | 0.87-0.89 |
-| S=2048 H=8 D=64 | 0.93 | 0.97-0.98 |
-| S=2048 H=16 D=128 | 1.00-1.01 | 0.87 |
-| S=4096 H=8 D=64 | 0.92-0.93 | 0.97-0.98 |
-| S=4096 H=16 D=128 | 1.00-1.01 | 0.98-0.99 |
+| S=128 H=8 D=64 | **1.12-1.13** | 0.95-1.02 |
+| S=256 H=16 D=128 | **1.01-1.07** | 0.80 |
+| S=512 H=8 D=64 | 0.90-0.93 | 0.90-0.91 |
+| S=512 H=32 D=128 | 1.00 | 0.99-1.00 |
+| S=1024 H=8 D=32 | 0.87 | 0.91 |
+| S=1024 H=8 D=64 | 0.90-0.91 | 0.93 |
+| S=1024 H=16 D=128 | 0.98 | 0.89-0.92 |
+| S=2048 H=8 D=64 | 0.92-0.93 | 0.96-0.98 |
+| S=2048 H=16 D=128 | 0.97-0.99 | 0.86-0.87 |
+| S=4096 H=8 D=64 | 0.91-0.92 | 0.97-0.98 |
+| S=4096 H=16 D=128 | **1.01-1.02** | 0.98-0.99 |
 
-**17/22 rows beat vLLM outright (2 more on the line at 1.00, 3 above), 22/22
-beat SDPA** — the run-to-run verdict on the 1.00-1.01 rows flips between
-"win" and "on the line", so quote the band. fp32 is 11/11 with one row
-(128:8:64) that reads 0.94-0.96 in isolation and 0.98-1.05 inside the matrix.
-The rows still above 1 are all bf16 and all within 12%: `128:8:64` (1.09-1.12),
-`256:16:128` (1.02-1.03) and the two long D=128 rows (1.00-1.01).
+**19/22 rows beat vLLM, none is on the line, 3 are above 1; 22/22 beat SDPA**
+by 1.3-3.4x (`o/sdpa` 0.30-0.88). fp32 is 11/11. The three rows still above 1 are
+all bf16: `128:8:64` (1.12-1.13), `256:16:128` (1.01-1.07) and `4096:16:128`
+(1.01-1.02). Two of them are inside a 2% band and flip verdict between runs;
+`128:8:64` is a real 12% and its budget is below.
 
 ## What moved this session, in order of payoff
 
