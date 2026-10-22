@@ -2986,7 +2986,21 @@ def _dense_arm_rows[
         # key is twice as large, so the same 256-key tile costs half as much per
         # row-key. Measured cycles/row-key: 1024:16:128 9.74 (128 keys) / 9.18
         # (256) / 9.52 (512); 2048:8:64 5.08 (128) / 5.31 (256) / 5.53 (64).
-        comptime if head_dim >= 128:
+        #
+        # The register budget is what couples the three: `RP*nsq` Q@K^T
+        # accumulators and `RP*dcp` P@V accumulators both have to fit beside the
+        # operands, so a wider row block has to trade `nsq` and `dcp` for it.
+        comptime if qt >= 16:
+            # 8 row pairs: 16 QK accumulators at nsq=2, 16 P@V ones at dcp=2.
+            _dense_rows_tile[head_dim, qt, 128, 2, 2](
+                job, batch, head, kv_head, q0
+            )
+        elif qt >= 12:
+            # 6 row pairs: 18 QK, 12 P@V.
+            _dense_rows_tile[head_dim, qt, 128, 2, 3](
+                job, batch, head, kv_head, q0
+            )
+        elif head_dim >= 128:
             _dense_rows_tile[head_dim, qt, 256, 4, TILE_NSQ](
                 job, batch, head, kv_head, q0
             )
@@ -3203,8 +3217,10 @@ def _run_shape[
         _dense_dispatch[dtype, head_dim, 10](job, num_workers)
     elif qt == 12:
         _dense_dispatch[dtype, head_dim, 12](job, num_workers)
+    elif qt == 16:
+        _dense_dispatch[dtype, head_dim, 16](job, num_workers)
     else:
-        raise Error("cpu_attention dense: qt must be 2, 4, 6, 8, 10 or 12")
+        raise Error("cpu_attention dense: qt must be 2, 4, 6, 8, 10, 12 or 16")
 
 
 def _run_dtype[dtype: DType](job: DenseJob, num_workers: Int, qt: Int) raises:
@@ -3519,8 +3535,12 @@ def _fused_shape[
         _dense_fused[dtype, head_dim, 12](
             tjob, djob, mode, num_workers, dtype_code_t
         )
+    elif qt == 16:
+        _dense_fused[dtype, head_dim, 16](
+            tjob, djob, mode, num_workers, dtype_code_t
+        )
     else:
-        raise Error("cpu_attention dense: qt must be 2, 4, 6, 8, 10 or 12")
+        raise Error("cpu_attention dense: qt must be 2, 4, 6, 8, 10, 12 or 16")
 
 
 def _fused_dtype[
