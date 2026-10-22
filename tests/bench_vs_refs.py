@@ -226,6 +226,13 @@ def main() -> int:
                     "vllm_us": m.get("vllm"),
                     "o_sdpa": m["ours"] / m["sdpa"],
                     "o_vllm": (m["ours"] / m["vllm"]) if "vllm" in m else None,
+                    # min-based: interference can only slow a sample down, so
+                    # these are the ratios a decision should use on a shared box
+                    "us_min": mmin["ours"], "sdpa_us_min": mmin["sdpa"],
+                    "vllm_us_min": mmin.get("vllm"),
+                    "o_sdpa_min": mmin["ours"] / mmin["sdpa"],
+                    "o_vllm_min": (mmin["ours"] / mmin["vllm"])
+                                  if "vllm" in mmin else None,
                     "gflops": gflops["ours"], "maxdiff": d_ours,
                     "parity_ok": ok_ours,
                     "threads": torch.get_num_threads(),
