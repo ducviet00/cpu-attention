@@ -1350,8 +1350,8 @@ def _dense_rows_bfmmla[
                         )
 
 
-comptime TILE_KS = 128
-"""Keys per tile in ``_dense_rows_tile`` (bf16): the whole tile's logits live in L1.
+comptime TILE_KS = 384
+"""Keys per tile in ``_dense_rows_tile`` (bf16).
 
 This is the vLLM structure (one QK pass over a key tile, one straight-line
 softmax over the whole tile, then P@V over it) as opposed to v1's online-softmax
@@ -1359,10 +1359,29 @@ chain, which re-derives the max and rescales the accumulator every 16 keys. A
 tile has to be a multiple of 64 because the K scratch is padded to 64 keys and
 the QK pass reads whole sub-blocks.
 
-Measured at S=2048 H=8 D=64 bf16, cycles/row-key: 64 keys 5.86, **128 keys
-5.33**, 256 keys 5.66 -- the per-tile P@V accumulator round trip and the tile
-epilogue amortise up to 128, and past that the two logit buffers (16 KB at 256)
-start competing with the K/V streams for L1.
+**384, not 128.** The old 128 came from a measurement where a 256-key tile cost
+more than a 128-key one at D=64/S=2048 ("past that the two logit buffers start
+competing with the K/V streams for L1"), and that stopped being true when the
+K^T scratch became ``[tile][key pair][dim group][8]``: one Q@K^T sub-block is
+now a linear run instead of a 512-byte-strided gather, so the K sweep does not
+need the tile to be L1-resident to stream. Re-measured in-process (a temporary
+`ks` selector, 9 rounds, two runs, min of the two, parity against SDPA per
+variant -- all ok)::
+
+    shape          ks128   ks192   ks256   ks384   ks512
+    512:8:64         221     216     216     215     221
+    2048:8:64       3316    3264    3239    3220    3301
+    4096:8:64      13076   12672   12856   12563   13021
+    512:32:128      1498    1471    1463    1464    1459
+    1024:16:128     2823    2772    2770    2764    2750
+    2048:16:128    11135   11027   10984   10903    10966
+    4096:16:128    44776   43973   43953   43744   43686
+
+384 is the best or within 0.6% of the best on six of the seven shapes, and
+2.1-4.1% below 128 on every one. The win is amortising the per-tile work (the
+row max/sum/rescale, the P@V accumulator round trip, the tile prologue) over 3x
+more keys, not L1 residency: at D=128 a 384-key K tile is 96 KB and does not fit
+in L1 at all, which is also why 512 is worse again at D=64.
 """
 
 comptime TILE_KS_F32 = 256
@@ -3045,7 +3064,7 @@ def _dense_arm_rows[
                 job, batch, head, kv_head, q0
             )
         elif head_dim >= 128:
-            _dense_rows_tile[head_dim, qt, 128, 4, TILE_NSQ](
+            _dense_rows_tile[head_dim, qt, TILE_KS, 4, TILE_NSQ](
                 job, batch, head, kv_head, q0
             )
         else:
