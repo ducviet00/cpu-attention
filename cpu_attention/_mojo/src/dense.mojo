@@ -1111,8 +1111,8 @@ def _dense_rows_bfmmla[
             # ``seq_k/2 * 16`` bytes per head-dim group (16 scattered lines per
             # sub-block, which was a 12% branch bubble at S=2048).
             var ktp = kt_base.unsafe_offset(
-                (tok // job.kt_blk) * (DG * job.kt_stride_d)
-                + ((tok % job.kt_blk) // 2) * 8
+                (tok // job.kt_blk) * (KS_STRIDE * head_dim)
+                + ((tok % job.kt_blk) // 2) * (DG * 8)
             )
             var g = 0
             while g < DG:
@@ -1123,7 +1123,7 @@ def _dense_rows_bfmmla[
                             accs[rp * NS + v],
                             a,
                             ktp.unsafe_load[width=8](
-                                g * job.kt_stride_d + v * 8
+                                v * (DG * 8) + g * 8
                             ),
                         )
                 g += 1
@@ -1517,7 +1517,7 @@ def _dense_rows_tile[
     var t0 = 0
     while t0 < loop_end:
         var kt_tile = kt_base.unsafe_offset(
-            (t0 // KS_STRIDE) * (DG * job.kt_stride_d)
+            (t0 // KS_STRIDE) * (KS_STRIDE * head_dim)
             + ((t0 % KS_STRIDE) // 2) * 8
         )
         # (recomputed per sub-block below: a tile wider than ``kt_blk`` would
@@ -1549,8 +1549,8 @@ def _dense_rows_tile[
             # sub-block loop, so it cost an `sdiv`+`msub` per sub-block (~30
             # cycles per 8 keys). With the comptime stride they are shifts.
             var kt_sub = kt_base.unsafe_offset(
-                ((t0 + 2 * sb) // KS_STRIDE) * (DG * job.kt_stride_d)
-                + (((t0 + 2 * sb) % KS_STRIDE) // 2) * 8
+                ((t0 + 2 * sb) // KS_STRIDE) * (KS_STRIDE * head_dim)
+                + (((t0 + 2 * sb) % KS_STRIDE) // 2) * (DG * 8)
             )
             var accs = Array[SIMD[DType.float32, 4], RP * nsq](
                 uninitialized=True
@@ -1611,7 +1611,7 @@ def _dense_rows_tile[
                         accs[rp * nsq + v] = _bfmmla(
                             zero,
                             a0,
-                            kt_sub.unsafe_load[width=8](v * 8),
+                            kt_sub.unsafe_load[width=8](v * (DG * 8)),
                         )
                 var g = 1
                 while g < DG:
@@ -1622,7 +1622,7 @@ def _dense_rows_tile[
                                 accs[rp * nsq + v],
                                 a,
                                 kt_sub.unsafe_load[width=8](
-                                    g * KT_PAIR_STRIDE + v * 8
+                                    v * (DG * 8) + g * 8
                                 ),
                             )
                     g += 1
@@ -2528,9 +2528,13 @@ def _transpose_head[
                     )
         elif mode == 2 and dtype == DType.bfloat16:
             # 16 tokens = 8 key pairs per head-dim group, blocked by key tile:
-            # ``[tile][dim group][key pair][8]``, so one tile's K for every dim
-            # group is contiguous (16 allocations instead of 16 strided runs when
-            # the QK sweep walks the groups).
+            # ``[tile][key pair][dim group][8]``, so one tile's K for every dim
+            # group is contiguous AND one *key pair*'s is a 512-byte linear run
+            # -- which is what the Q@K^T sweep wants: it walks the groups of one
+            # key pair with a 16-byte step. The other order
+            # (``[tile][dim group][key pair][8]``) makes that sweep touch 64 B
+            # out of every 512 B, i.e. one line per 512-B run, at 8x the stride
+            # and (measured) 3.5x vLLM's L1 refill rate.
             #
             # One key pair's 8 bf16 are the first four of key 2p then the first
             # four of key 2p+1, so a 16-byte load of *eight* head dims from each
@@ -2540,9 +2544,10 @@ def _transpose_head[
             # Every address except the loop step is folded out of the inner loop:
             # the block offset used to be a division by a *runtime* `kt_blk` per
             # (key pair, dim group), which cost more than the shuffles.
+            comptime KP_STRIDE = (head_dim // 4) * 8
             var k_blk_base = (
                 (t0 // job.kt_blk) * ((head_dim // 4) * job.kt_stride_d)
-                + ((t0 % job.kt_blk) // 2) * 8
+                + ((t0 % job.kt_blk) // 2) * KP_STRIDE
             )
             var k_src = src.unsafe_offset(t0 * job.k_stride_t)
             if n == TBLK:
@@ -2552,15 +2557,12 @@ def _transpose_head[
                     comptime for h in range(head_dim // 8):
                         var a = pa.unsafe_load[width=8](8 * h)
                         var b = pb.unsafe_load[width=8](8 * h)
-                        var base = (
-                            k_blk_base + (2 * h) * job.kt_stride_d + jp * 8
-                        )
+                        var base = k_blk_base + jp * KP_STRIDE + (2 * h) * 8
                         dst.unsafe_store[width=8](
                             base, a.shuffle[0, 1, 2, 3, 8, 9, 10, 11](b)
                         )
                         dst.unsafe_store[width=8](
-                            base + job.kt_stride_d,
-                            a.shuffle[4, 5, 6, 7, 12, 13, 14, 15](b),
+                            base + 8, a.shuffle[4, 5, 6, 7, 12, 13, 14, 15](b)
                         )
             else:
                 comptime for jp in range(TBLK // 2):
@@ -2578,15 +2580,12 @@ def _transpose_head[
                             b = src.unsafe_offset(
                                 (t + 1) * job.k_stride_t + 8 * h
                             ).unsafe_load[width=8]()
-                        var base = (
-                            k_blk_base + (2 * h) * job.kt_stride_d + jp * 8
-                        )
+                        var base = k_blk_base + jp * KP_STRIDE + (2 * h) * 8
                         dst.unsafe_store[width=8](
                             base, a.shuffle[0, 1, 2, 3, 8, 9, 10, 11](b)
                         )
                         dst.unsafe_store[width=8](
-                            base + job.kt_stride_d,
-                            a.shuffle[4, 5, 6, 7, 12, 13, 14, 15](b),
+                            base + 8, a.shuffle[4, 5, 6, 7, 12, 13, 14, 15](b)
                         )
         else:
             # Non-bf16 (x86 never selects mode 2, but it has to compile).

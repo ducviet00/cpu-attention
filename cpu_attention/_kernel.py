@@ -826,8 +826,10 @@ def _dense_plan(key, q, k, v, causal):
         # K blocked by key tile (64 keys): one tile's K for every head-dim group
         # is then one contiguous run, so the Q@K^T sweep walks it linearly
         # instead of jumping seq_k/2*16 bytes per head-dim group.
+        # [tile][key pair][head-dim group][8]: one key pair's whole head dim
+        # is a single linear run, which is the order the Q@K^T sweep reads.
         kt = _scratch("kt2", (batch, num_kv_heads, seq_k_pad // kt_blk,
-                              head_dim // 4, kt_blk // 2, 8), dt)
+                              kt_blk // 2, head_dim // 4, 8), dt)
         # V: [key group of 4][head-dim pair][8], so P@V's inner loop walks one
         # key group's dim pairs as a contiguous run (512 B at head_dim 64).
         vt = _scratch("vt2", (batch, num_kv_heads, seq_k_pad // 4, head_dim // 2, 8),
@@ -873,9 +875,10 @@ def _dense_plan(key, q, k, v, causal):
     ob, otok, oh = seq_q * num_heads * head_dim, num_heads * head_dim, head_dim
     ktb = kt_st[1]
     if mode == 2 or mode == 3:
-        # [tile][dim group][key pair][8]: stride(3) is one head-dim group
-        # inside a tile, 8 is one key pair. (The tile stride is derived in the
-        # kernel from the dim-group count.)
+        # mode 2 [tile][key pair][dim group][8]: stride(3) is one key pair, 8 a
+        # head-dim group; mode 3 [tile][dim group][key pair][16]: stride(3) is
+        # one head-dim group. The kernel derives the tile stride from the
+        # dim-group count.
         ktd, ktt = kt_st[3], 8
     else:
         ktd = kt_st[3]                          # dim stride within a block
