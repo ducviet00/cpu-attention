@@ -497,16 +497,18 @@ def set_small_maxk(seq_k) -> None:
     _SMALL_MAXK = int(seq_k)
 
 
-_HEAD_RATIO = int(os.environ.get("CPU_ATTENTION_HEAD_RATIO", "2"))
+_HEAD_RATIO = int(os.environ.get("CPU_ATTENTION_HEAD_RATIO", "0"))
 """Max heads per thread for the per-head dispatch (fp32; bf16 ignores it).
 
-Measured on fp32, in-process interleaved, 15 rounds: with **2** heads per thread
-the per-head order wins every shape it is used at (256:16:128 1.18x,
-1024:16:128 1.09x, 2048:16:128 1.04x, 4096:16:128 1.06x), but with **4**
-(512:32:128) it is *slower* than the paired order and unstable --
-4065..5350 us over 15 rounds per round, against 4560..4731 for the paired order,
-median 4802 vs 4659. bf16 at the same shape wants the per-head order (1.17x,
-1547..1585), so the cap is fp32-only. Overridable for a sweep; 0 disables it.
+**Off by default, and the cap must be re-justified before it is turned on.** I
+measured fp32 512:32:128 as 4802 us (median of 15) capped against 4659 uncapped
+and concluded 4 heads per thread was the problem; the integrator re-measured it
+three separate processes with 11 rounds and a min-based ratio and got the
+**opposite**: 0.84-0.85 uncapped against 0.94-0.98 capped, with `ab_two_trees` on
+the same pair reading 4027/4023/4024 us uncapped against 4510/4516/4529 capped.
+The 4065..5350 spread I saw was foreign load on the shared box, i.e. exactly the
+median-vs-min artefact the harness now guards against. So the default is 0 (no
+cap) and the knob stays for a box that measures otherwise.
 """
 _HEAD_MAXK = os.environ.get("CPU_ATTENTION_HEAD_MAXK", "1073741824")
 """``CPU_ATTENTION_HEAD_MAXK``: max ``seq_k`` for the per-head dispatch.
