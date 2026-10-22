@@ -531,3 +531,61 @@ histograms from an `objdump` dump), `hot.py` (per-instruction stall shares from
 report success and leave the old `.so`). Never run two measurements at once: a
 second process doubles every number and the first row of a sweep is still at
 idle clock.
+
+## Second campaign (2026-10-22, same m9g.xlarge box): what moved, and the int8 wall
+
+Read `docs/STATUS.md`'s "Second ARM campaign" section first; this is the
+mechanics. Everything below is `ours/baseline` (<1 wins), same convention.
+
+### What moved, with the interleaved number
+
+| change | effect | how it was measured |
+|---|---|---|
+| K/V pack vectorised (`zip1/zip2.2d`, 16-bit transposes, addresses hoisted, unguarded full-tile path) | pack 9 -> 6 us at 128:8:64, 286 -> 176 us at 4096:8:64; **0.98-1.07x whole call for S <= 512** | `ab_two_trees.py` base vs tree |
+| output epilogue vectorised (`zip1.2d`/`zip2.2d` between dim pairs + one reciprocal vector) | -1600 instructions per work item = 8% of the kernel at S=128 | static; parity green |
+| fp32 Q@K^T unrolled over the comptime `head_dim` | **1.03-1.05x fp32**; flips fp32 to 7/11 rows under 1.00 | `ab_two_trees.py`, 3 shapes |
+
+The pack is now **memory-bound, not instruction-bound** (73 GB/s at S=128 where
+the data is hot, 97 GB/s at S=4096) -- do not go looking for more there. What it
+cost was `t0 // job.kt_blk` *inside* the inner loop (a division by a runtime
+value, once per key pair per head-dim group) and the per-lane inserts.
+
+### Falsified: int8 Q@K^T on `smmla` (the big one)
+
+`smmla` with int8 Q and K halves both the matrix instructions and the operand
+loads of the Q@K^T phase. It is real and it is fast: **o/vllm 0.92-0.98 at
+S >= 1024** (from 1.03-1.13), 873 GFLOP/s at 4096:16:128 (from 708), 0.95-0.97
+at D=64 long. And it **fails parity**: `max|diff|` 3.1e-2 (3.9e-2 at D=128)
+against the 3e-2 gate.
+
+The mechanism, so nobody re-derives it: 127 symmetric levels on both operands is
+a ~0.8% logit error; for a *peaked* causal row (the first rows see 3-5 keys) that
+is a ~1% output error, and 1% of |out| ~ 4 is 2-4 bf16 ulp, which is exactly
+where `max|diff|` lives (the bf16 output rounding alone is 7.8e-3). It is not a
+bug: the error distribution is median 7e-4, p99 4.9e-3, and only the top 0.01%
+(a few dozen rows) is above 1e-2. Per-key K scales instead of per-64-key buy
+1.35x; hi/lo splitting doubles the matmul back to `bfmmla`'s cost. It needs ~2.5
+more bits per operand. Code is in the tree behind `comptime INT8_QK` (mode 3
+pack + the per-row scale path), off.
+
+### The residue, restated with the current numbers
+
+Per row-key the bf16 kernel has ~8 `bfmmla` + ~9-12 other instructions; at the
+measured 2.0 `bfmmla`/cycle ceiling the matmul alone is 4.0 cycles and we run
+5.6 against vLLM's 5.13. Both are issue-bound near IPC 4; ours is 3.56, theirs
+4.07, and the instruction counts are a wash. So there is **no instruction-count
+lever left that does not cost parity** (int8 is the only one and it is above),
+and the remaining 8% is schedule. `perf annotate` on the current fp32 kernel
+(after the unroll) says `fmla` 34%, `ldr` 26%, `add` 17%, `shl` 12% (the exp2
+exponent insert) -- the loads are still the largest non-matmul item, and the
+full unroll traded the `ldp` pairs (was 24% in one instruction) for single
+`ldr`s (26% spread out) while still coming out 5% ahead.
+
+### Tools that worked
+
+`perf record` + `perf annotate -s <mangled symbol>` + `scripts/prof/arm/hot.py`
+gives per-instruction cycle shares (the box's *instruction counter* is a vPMU
+artefact -- IPC 4.8 reported for a serial loop -- but sampling is usable).
+`tests/ab_two_trees.py --old ~/arm-old --new ~/arm-work` is the only honest
+tree-vs-tree comparison; `bench_vs_refs.py` between runs moves 3% on this box
+and cannot settle anything smaller.
