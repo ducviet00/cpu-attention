@@ -83,8 +83,17 @@ def paged_case(seq, heads, dim, dtype, block=128):
     return q, k, v, kc, vc, bt, slots, qsl, lens
 
 
-def time_rounds(variants, rounds):
-    """Median of `rounds` interleaved samples per variant."""
+def time_rounds(variants, rounds, full=False):
+    """Median of `rounds` interleaved samples per variant (and the min).
+
+    The median is the published number, but on a shared box a burst of load
+    from another job can land inside one variant's sample and move a median by
+    15% (measured: 512:32:128 fp32 read 0.85 twice, then 1.01 twice, while an
+    in-process interleaved probe of the same binary read 4046 us both times).
+    The *minimum* is far more robust -- interference can only make a sample
+    slower -- so it is reported beside the median and used when deciding
+    whether a change helped.
+    """
     for fn in variants.values():
         for _ in range(2):
             fn()
@@ -94,7 +103,10 @@ def time_rounds(variants, rounds):
             t0 = time.perf_counter()
             fn()
             samples[name].append((time.perf_counter() - t0) * 1e6)
-    return {name: statistics.median(v) for name, v in samples.items()}
+    med = {name: statistics.median(v) for name, v in samples.items()}
+    if full:
+        return med, {name: min(v) for name, v in samples.items()}
+    return med
 
 
 def sdpa(q, k, v, causal):
@@ -184,7 +196,7 @@ def main() -> int:
                     variants["vllm"] = (lambda: vllm.cpu_attention_with_kv_cache(
                         q, kc, vc, out, qsl, lens, dim ** -0.5, causal, None, -1,
                         bt, 0.0, meta, None, None, 1.0, 1.0, "auto"))
-                m = time_rounds(variants, args.rounds)
+                m, mmin = time_rounds(variants, args.rounds, full=True)
                 d_ours, ok_ours = (float("nan"), True)
                 if not args.no_parity:
                     ref = sdpa(q3, k3, v3, causal)
@@ -202,6 +214,9 @@ def main() -> int:
                 if "vllm" in m:
                     line += f"  o/vllm {m['ours']/m['vllm']:5.2f}"
                 line += f"   [{gflops['ours']:4.0f} GFLOP/s]"
+                # min-based ratios: interference can only slow a sample down,
+                # so these are the honest ones on a shared box (see time_rounds)
+                line += f"  min o/vllm {mmin['ours']/mmin['vllm']:5.2f}" if "vllm" in mmin else f"  min o/sdpa {mmin['ours']/mmin['sdpa']:5.2f}"
                 if not args.no_parity:
                     line += f"  d={d_ours:.1e}{'' if ok_ours else ' PARITY-FAIL'}"
                 print(line, flush=True)

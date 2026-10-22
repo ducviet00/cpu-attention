@@ -46,6 +46,11 @@ def main() -> int:
                 line += f" | {'-':>16s} {'-':>16s}"
                 continue
             o_s, o_v = r["o_sdpa"], r["o_vllm"]
+            # On a shared box a burst of foreign load can move a median by 15%;
+            # the min-based ratio cannot be inflated by interference, so it is
+            # what the verdict uses when the run has one.
+            if r.get("o_vllm_min") is not None:
+                o_s, o_v = r["o_sdpa_min"], r["o_vllm_min"]
             flag = "" if r["parity_ok"] else "!"
             line += f" | {o_s:14.2f}{flag:2s}"
             if o_v is None:

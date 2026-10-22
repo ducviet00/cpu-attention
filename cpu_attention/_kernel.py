@@ -481,16 +481,23 @@ def set_qt(rows) -> None:
     global _QT_ENV
     _QT_ENV = str(int(rows)) if rows else None
 
-_HEAD_RATIO = int(os.environ.get("CPU_ATTENTION_HEAD_RATIO", "2"))
+_HEAD_RATIO = int(os.environ.get("CPU_ATTENTION_HEAD_RATIO", "0"))
 """Max heads per thread for the per-head dispatch (fp32; bf16 ignores it).
 
-Measured on fp32, in-process interleaved, 15 rounds: with **2** heads per thread
-the per-head order wins every shape it is used at (256:16:128 1.18x,
-1024:16:128 1.09x, 2048:16:128 1.04x, 4096:16:128 1.06x), but with **4**
-(512:32:128) it is *slower* than the paired order and unstable --
-4065..5350 us over 15 rounds per round, against 4560..4731 for the paired order,
-median 4802 vs 4659. bf16 at the same shape wants the per-head order (1.17x,
-1547..1585), so the cap is fp32-only. Overridable for a sweep; 0 disables it.
+**Default 0 = no cap, and that is a measured reversal of an earlier "2".** The
+argument for capping was that fp32 512:32:128 (4 heads per thread) is slower
+with the per-head order than with the paired order and unstable: one process
+gave 4065..5350 us against 4560..4731. That does not reproduce. Measured three
+times in three separate processes with `tests/bench_vs_refs.py` (11 rounds,
+medians, ours and vLLM interleaved) on a quiet box, fp32 512:32:128 is
+**0.84, 0.85, 0.85** against vLLM with the per-head order and **0.94, 0.98,
+0.98** with the cap in place, i.e. the cap costs 12% on that row
+(`tests/ab_two_trees.py` --old main --new capped: 4027/4023/4024 us against
+4510/4516/4529 us, three interleaved runs of 15 rounds). The earlier spread was
+a harness artefact: a plan-level knob toggled inside one timing loop, which is
+the same class of error as clearing the plan cache mid-loop.
+
+The knob stays for sweeps (`CPU_ATTENTION_HEAD_RATIO=2`), and `0` disables it.
 """
 _HEAD_MAXK = os.environ.get("CPU_ATTENTION_HEAD_MAXK", "1073741824")
 """``CPU_ATTENTION_HEAD_MAXK``: max ``seq_k`` for the per-head dispatch.

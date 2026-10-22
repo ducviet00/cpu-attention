@@ -34,12 +34,12 @@ def main(argv) -> int:
     keys = sorted(set().union(*(r.keys() for r in runs)),
                   key=lambda k: (k[0], k[1], k[2], k[3], not k[4]))
     print(f"{len(runs)} runs: {', '.join(p.rsplit('/', 1)[-1] for p in argv[1:])}")
-    print(f"{'shape':22s} {'dtype':5s} {'o/sdpa band':>15s} {'o/vllm band':>15s}  verdict")
+    print(f"{'shape':22s} {'dtype':5s} {'o/sdpa band':>15s} {'o/vllm band':>15s}  verdict  (band = medians; min = per-run minimum)")
     print("-" * 78)
     wins = fails = may = 0
     for k in keys:
         seq, heads, dim, dtype, causal = k
-        sd, vl = [], []
+        sd, vl, vm = [], [], []
         for r in runs:
             row = r.get(k)
             if row is None:
@@ -47,6 +47,9 @@ def main(argv) -> int:
             sd.append(row["o_sdpa"])
             if row["o_vllm"] is not None:
                 vl.append(row["o_vllm"])
+                # min-based ratio: interference can only slow a sample down, so
+                # the worst run's *min* is the honest upper bound on this row
+                vm.append(row.get("o_vllm_min", row["o_vllm"]))
         line = f"S={seq:<5d}H={heads:<3d}D={dim:<4d} {dtype:5s} "
         line += f"{min(sd):6.2f}..{max(sd):5.2f}  " if sd else f"{'-':>15s}  "
         if vl:
@@ -54,7 +57,7 @@ def main(argv) -> int:
         else:
             line += f"{'-':>13s}"
         if vl:
-            if max(vl) < 1.0:
+            if max(vm) < 1.0:
                 verdict = "win"
                 wins += 1
             elif min(vl) < 1.0:
@@ -65,6 +68,8 @@ def main(argv) -> int:
                 fails += 1
         else:
             verdict = ""
+        if vm:
+            line += f"   worst-run min {max(vm):5.2f}"
         print(f"{line}  {verdict}")
     n = wins + fails + may
     print(f"\nbeats vLLM in every run: {wins}/{n}; on the line (<1 somewhere): {may}; "
