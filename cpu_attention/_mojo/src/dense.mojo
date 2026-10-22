@@ -2921,9 +2921,21 @@ def _dense_arm_rows[
         # at head_dim 128 is 32 accumulator registers beside 8 V and 4 panel
         # registers and spills: measured 12.39 cycles/row-key against 9.58 for
         # `dcp = 4` at 1024:16:128 (46.3 instructions against 33.1). It stays 4.
-        _dense_rows_tile[head_dim, qt, TILE_KS, 4, TILE_NSQ](
-            job, batch, head, kv_head, q0
-        )
+        #
+        # Keys per tile: 256 at head_dim 128, 128 below it. The per-tile cost
+        # (running max, `alpha`, the P@V accumulator round trip, tile prologue) is
+        # amortised over `qt * ks` row-keys, and at head_dim 128 the matmul per
+        # key is twice as large, so the same 256-key tile costs half as much per
+        # row-key. Measured cycles/row-key: 1024:16:128 9.74 (128 keys) / 9.18
+        # (256) / 9.52 (512); 2048:8:64 5.08 (128) / 5.31 (256) / 5.53 (64).
+        comptime if head_dim >= 128:
+            _dense_rows_tile[head_dim, qt, 256, 4, TILE_NSQ](
+                job, batch, head, kv_head, q0
+            )
+        else:
+            _dense_rows_tile[head_dim, qt, TILE_KS, 4, TILE_NSQ](
+                job, batch, head, kv_head, q0
+            )
     else:
         _dense_rows_tile_f32[head_dim, qt, TILE_KS_F32, 8, 8](
             job, batch, head, kv_head, q0
