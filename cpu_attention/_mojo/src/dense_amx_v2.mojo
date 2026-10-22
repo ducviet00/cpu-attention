@@ -81,16 +81,17 @@ reference oneDNN's bf16 GEMM reaches 1.11 TFLOP/s/core on this box, 33% of the
   super-tile, so that phase reported 0.3-1% and the shares summed past 100%.
   With the bit fixed here P@V is 14% of a 4096:16:128 call.
 
-## Where the time actually goes (v2, 4096:16:128 bf16, 25.2 ms)
+## Where the time actually goes (v2, 4096:16:128 bf16, 22.8 ms)
 
-    Q@K^T 7.2 ms (28%)   softmax 11.6 ms (45%)   P@V 3.6 ms (14%)
-    K/V pack 1.2 ms (5%)   epilogue 0.5 ms (2%)
+    Q@K^T 7.9 ms (35%)   softmax 8.9 ms (39%)   P@V 1.7 ms (7%)
+    K/V pack 1.3 ms (6%)   epilogue 0.5 ms (2%)   unattributed 2.7 ms (12%)
 
-against isolated floors of 0.17 / 0.176 / 0.11 ns per logit. QK and P@V sit at
-their floors; **the softmax runs at 0.343 ns/logit, 2x the same loop measured in
-isolation, and neither this kernel nor v1 beats that** -- that is the single
-biggest item left, worth ~1.4x on the whole call if it can be found, and it is
-not any of the six things listed above.
+in ns per logit that is 0.235 / 0.265 / 0.049 / 0.038 / 0.016, against isolated
+floors of 0.17 / 0.176 / 0.11. QK is 1.4x its floor, P@V is under it (the
+running V pointer above was worth 2x on that phase: 3.6 -> 1.7 ms), and **the
+softmax is 1.5x the same loop measured in isolation. Neither this kernel nor v1
+beats that, and it is not any of the six things listed above** -- it is the
+biggest single item left, worth ~1.3x on the whole call if it can be found.
 
 ## Net effect
 
@@ -1265,6 +1266,8 @@ def _v2_worker[
     # stall). `QROWS * MAXKT * 4` is exactly 64 KB, i.e. the worst possible
     # distance, so the probability slabs are shifted by 64 bytes: they stay
     # 64-byte aligned for the tile loads and stop being 4K-congruent.
+    # Measured: **no change**, so 4K aliasing is not what makes the softmax
+    # cost 2x its isolated rate. The shift is kept because it is free.
     var logits = stack_allocation[QROWS * MAXKT, Float32, alignment=64]()
     var prob_pad = stack_allocation[
         QROWS * MAXKT * nlo + 96, BFloat16, alignment=64
