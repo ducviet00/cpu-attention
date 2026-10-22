@@ -70,7 +70,6 @@ from std.math import fma, iota
 from std.memory import MutPointer, bitcast, stack_allocation
 from std.origin import MutUntrackedOrigin
 from std.sys.info import CompilationTarget
-
 from amx import (
     tile_cfg_load,
     tile_config_bf16,
@@ -135,6 +134,16 @@ def _exp2(x: SIMD[DType.float32, 16]) -> SIMD[DType.float32, 16]:
     the bf16 the probabilities are rounded to) and an exponent bit-insert for
     the 2**n scale. The clamp at -127 makes a fully masked lane underflow to +0,
     which P@V needs: `0 * garbage` must be 0.
+
+    Do not "optimise" this without an in-process A/B against this exact form:
+    a degree-3 polynomial for bf16, `round()` instead of the magic-constant
+    trick, a one-sided clamp and `llvm.ldexp` (one `vscalefps` per vector
+    instead of the bit insert) were all tried together and measured **0.73-0.91x**
+    -- i.e. 10-27% *slower* on every shape up to 1024 keys -- while a
+    single-threaded probe of the same loop showed it 8% faster. The probe runs
+    one thread with an L1-resident buffer; the kernel runs four. Suspect the
+    `vscalefps` dependency on the vector port that the tile loads also need;
+    untested, and the honest statement is that the replacement lost.
     """
     comptime V = SIMD[DType.float32, 16]
     comptime MAGIC = 12582912.0  # 1.5 * 2**23: round-to-nearest in fp32
@@ -780,6 +789,9 @@ def _amx_dense_item[
                 s0 = fma(s0, alpha, rows)
 
         # ---- P@V over the super-tile, two dim chunks (four accumulators) ----
+        # prob_lo is the lo slab of the same workspace (hi slab first), so one
+        # constant offset reaches it from the hi pointer.
+        comptime plo_off = QROWS * MAXKT * 2
         var nks = nk // 32 if (job.mode & 64) != 0 else (nk + 31) // 32
         var first = t0 == 0
         var dc = 0
@@ -799,8 +811,9 @@ def _amx_dense_item[
             for ks in range(nks):
                 var vb = ((t0 // 32) + ks) * DC16 * vstride
                 var vt_hi = Int(vbase) + (vb + dc * vstride) * 2
-                tile_load[0](Int(prob) + (ks * 32) * 2, pstride)
-                tile_load[1](Int(prob) + (16 * kt + ks * 32) * 2, pstride)
+                var pp0 = Int(prob) + (ks * 32) * 2
+                tile_load[0](pp0, pstride)
+                tile_load[1](pp0 + 16 * kt * 2, pstride)
                 tile_load[2](vt_hi, 64)
                 tile_load[3](vt_hi + vstride * 2, 64)
                 tile_dpbf16ps[4, 0, 2]()
@@ -815,16 +828,15 @@ def _amx_dense_item[
                     tile_dpbf16ps[5, 0, 3]()
                     tile_dpbf16ps[6, 1, 2]()
                     tile_dpbf16ps[7, 1, 3]()
-                    tile_load[0](Int(prob_lo) + (ks * 32) * 2, pstride)
-                    tile_load[1](
-                        Int(prob_lo) + (16 * kt + ks * 32) * 2, pstride
-                    )
+                    tile_load[0](pp0 + plo_off, pstride)
+                    tile_load[1](pp0 + 16 * kt * 2 + plo_off, pstride)
                     tile_load[2](vt_hi, 64)
                     tile_load[3](vt_hi + vstride * 2, 64)
                     tile_dpbf16ps[4, 0, 2]()
                     tile_dpbf16ps[5, 0, 3]()
                     tile_dpbf16ps[6, 1, 2]()
                     tile_dpbf16ps[7, 1, 3]()
+
             tile_store[4](Int(acc) + dc * 64, astride)
             tile_store[5](Int(acc) + (dc + 1) * 64, astride)
             tile_store[6](Int(acc) + (16 * D + dc * 16) * 4, astride)
