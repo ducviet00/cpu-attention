@@ -350,6 +350,29 @@ def _rows_small[
             var st = (sumv[0] + sumv[1]) + (sumv[2] + sumv[3])
             s_v[rp] = s_v[rp] + _swap_pairs(st) + st
 
+        # Is this the last tile of the block? Then the row sums are final and the
+        # output can be written straight out of the P@V chunk registers, which
+        # skips the accumulator's 4 KB round trip per block (the epilogue's loads
+        # and stores are the largest single term the ablation found).
+        var last = t0 + ks >= loop_end
+        var inv4s = Array[SIMD[DType.float32, 4], RP](uninitialized=True)
+        if last:
+            comptime for rp in range(RP):
+                var vv0 = seq_k > 0
+                var vv1 = vv0
+                if job.causal:
+                    vv0 = q0 + 2 * rp + diag + 1 > 0
+                    vv1 = q0 + 2 * rp + 1 + diag + 1 > 0
+                var j0 = Scalar[DType.float32](0.0)
+                var j1 = Scalar[DType.float32](0.0)
+                var q0s = s_v[rp][0]
+                var q1s = s_v[rp][2]
+                if vv0 and q0s > Scalar[DType.float32](0.0):
+                    j0 = Scalar[DType.float32](1.0) / q0s
+                if vv1 and q1s > Scalar[DType.float32](0.0):
+                    j1 = Scalar[DType.float32](1.0) / q1s
+                inv4s[rp] = SIMD[DType.float32, 4](j0, j0, j1, j1)
+
         # ---- 3. P@V over the tile, dcp dim pairs at a time.
         comptime for dc in range(0, DP, dcp):
             var accv = Array[SIMD[DType.float32, 4], RP * dcp](
@@ -380,61 +403,68 @@ def _rows_small[
                             accv[rp * dcp + d], ap[rp], vv
                         )
                 kg += 1
-            comptime for rp in range(RP):
-                comptime for d in range(dcp):
-                    acc.unsafe_store[width=4](
-                        (rp * DP + dc + d) * 4, accv[rp * dcp + d]
-                    )
+            if last:
+                # Normalise and de-interleave in registers: the same arithmetic
+                # the epilogue did, without the accumulator round trip.
+                comptime for rp in range(RP):
+                    var b0 = accv[rp * dcp + 0] * inv4s[rp]
+                    var b1 = accv[rp * dcp + 1] * inv4s[rp]
+                    var b2 = accv[rp * dcp + 2] * inv4s[rp]
+                    var b3 = accv[rp * dcp + 3] * inv4s[rp]
+                    if 2 * rp < nrows:
+                        o_base.unsafe_offset(
+                            (q0 + 2 * rp) * job.o_stride_t
+                        ).unsafe_store[width=8](
+                            2 * dc,
+                            b0.shuffle[0, 1, 4, 5](b1)
+                            .cast[DType.bfloat16]()
+                            .join(
+                                b2.shuffle[0, 1, 4, 5](b3).cast[
+                                    DType.bfloat16
+                                ]()
+                            ),
+                        )
+                    if 2 * rp + 1 < nrows:
+                        o_base.unsafe_offset(
+                            (q0 + 2 * rp + 1) * job.o_stride_t
+                        ).unsafe_store[width=8](
+                            2 * dc,
+                            b0.shuffle[2, 3, 6, 7](b1)
+                            .cast[DType.bfloat16]()
+                            .join(
+                                b2.shuffle[2, 3, 6, 7](b3).cast[
+                                    DType.bfloat16
+                                ]()
+                            ),
+                        )
+            else:
+                comptime for rp in range(RP):
+                    comptime for d in range(dcp):
+                        acc.unsafe_store[width=4](
+                            (rp * DP + dc + d) * 4, accv[rp * dcp + d]
+                        )
 
         t0 += ks
 
-    # Output: one row of `head_dim` bf16 per query row. The reciprocals for
-    # *all* row pairs are computed first so the divides are independent and
-    # issue together, instead of each row pair's 8 de-interleave chains waiting
-    # on its own scalar divide. Measured: 21.68-21.71 us against 21.67-21.83 for
-    # the per-pair form at 128:8:64, i.e. no change -- kept because it is free
-    # and reads better, not because it bought anything.
-    var inv4s = Array[SIMD[DType.float32, 4], RP](uninitialized=True)
-    comptime for rp in range(RP):
-        var vv0 = seq_k > 0
-        var vv1 = vv0
-        if job.causal:
-            vv0 = q0 + 2 * rp + diag + 1 > 0
-            vv1 = q0 + 2 * rp + 1 + diag + 1 > 0
-        var j0 = Scalar[DType.float32](0.0)
-        var j1 = Scalar[DType.float32](0.0)
-        var q0s = s_v[rp][0]
-        var q1s = s_v[rp][2]
-        if vv0 and q0s > Scalar[DType.float32](0.0):
-            j0 = Scalar[DType.float32](1.0) / q0s
-        if vv1 and q1s > Scalar[DType.float32](0.0):
-            j1 = Scalar[DType.float32](1.0) / q1s
-        inv4s[rp] = SIMD[DType.float32, 4](j0, j0, j1, j1)
-    comptime for rp in range(RP):
-        var inv4 = inv4s[rp]
-        comptime for h in range(DP // 4):
-            var a0 = acc.unsafe_load[width=4]((rp * DP + 4 * h) * 4) * inv4
-            var a1 = acc.unsafe_load[width=4]((rp * DP + 4 * h + 1) * 4) * inv4
-            var a2 = acc.unsafe_load[width=4]((rp * DP + 4 * h + 2) * 4) * inv4
-            var a3 = acc.unsafe_load[width=4]((rp * DP + 4 * h + 3) * 4) * inv4
+    # Output: one row of `head_dim` bf16 per query row -- already written by the
+    # last tile's fused store unless the block had no tile at all (loop_end <= 0),
+    # where nothing was ever accumulated and the row is zero.
+    if loop_end <= 0:
+        comptime for rp in range(RP):
             if 2 * rp < nrows:
-                o_base.unsafe_offset(
-                    (q0 + 2 * rp) * job.o_stride_t
-                ).unsafe_store[width=8](
-                    h * 8,
-                    a0.shuffle[0, 1, 4, 5](a1)
-                    .cast[DType.bfloat16]()
-                    .join(a2.shuffle[0, 1, 4, 5](a3).cast[DType.bfloat16]()),
-                )
+                var orow = o_base.unsafe_offset((q0 + 2 * rp) * job.o_stride_t)
+                comptime for i in range(DP // 4):
+                    orow.unsafe_store[width=8](
+                        i * 8, SIMD[DType.bfloat16, 8](0.0)
+                    )
             if 2 * rp + 1 < nrows:
-                o_base.unsafe_offset(
+                var orow1 = o_base.unsafe_offset(
                     (q0 + 2 * rp + 1) * job.o_stride_t
-                ).unsafe_store[width=8](
-                    h * 8,
-                    a0.shuffle[2, 3, 6, 7](a1)
-                    .cast[DType.bfloat16]()
-                    .join(a2.shuffle[2, 3, 6, 7](a3).cast[DType.bfloat16]()),
                 )
+                comptime for i in range(DP // 4):
+                    orow1.unsafe_store[width=8](
+                        i * 8, SIMD[DType.bfloat16, 8](0.0)
+                    )
 
 
 def _task_small[head_dim: Int, qt: Int, ks: Int](job: DenseJob, task: Int):

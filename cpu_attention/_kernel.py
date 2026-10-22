@@ -528,7 +528,7 @@ def set_qt(rows) -> None:
     global _QT_ENV
     _QT_ENV = str(int(rows)) if rows else None
 
-_SMALL_MAXK = int(os.environ.get("CPU_ATTENTION_SMALL_MAXK", "0"))
+_SMALL_MAXK = int(os.environ.get("CPU_ATTENTION_SMALL_MAXK", "256"))
 """``seq_k`` up to which the short-sequence kernel (``dense_small.mojo``) runs.
 
 That path is the shipped bf16 tile with the key coverage rounded to 8 keys
