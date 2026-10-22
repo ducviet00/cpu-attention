@@ -816,8 +816,12 @@ def _dense(q, k, v, scale: float, causal: bool, geom=None):
     the worker count, the scratch buffer, its strides, and the ~30 constant
     arguments the extension takes -- is built once per geometry by
     :func:`_dense_plan` and cached, which took the path from 3.5 us to ~1.5 us.
-    What is left per call is the output allocation, four ``data_ptr()`` reads,
-    one dict lookup and the extension call itself.
+    What is left per call is the output allocation (0.53 us), four
+    ``data_ptr()`` reads (0.25), one dict lookup (0.05) and the extension call
+    itself -- measured at **0.76 us for a 42-argument call with zero work in it**,
+    so the marshal is the floor and cutting the argument count is the only way
+    left. It is not worth it: that is 1.5% of a 51 us call at S=128 and nothing
+    above it.
     """
     out = _amx_dense(q, k, v, scale, causal)
     if out is not None:
