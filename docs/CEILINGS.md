@@ -10,14 +10,35 @@ The measured accounting for the rows that are still above 1 is now:
 | 2048:16:128 | 39+46% | 16% | 1.8% | 6.7% | 0.1% |
 | 4096:16:128 | 38+42% | 15% | 0.8% | 4.7% | 0.1% |
 
-The matmul is at the hardware floor for this kernel's load shape: `bfmmla` does
-208 MAC/ns/core with no loads and **105 with the 8 loads per 16 instructions the
-kernel emits** (the operand loads halve it), i.e. 840 MAC/ns over 8 cores, and we
-measure 94% of that — the same place vLLM sits. There is no 2x in the matmul, and
-the exp block is already down to a degree-2 polynomial. The two things we pay for
-that vLLM does not are the K/V pack (0.8-6.3%, the scorecard's contract: their
-cache is staged before the timer) and a Python call path (~4.5 us against ~1.5
-through pybind, which is the whole of the `128:8:64` gap).
+The matmul was recorded as being at the hardware floor for this kernel's load
+shape: `bfmmla` does 208 MAC/ns/core with no loads and **105 with the 8 loads per
+16 instructions the kernel emits** (the operand loads halve it), i.e. 840 MAC/ns
+over 8 cores, and we measure 94% of that — the same place vLLM sits.
+
+> **That paragraph is wrong and is corrected by measurement (2026-10-23,
+> `REMEASURE.md` §4a).** Two separate errors. (a) The pair "208 / 105" is one
+> rate in two units: this file's own table below says `bfmmla` is **2.0
+> instr/cycle = 32 MACs/cycle = 208 GFLOP/s/core**, i.e. 104 MAC/ns, which is
+> what `peak.c` prints (209-210 GFLOP/s) and what the "105" is. (b) The
+> 0.0769 ns/instr no-load measurement behind "208 MAC/ns" does not reproduce: a
+> hand-written asm loop with 16 accumulators and all 8 cores pinned measures
+> **128-134 MAC/ns** no-load, **114-115** with 8 loads per 16, and **144-145**
+> with the 4 `ldp` per 16 the kernel actually emits. 105 MAC/ns reproduces
+> exactly for an **8-accumulator** loop (0.152 ns/instr) and that loop is
+> latency-bound, so "the loads halve the MMA" was a loop-shape artefact.
+> Consequence: the Q@K^T + P@V phases (118-124 MAC/ns/core at 4096:16:128) are
+> at **82-85%** of the measured 4-load ceiling, and the whole call at 68%, not
+> 94%. The per-row conclusions below (D=128 long-S is capped at parity, D=64 has
+> room) do not depend on the exact ceiling and still hold; the *reason* given
+> for the cap does not.
+
+There is no 2x in the matmul, and the exp block is already down to a degree-2
+polynomial. The two things we pay for that vLLM does not are the K/V pack
+(0.6-1.7% of a call for S>=512, 3.5% at 256:16:128, 10% at 128:8:64 on the
+2026-10-23 instance — the 0.8-6.3% band here is narrow and wrong at both ends,
+`REMEASURE.md` §4b, and it is the scorecard's contract: their cache is staged
+before the timer) and a Python call path (~3.4 us against ~1.5 through pybind,
+which is most of the `128:8:64` gap).
 
 
 ## The ceiling on bf16

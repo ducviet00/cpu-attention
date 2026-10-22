@@ -211,6 +211,21 @@ and vLLM write. (The kernel actually runs slightly *above* this, because it
 emits `ldp` pairs: 4 load instructions per 16 `bfmmla`, where the probe issues
 8.)
 
+> **Re-measured on a fresh instance (2026-10-23, `REMEASURE.md` §4a): the
+> no-load row does not reproduce and the "loads halve it" mechanism is a
+> loop-shape artefact.** Hand-written asm, 16 accumulators, 8 cores pinned:
+> **128-134 MAC/ns** with no loads (0.119-0.126 ns/instr, not 0.0769),
+> **114-115** with 8 loads per 16, and **144-145** with the 4 `ldp` per 16 the
+> kernel actually emits — which is 1.4x the "ceiling" above. An 8-accumulator
+> loop measures 0.152 ns/instr (105 MAC/ns) on this box too (`peak.c` 209-210
+> GFLOP/s/core, `bfmmla_peak.mojo` 0.1519 ns/instr), which is what the table
+> above is: a *latency*-bound loop, not the issue limit. The parenthetical was
+> the tell — the probe issues 8 loads where the kernel issues 4, and 4 loads
+> cost nothing. Consequence: the Q@K^T + P@V phases are at 82-85% of the
+> measured 4-load ceiling, and the whole call at 68%, so "the matmul has 6%
+> left" understates it. The phase shares and the per-row conclusions in this
+> file are unaffected; the ceiling needs the new numbers.
+
 **(b) The phase split**, `tests/bench_ablate.py` (a runtime phase-ablation
 selector added for this, on the `arm-floor` branch only -- the guards cost 2-3%
 of a D=128 call so nothing below is judged on that build), `qt=8`, two runs,

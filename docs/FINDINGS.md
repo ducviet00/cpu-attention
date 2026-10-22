@@ -126,6 +126,17 @@ Measured by wrapping the extension entry with a no-op:
 | geometry + plan key + dict lookup | 0.5 |
 | the 40 argument checks | ~0.3 |
 
+> **Re-measured on a fresh instance (2026-10-23, `REMEASURE.md` §5).** The
+> column above is from the previous box and two of its entries do not transfer.
+> Same method, 400-800 rounds, box idle: `flash_attn_func` **21.4 us** (kernel
+> included), the Python path with the seven-argument entry no-op'd **3.40 us**
+> (min 3.25), with the 42-argument entry no-op'd **3.80 us** — so the plan
+> buffer is worth **0.40 us**, not 1.87 — `torch.empty(q.shape)` **1.36 us**
+> (not 0.56), and the plan key + `dict.get` **0.027 us**. The Python path is
+> therefore 15.9% of the call, not 11%, and the output allocation is its largest
+> single item. The direction of the doc's conclusion (the marshal is not the
+> lever; leaving Python is) stands; the sizes do not.
+
 vLLM reaches its kernel through pybind for ~1.5 us, so ~3 us of a 25 us call is
 our Python. Two attempts: caching the validation saves 0.26 us (not worth a
 cache), and a plan-buffer ABI (5 args instead of 42) saves ~1 us but needs 49
@@ -143,9 +154,44 @@ took the call path from 4.47 us to ~2.6 us, worth 5% of a 24 us call at
 kept. The remaining route would be to leave Python entirely, which is an engine
 change, not a kernel change.
 
+**Corrected 2026-10-23 (fresh instance, same method):** the seven-argument
+entry is worth **0.40 us**, not 1.87, and the call path is **3.40 us of a
+21.4 us call**, not 2.6 of 24. The output allocation measures **1.36 us** on
+this box (0.56 on the old one) and is the largest item; the plan key and the
+dict lookup are 0.027 us together. See `docs/REMEASURE.md` §5 — quote the new
+numbers, not this paragraph's.
+
 ## 7. Where the *rest* of the 128:8:64 budget goes
 
 25 us = kernel 19.6 + pack 2.4 + Python 4.5 (overlapping a little). vLLM's 22 =
 attention 21 + ~1.5 Python, with its cache staged **outside** the timer. So on
 that row we win the kernel by 6% and lose 2.4 us of pack (charged to us by the
 scorecard's contract) and ~3 us of Python.
+
+## 8. Re-measured on a fresh instance, 2026-10-23 (`docs/REMEASURE.md`)
+
+Same box type (m9g.2xlarge, Neoverse-V3), new physical host, `main` @ `973cce9`.
+The §1 peaks are the part of this file that does **not** transfer, and they are
+the part the campaign's ceiling argument used:
+
+| quantity | this file §1 | re-measured |
+|---|---:|---:|
+| `bfmmla`, no loads, 16 accumulators | 208 MAC/ns/core (0.0769 ns/instr) | **128-134 MAC/ns** (0.119-0.126 ns/instr) |
+| `bfmmla`, 8 loads per 16 | 105 MAC/ns/core (0.1527 ns/instr) | **114-115** (0.139-0.141) |
+| `bfmmla`, 4 `ldp` per 16 (the kernel's shape) | not measured | **144-145** (0.110-0.111) |
+| `bfmmla`, 8 accumulators (the shipped probes) | 105 | **105** — reproduces exactly (`peak.c` 209-210 GFLOP/s/core) |
+| `fmla` f32 | 39-52 MAC/ns | not re-measured |
+| `bfdot` | 39 | 140 GFLOP/s/core = 35 MAC/ns (`peak.c`, reproduces) |
+
+The hand-written asm probe is `/tmp/opencode/remeasure/bfmmla_probe.c`
+(16 accumulators, 8 threads pinned one per core, per-core min). The finding: the
+documented no-load figure is 1.55x faster than this core delivers, and the
+"loads halve it" ratio is a property of an 8-accumulator latency-bound loop, not
+of the operand loads. What *does* reproduce is 105 MAC/ns for that
+8-accumulator loop, which is why every shipped probe agrees with the old number.
+
+Also re-measured, and different from this file: the call path (§6/§6a above,
+3.40 us not 2.6), the pack rate and share (§7's 2.4 us at 128:8:64 is 2.16 us,
+but it is 10% of a 21.4 us call), and the row counts (18/22 vs vLLM on the min,
+not 19/22). The harness rules in §5 all held: min-based ratios, a control arm
+(0.97-1.05), and a box idle at load < 0.3.
