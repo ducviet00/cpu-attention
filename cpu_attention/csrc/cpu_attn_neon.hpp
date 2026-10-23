@@ -899,10 +899,12 @@ struct PagedF32 {
     float* vp =
         reinterpret_cast<float*>(static_cast<char*>(job.v_cache) + base);
     const int64_t kvst = kv_stride_of(job);
+    // The new K/V carries one head per *kv* head (GQA packs several query
+    // heads on one), so the source is indexed by `kvh`, not by the query head.
     const float* ks =
-        reinterpret_cast<const float*>(job.k) + seq * kvst + head * HD;
+        reinterpret_cast<const float*>(job.k) + seq * kvst + kvh * HD;
     const float* vs =
-        reinterpret_cast<const float*>(job.v) + seq * kvst + head * HD;
+        reinterpret_cast<const float*>(job.v) + seq * kvst + kvh * HD;
     for (int d = 0; d < HD; ++d) kp[d * job.page + off] = ks[d];
     std::memcpy(vp + off * HD, vs, sizeof(float) * HD);
   }
@@ -1067,9 +1069,9 @@ struct PagedBF {
     char* vp = static_cast<char*>(job.v_cache) + base;
     const int64_t kvst = kv_stride_of(job);
     const char* ks =
-        static_cast<const char*>(job.k) + (seq * kvst + head * HD) * 2;
+        static_cast<const char*>(job.k) + (seq * kvst + kvh * HD) * 2;
     const char* vs =
-        static_cast<const char*>(job.v) + (seq * kvst + head * HD) * 2;
+        static_cast<const char*>(job.v) + (seq * kvst + kvh * HD) * 2;
     for (int dp = 0; dp < HD / 2; ++dp)
       std::memcpy(kp + (dp * job.page + off) * 4, ks + dp * 4, 4);
     char* vdst = vp + ((off / 2) * HD + 0) * 4 + (off & 1) * 2;
