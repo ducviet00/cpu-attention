@@ -181,28 +181,35 @@ inline __m512 exp2v(__m512 x) {
   return _mm512_mul_ps(p, _mm512_castsi512_ps(e));
 }
 
-// 16x16 transpose of 32-bit units, in place over 16 zmm. Four shuffle stages;
-// every stage writes back the pair it read, so the peak is 16 + 2 live
-// registers rather than 32 (the two-array form cost ~25% of the K pack in the
-// Mojo tree). Bit-identical for integer data: the float shuffles are lane
-// permutations.
-inline void transpose16x16(__m512* r) {
-  __m512 t[16], u[16];
-  for (int i = 0; i < 8; ++i) {
-    t[2 * i] = _mm512_unpacklo_ps(r[2 * i], r[2 * i + 1]);
-    t[2 * i + 1] = _mm512_unpackhi_ps(r[2 * i], r[2 * i + 1]);
+// 16x16 transpose of 32-bit units, in place over 16 zmm: three shuffle stages,
+// each writing back the pair it read so the live set is 16 + 4 registers rather
+// than 32 (`t[16]` + `u[16]` live at once does spill, and the two-array form
+// needs no extra shuffles -- it is strictly worse). Bit-identical for integer
+// data: every stage is a lane permutation.
+//
+// The pack is memory-bound, not shuffle-bound: measured 21 GB/s on one thread
+// and 60-111 GB/s on four, against a measured 62-70 GB/s DRAM ceiling for this
+// box (`docs/AUDIT.md`). `always_inline` here is for the register file, not for
+// bandwidth; it moved the pack by 0-3%.
+__attribute__((always_inline)) inline void transpose16x16(__m512* r) {
+  for (int i = 0; i < 16; i += 2) {
+    const __m512 a = r[i], b = r[i + 1];
+    r[i] = _mm512_unpacklo_ps(a, b);
+    r[i + 1] = _mm512_unpackhi_ps(a, b);
   }
-  for (int i = 0; i < 4; ++i) {
-    u[4 * i + 0] = _mm512_shuffle_ps(t[4 * i + 0], t[4 * i + 2], 0x44);
-    u[4 * i + 1] = _mm512_shuffle_ps(t[4 * i + 0], t[4 * i + 2], 0xEE);
-    u[4 * i + 2] = _mm512_shuffle_ps(t[4 * i + 1], t[4 * i + 3], 0x44);
-    u[4 * i + 3] = _mm512_shuffle_ps(t[4 * i + 1], t[4 * i + 3], 0xEE);
+  for (int i = 0; i < 16; i += 4) {
+    const __m512 a0 = r[i], a1 = r[i + 1], a2 = r[i + 2], a3 = r[i + 3];
+    r[i + 0] = _mm512_shuffle_ps(a0, a2, 0x44);
+    r[i + 1] = _mm512_shuffle_ps(a0, a2, 0xEE);
+    r[i + 2] = _mm512_shuffle_ps(a1, a3, 0x44);
+    r[i + 3] = _mm512_shuffle_ps(a1, a3, 0xEE);
   }
   for (int j = 0; j < 4; ++j) {
-    const __m512 p0 = _mm512_shuffle_f32x4(u[j], u[4 + j], 0x88);
-    const __m512 p1 = _mm512_shuffle_f32x4(u[j], u[4 + j], 0xDD);
-    const __m512 q0 = _mm512_shuffle_f32x4(u[8 + j], u[12 + j], 0x88);
-    const __m512 q1 = _mm512_shuffle_f32x4(u[8 + j], u[12 + j], 0xDD);
+    const __m512 a0 = r[j], a1 = r[j + 4], a2 = r[j + 8], a3 = r[j + 12];
+    const __m512 p0 = _mm512_shuffle_f32x4(a0, a1, 0x88);
+    const __m512 p1 = _mm512_shuffle_f32x4(a0, a1, 0xDD);
+    const __m512 q0 = _mm512_shuffle_f32x4(a2, a3, 0x88);
+    const __m512 q1 = _mm512_shuffle_f32x4(a2, a3, 0xDD);
     r[j + 0] = _mm512_shuffle_f32x4(p0, q0, 0x88);
     r[j + 8] = _mm512_shuffle_f32x4(p0, q0, 0xDD);
     r[j + 4] = _mm512_shuffle_f32x4(p1, q1, 0x88);
@@ -223,7 +230,7 @@ struct Dense {
   // Query rows per work item and per register tile: two 16-row AMX groups.
   static constexpr int RQT = 32;
   // Largest super-tile: the level the driver's logits/acc/P buffers are sized
-  // for. `kt` is a runtime knob (kelvin: 128/256/512 all legal).
+  // for. `kt` is a runtime knob (CPU_ATTENTION_KT; 128/256/512 all legal).
   static constexpr int KTMAX = 1024;
   // Largest `rq` the per-thread buffers are laid out for (env RQ sweep).
   static constexpr int AROWS = 64;
