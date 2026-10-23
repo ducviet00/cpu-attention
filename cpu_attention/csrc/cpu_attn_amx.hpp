@@ -564,7 +564,10 @@ struct Dense {
         a = 0.0f;
       } else if (mxv > mo + slack) {
         mn = mxv;
-        a = std::exp2((mo - mn) * c);
+        // `mo`/`mn` are already in log2 units (the logits were scaled by
+        // c = scale*log2e above), so no further factor here. Multiplying by c
+        // again leaves the old accumulator over-weighted.
+        a = std::exp2(mo - mn);
       } else {
         mn = mo;
         a = 1.0f;
