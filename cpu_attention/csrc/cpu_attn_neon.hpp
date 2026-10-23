@@ -157,12 +157,31 @@ inline size_t round64(size_t n) { return (n + 63) & ~size_t(63); }
 template <int HD>
 struct DenseF32 {
   static constexpr int RQT = 8;
-  static constexpr int KT = HD == 128 ? 1024 : 256;
-  static constexpr int RQ = HD == 128 ? 32 : 64;
-  static constexpr int AROWS = ((RQ + RQT - 1) / RQT) * RQT;
+  static constexpr int KTMAXV = 2048;
 
-  static int kt_() { return KT; }
-  static int rq(int64_t, int) { return RQ; }
+  static int kt_() {
+    static const int k = env_int("CPU_ATTENTION_KT", 0, 0, KTMAXV);
+    if (k) return k;
+    return HD >= 128 ? 1024 : 256;
+  }
+  // Work item = (batch, q head, q tile) with vLLM's q tile: as many rows as fit
+  // the tile, so one K/V sweep feeds them and the accumulator lives in L2 rather
+  // than the register file.
+  static int& rq_cached() {
+    static int v = 64;
+    return v;
+  }
+  static int rq(int64_t seq_q, int) {
+    static const int fixed = env_int("CPU_ATTENTION_RQ", 0, 0, 4096);
+    const int64_t base =
+        seq_q <= 512 ? seq_q : (HD >= 128 ? int64_t(128) : int64_t(64));
+    const int64_t want = fixed > 0 ? fixed : base;
+    const int64_t capped = std::min<int64_t>(want, std::max<int64_t>(seq_q, 1));
+    const int v =
+        static_cast<int>(std::max<int64_t>(RQT, (capped / RQT) * RQT));
+    rq_cached() = v;
+    return v;
+  }
   // `pv` runs its row loop over the whole register tile, so the accumulator is
   // sized for roundup(rq, RQT) rows even when the last block is short.
   static int acc_rows(int rq_) { return ((rq_ + RQT - 1) / RQT) * RQT; }
@@ -170,20 +189,19 @@ struct DenseF32 {
   static size_t slab_bytes(int64_t seq_k, int) {
     return static_cast<size_t>(2) * pad_of(seq_k) * HD * 4;
   }
-  // [logits RQT*KT f32][acc AROWS*HD f32][m,l,alpha RQ][tmax RQT][P_T]
-  static size_t aux_bytes(int, int) {
-    return round64(static_cast<size_t>(RQT) * KT * 4 +
-                   static_cast<size_t>(AROWS) * HD * 4 +
-                   static_cast<size_t>(RQ) * 3 * 4 +
+  // [logits RQT*kt f32][acc acc_rows(rq)*hd f32][m,l,alpha rq][tmax RQT][P_T]
+  static size_t aux_bytes(int rq_, int) {
+    return round64(static_cast<size_t>(RQT) * kt_() * 4 +
+                   static_cast<size_t>(acc_rows(rq_)) * HD * 4 +
+                   static_cast<size_t>(rq_) * 3 * 4 +
                    static_cast<size_t>(RQT) * 4 + 64 +
-                   static_cast<size_t>(KT) * RQT * 4);
+                   static_cast<size_t>(kt_()) * RQT * 4);
   }
-  // The probability panel and the per-row tile max start past the driver's own
-  // regions, all of which are sized by the compile-time RQ, so `logits` alone
-  // locates them.
   static float* tmax_of(float* logits) {
-    return logits + static_cast<size_t>(RQT) * KT +
-           static_cast<size_t>(AROWS) * HD + static_cast<size_t>(RQ) * 3;
+    const int rq_ = rq_cached();
+    return logits + static_cast<size_t>(RQT) * kt_() +
+           static_cast<size_t>(acc_rows(rq_)) * HD +
+           static_cast<size_t>(rq_) * 3;
   }
   static float* pof(float* logits) { return tmax_of(logits) + RQT + 16; }
 
@@ -232,6 +250,7 @@ struct DenseF32 {
   static void qk(const DenseJob& job, const char* slab, int64_t b, int64_t kvh,
                  const char* q_base, int nrows, int64_t k0, int nkeys,
                  int64_t row_limit0, float* logits) {
+    const int KT = kt_();
     const int64_t pad = pad_of(job.seq_k);
     const int64_t qt = job.qt;
     const float* kd = reinterpret_cast<const float*>(slab);
@@ -322,6 +341,7 @@ struct DenseF32 {
     // Four rows at a time: the four exp vectors are transposed so the P panel
     // ([key][row]) is written with one 16-byte store per key instead of four
     // strided 4-byte lane stores, and the four chains give the exp some ILP.
+    const int KT = kt_();
     float* pt = pof(logits);
     const float* tm = tmax_of(logits);
     const float32x4_t vc = vdupq_n_f32(c);
@@ -387,6 +407,7 @@ struct DenseF32 {
   static void pv(const DenseJob& job, const char* slab, int64_t b, int64_t kvh,
                  int64_t k0, int nkeys, const float* logits, int nrows,
                  float* acc) {
+    const int KT = kt_();
     const float* pt = pof(const_cast<float*>(logits));
     const float* vd =
         reinterpret_cast<const float*>(slab) + pad_of(job.seq_k) * HD;
@@ -422,33 +443,51 @@ struct DenseF32 {
 template <int HD>
 struct DenseBF {
   static constexpr int RQT = 8;
-  static constexpr int KT = HD == 128 ? 1024 : 256;
-  static constexpr int RQ = HD == 128 ? 32 : 64;
-  static constexpr int AROWS = ((RQ + RQT - 1) / RQT) * RQT;
+  static constexpr int KTMAXV = 2048;
   static constexpr int DG = HD / 4;   // head-dim groups of 4
-  static constexpr int KG = KT / 4;   // 4-key groups per tile
   static constexpr int RP = RQT / 2;  // row pairs
 
-  static int kt_() { return KT; }
-  static int rq(int64_t, int) { return RQ; }
+  static int kt_() {
+    static const int k = env_int("CPU_ATTENTION_KT", 0, 0, KTMAXV);
+    if (k) return k;
+    return HD >= 128 ? 1024 : 256;
+  }
+  static int& rq_cached() {
+    static int v = 64;
+    return v;
+  }
+  static int rq(int64_t seq_q, int) {
+    static const int fixed = env_int("CPU_ATTENTION_RQ", 0, 0, 4096);
+    const int64_t base =
+        seq_q <= 512 ? seq_q : (HD >= 128 ? int64_t(128) : int64_t(64));
+    const int64_t want = fixed > 0 ? fixed : base;
+    const int64_t capped = std::min<int64_t>(want, std::max<int64_t>(seq_q, 1));
+    const int v =
+        static_cast<int>(std::max<int64_t>(RQT, (capped / RQT) * RQT));
+    rq_cached() = v;
+    return v;
+  }
+
   static int acc_rows(int rq_) { return ((rq_ + RQT - 1) / RQT) * RQT; }
 
   static size_t slab_bytes(int64_t seq_k, int) {
     return static_cast<size_t>(pad_of(seq_k)) * HD * 2 * 2;
   }
-  // [logits RQT*KT f32][acc AROWS*HD f32][m,l,alpha RQ][tmax RQT]
-  // [Qpack RQT*HD bf16][P RP*KG*8 bf16]
-  static size_t aux_bytes(int, int) {
-    return round64(static_cast<size_t>(RQT) * KT * 4 +
-                   static_cast<size_t>(AROWS) * HD * 4 +
-                   static_cast<size_t>(RQ) * 3 * 4 +
+  // [logits RQT*kt f32][acc acc_rows(rq)*hd f32][m,l,alpha rq][tmax RQT]
+  // [Qpack RQT*HD bf16][P RP*(kt/4)*8 bf16]
+  static size_t aux_bytes(int rq_, int) {
+    return round64(static_cast<size_t>(RQT) * kt_() * 4 +
+                   static_cast<size_t>(acc_rows(rq_)) * HD * 4 +
+                   static_cast<size_t>(rq_) * 3 * 4 +
                    static_cast<size_t>(RQT) * 4 + 64 +
                    static_cast<size_t>(RQT) * HD * 2 +
-                   static_cast<size_t>(RP) * KG * 8 * 2);
+                   static_cast<size_t>(RP) * (kt_() / 4) * 8 * 2);
   }
   static float* tmax_of(float* logits) {
-    return logits + static_cast<size_t>(RQT) * KT +
-           static_cast<size_t>(AROWS) * HD + static_cast<size_t>(RQ) * 3;
+    const int rq_ = rq_cached();
+    return logits + static_cast<size_t>(RQT) * kt_() +
+           static_cast<size_t>(acc_rows(rq_)) * HD +
+           static_cast<size_t>(rq_) * 3;
   }
   static char* qpack_of(float* logits) {
     return reinterpret_cast<char*>(tmax_of(logits) + RQT + 16);
@@ -510,6 +549,7 @@ struct DenseBF {
   static void qk(const DenseJob& job, const char* slab, int64_t b, int64_t kvh,
                  const char* q_base, int nrows, int64_t k0, int nkeys,
                  int64_t row_limit0, float* logits) {
+    const int KT = kt_();
     const int64_t pad = pad_of(job.seq_k);
     const int64_t qt = job.qt;
     const char* kd = slab;
@@ -600,6 +640,8 @@ struct DenseBF {
     // A row pair at a time: the two rows of a P@V operand group are adjacent
     // halves of one 16-byte group, so both are written by a single full store
     // (and the two exp chains interleave).
+    const int KT = kt_();
+    const int KG = KT / 4;
     char* pt = pof(logits);
     const float* tmv = tmax_of(logits);
     const float32x4_t vc = vdupq_n_f32(c);
@@ -650,6 +692,7 @@ struct DenseBF {
   static void pv(const DenseJob& job, const char* slab, int64_t b, int64_t kvh,
                  int64_t k0, int nkeys, const float* logits, int nrows,
                  float* acc) {
+    const int KG = kt_() / 4;
     const char* pt = pof(const_cast<float*>(logits));
     const int64_t pad = pad_of(job.seq_k);
     const int64_t kgn = pad / 4;
