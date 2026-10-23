@@ -9,8 +9,15 @@ works as a standalone library.
   one query token per sequence.
 * `flash_attn_func` — dense attention over whole prompts, causal or not.
 * fp32 and bf16, MHA / MQA / GQA, head_dim 32/64/128.
-* Linux, PyTorch, Python ≥ 3.10. The build needs the `mojo` wheel (installed by
-  the `build` extra), not a separate Mojo toolchain.
+* Two interchangeable kernels behind one API: a C++ backend in
+  `cpu_attention/csrc/` and the original Mojo kernel in
+  `cpu_attention/_mojo/`. `CPU_ATTENTION_BACKEND=auto|cpp|mojo` selects one;
+  `auto` (the default) is `cpp` on x86-64 and `mojo` on aarch64, which is where
+  each measured ahead — see [`docs/CPP_REPORT.md`](docs/CPP_REPORT.md). Both
+  shared objects load in one process, so `tests/bench_cpp.py` A/Bs them.
+* Linux, PyTorch, Python ≥ 3.10. The Mojo backend's build needs the `mojo` wheel
+  (installed by the `build` extra), not a separate Mojo toolchain; the C++ one
+  needs only `g++`.
 
 ## Performance
 
@@ -91,6 +98,23 @@ column is against vLLM's VEC (x86) or NEON (ARM) build.
 
 Ryzen paged uses 40-call blocks; the server paged columns use 15 interleaved
 rounds. See [`TECHNICAL.md`](TECHNICAL.md) for the protocol.
+
+### The C++ backend
+
+`uv run --extra build python scripts/build_cpp.py` builds `_C_cpp.so`;
+`tests/bench_cpp.py` (servers) or `tests/bench_matrix.py` (laptop) measure it
+against the Mojo backend and vLLM in one process with a duplicate control arm.
+Headline ratios `cpp / baseline`, below 1 is faster, full tables and the
+falsification ledger in [`docs/CPP_REPORT.md`](docs/CPP_REPORT.md):
+
+| | Ryzen 7840H | Graviton 5 | Xeon (4C) |
+|---|---|---|---|
+| dense bf16 vs Mojo / vs vLLM | 0.51-0.74 / 0.46-0.69 | 1.03-1.19 / 0.91-1.05 | 0.94-1.09 / 0.74-1.00 |
+| dense fp32 vs Mojo / vs vLLM | 0.60-0.98 / 0.80-1.09 | 0.97-1.14 / 0.88-1.07 | 0.94-1.14 / 0.49-0.83 |
+| paged vs Mojo / vs vLLM | 0.32-1.01 / 0.35-1.01 | 0.44-0.99 / 0.26-1.04 | see `docs/amx/AMX_PAGED.md` |
+
+In the engine (`fast-encdec/benchmarks/kernel_ab.py`) the per-step attention is
+0.44-0.90 of the vendored C++ backend, i.e. 1.1-2.3x faster end to end.
 
 ### The short version
 
