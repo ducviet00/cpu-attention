@@ -154,16 +154,12 @@ inline size_t round64(size_t n) { return (n + 63) & ~size_t(63); }
 // ===========================================================================
 // dense fp32
 // ===========================================================================
-template <int HD>
+template <int HD, int KTC>
 struct DenseF32 {
   static constexpr int RQT = 8;
   static constexpr int KTMAXV = 2048;
 
-  static int kt_() {
-    static const int k = env_int("CPU_ATTENTION_KT", 0, 0, KTMAXV);
-    if (k) return k;
-    return HD >= 128 ? 1024 : 256;
-  }
+  static constexpr int kt_() { return KTC; }
   // Work item = (batch, q head, q tile) with vLLM's q tile: as many rows as fit
   // the tile, so one K/V sweep feeds them and the accumulator lives in L2 rather
   // than the register file.
@@ -440,18 +436,14 @@ struct DenseF32 {
 // ===========================================================================
 // dense bf16 (bfmmla on both phases)
 // ===========================================================================
-template <int HD>
+template <int HD, int KTC>
 struct DenseBF {
   static constexpr int RQT = 8;
   static constexpr int KTMAXV = 2048;
   static constexpr int DG = HD / 4;   // head-dim groups of 4
   static constexpr int RP = RQT / 2;  // row pairs
 
-  static int kt_() {
-    static const int k = env_int("CPU_ATTENTION_KT", 0, 0, KTMAXV);
-    if (k) return k;
-    return HD >= 128 ? 1024 : 256;
-  }
+  static constexpr int kt_() { return KTC; }
   static int& rq_cached() {
     static int v = 64;
     return v;
@@ -1074,7 +1066,17 @@ bool available() {
 }
 
 void dense(const DenseJob& job, int workers) {
-#define ATTN_DN(DT, HD) dense_run<Dense##DT<HD>>(job, workers)
+  // The k tile is a compile-time constant in the kernel (it is the logits row
+  // stride, the probability-panel geometry and every tile offset), so the two
+  // shipped sizes get their own instantiation and the choice is one branch.
+  // `CPU_ATTENTION_KT` still selects between them (>= 512 means the big tile).
+  const int kt_env = env_int("CPU_ATTENTION_KT", 0, 0, DenseF32<128, 256>::KTMAXV);
+  const bool big = kt_env ? (kt_env >= 512) : (job.head_dim >= 128);
+#define ATTN_DN(DT, HD)                                                    \
+  do {                                                                     \
+    if (big) dense_run<Dense##DT<HD, 1024>>(job, workers);                  \
+    else dense_run<Dense##DT<HD, 256>>(job, workers);                       \
+  } while (0)
   if (job.dtype == kF32) {
     if (job.head_dim == 32) ATTN_DN(F32, 32);
     else if (job.head_dim == 64) ATTN_DN(F32, 64);
