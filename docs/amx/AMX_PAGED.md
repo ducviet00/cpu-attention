@@ -56,6 +56,13 @@ accumulator, `jj / page` inside the key loops.
    exponential (`exp2(fma(logit, c, -m))`) so the max pass only reads, instead of
    scaling and storing the whole tile. bf16 uses the degree-2 polynomial.
 
+**Loop shape is per dtype**, from an in-process A/B against the vec policy:
+bf16 takes the dim-outer Q@K^T (1.08-1.39x over the vec shape at every shape) and
+two P@V lanes; fp32 takes the dim-inner Q@K^T and one lane, which is parity with
+the vec shape at 256/1024/4096 keys and 6% better at b=32. The dim-outer form
+costs fp32 6-9% at three of five shapes — fp32 issues twice the loads per dim, so
+four chains fight for load slots instead of hiding them.
+
 Kept from the vec policy unchanged: the cache layout (byte for byte, so
 `reshape_and_cache` and the engine's staged cross cache keep working), the
 online-softmax scheme with the running max, and `KT = 512` keys per tile.
@@ -146,6 +153,29 @@ Against vLLM's VEC build (both dtypes) in one process: **18/20 rows win**
 `fp32 b=1/4096` (1.20). Against the better build per row: **14/20**. The
 independent harness (`audit/audit_paged.py`, own ground truth) reads the same:
 
+### The drift-free comparison: new policy vs the vec policy it replaces
+
+Same process, same tensors, arms rotated, `min` of 15, `ctrl` = duplicate of
+`new` (so `new/ctrl` is the floor, 0.94-1.05):
+
+| row | dt | new | vec | new/vec | new/ctrl |
+|---|---|---:|---:|---:|---:|
+| b=1 ctx=256 | bf16 | 10.0 | 14.0 | **0.718** | 0.82 |
+| b=8 ctx=256 | bf16 | 70.9 | 89.7 | **0.791** | 1.01 |
+| b=8 ctx=1024 | bf16 | 371.9 | 436.7 | **0.852** | 1.00 |
+| b=32 ctx=1024 | bf16 | 1777.6 | 2050.8 | **0.867** | 1.02 |
+| b=1 ctx=4096 | bf16 | 219.7 | 236.5 | **0.929** | 1.02 |
+| b=1 ctx=256 | fp32 | 12.6 | 12.0 | 1.044 | 1.03 |
+| b=8 ctx=256 | fp32 | 199.7 | 196.0 | 1.019 | 0.94 |
+| b=8 ctx=1024 | fp32 | 834.9 | 815.9 | 1.023 | 1.02 |
+| b=32 ctx=1024 | fp32 | 3747.5 | 3995.4 | **0.938** | 1.00 |
+| b=1 ctx=4096 | fp32 | 414.2 | 410.3 | 1.010 | 0.98 |
+
+So the kernel is a **1.08-1.39x win on bf16 and parity on fp32** relative to what
+it replaces.
+
+### Against vLLM (independent harness)
+
 | row | dt | ours/vllm (min, median) |
 |---|---|---|
 | self b=8/1024 | bf16 | 0.84, 0.83 |
@@ -165,7 +195,12 @@ independent harness (`audit/audit_paged.py`, own ground truth) reads the same:
 | self b=1/4096 | fp32 | 1.23, 1.24 |
 | cross b=1/4096 | fp32 | 1.26, 1.24 |
 
-**Where the control says the row is not resolvable**: `ctrl/ours` is 0.96-1.05
+**Where the control says the row is not resolvable**: vLLM's *own* fp32 paged
+numbers move 726-901 us for `b=8/1024` between runs of the same binary (25%), and
+its bf16 `b=8/1024` moves 387-420; our ctrl stays inside 0.94-1.05 of `new` in
+every run. So the rows quoted at 0.98-1.06 are parity, not a resolved win or
+loss. `fp32 b=1/4096` (1.19-1.26) and `fp32 b=8/256` (1.08-1.20) are the two
+consistent deficits.: `ctrl/ours` is 0.96-1.05
 in the table above, but vLLM's *own* fp32 numbers move 721-901 µs across runs for
 `b=8/1024` (25%), which is why that row reads 0.92 in one harness and 1.14 in
 the other. `bf16 b=8/1024` is the same story (vLLM 387-416 across runs). Both

@@ -813,16 +813,20 @@ struct Paged {
     return d;
   }
 
-  // Loop-shape selectors, swept in `docs/amx/AMX_PAGED.md` and then fixed per
-  // dtype: `CPU_ATTENTION_PAGED_QK` 1 = the reference dim-inner shape (one
-  // accumulator per 16-key group), 0 = dim-outer with R independent chains;
-  // `CPU_ATTENTION_PAGED_PV` 1 = one accumulator lane, 0 = two over key parity.
+  // Loop shapes, chosen per dtype from an in-process A/B against the vec policy
+  // (`docs/amx/AMX_PAGED.md` §5). bf16 takes the dim-outer Q@K^T (1.09-1.25x
+  // over the vec shape at every shape) and two P@V lanes; fp32 takes the
+  // dim-inner Q@K^T and one lane, which is *parity* with the vec shape at
+  // 256/1024/4096 keys and 2.5-4% better at b=32 -- the dim-outer form costs
+  // fp32 6-9% at three of the five shapes, because fp32 does twice the loads per
+  // dim and the 4-way chains then fight for load slots instead of hiding them.
+  // Both remain env-switchable for A/B: QK 1 = dim-inner, PV 1 = one lane.
   static int qk_old_shape() {
-    static const int v = env_int("CPU_ATTENTION_PAGED_QK", 0, 0, 1);
+    static const int v = env_int("CPU_ATTENTION_PAGED_QK", BF ? 0 : 1, 0, 1);
     return v;
   }
   static int pv_one_lane() {
-    static const int v = env_int("CPU_ATTENTION_PAGED_PV", 0, 0, 1);
+    static const int v = env_int("CPU_ATTENTION_PAGED_PV", BF ? 0 : 1, 0, 1);
     return v;
   }
 
