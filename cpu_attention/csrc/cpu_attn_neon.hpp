@@ -341,6 +341,7 @@ struct DenseF32 {
     float* pt = pof(logits);
     const float* tm = tmax_of(logits);
     const float32x4_t vc = vdupq_n_f32(c);
+    const float32x4_t zero = vdupq_n_f32(0.0f);
     for (int r0 = 0; r0 < nrows; r0 += 4) {
       float mn[4], av[4];
       for (int k = 0; k < 4; ++k) {
@@ -367,34 +368,65 @@ struct DenseF32 {
       const float32x4_t vmn1 = vdupq_n_f32(-mn[1]);
       const float32x4_t vmn2 = vdupq_n_f32(-mn[2]);
       const float32x4_t vmn3 = vdupq_n_f32(-mn[3]);
-      const float32x4_t zero = vdupq_n_f32(0.0f);
       const float* __restrict__ p0 = logits + (r0 + 0) * KT;
       const float* __restrict__ p1 = logits + (r0 + 1) * KT;
       const float* __restrict__ p2 = logits + (r0 + 2) * KT;
       const float* __restrict__ p3 = logits + (r0 + 3) * KT;
       float* __restrict__ pt0 = pt + r0;
-      for (int j = 0; j < nkeys; j += 4) {
-        float32x4_t e0 = mn[0] == kNegInf
-                             ? zero
-                             : exp2v<5>(vfmaq_f32(vmn0, vc, ldf(p0 + j)));
-        float32x4_t e1 = mn[1] == kNegInf
-                             ? zero
-                             : exp2v<5>(vfmaq_f32(vmn1, vc, ldf(p1 + j)));
-        float32x4_t e2 = mn[2] == kNegInf
-                             ? zero
-                             : exp2v<5>(vfmaq_f32(vmn2, vc, ldf(p2 + j)));
-        float32x4_t e3 = mn[3] == kNegInf
-                             ? zero
-                             : exp2v<5>(vfmaq_f32(vmn3, vc, ldf(p3 + j)));
-        sum[0] = vaddq_f32(sum[0], e0);
-        sum[1] = vaddq_f32(sum[1], e1);
-        sum[2] = vaddq_f32(sum[2], e2);
-        sum[3] = vaddq_f32(sum[3], e3);
-        tr4x4(e0, e1, e2, e3);
-        stf(pt0 + (j + 0) * RQT, e0);
-        stf(pt0 + (j + 1) * RQT, e1);
-        stf(pt0 + (j + 2) * RQT, e2);
-        stf(pt0 + (j + 3) * RQT, e3);
+      if (mn[0] == kNegInf || mn[1] == kNegInf || mn[2] == kNegInf ||
+          mn[3] == kNegInf) {
+        // A row with no visible key at all: its logits are all -inf and
+        // exp2(-inf - -inf) is NaN, so that row's probabilities are exactly 0.
+        // Rare (empty or padding rows), so the branch belongs outside the loop
+        // -- inside it, it kept four predicated selects and a branch per 4 keys.
+        for (int j = 0; j < nkeys; j += 4) {
+          float32x4_t e[4];
+          e[0] = mn[0] == kNegInf ? zero : exp2v<5>(vfmaq_f32(vmn0, vc, ldf(p0 + j)));
+          e[1] = mn[1] == kNegInf ? zero : exp2v<5>(vfmaq_f32(vmn1, vc, ldf(p1 + j)));
+          e[2] = mn[2] == kNegInf ? zero : exp2v<5>(vfmaq_f32(vmn2, vc, ldf(p2 + j)));
+          e[3] = mn[3] == kNegInf ? zero : exp2v<5>(vfmaq_f32(vmn3, vc, ldf(p3 + j)));
+          for (int k = 0; k < 4; ++k) sum[k] = vaddq_f32(sum[k], e[k]);
+          tr4x4(e[0], e[1], e[2], e[3]);
+          for (int k = 0; k < 4; ++k) stf(pt0 + (j + k) * RQT, e[k]);
+        }
+      } else {
+        int j = 0;
+        // Eight keys per step: eight independent exp chains instead of four.
+        for (; j + 8 <= nkeys; j += 8) {
+          float32x4_t e[4], f[4];
+          e[0] = exp2v<5>(vfmaq_f32(vmn0, vc, ldf(p0)));
+          e[1] = exp2v<5>(vfmaq_f32(vmn1, vc, ldf(p1)));
+          e[2] = exp2v<5>(vfmaq_f32(vmn2, vc, ldf(p2)));
+          e[3] = exp2v<5>(vfmaq_f32(vmn3, vc, ldf(p3)));
+          f[0] = exp2v<5>(vfmaq_f32(vmn0, vc, ldf(p0 + 4)));
+          f[1] = exp2v<5>(vfmaq_f32(vmn1, vc, ldf(p1 + 4)));
+          f[2] = exp2v<5>(vfmaq_f32(vmn2, vc, ldf(p2 + 4)));
+          f[3] = exp2v<5>(vfmaq_f32(vmn3, vc, ldf(p3 + 4)));
+          p0 += 8;
+          p1 += 8;
+          p2 += 8;
+          p3 += 8;
+          for (int k = 0; k < 4; ++k) sum[k] = vaddq_f32(sum[k], e[k]);
+          for (int k = 0; k < 4; ++k) sum[k] = vaddq_f32(sum[k], f[k]);
+          tr4x4(e[0], e[1], e[2], e[3]);
+          for (int k = 0; k < 4; ++k) stf(pt0 + (j + k) * RQT, e[k]);
+          tr4x4(f[0], f[1], f[2], f[3]);
+          for (int k = 0; k < 4; ++k) stf(pt0 + (j + 4 + k) * RQT, f[k]);
+        }
+        for (; j < nkeys; j += 4) {
+          float32x4_t e[4];
+          e[0] = exp2v<5>(vfmaq_f32(vmn0, vc, ldf(p0)));
+          e[1] = exp2v<5>(vfmaq_f32(vmn1, vc, ldf(p1)));
+          e[2] = exp2v<5>(vfmaq_f32(vmn2, vc, ldf(p2)));
+          e[3] = exp2v<5>(vfmaq_f32(vmn3, vc, ldf(p3)));
+          p0 += 4;
+          p1 += 4;
+          p2 += 4;
+          p3 += 4;
+          for (int k = 0; k < 4; ++k) sum[k] = vaddq_f32(sum[k], e[k]);
+          tr4x4(e[0], e[1], e[2], e[3]);
+          for (int k = 0; k < 4; ++k) stf(pt0 + (j + k) * RQT, e[k]);
+        }
       }
       for (int k = 0; k < 4; ++k) l[r0 + k] += hsum(sum[k]);
     }
@@ -413,11 +445,16 @@ struct DenseF32 {
         a[r][0] = ldf(acc + r * HD + dc);
         a[r][1] = ldf(acc + r * HD + dc + 4);
       }
+      // Pointer walk: the V row of the next key is `HD` floats on and the P
+      // panel's next key is `RQT`, so neither the key index nor the (key, dim)
+      // product has to be recomputed per key.
+      const float* vp = vd + (k0 * HD + dc);
+      const float* pp = pt;
       for (int j = 0; j < nkeys; ++j) {
-        const float* vp = vd + (k0 + j) * HD + dc;
         const float32x4_t v0 = ldf(vp), v1 = ldf(vp + 4);
-        const float32x4_t pl = ldf(pt + j * RQT);
-        const float32x4_t ph = ldf(pt + j * RQT + 4);
+        const float32x4_t pl = ldf(pp), ph = ldf(pp + 4);
+        vp += HD;
+        pp += RQT;
         for (int r = 0; r < RQT; ++r) {
           const float32x4_t p = r < 4 ? pl : ph;
           const int lane = r & 3;
@@ -637,6 +674,7 @@ struct DenseBF {
     char* pt = pof(logits);
     const float* tmv = tmax_of(logits);
     const float32x4_t vc = vdupq_n_f32(c);
+    const float32x4_t zero = vdupq_n_f32(0.0f);
     for (int r0 = 0; r0 < nrows; r0 += 2) {
       const int r1 = r0 + 1 < RQT ? r0 + 1 : r0;
       float mn[2], av[2];
@@ -659,22 +697,90 @@ struct DenseBF {
         alpha[r] = av[k];
         l[r] *= av[k];
       }
-      char* dst = pt + (r0 / 2) * KG * 8 * 2;
+      char* dst = pt + (r0 / 2) * KG * 16;
       const float* __restrict__ p0 = logits + rr[0] * KT;
       const float* __restrict__ p1 = logits + rr[1] * KT;
       const float32x4_t vmn0 = vdupq_n_f32(-mn[0]);
       const float32x4_t vmn1 = vdupq_n_f32(-mn[1]);
-      const float32x4_t zero = vdupq_n_f32(0.0f);
       float32x4_t s0 = zero, s1 = zero;
-      for (int j = 0; j < nkeys; j += 4) {
-        const float32x4_t e0 =
-            mn[0] == kNegInf ? zero : exp2v<3>(vfmaq_f32(vmn0, vc, ldf(p0 + j)));
-        const float32x4_t e1 =
-            mn[1] == kNegInf ? zero : exp2v<3>(vfmaq_f32(vmn1, vc, ldf(p1 + j)));
-        s0 = vaddq_f32(s0, e0);
-        s1 = vaddq_f32(s1, e1);
-        stb(dst + (j / 4) * 16,
-            vcombine_bf16(vcvt_bf16_f32(e0), vcvt_bf16_f32(e1)));
+      // Two loops instead of a `? :` inside the inner one: the test is on the
+      // row's running max, i.e. loop invariant, and leaving it in the body made
+      // the compiler keep a branch and re-splat the polynomial constants every
+      // 4 keys (54 instructions where 40 are the polynomial). The -inf case is
+      // a row with no visible key at all -- exp2(-inf - -inf) is NaN, so that
+      // row's half of the operand group must be an exact zero.
+      if (mn[0] == kNegInf || mn[1] == kNegInf) {
+        const bool z0 = mn[0] == kNegInf, z1 = mn[1] == kNegInf;
+        for (int j = 0; j < nkeys; j += 4) {
+          const float32x4_t e0 =
+              z0 ? zero : exp2v<3>(vfmaq_f32(vmn0, vc, ldf(p0 + j)));
+          const float32x4_t e1 =
+              z1 ? zero : exp2v<3>(vfmaq_f32(vmn1, vc, ldf(p1 + j)));
+          s0 = vaddq_f32(s0, e0);
+          s1 = vaddq_f32(s1, e1);
+          stb(dst + (j / 4) * 16,
+              vcombine_bf16(vcvt_bf16_f32(e0), vcvt_bf16_f32(e1)));
+        }
+      } else {
+        int j = 0;
+        // 16 keys per step: the softmax is latency-bound, not issue-bound (the
+        // exp is a ~6-link dependent chain and one iteration only keeps four
+        // chains in flight, which measures as 1.6 cycles per row-key for twelve
+        // instructions' worth of work). Eight chains in flight is what closes
+        // that gap.
+        for (; j + 16 <= nkeys; j += 16) {
+          const float32x4_t c0 = exp2v<3>(vfmaq_f32(vmn0, vc, ldf(p0)));
+          const float32x4_t d0 = exp2v<3>(vfmaq_f32(vmn1, vc, ldf(p1)));
+          const float32x4_t c1 = exp2v<3>(vfmaq_f32(vmn0, vc, ldf(p0 + 4)));
+          const float32x4_t d1 = exp2v<3>(vfmaq_f32(vmn1, vc, ldf(p1 + 4)));
+          const float32x4_t c2 = exp2v<3>(vfmaq_f32(vmn0, vc, ldf(p0 + 8)));
+          const float32x4_t d2 = exp2v<3>(vfmaq_f32(vmn1, vc, ldf(p1 + 8)));
+          const float32x4_t c3 = exp2v<3>(vfmaq_f32(vmn0, vc, ldf(p0 + 12)));
+          const float32x4_t d3 = exp2v<3>(vfmaq_f32(vmn1, vc, ldf(p1 + 12)));
+          p0 += 16;
+          p1 += 16;
+          s0 = vaddq_f32(s0, c0);
+          s1 = vaddq_f32(s1, d0);
+          s0 = vaddq_f32(s0, c1);
+          s1 = vaddq_f32(s1, d1);
+          s0 = vaddq_f32(s0, c2);
+          s1 = vaddq_f32(s1, d2);
+          s0 = vaddq_f32(s0, c3);
+          s1 = vaddq_f32(s1, d3);
+          stb(dst, vcombine_bf16(vcvt_bf16_f32(c0), vcvt_bf16_f32(d0)));
+          stb(dst + 16, vcombine_bf16(vcvt_bf16_f32(c1), vcvt_bf16_f32(d1)));
+          stb(dst + 32, vcombine_bf16(vcvt_bf16_f32(c2), vcvt_bf16_f32(d2)));
+          stb(dst + 48, vcombine_bf16(vcvt_bf16_f32(c3), vcvt_bf16_f32(d3)));
+          dst += 64;
+        }
+        for (; j + 8 <= nkeys; j += 8) {
+          const float32x4_t a0 = exp2v<3>(vfmaq_f32(vmn0, vc, ldf(p0)));
+          const float32x4_t a1 = exp2v<3>(vfmaq_f32(vmn1, vc, ldf(p1)));
+          const float32x4_t b0 = exp2v<3>(vfmaq_f32(vmn0, vc, ldf(p0 + 4)));
+          const float32x4_t b1 = exp2v<3>(vfmaq_f32(vmn1, vc, ldf(p1 + 4)));
+          p0 += 8;
+          p1 += 8;
+          s0 = vaddq_f32(s0, a0);
+          s1 = vaddq_f32(s1, a1);
+          s0 = vaddq_f32(s0, b0);
+          s1 = vaddq_f32(s1, b1);
+          stb(dst, vcombine_bf16(vcvt_bf16_f32(a0), vcvt_bf16_f32(a1)));
+          stb(dst + 16, vcombine_bf16(vcvt_bf16_f32(b0), vcvt_bf16_f32(b1)));
+          dst += 32;
+        }
+        // ceil(nkeys/4) groups in total: `pv` walks the same rounded-up count,
+        // and the extra keys carry a ~1e-38 probability because their logits
+        // were masked to -inf.
+        for (; j < nkeys; j += 4) {
+          const float32x4_t a0 = exp2v<3>(vfmaq_f32(vmn0, vc, ldf(p0)));
+          const float32x4_t a1 = exp2v<3>(vfmaq_f32(vmn1, vc, ldf(p1)));
+          p0 += 4;
+          p1 += 4;
+          s0 = vaddq_f32(s0, a0);
+          s1 = vaddq_f32(s1, a1);
+          stb(dst, vcombine_bf16(vcvt_bf16_f32(a0), vcvt_bf16_f32(a1)));
+          dst += 16;
+        }
       }
       l[rr[0]] += hsum(s0);
       if (rr[1] != rr[0]) l[rr[1]] += hsum(s1);
@@ -687,8 +793,8 @@ struct DenseBF {
     const int KG = kt_() / 4;
     const char* pt = pof(const_cast<float*>(logits));
     const int64_t pad = pad_of(job.seq_k);
-    const int64_t kgn = pad / 4;
-    const char* vd = slab + pad * HD * 2;
+    const int64_t vs = (pad / 4) * 16;  // one key group of one dim pair
+    const char* vd = slab + pad * HD * 2 + (k0 / 4) * 16;
     // Eight head dims per pass: the accumulator is 4 row pairs x 4 dim pairs =
     // 16 registers, which leaves room for the operands. Sixteen dims per pass
     // would halve the number of sweeps over V but needs 32 accumulator
@@ -701,18 +807,51 @@ struct DenseBF {
           a[rp][i] = vcombine_f32(vld1_f32(acc + r0 * HD + dc + 2 * i),
                                   vld1_f32(acc + r1 * HD + dc + 2 * i));
       }
-      for (int j = 0; j < nkeys; j += 4) {
-        // The P panel is per key tile (the softmax never sees k0); the V slab
-        // is indexed by the global key group.
-        const int64_t kgp = j / 4, kgv = (k0 + j) / 4;
-        bfloat16x8_t pa[RP];
-        for (int rp = 0; rp < RP; ++rp) pa[rp] = ldb(pt + (rp * KG + kgp) * 16);
-        bfloat16x8_t vb[4];
-        for (int i = 0; i < 4; ++i)
-          vb[i] = ldb(vd + ((dc / 2 + i) * kgn + kgv) * 16);
+      // Both operands advance by one 16-byte group per four keys, so the walk is
+      // two pointers and an add per group. Recomputing the V address from
+      // (dim pair, key group) inside the loop cost 16 of the body's 42
+      // instructions -- more than the matmul's own loads.
+      const char* p = pt;
+      const char* v = vd + (int64_t(dc / 2) * (pad / 4)) * 16;
+      int j = 0;
+      // Sixteen keys per step (four 4-key groups): the eight loads of a group
+      // feed sixteen `bfmmla`, so a wider step is what lets the loads run ahead
+      // of the matmul instead of stalling behind it.
+      for (; j + 16 <= nkeys; j += 16) {
+        for (int h = 0; h < 4; ++h) {
+          bfloat16x8_t pa[RP], vb[4];
+          for (int rp = 0; rp < RP; ++rp)
+            pa[rp] = ldb(p + rp * KG * 16 + h * 16);
+          for (int i = 0; i < 4; ++i) vb[i] = ldb(v + i * vs + h * 16);
+          for (int rp = 0; rp < RP; ++rp)
+            for (int i = 0; i < 4; ++i)
+              a[rp][i] = bfmmla(a[rp][i], pa[rp], vb[i]);
+        }
+        p += 64;
+        v += 64;
+      }
+      for (; j + 8 <= nkeys; j += 8) {
+        for (int h = 0; h < 2; ++h) {
+          bfloat16x8_t pa[RP], vb[4];
+          for (int rp = 0; rp < RP; ++rp)
+            pa[rp] = ldb(p + rp * KG * 16 + h * 16);
+          for (int i = 0; i < 4; ++i) vb[i] = ldb(v + i * vs + h * 16);
+          for (int rp = 0; rp < RP; ++rp)
+            for (int i = 0; i < 4; ++i)
+              a[rp][i] = bfmmla(a[rp][i], pa[rp], vb[i]);
+        }
+        p += 32;
+        v += 32;
+      }
+      for (; j < nkeys; j += 4) {
+        bfloat16x8_t pa[RP], vb[4];
+        for (int rp = 0; rp < RP; ++rp) pa[rp] = ldb(p + rp * KG * 16);
+        for (int i = 0; i < 4; ++i) vb[i] = ldb(v + i * vs);
         for (int rp = 0; rp < RP; ++rp)
           for (int i = 0; i < 4; ++i)
             a[rp][i] = bfmmla(a[rp][i], pa[rp], vb[i]);
+        p += 16;
+        v += 16;
       }
       for (int rp = 0; rp < RP; ++rp) {
         const int r0 = 2 * rp, r1 = 2 * rp + 1;
