@@ -1,4 +1,107 @@
-# ARM (Graviton 5, m9g.2xlarge, Neoverse-V3) dense kernel — round 1
+# ARM (Graviton 5, m9g.2xlarge, Neoverse-V3) dense kernel
+
+## Round 2 (same box, branch `cpp-arm-dense`)
+
+Two things were done and one lever was costed out with the kernel's own measured
+constants. Raw JSON: `bench_arm_final2.json` (41 rounds, dense + paged).
+
+### 1. Paged GQA store bug — fixed (real, and it was reading off the tensor)
+
+`PagedF32::store_head` / `PagedBF::store_head` computed `kvh = head / group` for
+the cache slot but read the source `k`/`v` at `head * HD`. The fused qkv
+projection carries one head per *kv* head, so every query head of a group past 0
+read the wrong slice and the last group ran off the tensor. Indexing by `kvh`
+matches `cpu_attn_vec.hpp`. Measured against the naive fp32 reference on the
+sweep's GQA shapes (bf16, fixed seed):
+
+| shape | before | after |
+|---|---|---|
+| hd 32, page 64, 16 heads / 4 kv, ctx 2049 b2 | 6.628e-03 | 3.615e-04 |
+| hd 128, page 32, 16 heads / 8 kv, ctx 257 b1 | **NaN** | 1.108e-03 |
+
+`tests/test_paged_sweep.py` reads **336/504**, and the cause is *not* this
+kernel: the bf16 gate compares `cpp` against `mojo`, and the `mojo` arm on this
+box reads **6.628e-03 on the first case and 5.596e-02 on the second against the
+same reference** — the first number is bit-identical to the buggy `head * HD`
+indexing above, i.e. the box's `_C.so` still has the GQA store bug (or its ARM
+bf16 path was missed by the fix). Every bf16 GQA case therefore fails a 2-ulp
+cross-backend gate while `cpp` is 4-20x closer to the truth. The fp32 gate
+(against the naive reference) passes at **2.00e-06 against a 2e-06 tolerance**,
+i.e. at the gate, not over it. Rebuilding `_C.so` on the box from the fixed
+source is required before that sweep can be 504/504; nothing in this file can
+move it.
+
+### 2. Paged performance: no regression
+
+Paged is byte-identical code this round (the GQA fix only changes which source
+slice is stored). Re-measured 20/20 rows: `cpp/vllm` **0.273-1.339**, 18/20 at
+<= 1.0, `cpp/mojo` **0.523-1.047**, `d_cpp` <= 1.3e-3 bf16 / 4.8e-7 fp32. The
+two rows over 1.0 are again `b=1 ctx=256 bf16`, where the `mojo` arm reads
+*1.14/1.48* — the harness asymmetry (vLLM's output is preallocated outside the
+timed region), not a kernel difference.
+
+### 3. fp32 hi/lo `bfmmla`: costed, not shipped — and it is not the 1.33x it looks like
+
+The MAC-rate argument for the hi/lo split (`bfmmla` retires 16 MACs against 4
+for a 4-wide fp32 FMA) is right about the *instruction*, but this core's
+measured issue rates make the three-product form much less than 4x cheaper than
+fp32 FMA:
+
+* fp32 dense executes 32 fp32 FMAs per row-key and runs 14.2 cycles/row-key:
+  **2.25 fp32 FMA/cycle achieved**, i.e. the fp32 kernel is FMA-throughput
+  bound and the matmul *is* the whole runtime.
+* bf16 `bfmmla` **per phase, measured by cycle-sampling attribution at
+  2048:8:64**: `qk` 4 `bfmmla` in 1.6 cycles (**2.5/cycle**), `pv` 4 in 2.13
+  cycles (**1.88/cycle**). A stride-1 microbenchmark of `bfmmla` vs `vbfma`
+  could not settle the ceilings — with `-O2` the 16-accumulator array spilled
+  and both loops read ~1 op/cycle, which contradicts the kernel's own 2.25, so
+  the phase numbers above are the trustworthy ones.
+
+So the hi/lo split costs 3 products x (4 Q@K^T + 4 P@V) = **24 `bfmmla` per
+row-key** where fp32 needs 32 FMAs, and the loads double (hi and lo planes for
+K, V and P). At the measured per-instruction costs that is 12/2.5 + 12/1.88 =
+**11.2 cycles/row-key of matmul against 14.2**, plus the fp32 softmax (6.6
+instructions/row-key, heavier than bf16's) which does not overlap — a projected
+**1.1-1.25x, i.e. `cpp/mojo` 1.10 -> 0.88-0.98**. It would reach the gate, but
+only just, and it is a ~300-line second policy (new K/V/P hi-lo layouts, Q split
+on the fly, three accumulator products, a P panel written twice) whose
+correctness has to be re-proven on all 22 rows. Not attempted in the window
+left; the numbers above are what an implementation should be judged against.
+
+### 4. Round-2 dense matrix (41 rounds, `ctrl/mojo` tracks `cpp` within 0.005)
+
+| dense row | dtype | cpp us | mojo us | vllm us | cpp/mojo | cpp/vllm |
+|---|---|---:|---:|---:|---:|---:|
+| 128:8:64 | bf16 | 25.0 | 21.2 | 22.4 | 1.181 | 1.114 |
+| 128:8:64 | fp32 | 43.2 | 42.0 | 46.0 | 1.029 | 0.940 |
+| 512:8:64 | bf16 | 238.9 | 196.6 | 234.6 | 1.215 | 1.018 |
+| 512:8:64 | fp32 | 578.2 | 523.6 | 592.7 | 1.104 | 0.976 |
+| 1024:8:64 | bf16 | 885.1 | 773.2 | 924.4 | 1.145 | 0.958 |
+| 1024:8:64 | fp32 | 2307.7 | 2077.8 | 2257.0 | 1.111 | 1.022 |
+| 2048:8:64 | bf16 | 3428.2 | 3152.8 | 3576.6 | 1.087 | 0.959 |
+| 2048:8:64 | fp32 | 9180.7 | 8190.7 | 8907.9 | 1.121 | 1.031 |
+| 4096:8:64 | bf16 | 13490.7 | 12553.0 | 14043.4 | 1.075 | 0.961 |
+| 4096:8:64 | fp32 | 36551.4 | 33400.9 | 35033.1 | 1.094 | 1.043 |
+| 256:16:128 | bf16 | 219.4 | 193.7 | 211.7 | 1.133 | 1.036 |
+| 1024:16:128 | bf16 | 2892.3 | 2736.9 | 2947.5 | 1.057 | 0.981 |
+| 1024:16:128 | fp32 | 8564.7 | 8003.9 | 9409.9 | 1.070 | 0.910 |
+| 2048:16:128 | bf16 | 11160.1 | 10958.5 | 11416.7 | 1.018 | 0.978 |
+| 2048:16:128 | fp32 | 33858.6 | 31347.1 | 36432.2 | 1.080 | 0.929 |
+| 4096:16:128 | bf16 | 43901.1 | 43052.0 | 45066.4 | 1.020 | 0.974 |
+| 4096:16:128 | fp32 | 135056.6 | 140333.8 | 144487.2 | **0.962** | 0.935 |
+| 512:32:128 | bf16 | 1551.1 | 1436.1 | 1545.8 | 1.080 | 1.003 |
+| 512:32:128 | fp32 | 4642.1 | 4145.2 | 4809.2 | 1.120 | 0.965 |
+| 1024:8:32 | bf16 | 585.9 | 527.4 | 640.0 | 1.111 | 0.915 |
+| 1024:8:32 | fp32 | 1289.0 | 1187.0 | 1321.2 | 1.086 | 0.976 |
+
+Bands: dense `cpp/mojo` **0.962-1.215**, `cpp/vllm` **0.871-1.114**; 10/22 rows
+at <= 0.97 against vLLM, 1/22 against Mojo. Round 2 added no dense performance
+change beyond round 1 (`docs/arm/bench_arm_final.json` is the round-1 artifact;
+the two runs agree to within the box's 1-2%).
+
+---
+
+# Round 1
 
 `cpu_attention/csrc/cpu_attn_neon.hpp` only. Branch `cpp-arm-dense`, base
 `b199f3a`. Harness: `tests/bench_cpp.py --isa neon --rounds 41` (one process,
