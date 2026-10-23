@@ -75,6 +75,13 @@
 #include "cpu_isa.hpp"
 
 namespace attn {
+
+// `vec` is authoritative for the paged path (see the note on `paged` below).
+namespace vec {
+void paged(const PagedJob&, int);
+void store(const PagedJob&, int);
+}  // namespace vec
+
 namespace amx {
 namespace {
 
@@ -148,43 +155,6 @@ inline __m512i interleave_bf16x2(__m256i a, __m256i b) {
                                    _mm512_castsi256_si512(b));
 }
 
-
-// ---------------------------------------------------------------------------
-// paged-path vector helpers
-// ---------------------------------------------------------------------------
-// The paged kernel is a vector kernel (see the Paged policy for why AMX does not
-// pay there), so it needs the ld/st/broadcast shapes the vec policy uses. They
-// are re-declared here rather than including cpu_attn_vec.hpp, whose definitions
-// have external linkage.
-inline __m512 ld16(const void* p) { return _mm512_loadu_ps(p); }
-inline void st16(void* p, __m512 v) {
-  _mm512_storeu_ps(reinterpret_cast<float*>(p), v);
-}
-
-// One bf16 pair (two adjacent head dims of the query row) broadcast to all 16
-// key lanes: the A operand of `dpbf16ps`.
-inline __m512bh bcast_pair(const void* p) {
-  const __m512i i = _mm512_set1_epi32(*static_cast<const int*>(p));
-  __m512bh r;
-  std::memcpy(&r, &i, 64);
-  return r;
-}
-
-// The B operand: 32 bf16 = 16 keys x 2 adjacent dims.
-inline __m512bh load_pair_bf16(const void* p) {
-  const __m512 v = _mm512_loadu_ps(p);
-  __m512bh r;
-  std::memcpy(&r, &v, 64);
-  return r;
-}
-
-inline __m512 dot_bf16(__m512 acc, __m512bh a, __m512bh b) {
-  return _mm512_dpbf16_ps(acc, a, b);
-}
-
-// 16 bf16 -> 16 fp32. There is no AVX512-BF16 widening instruction (VCVTBF16PS
-// is AVX10.1), so this is the two-uop exponent shift every kernel uses.
-inline __m512 widen_bf16x16_fast(const void* p) { return widen_bf16x16(p); }
 
 // 2^x for x in [-127, 127]: degree-5 polynomial on the fraction, exponent by
 // insertion. The positive side is reachable because the online softmax may hold
@@ -754,361 +724,19 @@ struct Dense {
 };
 
 // ---------------------------------------------------------------------------
-// paged policy: decode, one query token per (sequence, head)
+// paged: forwarded, not duplicated
 // ---------------------------------------------------------------------------
-// **AMX does not pay here, and that is measured rather than assumed.** A paged
-// decode work item is one live query row, so an M=16 tile is 15/16 waste and
-// there is no GQA to pack, which puts a 16x16 `tdpbf16ps` at ~31 useful
-// MAC/cycle -- the same number as `dpbf16ps` (32). It would also need the K
-// cache in `[dim pair][key]` form, i.e. a different `reshape_and_cache`, and
-// this path's layout is fixed. What *does* pay is memory-level parallelism and
-// arithmetic-count: see the four structural fixes below, each measured.
-//
-// The reference shape (and the vec policy's) has three problems that dominate
-// the runtime at every batch size:
-//
-//  1. **One FMA chain per 16-key group.** `cv = fma(bcast(q[d]), k[d], cv)` for
-//     d = 0..head_dim is a 64- or 128-deep dependency chain at 4 cycles per
-//     link, so each group costs `4*head_dim` cycles whether or not the data is
-//     in L1, and exactly one K load is in flight while it does. Four
-//     independent accumulators over 64 keys cut both: 4 loads in flight and
-//     4 FMAs per chain link.
-//  2. **The q broadcast is re-issued per 16-key group** (once per dim per
-//     group). Dim-outer with four groups per step issues one broadcast per
-//     dim per *64* keys: 4x fewer, and it is the only port-5 consumer.
-//  3. **`jj / page` and `jj % page` inside the key loops.** `job.page` is a
-//     runtime int64, so that is a 64-bit `idiv` (20-40 cycles) per key in the
-//     P@V walk and per 16 keys in Q@K^T -- at ctx 4096 more cycles than the
-//     FMAs it feeds. Both loops now walk pages and carry the offset.
-//  4. **A single accumulator per output dim-chunk in P@V**, another chain of
-//     `nkeys` linked FMAs. Two lanes over key parity halve it and reach the
-//     throughput bound at head_dim 64.
-//
-// The cache layout is the vec policy's, byte for byte, so `reshape_and_cache`
-// and the engine's staged cross cache keep working unchanged.
-template <int DT, int HD>
-struct Paged {
-  static constexpr bool BF = DT == kBF16;
-  static constexpr int ESZ = BF ? 2 : 4;
-  // K rows are 4-byte units: fp32 is one dim, bf16 is the dim pair `dpbf16ps`
-  // contracts, so both walk `NDIM` rows of `page * 4` bytes.
-  static constexpr int NDIM = BF ? HD / 2 : HD;
-  static constexpr int NV = HD / 16;
-  static constexpr int R = 4;            // 16-key groups per Q@K^T step
-  static constexpr int KSTEP = R * 16;
-
-  static int kt_() {
-    static const int k = env_int("CPU_ATTENTION_PAGED_KT", 512, 64, 4096);
-    return k & ~15;
-  }
-  static size_t aux_bytes(int) { return static_cast<size_t>(4096) * 4; }
-
-  // Software prefetch distance along the *current* stream, in dim rows for
-  // Q@K^T and in keys for P@V (0 = off). The kernel is latency-bound -- each
-  // phase reaches 70-88% of what a plain sequential read of the same bytes
-  // measures -- so the question is whether a few lines fetched ahead buy
-  // anything. `docs/amx/AMX_PAGED.md` has the sweep.
-  static int pf_dist() {
-    static const int d = env_int("CPU_ATTENTION_PAGED_PF", 0, 0, 64);
-    return d;
-  }
-
-  // Loop shapes, chosen per dtype from an in-process A/B against the vec policy
-  // (`docs/amx/AMX_PAGED.md` §5). bf16 takes the dim-outer Q@K^T (1.09-1.25x
-  // over the vec shape at every shape) and two P@V lanes; fp32 takes the
-  // dim-inner Q@K^T and one lane, which is *parity* with the vec shape at
-  // 256/1024/4096 keys and 2.5-4% better at b=32 -- the dim-outer form costs
-  // fp32 6-9% at three of the five shapes, because fp32 does twice the loads per
-  // dim and the 4-way chains then fight for load slots instead of hiding them.
-  // Both remain env-switchable for A/B: QK 1 = dim-inner, PV 1 = one lane.
-  static int qk_old_shape() {
-    static const int v = env_int("CPU_ATTENTION_PAGED_QK", BF ? 0 : 1, 0, 1);
-    return v;
-  }
-  static int pv_one_lane() {
-    static const int v = env_int("CPU_ATTENTION_PAGED_PV", BF ? 0 : 1, 0, 1);
-    return v;
-  }
-
-  // Profiling only (`CPU_ATTENTION_PAGED_MODE`): 1 skips Q@K^T, 2 the softmax,
-  // 4 P@V. Results are garbage; timings only.
-  static int mode() {
-    static const int m = env_int("CPU_ATTENTION_PAGED_MODE", 0, 0, 7);
-    return m;
-  }
-
-  static int64_t kv_stride_of(const PagedJob& job) {
-    // reshape_and_cache reaches this entry through the store-only form, which
-    // carries the token stride in the q slot (there is no query there).
-    return job.kv_stride ? job.kv_stride : job.q_stride;
-  }
-
-  // Same store as the vec policy: fp32 K[hd][page] / V[page][hd], bf16
-  // K[hd/2][page][2] / V[page][hd].
-  static void store_head(const PagedJob& job, int64_t seq, int64_t head) {
-    const int64_t group = job.num_heads / job.num_kv_heads;
-    const int64_t kvh = head / group;
-    const int64_t slot = job.slots[seq];
-    const int64_t pg = slot / job.page, off = slot % job.page;
-    const int64_t stride = job.page * HD * ESZ;
-    const int64_t base = (pg * job.num_kv_heads + kvh) * stride;
-    char* kp = static_cast<char*>(job.k_cache) + base;
-    char* vp = static_cast<char*>(job.v_cache) + base;
-    const int64_t kvst = kv_stride_of(job);
-    const char* ks =
-        static_cast<const char*>(job.k) + (seq * kvst + head * HD) * ESZ;
-    const char* vs =
-        static_cast<const char*>(job.v) + (seq * kvst + head * HD) * ESZ;
-    if constexpr (BF) {
-      for (int d = 0; d < HD; ++d)
-        std::memcpy(kp + (((d / 2) * job.page + off) * 2 + (d & 1)) * ESZ,
-                    ks + d * ESZ, ESZ);
-    } else {
-      for (int d = 0; d < HD; ++d)
-        std::memcpy(kp + (d * job.page + off) * ESZ, ks + d * ESZ, ESZ);
-    }
-    std::memcpy(vp + off * HD * ESZ, vs, HD * ESZ);
-  }
-
-  // -------------------------------------------------------------------------
-  // Q@K^T for N 16-key groups: dim-outer, one broadcast per dim, N independent
-  // accumulators (N is a compile-time constant so `cv[]` stays in registers).
-  // -------------------------------------------------------------------------
-  static inline __attribute__((always_inline)) __m512 load_v(const void* p) {
-    if constexpr (BF) return widen_bf16x16_fast(p);
-    else return ld16(p);
-  }
-
-  template <int N>
-  static inline __attribute__((always_inline)) void qk_groups(
-      const char* const* kp, int64_t krow, const char* q, float* out, int pfd) {
-    __m512 cv[N];
-#pragma GCC unroll 8
-    for (int r = 0; r < N; ++r) cv[r] = _mm512_setzero_ps();
-    if constexpr (BF) {
-      for (int di = 0; di < NDIM; ++di) {
-        if (pfd != 0 && (di & 1) == 0) {
-#pragma GCC unroll 8
-          for (int r = 0; r < N; ++r) __builtin_prefetch(kp[r] + (di + pfd) * krow);
-        }
-        const __m512bh qv = bcast_pair(q + di * 4);
-        __m512bh kb[N];
-#pragma GCC unroll 8
-        for (int r = 0; r < N; ++r) kb[r] = load_pair_bf16(kp[r] + di * krow);
-#pragma GCC unroll 8
-        for (int r = 0; r < N; ++r) cv[r] = dot_bf16(cv[r], qv, kb[r]);
-      }
-    } else {
-      const float* qf = reinterpret_cast<const float*>(q);
-      for (int di = 0; di < NDIM; ++di) {
-        if (pfd != 0 && (di & 1) == 0) {
-#pragma GCC unroll 8
-          for (int r = 0; r < N; ++r) __builtin_prefetch(kp[r] + (di + pfd) * krow);
-        }
-        const __m512 qv = _mm512_set1_ps(qf[di]);
-        __m512 kb[N];
-#pragma GCC unroll 8
-        for (int r = 0; r < N; ++r) kb[r] = ld16(kp[r] + di * krow);
-#pragma GCC unroll 8
-        for (int r = 0; r < N; ++r) cv[r] = _mm512_fmadd_ps(qv, kb[r], cv[r]);
-      }
-    }
-#pragma GCC unroll 8
-    for (int r = 0; r < N; ++r) st16(out + r * 16, cv[r]);
-  }
-
-  // One 16-key group, with the lane mask for a key range that ends inside it.
-  static inline __attribute__((always_inline)) void qk_one(
-      const char* kp, int64_t krow, const char* q, float* out, int64_t jj,
-      int64_t len, const __m512i& lane, const __m512& ninf) {
-    __m512 cv = _mm512_setzero_ps();
-    if constexpr (BF) {
-      for (int di = 0; di < NDIM; ++di)
-        cv = dot_bf16(cv, bcast_pair(q + di * 4), load_pair_bf16(kp + di * krow));
-    } else {
-      const float* qf = reinterpret_cast<const float*>(q);
-      for (int di = 0; di < NDIM; ++di)
-        cv = _mm512_fmadd_ps(_mm512_set1_ps(qf[di]), ld16(kp + di * krow), cv);
-    }
-    if (jj + 16 <= len) {
-      st16(out, cv);
-    } else {
-      const __m512i idx = _mm512_add_epi32(_mm512_set1_epi32((int)jj), lane);
-      const __mmask16 bad =
-          _mm512_cmpge_epi32_mask(idx, _mm512_set1_epi32((int)len));
-      st16(out, _mm512_mask_blend_ps(bad, cv, ninf));
-    }
-  }
-
-  static void attend_head(const PagedJob& job, int64_t seq, int64_t head,
-                          char* ws) {
-    const int64_t group = job.num_heads / job.num_kv_heads;
-    const int64_t kvh = head / group;
-    const int64_t len = job.lens[seq];
-    const int32_t* bt = job.block_table + seq * job.bt_stride;
-    const char* q = static_cast<const char*>(job.q) +
-                    (seq * job.q_stride + head * HD) * ESZ;
-    char* op = static_cast<char*>(job.out) +
-               (seq * job.out_stride + head * HD) * ESZ;
-    float* logits = reinterpret_cast<float*>(ws);
-    const int64_t page = job.page;
-    const int64_t stride = page * HD * ESZ;   // bytes per (page, head)
-    const int64_t krow = page * 4;            // bytes between K dim rows
-    const int64_t vrow = HD * ESZ;            // bytes between V keys
-    const __m512i lane = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
-                                          12, 13, 14, 15);
-    const __m512 ninf = _mm512_set1_ps(-INFINITY);
-    const int kt = kt_();
-
-    __m512 acc[NV];
-    for (int i = 0; i < NV; ++i) acc[i] = _mm512_setzero_ps();
-    float m = -INFINITY, l = 0.0f;
-    const float c = job.scale * kLog2e;
-    const __m512 vc = _mm512_set1_ps(c);
-
-    for (int64_t kt0 = 0; kt0 < len; kt0 += kt) {
-      const int nkeys = static_cast<int>(std::min<int64_t>(kt, len - kt0));
-
-      // ---- Q@K^T: 64 keys per step (4 pages of work), dim-outer
-      const int md = mode();
-      const int pfd = pf_dist();
-      int j = 0;
-      int64_t p = kt0 / page;
-      int64_t off = kt0 - p * page;
-      const char* kpage = static_cast<const char*>(job.k_cache) +
-                          (bt[p] * job.num_kv_heads + kvh) * stride;
-      for (; j + KSTEP <= nkeys && (md & 1) == 0 && qk_old_shape() == 0; j += KSTEP) {
-        const char* kp[R];
-#pragma GCC unroll 8
-        for (int r = 0; r < R; ++r) {
-          if (off >= page) {
-            ++p;
-            off = 0;
-            kpage = static_cast<const char*>(job.k_cache) +
-                    (bt[p] * job.num_kv_heads + kvh) * stride;
-          }
-          kp[r] = kpage + off * 4;
-          off += 16;
-        }
-        qk_groups<R>(kp, krow, q, logits + j, pfd);
-      }
-      for (; j < nkeys && (md & 1) == 0; j += 16) {
-        const int64_t jj = kt0 + j;
-        if (off >= page) {
-          ++p;
-          off = 0;
-          kpage = static_cast<const char*>(job.k_cache) +
-                  (bt[p] * job.num_kv_heads + kvh) * stride;
-        }
-        qk_one(kpage + off * 4, krow, q, logits + j, jj, len, lane, ninf);
-        off += 16;
-      }
-
-      // ---- online softmax: max pass reads only, the scale is folded into the
-      // exponential (the reference wrote the scaled logits back, one extra
-      // full pass over the tile per 512 keys).
-      __m512 mx = _mm512_set1_ps(-INFINITY);
-      for (int t = 0; t < nkeys && (md & 2) == 0; t += 16)
-        mx = _mm512_max_ps(mx, ld16(logits + t));
-      const float mxv = _mm512_reduce_max_ps(mx) * c;
-      float mn, a;
-      if (mxv == -INFINITY) {
-        mn = m;
-        a = 1.0f;
-      } else if (m == -INFINITY) {
-        mn = mxv;
-        a = 0.0f;
-      } else {
-        mn = m > mxv ? m : mxv;
-        a = std::exp2(m - mn);
-      }
-      m = mn;
-      l *= a;
-      if (a != 1.0f) {
-        const __m512 va = _mm512_set1_ps(a);
-        for (int i = 0; i < NV; ++i) acc[i] = _mm512_mul_ps(acc[i], va);
-      }
-      if (mn == -INFINITY) {
-        for (int t = 0; t < nkeys; t += 16)
-          st16(logits + t, _mm512_setzero_ps());
-      } else {
-        const __m512 vmn = _mm512_set1_ps(mn);
-        __m512 sum = _mm512_setzero_ps();
-        for (int t = 0; t < nkeys; t += 16) {
-          const __m512 e = exp2v<BF>(_mm512_fmsub_ps(ld16(logits + t), vc, vmn));
-          st16(logits + t, e);
-          sum = _mm512_add_ps(sum, e);
-        }
-        l += _mm512_reduce_add_ps(sum);
-      }
-
-      // ---- P@V: walk pages (one division per page, not per key), two
-      // accumulator lanes over key parity.
-      __m512 a0[NV], a1[NV];
-#pragma GCC unroll 8
-      for (int i = 0; i < NV; ++i) {
-        a0[i] = acc[i];
-        a1[i] = _mm512_setzero_ps();
-      }
-      int done = (md & 4) ? nkeys : 0;
-      int64_t vp64 = kt0 / page;
-      int64_t voff = kt0 - vp64 * page;
-      while (done < nkeys) {
-        const char* vp = static_cast<const char*>(job.v_cache) +
-                         (bt[vp64] * job.num_kv_heads + kvh) * stride +
-                         voff * vrow;
-        const int64_t chunk = std::min<int64_t>(page - voff, nkeys - done);
-        const float* lp = logits + done;
-        int64_t t = 0;
-        for (; t + 1 < chunk && pv_one_lane() == 0; t += 2) {
-          if (pfd != 0 && (t & 1) == 0) __builtin_prefetch(vp + (t + 2 * pfd) * vrow);
-          const char* vb0 = vp + t * vrow;
-          const char* vb1 = vb0 + vrow;
-          const __m512 p0 = _mm512_set1_ps(lp[t]);
-          const __m512 p1 = _mm512_set1_ps(lp[t + 1]);
-          __m512 v0[NV], v1[NV];
-#pragma GCC unroll 8
-          for (int i = 0; i < NV; ++i) {
-            v0[i] = load_v(vb0 + i * 16 * ESZ);
-            v1[i] = load_v(vb1 + i * 16 * ESZ);
-          }
-#pragma GCC unroll 8
-          for (int i = 0; i < NV; ++i) {
-            a0[i] = _mm512_fmadd_ps(p0, v0[i], a0[i]);
-            a1[i] = _mm512_fmadd_ps(p1, v1[i], a1[i]);
-          }
-        }
-        for (; t < chunk; ++t) {
-          const char* vb = vp + t * vrow;
-          const __m512 pj = _mm512_set1_ps(lp[t]);
-#pragma GCC unroll 8
-          for (int i = 0; i < NV; ++i)
-            a0[i] = _mm512_fmadd_ps(pj, load_v(vb + i * 16 * ESZ), a0[i]);
-        }
-        done += static_cast<int>(chunk);
-        voff += chunk;
-        if (voff >= page) {
-          voff = 0;
-          ++vp64;
-        }
-      }
-#pragma GCC unroll 8
-      for (int i = 0; i < NV; ++i) acc[i] = _mm512_add_ps(a0[i], a1[i]);
-    }
-
-    const float inv = l > 0.0f ? 1.0f / l : 0.0f;
-    const __m512 vi = _mm512_set1_ps(inv);
-    for (int i = 0; i < NV; ++i) {
-      const __m512 o = _mm512_mul_ps(acc[i], vi);
-      if constexpr (BF) {
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(op + i * 16 * ESZ),
-                            cvt_bf16x16(o));
-      } else {
-        st16(op + i * 16 * ESZ, o);
-      }
-    }
-  }
-};
+// The paged kernel used to live here, on the theory that an AMX box would want
+// a tile kernel for it. It does not: a decode item is one live query row, so an
+// M=16 tile is 15/16 waste (31 useful MAC/cycle against `dpbf16ps`'s 32) and the
+// rows that matter are memory-bound. What did pay was the loop shape -- dim-outer
+// Q@K^T with the broadcast hoisted, no `idiv` in the key loops, two P@V lanes for
+// bf16, a two-pass softmax -- none of which is per-ISA, so it now lives in
+// `cpu_attn_vec.hpp`'s `Paged` policy and every x86 machine runs it.
+// `docs/amx/AMX_PAGED.md` has the measurements and the A/B against the body it
+// replaced. `vec` is authoritative; nothing paged is defined in this TU, and
+// `amx::paged`/`amx::store` below are one-line forwards so the dispatcher's
+// kIsaAmx route keeps working without a second copy to drift.
 
 }  // namespace
 
@@ -1131,33 +759,9 @@ void dense(const DenseJob& job, int workers) {
 #undef ATTN_DENSE
 }
 
-void paged(const PagedJob& job, int workers) {
-#define ATTN_PAGED(DT, HD) paged_run<Paged<DT, HD>>(job, workers)
-  if (job.dtype == kF32) {
-    if (job.head_dim == 32) ATTN_PAGED(kF32, 32);
-    else if (job.head_dim == 64) ATTN_PAGED(kF32, 64);
-    else ATTN_PAGED(kF32, 128);
-  } else {
-    if (job.head_dim == 32) ATTN_PAGED(kBF16, 32);
-    else if (job.head_dim == 64) ATTN_PAGED(kBF16, 64);
-    else ATTN_PAGED(kBF16, 128);
-  }
-#undef ATTN_PAGED
-}
+void paged(const PagedJob& job, int workers) { vec::paged(job, workers); }
 
-void store(const PagedJob& job, int workers) {
-#define ATTN_STORE(DT, HD) store_run<Paged<DT, HD>>(job, workers)
-  if (job.dtype == kF32) {
-    if (job.head_dim == 32) ATTN_STORE(kF32, 32);
-    else if (job.head_dim == 64) ATTN_STORE(kF32, 64);
-    else ATTN_STORE(kF32, 128);
-  } else {
-    if (job.head_dim == 32) ATTN_STORE(kBF16, 32);
-    else if (job.head_dim == 64) ATTN_STORE(kBF16, 64);
-    else ATTN_STORE(kBF16, 128);
-  }
-#undef ATTN_STORE
-}
+void store(const PagedJob& job, int workers) { vec::store(job, workers); }
 
 }  // namespace amx
 }  // namespace attn

@@ -104,6 +104,35 @@ inline __m512 exp2v(__m512 x) {
   return _mm512_mul_ps(p, _mm512_castsi512_ps(e));
 }
 
+
+// 2^x for the paged policy's softmax, where the argument is always <= 0 (the
+// running max never lags the tile max there, unlike the dense FA4 slack), and
+// where bf16 probabilities are rounded to 8 bits two instructions later. The
+// degree-2 form is inside that rounding; fp32 keeps the degree-5 `exp2v` above.
+template <bool FAST>
+inline __m512 exp2v_page(__m512 x) {
+  x = _mm512_max_ps(x, _mm512_set1_ps(-127.0f));
+  const __m512 n =
+      _mm512_roundscale_ps(x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+  const __m512 r = _mm512_sub_ps(x, n);
+  __m512 p;
+  if constexpr (FAST) {
+    p = _mm512_fmadd_ps(_mm512_set1_ps(2.3473140e-1f), r,
+                        _mm512_set1_ps(6.9335938e-1f));
+    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f));
+  } else {
+    p = _mm512_set1_ps(1.3392112e-3f);
+    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(9.6180963e-3f));
+    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(5.5503282e-2f));
+    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(2.4022652e-1f));
+    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(6.9314718e-1f));
+    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f));
+  }
+  const __m512i e = _mm512_slli_epi32(
+      _mm512_add_epi32(_mm512_cvtps_epi32(n), _mm512_set1_epi32(127)), 23);
+  return _mm512_mul_ps(p, _mm512_castsi512_ps(e));
+}
+
 // 16x16 fp32 transpose, in place over 16 zmm (one per row).
 inline void transpose16x16_f32(__m512* r) {
   __m512 t[16], u[16];
@@ -401,10 +430,52 @@ template <int DT, int HD>
 struct Paged {
   static constexpr bool BF = DT == kBF16;
   static constexpr int ESZ = BF ? 2 : 4;
-  static constexpr int KT = 512;
+  // K rows are 4-byte units: fp32 is one dim, bf16 is the dim pair `dpbf16ps`
+  // contracts, so both walk `NDIM` rows of `page * 4` bytes.
+  static constexpr int NDIM = BF ? HD / 2 : HD;
   static constexpr int NV = HD / 16;
+  static constexpr int R = 4;            // 16-key groups per Q@K^T step
+  static constexpr int KSTEP = R * 16;
 
-  static size_t aux_bytes(int) { return static_cast<size_t>(KT) * 4; }
+  static int kt_() {
+    static const int k = env_int("CPU_ATTENTION_PAGED_KT", 512, 64, 4096);
+    return k & ~15;
+  }
+  static size_t aux_bytes(int) { return static_cast<size_t>(4096) * 4; }
+
+  // Software prefetch distance along the *current* stream, in dim rows for
+  // Q@K^T and in keys for P@V (0 = off). The kernel is latency-bound -- each
+  // phase reaches 70-88% of what a plain sequential read of the same bytes
+  // measures -- so the question is whether a few lines fetched ahead buy
+  // anything. `docs/amx/AMX_PAGED.md` has the sweep.
+  static int pf_dist() {
+    static const int d = env_int("CPU_ATTENTION_PAGED_PF", 0, 0, 64);
+    return d;
+  }
+
+  // Loop shapes, chosen per dtype from an in-process A/B against the vec policy
+  // (`docs/amx/AMX_PAGED.md` §5). bf16 takes the dim-outer Q@K^T (1.09-1.25x
+  // over the vec shape at every shape) and two P@V lanes; fp32 takes the
+  // dim-inner Q@K^T and one lane, which is *parity* with the vec shape at
+  // 256/1024/4096 keys and 2.5-4% better at b=32 -- the dim-outer form costs
+  // fp32 6-9% at three of the five shapes, because fp32 does twice the loads per
+  // dim and the 4-way chains then fight for load slots instead of hiding them.
+  // Both remain env-switchable for A/B: QK 1 = dim-inner, PV 1 = one lane.
+  static int qk_old_shape() {
+    static const int v = env_int("CPU_ATTENTION_PAGED_QK", BF ? 0 : 1, 0, 1);
+    return v;
+  }
+  static int pv_one_lane() {
+    static const int v = env_int("CPU_ATTENTION_PAGED_PV", BF ? 0 : 1, 0, 1);
+    return v;
+  }
+
+  // Profiling only (`CPU_ATTENTION_PAGED_MODE`): 1 skips Q@K^T, 2 the softmax,
+  // 4 P@V. Results are garbage; timings only.
+  static int mode() {
+    static const int m = env_int("CPU_ATTENTION_PAGED_MODE", 0, 0, 7);
+    return m;
+  }
 
   static int64_t kv_stride_of(const PagedJob& job) {
     // reshape_and_cache reaches this entry through the store-only form, which
@@ -412,6 +483,8 @@ struct Paged {
     return job.kv_stride ? job.kv_stride : job.q_stride;
   }
 
+  // Same store as the vec policy: fp32 K[hd][page] / V[page][hd], bf16
+  // K[hd/2][page][2] / V[page][hd].
   static void store_head(const PagedJob& job, int64_t seq, int64_t head) {
     const int64_t group = job.num_heads / job.num_kv_heads;
     const int64_t kvh = head / group;
@@ -437,6 +510,76 @@ struct Paged {
     std::memcpy(vp + off * HD * ESZ, vs, HD * ESZ);
   }
 
+  // -------------------------------------------------------------------------
+  // Q@K^T for N 16-key groups: dim-outer, one broadcast per dim, N independent
+  // accumulators (N is a compile-time constant so `cv[]` stays in registers).
+  // -------------------------------------------------------------------------
+  static inline __attribute__((always_inline)) __m512 load_v(const void* p) {
+    if constexpr (BF) return widen_bf16(p);
+    else return ld16(p);
+  }
+
+  template <int N>
+  static inline __attribute__((always_inline)) void qk_groups(
+      const char* const* kp, int64_t krow, const char* q, float* out, int pfd) {
+    __m512 cv[N];
+#pragma GCC unroll 8
+    for (int r = 0; r < N; ++r) cv[r] = _mm512_setzero_ps();
+    if constexpr (BF) {
+      for (int di = 0; di < NDIM; ++di) {
+        if (pfd != 0 && (di & 1) == 0) {
+#pragma GCC unroll 8
+          for (int r = 0; r < N; ++r) __builtin_prefetch(kp[r] + (di + pfd) * krow);
+        }
+        const __m512bh qv = bcast_pair(q + di * 4);
+        __m512bh kb[N];
+#pragma GCC unroll 8
+        for (int r = 0; r < N; ++r) kb[r] = load_pair_bf16(kp[r] + di * krow);
+#pragma GCC unroll 8
+        for (int r = 0; r < N; ++r) cv[r] = _mm512_dpbf16_ps(cv[r], qv, kb[r]);
+      }
+    } else {
+      const float* qf = reinterpret_cast<const float*>(q);
+      for (int di = 0; di < NDIM; ++di) {
+        if (pfd != 0 && (di & 1) == 0) {
+#pragma GCC unroll 8
+          for (int r = 0; r < N; ++r) __builtin_prefetch(kp[r] + (di + pfd) * krow);
+        }
+        const __m512 qv = _mm512_set1_ps(qf[di]);
+        __m512 kb[N];
+#pragma GCC unroll 8
+        for (int r = 0; r < N; ++r) kb[r] = ld16(kp[r] + di * krow);
+#pragma GCC unroll 8
+        for (int r = 0; r < N; ++r) cv[r] = _mm512_fmadd_ps(qv, kb[r], cv[r]);
+      }
+    }
+#pragma GCC unroll 8
+    for (int r = 0; r < N; ++r) st16(out + r * 16, cv[r]);
+  }
+
+  // One 16-key group, with the lane mask for a key range that ends inside it.
+  static inline __attribute__((always_inline)) void qk_one(
+      const char* kp, int64_t krow, const char* q, float* out, int64_t jj,
+      int64_t len, const __m512i& lane, const __m512& ninf) {
+    __m512 cv = _mm512_setzero_ps();
+    if constexpr (BF) {
+      for (int di = 0; di < NDIM; ++di)
+        cv = _mm512_dpbf16_ps(cv, bcast_pair(q + di * 4), load_pair_bf16(kp + di * krow));
+    } else {
+      const float* qf = reinterpret_cast<const float*>(q);
+      for (int di = 0; di < NDIM; ++di)
+        cv = _mm512_fmadd_ps(_mm512_set1_ps(qf[di]), ld16(kp + di * krow), cv);
+    }
+    if (jj + 16 <= len) {
+      st16(out, cv);
+    } else {
+      const __m512i idx = _mm512_add_epi32(_mm512_set1_epi32((int)jj), lane);
+      const __mmask16 bad =
+          _mm512_cmpge_epi32_mask(idx, _mm512_set1_epi32((int)len));
+      st16(out, _mm512_mask_blend_ps(bad, cv, ninf));
+    }
+  }
+
   static void attend_head(const PagedJob& job, int64_t seq, int64_t head,
                           char* ws) {
     const int64_t group = job.num_heads / job.num_kv_heads;
@@ -448,55 +591,66 @@ struct Paged {
     char* op = static_cast<char*>(job.out) +
                (seq * job.out_stride + head * HD) * ESZ;
     float* logits = reinterpret_cast<float*>(ws);
-    const int64_t stride = job.page * HD * ESZ;
+    const int64_t page = job.page;
+    const int64_t stride = page * HD * ESZ;   // bytes per (page, head)
+    const int64_t krow = page * 4;            // bytes between K dim rows
+    const int64_t vrow = HD * ESZ;            // bytes between V keys
     const __m512i lane = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
-                                           12, 13, 14, 15);
+                                          12, 13, 14, 15);
+    const __m512 ninf = _mm512_set1_ps(-INFINITY);
+    const int kt = kt_();
 
-    // One query row: the whole head-dim accumulator stays in registers (4 zmm
-    // at D=64, 8 at D=128) and the key loop is dim-inner, so V is read once.
     __m512 acc[NV];
     for (int i = 0; i < NV; ++i) acc[i] = _mm512_setzero_ps();
     float m = -INFINITY, l = 0.0f;
     const float c = job.scale * kLog2e;
+    const __m512 vc = _mm512_set1_ps(c);
 
-    for (int64_t kt0 = 0; kt0 < len; kt0 += KT) {
-      const int nkeys = static_cast<int>(std::min<int64_t>(KT, len - kt0));
-      for (int j = 0; j < nkeys; j += LANES) {
+    for (int64_t kt0 = 0; kt0 < len; kt0 += kt) {
+      const int nkeys = static_cast<int>(std::min<int64_t>(kt, len - kt0));
+
+      // ---- Q@K^T: 64 keys per step (4 pages of work), dim-outer
+      const int md = mode();
+      const int pfd = pf_dist();
+      int j = 0;
+      int64_t p = kt0 / page;
+      int64_t off = kt0 - p * page;
+      const char* kpage = static_cast<const char*>(job.k_cache) +
+                          (bt[p] * job.num_kv_heads + kvh) * stride;
+      for (; j + KSTEP <= nkeys && (md & 1) == 0 && qk_old_shape() == 0; j += KSTEP) {
+        const char* kp[R];
+#pragma GCC unroll 8
+        for (int r = 0; r < R; ++r) {
+          if (off >= page) {
+            ++p;
+            off = 0;
+            kpage = static_cast<const char*>(job.k_cache) +
+                    (bt[p] * job.num_kv_heads + kvh) * stride;
+          }
+          kp[r] = kpage + off * 4;
+          off += 16;
+        }
+        qk_groups<R>(kp, krow, q, logits + j, pfd);
+      }
+      for (; j < nkeys && (md & 1) == 0; j += 16) {
         const int64_t jj = kt0 + j;
-        const char* kb = static_cast<const char*>(job.k_cache) +
-                         (bt[jj / job.page] * job.num_kv_heads + kvh) * stride;
-        const int64_t off = jj % job.page;
-        __m512 cv = _mm512_setzero_ps();
-        if constexpr (BF) {
-          for (int d2 = 0; d2 < HD / 2; ++d2) {
-            const __m512bh kbv =
-                load_pair_bf16(kb + (((d2 * job.page) + off) * 2) * 2);
-            cv = _mm512_dpbf16_ps(cv, bcast_pair(q + 2 * d2 * 2), kbv);
-          }
-        } else {
-          for (int d = 0; d < HD; ++d) {
-            const __m512 kbv = ld16(kb + ((d * job.page) + off) * 4);
-            cv = _mm512_fmadd_ps(bcast_f32(q + d * 4), kbv, cv);
-          }
+        if (off >= page) {
+          ++p;
+          off = 0;
+          kpage = static_cast<const char*>(job.k_cache) +
+                  (bt[p] * job.num_kv_heads + kvh) * stride;
         }
-        if (jj + LANES <= len) {
-          st16(logits + j, cv);
-        } else {
-          const __m512i idx = _mm512_add_epi32(_mm512_set1_epi32((int)jj), lane);
-          const __mmask16 bad = _mm512_cmpge_epi32_mask(
-              idx, _mm512_set1_epi32((int)len));
-          st16(logits + j,
-               _mm512_mask_blend_ps(bad, cv, _mm512_set1_ps(-INFINITY)));
-        }
+        qk_one(kpage + off * 4, krow, q, logits + j, jj, len, lane, ninf);
+        off += 16;
       }
-      const __m512 vc = _mm512_set1_ps(c);
+
+      // ---- online softmax: max pass reads only, the scale is folded into the
+      // exponential (the reference wrote the scaled logits back, one extra
+      // full pass over the tile per 512 keys).
       __m512 mx = _mm512_set1_ps(-INFINITY);
-      for (int j = 0; j < nkeys; j += LANES) {
-        const __m512 s = _mm512_mul_ps(ld16(logits + j), vc);
-        st16(logits + j, s);
-        mx = _mm512_max_ps(mx, s);
-      }
-      const float mxv = _mm512_reduce_max_ps(mx);
+      for (int t = 0; t < nkeys && (md & 2) == 0; t += 16)
+        mx = _mm512_max_ps(mx, ld16(logits + t));
+      const float mxv = _mm512_reduce_max_ps(mx) * c;
       float mn, a;
       if (mxv == -INFINITY) {
         mn = m;
@@ -515,35 +669,73 @@ struct Paged {
         for (int i = 0; i < NV; ++i) acc[i] = _mm512_mul_ps(acc[i], va);
       }
       if (mn == -INFINITY) {
-        for (int j = 0; j < nkeys; j += LANES)
-          st16(logits + j, _mm512_setzero_ps());
+        for (int t = 0; t < nkeys; t += 16)
+          st16(logits + t, _mm512_setzero_ps());
       } else {
         const __m512 vmn = _mm512_set1_ps(mn);
         __m512 sum = _mm512_setzero_ps();
-        for (int j = 0; j < nkeys; j += LANES) {
-          const __m512 e = exp2v(_mm512_sub_ps(ld16(logits + j), vmn));
-          st16(logits + j, e);
+        for (int t = 0; t < nkeys; t += 16) {
+          const __m512 e = exp2v_page<BF>(_mm512_fmsub_ps(ld16(logits + t), vc, vmn));
+          st16(logits + t, e);
           sum = _mm512_add_ps(sum, e);
         }
         l += _mm512_reduce_add_ps(sum);
       }
-      for (int j = 0; j < nkeys; ++j) {
-        const int64_t jj = kt0 + j;
-        const char* vb = static_cast<const char*>(job.v_cache) +
-                         (bt[jj / job.page] * job.num_kv_heads + kvh) * stride +
-                         ((jj % job.page) * HD) * ESZ;
-        const __m512 pj = _mm512_set1_ps(logits[j]);
-        for (int i = 0; i < NV; ++i) {
-          __m512 v;
-          if constexpr (BF) {
-            v = widen_bf16(vb + i * 16 * ESZ);
-          } else {
-            v = ld16(vb + i * 16 * ESZ);
+
+      // ---- P@V: walk pages (one division per page, not per key), two
+      // accumulator lanes over key parity.
+      __m512 a0[NV], a1[NV];
+#pragma GCC unroll 8
+      for (int i = 0; i < NV; ++i) {
+        a0[i] = acc[i];
+        a1[i] = _mm512_setzero_ps();
+      }
+      int done = (md & 4) ? nkeys : 0;
+      int64_t vp64 = kt0 / page;
+      int64_t voff = kt0 - vp64 * page;
+      while (done < nkeys) {
+        const char* vp = static_cast<const char*>(job.v_cache) +
+                         (bt[vp64] * job.num_kv_heads + kvh) * stride +
+                         voff * vrow;
+        const int64_t chunk = std::min<int64_t>(page - voff, nkeys - done);
+        const float* lp = logits + done;
+        int64_t t = 0;
+        for (; t + 1 < chunk && pv_one_lane() == 0; t += 2) {
+          if (pfd != 0 && (t & 1) == 0) __builtin_prefetch(vp + (t + 2 * pfd) * vrow);
+          const char* vb0 = vp + t * vrow;
+          const char* vb1 = vb0 + vrow;
+          const __m512 p0 = _mm512_set1_ps(lp[t]);
+          const __m512 p1 = _mm512_set1_ps(lp[t + 1]);
+          __m512 v0[NV], v1[NV];
+#pragma GCC unroll 8
+          for (int i = 0; i < NV; ++i) {
+            v0[i] = load_v(vb0 + i * 16 * ESZ);
+            v1[i] = load_v(vb1 + i * 16 * ESZ);
           }
-          acc[i] = _mm512_fmadd_ps(pj, v, acc[i]);
+#pragma GCC unroll 8
+          for (int i = 0; i < NV; ++i) {
+            a0[i] = _mm512_fmadd_ps(p0, v0[i], a0[i]);
+            a1[i] = _mm512_fmadd_ps(p1, v1[i], a1[i]);
+          }
+        }
+        for (; t < chunk; ++t) {
+          const char* vb = vp + t * vrow;
+          const __m512 pj = _mm512_set1_ps(lp[t]);
+#pragma GCC unroll 8
+          for (int i = 0; i < NV; ++i)
+            a0[i] = _mm512_fmadd_ps(pj, load_v(vb + i * 16 * ESZ), a0[i]);
+        }
+        done += static_cast<int>(chunk);
+        voff += chunk;
+        if (voff >= page) {
+          voff = 0;
+          ++vp64;
         }
       }
+#pragma GCC unroll 8
+      for (int i = 0; i < NV; ++i) acc[i] = _mm512_add_ps(a0[i], a1[i]);
     }
+
     const float inv = l > 0.0f ? 1.0f / l : 0.0f;
     const __m512 vi = _mm512_set1_ps(inv);
     for (int i = 0; i < NV; ++i) {

@@ -10,6 +10,71 @@ Box: `m8i.2xlarge` (Xeon 6975P-C, 8 vCPU = **4 physical cores**, `amx_tile` /
 us-west-2. All arms interleaved and rotated in **one process**, `min` of 15
 (`bench_cpp.py`), duplicate `cpp` arm as the noise floor.
 
+
+## 0. Port: the paged kernel now lives in `cpu_attn_vec.hpp` (every x86 box)
+
+It was reachable only through `amx::paged`, so every non-AMX x86 machine --
+including the Ryzen dev box where the project's local matrix is measured -- still
+ran the old `Paged::attend_head`. The body moved to
+`cpu_attention/csrc/cpu_attn_vec.hpp` (paged policy only), and
+`cpu_attn_amx.hpp` now holds one-line forwards:
+
+```cpp
+void paged(const PagedJob& job, int workers) { vec::paged(job, workers); }
+void store(const PagedJob& job, int workers) { vec::store(job, workers); }
+```
+
+so there is exactly one paged kernel, `vec` is authoritative, and the
+dispatcher's `kIsaAmx` route keeps working with nothing to drift. `Dense`,
+`cpu_attn_impl.hpp`, `cpu_attn.cpp`, `utils.hpp` and the Python layer are
+untouched. The cache layout is byte-identical, `KT = 512` and the online-softmax
+scheme are unchanged, and the only new helper is `exp2v_page<FAST>` (the
+degree-2 bf16 exponential) next to the existing `exp2v`, because the dense policy
+uses the latter and is not mine to touch.
+
+### Did the port transfer the win? Two trees, alternating processes
+
+Pre-port commit `0e4c206` (old vec body, `jj / job.page` per key, three-pass
+softmax) against the ported tree, both forced to the VEC paged path
+(`CPU_ATTENTION_ISA=vec`), three alternating rounds each, `min` of 11 per round,
+medians of the per-round mins, and a vLLM arm in every process to divide out the
+box's drift:
+
+| row | dt | old vec | new vec | old/new | vllm | old/vllm | new/vllm |
+|---|---|---:|---:|---:|---:|---:|---:|
+| b=1 ctx=256 | bf16 | 13.5 | 11.6 | **1.163** | 10.6 | 1.277 | 1.098 |
+| b=8 ctx=256 | bf16 | 84.7 | 64.8 | **1.306** | 102.8 | 0.824 | **0.631** |
+| b=8 ctx=1024 | bf16 | 453.3 | 378.3 | **1.198** | 423.4 | 1.071 | **0.893** |
+| b=32 ctx=1024 | bf16 | 2248.7 | 1746.6 | **1.287** | 2291.3 | 0.981 | **0.762** |
+| b=1 ctx=4096 | bf16 | 255.5 | 224.3 | **1.139** | 267.6 | 0.955 | **0.838** |
+| b=1 ctx=256 | fp32 | 13.5 | 11.3 | **1.188** | 11.4 | 1.177 | 0.991 |
+| b=8 ctx=256 | fp32 | 191.8 | 197.2 | 0.973 | 184.2 | 1.041 | 1.070 |
+| b=8 ctx=1024 | fp32 | 827.5 | 847.8 | 0.976 | 728.4 | 1.136 | 1.164 |
+| b=32 ctx=1024 | fp32 | 4113.9 | 3946.5 | **1.042** | 3641.0 | 1.130 | 1.084 |
+| b=1 ctx=4096 | fp32 | 426.6 | 420.6 | 1.014 | 385.5 | 1.107 | 1.091 |
+
+**bf16 median 1.198 (1.139-1.306), fp32 median 1.014 (0.973-1.188)**: the port
+transferred the win and the fp32 rows stayed at parity, which is what the loop
+shapes were chosen for. Nothing regressed at `b=1`.
+
+### Parity with `CPU_ATTENTION_ISA=vec` forced (the moved code)
+
+```
+tests/test_flash_api.py            cpu_attention 0.1.0: all checks passed
+tests/test_dense.py                cpu_attention dense: 65/65 checks passed
+tests/fuzz_dense.py --cases 80     fuzz dense: 80/80 cases within tolerance, worst was 0.52x its tolerance
+300-shape paged sweep              paged parity: 600/600 checks passed over 300 shapes
+same sweep, ISA not forced         paged parity: 600/600 (amx::paged -> vec::paged)
+audit/audit_paged.py --rounds 15   d(ours) fp32 2.4e-7..4.5e-7, bf16 2.8e-4..1.7e-3
+```
+
+### Matrix with `CPU_ATTENTION_ISA=vec` (min of 15, one process, rotated)
+
+Against the better vLLM build per row: bf16 **7/10 win** (0.579-0.861, losses
+1.04 x2 at b=8/1024 and 1.11 at the 8-us cross b=1/256 row); fp32 **6/10 win**
+(0.524-0.922; losses 1.05/1.11 at b=8/256, 1.11/1.13 at b=1/4096, 1.005 at
+b=8/1024 cross).
+
 ## 1. AMX does not pay for paged decode — the number
 
 A paged decode work item is one live query row, so an M=16 tile is 15/16 waste
