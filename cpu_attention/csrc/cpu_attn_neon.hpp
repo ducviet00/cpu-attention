@@ -59,6 +59,9 @@ inline void stf(void* p, float32x4_t v) {
 inline bfloat16x8_t ldb(const void* p) {
   return vld1q_bf16(static_cast<const bfloat16_t*>(p));
 }
+inline void stb(void* p, bfloat16x8_t v) {
+  vst1q_bf16(static_cast<bfloat16_t*>(p), v);
+}
 inline bfloat16x4_t ldb4(const void* p) {
   return vld1_bf16(static_cast<const bfloat16_t*>(p));
 }
@@ -282,50 +285,68 @@ struct DenseF32 {
   // panel (P_T[j][r]) so P@V loads one vector of rows per key.
   static void softmax(float* logits, int nrows, int nkeys, float c, float* m,
                       float* l, float* alpha) {
+    // Four rows at a time: the four exp vectors are transposed so the P panel
+    // ([key][row]) is written with one 16-byte store per key instead of four
+    // strided 4-byte lane stores, and the four chains give the exp some ILP.
     float* pt = pof(logits);
     const float* tm = tmax_of(logits);
     const float32x4_t vc = vdupq_n_f32(c);
-    for (int r = 0; r < nrows; ++r) {
-      const float* p = logits + r * KT;
-      const float mxv = tm[r] * c;  // c > 0: max(c*x) == c*max(x)
-      const float mo = m[r];
-      float mn, a;
-      if (mxv == kNegInf) {
-        mn = mo;
-        a = 1.0f;
-      } else if (mo == kNegInf) {
-        mn = mxv;
-        a = 0.0f;
-      } else {
-        mn = mo > mxv ? mo : mxv;
-        a = std::exp2(mo - mn);
-      }
-      m[r] = mn;
-      alpha[r] = a;
-      l[r] *= a;
-      float32x4_t sum = vdupq_n_f32(0.0f);
-      if (mn == kNegInf) {
-        // No key visible yet: exp2(-inf - -inf) would be NaN.
-        for (int j = 0; j < nkeys; j += 4) {
-          stf(pt + (j + 0) * RQT + r, vdupq_n_f32(0.0f));
-          stf(pt + (j + 1) * RQT + r, vdupq_n_f32(0.0f));
-          stf(pt + (j + 2) * RQT + r, vdupq_n_f32(0.0f));
-          stf(pt + (j + 3) * RQT + r, vdupq_n_f32(0.0f));
+    for (int r0 = 0; r0 < nrows; r0 += 4) {
+      float mn[4], av[4];
+      for (int k = 0; k < 4; ++k) {
+        const int r = r0 + k;
+        const float mxv = tm[r] * c;  // c > 0: max(c*x) == c*max(x)
+        const float mo = m[r];
+        float v;
+        if (mxv == kNegInf) {
+          mn[k] = mo;
+          av[k] = 1.0f;
+        } else if (mo == kNegInf) {
+          mn[k] = mxv;
+          av[k] = 0.0f;
+        } else {
+          mn[k] = mo > mxv ? mo : mxv;
+          av[k] = std::exp2(mo - mn[k]);
         }
-      } else {
-        const float32x4_t vmn = vdupq_n_f32(-mn);
-#pragma GCC unroll 4
-        for (int j = 0; j < nkeys; j += 4) {
-          const float32x4_t e = exp2v<5>(vfmaq_f32(vmn, vc, ldf(p + j)));
-          // P_T is [key][row]: four strided lane stores, not one vector store.
-          vst1q_lane_f32(pt + (j + 0) * RQT + r, e, 0);
-          vst1q_lane_f32(pt + (j + 1) * RQT + r, e, 1);
-          vst1q_lane_f32(pt + (j + 2) * RQT + r, e, 2);
-          vst1q_lane_f32(pt + (j + 3) * RQT + r, e, 3);
-          sum = vaddq_f32(sum, e);
-        }
+        m[r] = mn[k];
+        alpha[r] = av[k];
+        l[r] *= av[k];
       }
-      l[r] += hsum(sum);
+      float32x4_t sum[4];
+      for (int k = 0; k < 4; ++k) sum[k] = vdupq_n_f32(0.0f);
+      const float32x4_t vmn0 = vdupq_n_f32(-mn[0]);
+      const float32x4_t vmn1 = vdupq_n_f32(-mn[1]);
+      const float32x4_t vmn2 = vdupq_n_f32(-mn[2]);
+      const float32x4_t vmn3 = vdupq_n_f32(-mn[3]);
+      const float32x4_t zero = vdupq_n_f32(0.0f);
+      const float* p0 = logits + (r0 + 0) * KT;
+      const float* p1 = logits + (r0 + 1) * KT;
+      const float* p2 = logits + (r0 + 2) * KT;
+      const float* p3 = logits + (r0 + 3) * KT;
+      for (int j = 0; j < nkeys; j += 4) {
+        float32x4_t e0 = mn[0] == kNegInf
+                             ? zero
+                             : exp2v<5>(vfmaq_f32(vmn0, vc, ldf(p0 + j)));
+        float32x4_t e1 = mn[1] == kNegInf
+                             ? zero
+                             : exp2v<5>(vfmaq_f32(vmn1, vc, ldf(p1 + j)));
+        float32x4_t e2 = mn[2] == kNegInf
+                             ? zero
+                             : exp2v<5>(vfmaq_f32(vmn2, vc, ldf(p2 + j)));
+        float32x4_t e3 = mn[3] == kNegInf
+                             ? zero
+                             : exp2v<5>(vfmaq_f32(vmn3, vc, ldf(p3 + j)));
+        sum[0] = vaddq_f32(sum[0], e0);
+        sum[1] = vaddq_f32(sum[1], e1);
+        sum[2] = vaddq_f32(sum[2], e2);
+        sum[3] = vaddq_f32(sum[3], e3);
+        tr4x4(e0, e1, e2, e3);
+        stf(pt + (j + 0) * RQT + r0, e0);
+        stf(pt + (j + 1) * RQT + r0, e1);
+        stf(pt + (j + 2) * RQT + r0, e2);
+        stf(pt + (j + 3) * RQT + r0, e3);
+      }
+      for (int k = 0; k < 4; ++k) l[r0 + k] += hsum(sum[k]);
     }
   }
 
@@ -525,42 +546,53 @@ struct DenseBF {
   // (row0's four keys, row1's four keys).
   static void softmax(float* logits, int nrows, int nkeys, float c, float* m,
                       float* l, float* alpha) {
+    // A row pair at a time: the two rows of a P@V operand group are adjacent
+    // halves of one 16-byte group, so both are written by a single full store
+    // (and the two exp chains interleave).
     char* pt = pof(logits);
     const float* tmv = tmax_of(logits);
     const float32x4_t vc = vdupq_n_f32(c);
-    for (int r = 0; r < nrows; ++r) {
-      const float* p = logits + r * KT;
-      const float mxv = tmv[r] * c;
-      const float mo = m[r];
-      float mn, a;
-      if (mxv == kNegInf) {
-        mn = mo;
-        a = 1.0f;
-      } else if (mo == kNegInf) {
-        mn = mxv;
-        a = 0.0f;
-      } else {
-        mn = mo > mxv ? mo : mxv;
-        a = std::exp2(mo - mn);
-      }
-      m[r] = mn;
-      alpha[r] = a;
-      l[r] *= a;
-      char* dst = pt + ((r / 2) * KG * 8 + (r & 1) * 4) * 2;
-      float32x4_t sum = vdupq_n_f32(0.0f);
-      if (mn == kNegInf) {
-        // No key visible yet: exp2(-inf - -inf) would be NaN.
-        for (int j = 0; j < nkeys; j += 4) stb4(dst + (j / 4) * 16, vdup_n_bf16(0));
-      } else {
-        const float32x4_t vmn = vdupq_n_f32(-mn);
-#pragma GCC unroll 4
-        for (int j = 0; j < nkeys; j += 4) {
-          const float32x4_t e = exp2v<3>(vfmaq_f32(vmn, vc, ldf(p + j)));
-          stb4(dst + (j / 4) * 16, vcvt_bf16_f32(e));
-          sum = vaddq_f32(sum, e);
+    for (int r0 = 0; r0 < nrows; r0 += 2) {
+      const int r1 = r0 + 1 < RQT ? r0 + 1 : r0;
+      float mn[2], av[2];
+      const int rr[2] = {r0, r1};
+      for (int k = 0; k < 2; ++k) {
+        const int r = rr[k];
+        const float mxv = tmv[r] * c;
+        const float mo = m[r];
+        if (mxv == kNegInf) {
+          mn[k] = mo;
+          av[k] = 1.0f;
+        } else if (mo == kNegInf) {
+          mn[k] = mxv;
+          av[k] = 0.0f;
+        } else {
+          mn[k] = mo > mxv ? mo : mxv;
+          av[k] = std::exp2(mo - mn[k]);
         }
+        m[r] = mn[k];
+        alpha[r] = av[k];
+        l[r] *= av[k];
       }
-      l[r] += hsum(sum);
+      char* dst = pt + (r0 / 2) * KG * 8 * 2;
+      const float* p0 = logits + rr[0] * KT;
+      const float* p1 = logits + rr[1] * KT;
+      const float32x4_t vmn0 = vdupq_n_f32(-mn[0]);
+      const float32x4_t vmn1 = vdupq_n_f32(-mn[1]);
+      const float32x4_t zero = vdupq_n_f32(0.0f);
+      float32x4_t s0 = zero, s1 = zero;
+      for (int j = 0; j < nkeys; j += 4) {
+        const float32x4_t e0 =
+            mn[0] == kNegInf ? zero : exp2v<3>(vfmaq_f32(vmn0, vc, ldf(p0 + j)));
+        const float32x4_t e1 =
+            mn[1] == kNegInf ? zero : exp2v<3>(vfmaq_f32(vmn1, vc, ldf(p1 + j)));
+        s0 = vaddq_f32(s0, e0);
+        s1 = vaddq_f32(s1, e1);
+        stb(dst + (j / 4) * 16,
+            vcombine_bf16(vcvt_bf16_f32(e0), vcvt_bf16_f32(e1)));
+      }
+      l[rr[0]] += hsum(s0);
+      if (rr[1] != rr[0]) l[rr[1]] += hsum(s1);
     }
   }
 
@@ -571,6 +603,10 @@ struct DenseBF {
     const int64_t pad = pad_of(job.seq_k);
     const int64_t kgn = pad / 4;
     const char* vd = slab + pad * HD * 2;
+    // Eight head dims per pass: the accumulator is 4 row pairs x 4 dim pairs =
+    // 16 registers, which leaves room for the operands. Sixteen dims per pass
+    // would halve the number of sweeps over V but needs 32 accumulator
+    // registers and spills 1.16x slower (measured).
     for (int dc = 0; dc < HD; dc += 8) {
       float32x4_t a[RP][4];
       for (int rp = 0; rp < RP; ++rp) {
