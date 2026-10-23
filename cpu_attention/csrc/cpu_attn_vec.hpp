@@ -8,9 +8,9 @@
 // `dpbf16ps` contracts, so one instruction retires 16 positions x 2 dims.
 //
 // Q@K^T is a register tile of RQT query rows against 16 positions: one load of
-// K plus RQT broadcast-FMAs, i.e. <= 1.25 loads per FMA, which these cores can
-// issue two of per cycle. P@V keeps the whole head-dim accumulator in registers
-// (paged: one row, 4-8 zmm) or an 8x32 tile (dense) so it is FMA-bound too.
+// K plus RQT broadcast-FMAs. P@V keeps the whole head-dim accumulator in
+// registers (paged: one row, 4-8 zmm) or an 8x32 tile (dense), so both phases
+// are FMA-bound rather than load-bound.
 //
 // Apache-2.0; structure after vLLM's csrc/cpu/cpu_attn_vec.hpp.
 #pragma once
@@ -67,9 +67,26 @@ inline __m256i pack_bf16_16(__m512 v) {
   return r;
 }
 
+// Two dims, 16 positions each, into the position-major pair layout the dot
+// instruction contracts: (d0,t0),(d1,t0),(d0,t1),(d1,t1),...
+inline void store_pair_bf16(char* dst, __m512 d0, __m512 d1) {
+  const __m256i a = pack_bf16_16(d0);
+  const __m256i b = pack_bf16_16(d1);
+  const __m256i lo = _mm256_permutex2var_epi16(
+      a, _mm256_setr_epi16(0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7,
+                           23),
+      b);
+  const __m256i hi = _mm256_permutex2var_epi16(
+      a, _mm256_setr_epi16(8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30,
+                           15, 31),
+      b);
+  std::memcpy(dst, &lo, 32);
+  std::memcpy(dst + 32, &hi, 32);
+}
+
 // 2^x for x <= 0: degree-5 polynomial on the fraction, exponent by insertion.
 // ~10 instructions; std::exp costs more than twice that and the softmax is
-// 15-30% of a call.
+// 15-30% of a call in the Mojo tree.
 inline __m512 exp2v(__m512 x) {
   x = _mm512_max_ps(x, _mm512_set1_ps(-127.0f));
   x = _mm512_min_ps(x, _mm512_setzero_ps());
@@ -112,53 +129,44 @@ inline void transpose16x16_f32(__m512* r) {
   }
 }
 
-// Two dims, 16 positions each, into the position-major pair layout the dot
-// instruction contracts: (d0,t0),(d1,t0),(d0,t1),(d1,t1),...
-inline void store_pair_bf16(char* dst, __m512 d0, __m512 d1) {
-  const __m256i a = pack_bf16_16(d0);
-  const __m256i b = pack_bf16_16(d1);
-  const __m256i lo = _mm256_permutex2var_epi16(
-      a, _mm256_setr_epi16(0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7,
-                           23),
-      b);
-  const __m256i hi = _mm256_permutex2var_epi16(
-      a, _mm256_setr_epi16(8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30,
-                           15, 31),
-      b);
-  std::memcpy(dst, &lo, 32);
-  std::memcpy(dst + 32, &hi, 32);
-}
-
 // ---------------------------------------------------------------------------
 // dense policy
 // ---------------------------------------------------------------------------
 template <int DT, int HD>
 struct Dense {
   static constexpr int RQT = 8;
-  static constexpr int KT = HD == 128 ? 256 : 512;
   static constexpr bool BF = DT == kBF16;
   static constexpr int ESZ = BF ? 2 : 4;
+  static constexpr int KTMAX = 1024;
 
+  static int kt_() {
+    static const int k = env_int("CPU_ATTENTION_KT", 256, 32, KTMAX);
+    return k;
+  }
   static int rq(int64_t seq_q, int hd) {
-    // The accumulator is rq*hd floats in L1: keep it near 32 KB so it is still
-    // there when the next key tile arrives, and stop growing when the query
-    // block already covers the whole sequence.
-    int n = 32768 / (hd * 4);
+    static const int fixed = env_int("CPU_ATTENTION_RQ", 0, 0, 512);
+    if (fixed) return static_cast<int>(std::min<int64_t>(fixed, seq_q));
+    // The accumulator is rq*hd floats in L1: keep it near 16 KB so it is still
+    // there when the next key tile arrives.
+    int n = 16384 / (hd * 4);
     n = n < 16 ? 16 : (n > 128 ? 128 : n);
     return static_cast<int>(std::min<int64_t>(n, std::max<int64_t>(seq_q, 1)));
   }
+  // `pv` runs its row loop over the whole register tile, so the accumulator is
+  // sized for roundup(rq, RQT) rows.
+  static int acc_rows(int rq) { return ((rq + RQT - 1) / RQT) * RQT; }
   static int64_t pad_of(int64_t seq_k) { return (seq_k + 63) & ~int64_t(63); }
   static size_t slab_bytes(int64_t seq_k, int hd) {
     return static_cast<size_t>(2 * pad_of(seq_k) * hd) * ESZ;
   }
   static size_t aux_bytes(int rq, int hd) {
-    return static_cast<size_t>(RQT * KT) * 4 + static_cast<size_t>(rq) * hd * 4 +
-           static_cast<size_t>(rq) * 3 * 4;
+    const size_t rows = static_cast<size_t>(acc_rows(rq));
+    return static_cast<size_t>(RQT) * KTMAX * 4 + rows * hd * 4 + rows * 3 * 4;
   }
 
   // K -> [hd][pad] (bf16: [hd/2][pad][2]); V -> [pad][hd]. One pass, 16 tokens x
-  // 16 dims at a time: a 16x16 transpose is 4 shuffle stages and one 64-byte
-  // store per output row, against 40-70 GB/s for torch's element-wise permute.
+  // 16 dims at a time: a 16x16 transpose is four shuffle stages and one 64-byte
+  // store per output row, against 11-15 GB/s for torch's element-wise permute.
   static void pack(const DenseJob& job, int64_t b, int64_t kvh, char* slab) {
     const int64_t pad = pad_of(job.seq_k);
     const char* ksrc =
@@ -167,10 +175,10 @@ struct Dense {
         static_cast<const char*>(job.v) + (b * job.vb + kvh * job.vh) * ESZ;
     char* kdst = slab;
     char* vdst = slab + pad * HD * ESZ;
-    for (int64_t t0 = 0; t0 < pad; t0 += 16) {
+    for (int64_t t0 = 0; t0 < job.seq_k; t0 += 16) {
       const int64_t tn = std::min<int64_t>(16, job.seq_k - t0);
-      for (int64_t d0 = 0; d0 < HD; d0 += 16) {
-        if (tn == 16) {
+      if (tn == 16) {
+        for (int64_t d0 = 0; d0 < HD; d0 += 16) {
           __m512 r[16];
           for (int i = 0; i < 16; ++i) {
             const char* s = ksrc + (t0 + i) * job.kt * ESZ + d0 * ESZ;
@@ -185,18 +193,16 @@ struct Dense {
             for (int d = 0; d < 16; ++d)
               st16(kdst + ((d0 + d) * pad + t0) * 4, r[d]);
           }
-        } else {
-          for (int64_t t = 0; t < tn; ++t) {
-            const char* s = ksrc + (t0 + t) * job.kt * ESZ + d0 * ESZ;
-            for (int d = 0; d < 16; ++d) {
-              if constexpr (BF) {
-                std::memcpy(kdst + (((d0 + d) / 2 * pad + t0 + t) * 2 +
-                                    ((d0 + d) & 1)) * ESZ,
-                            s + d * ESZ, ESZ);
-              } else {
-                std::memcpy(kdst + ((d0 + d) * pad + t0 + t) * ESZ,
-                            s + d * ESZ, ESZ);
-              }
+        }
+      } else {
+        for (int64_t t = 0; t < tn; ++t) {
+          const char* s = ksrc + (t0 + t) * job.kt * ESZ;
+          for (int64_t d = 0; d < HD; ++d) {
+            if constexpr (BF) {
+              std::memcpy(kdst + ((d / 2 * pad + t0 + t) * 2 + (d & 1)) * ESZ,
+                          s + d * ESZ, ESZ);
+            } else {
+              std::memcpy(kdst + ((d * pad) + t0 + t) * ESZ, s + d * ESZ, ESZ);
             }
           }
         }
@@ -204,72 +210,94 @@ struct Dense {
       for (int64_t t = 0; t < tn; ++t)
         std::memcpy(vdst + (t0 + t) * HD * ESZ, vsrc + (t0 + t) * job.vt * ESZ,
                     HD * ESZ);
-      if (tn < 16) {
-        std::memset(vdst + (t0 + tn) * HD * ESZ, 0, (16 - tn) * HD * ESZ);
-        for (int d = 0; d < HD; ++d) {
-          if constexpr (BF) {
-            std::memset(kdst + (((d / 2) * pad + t0 + tn) * 2 + (d & 1)) * ESZ,
-                        0, ESZ);
-          } else {
-            std::memset(kdst + ((d * pad) + t0 + tn) * ESZ, 0, ESZ);
-          }
+    }
+    // Zero the padding so a masked lane never reads a NaN left by an earlier
+    // geometry (or runs past the slab).
+    if (job.seq_k < pad) {
+      const int64_t tail = pad - job.seq_k;
+      std::memset(vdst + job.seq_k * HD * ESZ, 0, tail * HD * ESZ);
+      const int dgroups = BF ? HD / 2 : HD;
+      for (int d2 = 0; d2 < dgroups; ++d2) {
+        if constexpr (BF) {
+          std::memset(kdst + ((d2 * pad + job.seq_k) * 2) * ESZ, 0,
+                      tail * 2 * ESZ);
+        } else {
+          std::memset(kdst + (d2 * pad + job.seq_k) * ESZ, 0, tail * ESZ);
         }
       }
     }
   }
 
+  // logits[RQT][kt] = q[RQT] @ K^T for keys [k0, k0+nkeys), causal-masked.
   static void qk(const DenseJob& job, const char* slab, int64_t, int64_t,
                  const char* q_base, int nrows, int64_t k0, int nkeys,
                  int64_t row_limit0, float* logits) {
+    const int kt = kt_();
     const int64_t pad = pad_of(job.seq_k);
     const int64_t qt = job.qt;
     const int64_t kend = k0 + nkeys;
     const int64_t lim = std::min(kend, row_limit0 + 1);
     const __m512i lane = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
                                            12, 13, 14, 15);
+    // The row loop is unrolled over the compile-time RQT: an array of vectors
+    // indexed by a runtime bound lands in memory, which turns every FMA into a
+    // load+store. Rows past `nrows` read a clamped query row and their logits
+    // are never consumed.
     for (int j = 0; j < nkeys; j += LANES) {
       const int64_t jj = k0 + j;
       __m512 c[RQT];
-      for (int r = 0; r < nrows; ++r) c[r] = _mm512_setzero_ps();
+#pragma GCC unroll 16
+      for (int r = 0; r < RQT; ++r) c[r] = _mm512_setzero_ps();
       if constexpr (BF) {
         for (int d2 = 0; d2 < HD / 2; ++d2) {
           const __m512bh kb = load_pair_bf16(slab + ((d2 * pad + jj) * 2) * 2);
-          for (int r = 0; r < nrows; ++r)
+#pragma GCC unroll 16
+          for (int r = 0; r < RQT; ++r) {
+            const int rr = r < nrows ? r : nrows - 1;
             c[r] = _mm512_dpbf16_ps(c[r],
-                                    bcast_pair(q_base + (r * qt + 2 * d2) * 2),
+                                    bcast_pair(q_base + (rr * qt + 2 * d2) * 2),
                                     kb);
+          }
         }
       } else {
         for (int d = 0; d < HD; ++d) {
           const __m512 kb = ld16(slab + ((d * pad) + jj) * 4);
-          for (int r = 0; r < nrows; ++r)
+#pragma GCC unroll 16
+          for (int r = 0; r < RQT; ++r) {
+            const int rr = r < nrows ? r : nrows - 1;
             c[r] =
-                _mm512_fmadd_ps(bcast_f32(q_base + (r * qt + d) * 4), kb, c[r]);
+                _mm512_fmadd_ps(bcast_f32(q_base + (rr * qt + d) * 4), kb, c[r]);
+          }
         }
       }
       if (jj + LANES <= lim) {
-        for (int r = 0; r < nrows; ++r) st16(logits + r * KT + j, c[r]);
+#pragma GCC unroll 16
+        for (int r = 0; r < RQT; ++r)
+          if (r < nrows) st16(logits + r * kt + j, c[r]);
       } else {
         const __m512i idx = _mm512_add_epi32(_mm512_set1_epi32((int)jj), lane);
         const __m512 ninf = _mm512_set1_ps(-INFINITY);
-        for (int r = 0; r < nrows; ++r) {
+#pragma GCC unroll 16
+        for (int r = 0; r < RQT; ++r) {
+          if (r >= nrows) continue;
           const __mmask16 bad =
               _mm512_cmpge_epi32_mask(idx, _mm512_set1_epi32((int)kend)) |
               _mm512_cmpgt_epi32_mask(
                   idx, _mm512_set1_epi32((int)(row_limit0 + r)));
-          st16(logits + r * KT + j, _mm512_mask_blend_ps(bad, c[r], ninf));
+          st16(logits + r * kt + j, _mm512_mask_blend_ps(bad, c[r], ninf));
         }
       }
     }
   }
 
-  // Online-softmax step over one KT-wide row tile: `logits` is scaled in place
+  // Online-softmax step over one kt-wide row tile: `logits` is scaled in place
   // by c (= scale*log2e) and replaced by the probabilities.
   static void softmax(float* logits, int nrows, int nkeys, float c, float* m,
                       float* l, float* alpha) {
+    const int kt = kt_();
     const __m512 vc = _mm512_set1_ps(c);
     for (int r = 0; r < nrows; ++r) {
-      float* p = logits + r * KT;
+      float* p = logits + r * kt;
       __m512 mx = _mm512_set1_ps(-INFINITY);
       for (int j = 0; j < nkeys; j += LANES) {
         const __m512 s = _mm512_mul_ps(ld16(p + j), vc);
@@ -311,10 +339,12 @@ struct Dense {
   static void pv(const DenseJob& job, const char* slab, int64_t, int64_t,
                  int64_t k0, int nkeys, const float* p, int nrows,
                  float* acc) {
+    const int kt = kt_();
     const char* vs = slab + pad_of(job.seq_k) * HD * ESZ;
     for (int dc = 0; dc < HD; dc += 32) {
       __m512 c[RQT][2];
-      for (int r = 0; r < nrows; ++r) {
+#pragma GCC unroll 16
+      for (int r = 0; r < RQT; ++r) {
         c[r][0] = ld16(acc + r * HD + dc);
         c[r][1] = ld16(acc + r * HD + dc + 16);
       }
@@ -328,13 +358,15 @@ struct Dense {
           v0 = ld16(v);
           v1 = ld16(v + 64);
         }
-        for (int r = 0; r < nrows; ++r) {
-          const __m512 pr = _mm512_set1_ps(p[r * KT + j]);
+#pragma GCC unroll 16
+        for (int r = 0; r < RQT; ++r) {
+          const __m512 pr = _mm512_set1_ps(p[r * kt + j]);
           c[r][0] = _mm512_fmadd_ps(pr, v0, c[r][0]);
           c[r][1] = _mm512_fmadd_ps(pr, v1, c[r][1]);
         }
       }
-      for (int r = 0; r < nrows; ++r) {
+#pragma GCC unroll 16
+      for (int r = 0; r < RQT; ++r) {
         st16(acc + r * HD + dc, c[r][0]);
         st16(acc + r * HD + dc + 16, c[r][1]);
       }
@@ -365,25 +397,24 @@ struct Paged {
     const int64_t kvh = head / group;
     const int64_t slot = job.slots[seq];
     const int64_t pg = slot / job.page, off = slot % job.page;
-    const int64_t esz = ESZ;
-    const int64_t stride = job.page * HD * esz;
+    const int64_t stride = job.page * HD * ESZ;
     const int64_t base = (pg * job.num_kv_heads + kvh) * stride;
     char* kp = static_cast<char*>(job.k_cache) + base;
     char* vp = static_cast<char*>(job.v_cache) + base;
     const int64_t kvst = kv_stride_of(job);
     const char* ks =
-        static_cast<const char*>(job.k) + (seq * kvst + head * HD) * esz;
+        static_cast<const char*>(job.k) + (seq * kvst + head * HD) * ESZ;
     const char* vs =
-        static_cast<const char*>(job.v) + (seq * kvst + head * HD) * esz;
+        static_cast<const char*>(job.v) + (seq * kvst + head * HD) * ESZ;
     if constexpr (BF) {
       for (int d = 0; d < HD; ++d)
-        std::memcpy(kp + (((d / 2) * job.page + off) * 2 + (d & 1)) * esz,
-                    ks + d * esz, esz);
+        std::memcpy(kp + (((d / 2) * job.page + off) * 2 + (d & 1)) * ESZ,
+                    ks + d * ESZ, ESZ);
     } else {
       for (int d = 0; d < HD; ++d)
-        std::memcpy(kp + (d * job.page + off) * esz, ks + d * esz, esz);
+        std::memcpy(kp + (d * job.page + off) * ESZ, ks + d * ESZ, ESZ);
     }
-    std::memcpy(vp + off * HD * esz, vs, HD * esz);
+    std::memcpy(vp + off * HD * ESZ, vs, HD * ESZ);
   }
 
   static void attend_head(const PagedJob& job, int64_t seq, int64_t head,
@@ -401,6 +432,8 @@ struct Paged {
     const __m512i lane = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
                                            12, 13, 14, 15);
 
+    // One query row: the whole head-dim accumulator stays in registers (4 zmm
+    // at D=64, 8 at D=128) and the key loop is dim-inner, so V is read once.
     __m512 acc[NV];
     for (int i = 0; i < NV; ++i) acc[i] = _mm512_setzero_ps();
     float m = -INFINITY, l = 0.0f;

@@ -142,14 +142,16 @@ struct DenseKern {
   static constexpr bool BF = DT == kBF16;
   static constexpr int RQT = 4;
   static constexpr int KT = 256;
+  static int kt_() { return KT; }
 
   static int rq(int64_t seq_q, int) {
     return static_cast<int>(std::min<int64_t>(16, std::max<int64_t>(seq_q, 1)));
   }
   static size_t slab_bytes(int64_t, int) { return 0; }
+  static int acc_rows(int rq) { return ((rq + RQT - 1) / RQT) * RQT; }
   static size_t aux_bytes(int rq, int hd) {
-    return static_cast<size_t>(RQT * KT) * 4 + static_cast<size_t>(rq) * hd * 4 +
-           static_cast<size_t>(rq) * 3 * 4;
+    const size_t rows = static_cast<size_t>(acc_rows(rq));
+    return static_cast<size_t>(RQT * KT) * 4 + rows * hd * 4 + rows * 3 * 4;
   }
   static void pack(const DenseJob&, int64_t, int64_t, char*) {}
 
