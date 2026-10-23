@@ -194,3 +194,36 @@ the losing change was reverted.
    willing to pass a preallocated output.
 4. **The three-box matrix has not been completed**: the ARM (NEON) and Xeon
    (AMX) files are separate work items and this report only claims the Ryzen.
+
+## ARM / NEON (Graviton 5, m9g.2xlarge, 8 cores)
+
+`cpu_attn_neon.hpp`, measured by the ARM agent with the same protocol (one
+process, four arms, rotated, min of 41 dense / 15 paged with a duplicate `cpp`
+control reading 0.99-1.01).
+
+**Paged is the best column in the project**: `cpp/vllm` **0.20-0.95, 10/10
+wins**; `cpp/mojo` 0.56-1.09, 7/10 (the three losses are `b=1` rows at
+1.01-1.09). Highlights: b=8/256 bf16 0.23 of vLLM and 0.51 of Mojo, b=8/256
+fp32 0.36/0.54, b=1/4096 bf16 0.82/1.05. Parity: paged bf16 is within
+**0.25-0.5 bf16 ulp** of the Mojo oracle, fp32 2.2-3.7e-7.
+
+**Dense is `1.02-1.57x` of Mojo and `0.94-1.49x` of vLLM** — 4 of 22 rows beat
+vLLM (fp32 D=128 at ≥1024 keys, 0.97-1.00) and the fp32 D=128 long row is at
+parity with Mojo (1.02). The ablation puts qk+pv at 2.17 `bfmmla`/cycle against
+a 2.0 measured issue ceiling, i.e. the matmuls are at the hardware rate and the
+residue is the softmax (~28% of the call at D=64) plus, at S=128, 32% fixed cost
+(pack + accumulator zero + epilogue + fork-join). The single largest step was
+not a kernel change: rebasing onto the current shared driver (exact per-chunk
+`nk` clamp, per-chunk causal skip, LLC-aware fuse/split) took the matrix from
+`1.10-2.12x` to `1.06-1.58x` of Mojo.
+
+Falsified on ARM: 4-row bf16 softmax (+0.4%, and it introduced a NaN via
+`exp2(+inf)` on a never-visible row); 16 head dims per `pv` pass (1.16x slower,
+spills); KT 512/1024 (0-6% worse). The blocked K^T that was worth 1.17x on
+AVX-512 is only 1.03-1.04x on NEON — its K sweep already reads 16 bytes per
+(dim group, key pair), so the page walk is a smaller share.
+
+Open on ARM: fuse the exp into the `qk` loop (one pass with the running max as
+the base, falling back to two passes on the first tile). That needs a contract
+hook today's driver does not have — `qk` would take the row max, or `softmax`
+would be allowed to be a no-op.
