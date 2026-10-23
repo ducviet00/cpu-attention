@@ -1,5 +1,52 @@
 # ARM (Graviton 5, m9g.2xlarge, Neoverse-V3) dense kernel
 
+## Round 5 — the Cauchy-Schwarz bounded base: implemented, parity fails, reverted
+
+Implemented for bf16 exactly as specified, and it does *not* pass parity, so it
+is reverted (the shipped kernel is unchanged and re-verified below).
+
+What was built:
+
+* `pack` accumulates `max|k|` for the head while it already reads every element
+  (an unsigned max over the sign-masked bf16 halves -- positive bf16 values
+  order like their bit patterns), stored in a 64-byte tail added to
+  `slab_bytes`. That placement is what makes both driver paths work: fused (the
+  thread packs the head it attends) and split (the pack phase ends in a
+  barrier), with no per-thread aux needed.
+* `qk` computes `m_r = c * ||q_r|| * max|k|` once per chunk (`k0 == 0`), reading
+  `||q_r||` as one bf16-widened dot product per row, and then exponentiates the
+  panel *in place*: `p = exp2(min(c*logit - m_r, 0))` straight into the bf16 P
+  operand layout. The logits buffer, the tile-max scan, the second traversal
+  and the accumulator rescale all disappear; `softmax` becomes the per-tile
+  flush of the probability sums plus `alpha = 1`.
+
+Parity: **40/65** `test_dense`, with `max|diff|` 7.0e-2 .. 5.2e-1 against a
+3e-2 gate -- for both causal and non-causal cases, and for shapes where no row
+is empty and no key is masked. The pattern (a uniform-looking ~20% error on the
+output, independent of masking) is what a probability panel that has collapsed
+to 1 would produce: `exp2(NaN)` through `vminq_f32(x, 0)` returns 0 (FMIN takes
+the non-NaN operand), i.e. `p = 1` for every key. So `m_r` itself is the
+suspect -- `NaN`, or 0 from a `max|k|` that never got written -- and not the
+exponent path. The two things to look at, in order: whether the slab tail
+written by `pack` survives to `kmax_of` on the path the test exercises
+(`slab_bytes` is now 64 bytes longer, and `vd`'s V region ends exactly at the
+tail), and the `vmaxv_u16` reduction of the 4-lane accumulator.
+
+Second, independent defect: masked keys now exponentiate to 1.2e-38 instead of
+exactly 0, because the -126 clamp is inside `exp2v`. For a row with no visible
+key that makes `l` tiny-but-nonzero, so the epilogue's `1/l` returns `V`-scale
+garbage instead of 0 -- the `Sq=5 Sk=2 causal=1` case at 4.7e-1 is that shape.
+The fix is one select per panel (`x > -126 ? exp2(x) : 0`), or keeping the old
+`mn == -inf` row path.
+
+Not reached: the fp32 version of the same treatment, and the 41-round matrix --
+neither is meaningful on a kernel that does not pass its parity gate. The
+shipped binary re-verifies at `test_dense` **65/65**,
+`test_paged_sweep` 504/504 (worst bf16 1.85 ulp, fp32 1.58e-06) and 3421-3452 us
+for 2048:8:64 bf16, so nothing regressed.
+
+---
+
 ## Round 4 — the fused register panel, implemented and falsified
 
 Rewrote `DenseBF`'s three phases into one register-panel loop (branch saved in
