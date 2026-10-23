@@ -92,6 +92,36 @@ as `attn_backend="mojo"`. Read this before touching the kernel; the root
 >   that halve `bfmmla` (208 -> 105 MAC/ns/core) and the pack we are charged for.
 
 
+## 0a. There is a second backend now: `cpu_attention/csrc/` (C++)
+
+The Mojo kernel in `cpu_attention/_mojo` is still the oracle and is still the
+default on aarch64, but the C++ backend in `cpu_attention/csrc/` is what runs by
+default on x86-64 (`CPU_ATTENTION_BACKEND=auto|cpp|mojo`). It has the same Python
+API, the same parity gates and a much better dense/paged matrix there.
+`docs/CPP_REPORT.md` is its scoreboard, design and falsification ledger; read it
+before touching `csrc/`. File map:
+
+```
+csrc/cpu_attn.cpp / .hpp     dispatch (CPUID/HWCAP), plans, entry points
+csrc/cpu_attn_impl.hpp       shared core: jobs, workspace, dense/paged skeletons
+csrc/cpu_attn_vec.hpp        AVX-512 fp32/bf16, dense + paged
+csrc/cpu_attn_amx.hpp        AMX bf16 + fp32 hi/lo, dense (paged forwards to vec)
+csrc/cpu_attn_neon.hpp       NEON bf16 bfmmla / bdot, dense + paged
+csrc/cpu_isa.cpp             CPUID/getauxval + arch_prctl for XTILEDATA
+csrc/binding.cpp             CPython C API binding (no pybind, no torch)
+scripts/build_cpp.py         -> cpu_attention/_C_cpp.so
+tests/bench_cpp.py           four-arm in-process A/B (servers)
+tests/bench_matrix.py        one process per row (laptop, which throttles)
+```
+
+What the C++ backend taught the Mojo side (both measured there, both now in
+this file's ledger): `dpbf16ps` P@V with key-pair V and bf16 probability pairs is
+2.05x the fp32-FMA form (all bf16 dense rows 1.33-1.45x, and the same trick is
+*not* a win for fp32 because hi/lo needs three products); the bf16 dense
+epilogue must be vectorised (the NaN branch in `f32_to_bf16` stops GCC); and a
+paged call's fixed cost is a third of a batch-1 call, so `out=` and a
+plan-buffer entry matter more than the kernel there.
+
 ## 0. Conventions (read this first)
 
 **Performance ratios are `ours / baseline`.** A ratio **below 1 means we are

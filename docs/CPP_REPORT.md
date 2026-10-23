@@ -230,7 +230,7 @@ output-allocation convention (Mojo allocates, vLLM does not; ours does not when
 
 ## 6. Xeon (m8i.2xlarge, 4 physical cores, AVX-512 + AMX), `--isa amx` / `vec`
 
-See §7 for the number that matters most here: the AMX dense kernel runs 16x16
+The Xeon's strength is the AMX dense kernel, which runs 16x16
 tiles and covers **bf16 at 0.74-0.99 of vLLM's own AMX build and fp32 at
 0.49-0.83 of vLLM's VEC build** (`docs/amx/AMX_CPP_REPORT.md`, 41 rounds), i.e.
 the Xeon is the strongest dense column in the project. The paged path routes
