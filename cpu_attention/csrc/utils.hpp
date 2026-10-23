@@ -190,6 +190,11 @@ inline int last_level_cache_bytes() {
     std::fclose(f);
     int mult = 1;
     size_t n = std::strlen(buf);
+    // sysfs ends the line with '\n'; without this the K/M test below never
+    // fired and the LLC was read as a few thousand bytes, so every dense call
+    // rejected the per-head (fused) pack-then-attend order. Worth 1.51x at
+    // 256:16:128 on AMX and 1.3-1.5x on the same rows here.
+    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = 0;
     if (n == 0) continue;
     if (buf[n - 1] == 'K') {
       mult = 1024;
