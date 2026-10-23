@@ -227,3 +227,45 @@ Open on ARM: fuse the exp into the `qk` loop (one pass with the running max as
 the base, falling back to two passes on the first tile). That needs a contract
 hook today's driver does not have — `qk` would take the row max, or `softmax`
 would be allowed to be a no-op.
+
+## Closing ledger — the ARM bf16 dense column remains open
+
+Four rounds went into fusing the softmax's second pass into the P@V walk on
+NEON, on the theory that it was the exposed ~1.7 cycles/row-key residue. That
+theory is now **falsified with a number**, and the falsification is worth more
+than the change would have been:
+
+* At `kt=1024`, `rq=512` the softmax is already ~**1.2** cycles/row-key at D=64,
+  not 1.7 — the prize was ~8% of the call, not the 15-20% the older 256-key-tile
+  build suggested.
+* The fused form is **3-5% slower on all 11 bf16 rows** (`cpp/vllm` 1.16-1.27
+  against the two-pass 1.10-1.24). P@V's first d-chunk pass already holds 16
+  accumulator registers plus 4 A + 4 B operands; the exp adds 8 live logit
+  vectors and ~6 polynomial temps, so pass 0 spills. Phase total is conserved
+  and the spill traffic costs more than the overlap returns — the same register
+  wall that killed 16-dim `pv` passes (1.16x) and the 4-row bf16 softmax.
+* **The four rounds of apparent kernel failures were a harness bug.** Once
+  `t_neon` gained `batch` and strided q/k/v — the two dimensions it lacked, and
+  the two present in every "failing" case — the fused kernel and a *verbatim*
+  copy of the verified pre-fusion kernel agreed to the last digit on all nine
+  shapes (`4.941e-01` vs `4.941e-01`, ...), and both disagreed with the
+  harness's own reference. All 55 contiguous batch=1 shapes were correct in
+  both. **A shape grid that omits the failing axis produces four rounds of
+  confident misdiagnosis.**
+
+Two process rules earned the hard way, both now demonstrated:
+
+1. **A fallback restored by hand must be a verbatim copy of the verified file,
+   not a flag.** Restoring code by hand twice reintroduced the bug and made the
+   suite read "still failing" when the fast path was fine.
+2. **Scratch sized by the logical row count while the vector loop runs over the
+   register tile** has now produced three separate bugs in this tree: `acc_rows`
+   on AVX-512, the padding-row `m`/`l` write on NEON, and the `l`/`alpha` pointer
+   recovered from the accumulator address (correct only for a work item's first
+   chunk). Size scratch by what the loop touches.
+
+Where the remaining ARM bf16 headroom actually is, per the phase ablation:
+`qk`+P@V run at 2.17 `bfmmla`/cycle against a measured 2.0 issue ceiling, so the
+matmuls have ~no headroom, and the rest at `S<=512` is per-work-item overhead
+(pack, accumulator zero, epilogue, fork-join; 2.4% of the S=128 call is the
+driver's `memset` alone).
