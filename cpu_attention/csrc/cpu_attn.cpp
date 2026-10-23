@@ -157,6 +157,28 @@ int pick_dense_isa(const DenseJob& job) {
 void attention_entry(const PagedJob& job, int workers, bool do_store,
                      bool do_attend) {
   const int isa = pick_paged_isa();
+  // The attend entry takes the store with it when both are asked for: one
+  // OpenMP region instead of two (the second fork-join is ~1.1 us, a sixth of a
+  // batch-1 call). `shape_only` below is the store-only form reshape_and_cache
+  // uses.
+  if (do_attend) {
+    PagedJob j = job;
+    j.do_store = do_store;
+    if (isa == kIsaVec) {
+#if defined(__x86_64__)
+      vec::paged(j, workers);
+    } else if (isa == kIsaAmx) {
+      amx::paged(j, workers);
+#endif
+#if defined(__aarch64__)
+    } else if (isa == kIsaNeon) {
+      neon::paged(j, workers);
+#endif
+    } else {
+      scalar::paged(j, workers);
+    }
+    return;
+  }
   if (do_store) {
     if (isa == kIsaVec) {
 #if defined(__x86_64__)
@@ -170,21 +192,6 @@ void attention_entry(const PagedJob& job, int workers, bool do_store,
 #endif
     } else {
       scalar::store(job, workers);
-    }
-  }
-  if (do_attend) {
-    if (isa == kIsaVec) {
-#if defined(__x86_64__)
-      vec::paged(job, workers);
-    } else if (isa == kIsaAmx) {
-      amx::paged(job, workers);
-#endif
-#if defined(__aarch64__)
-    } else if (isa == kIsaNeon) {
-      neon::paged(job, workers);
-#endif
-    } else {
-      scalar::paged(job, workers);
     }
   }
 }

@@ -53,6 +53,7 @@ struct PagedJob {
   int64_t out_stride = 0;
   float scale = 1.0f;
   int dtype = kF32;
+  bool do_store = false;  // attend entry: also scatter k/v first (one region)
 };
 
 struct DenseJob {
@@ -109,6 +110,17 @@ size_t workspace_bytes();
 // `q_base` addresses query row 0 of this head; row r is `q_base + r*qt`
 // elements. `row_limit0` is the last key row 0 may see, and row r sees
 // `row_limit0 + r` (bottom-right-aligned causal).
+//
+// Optional policy member: `static constexpr bool zeroes_acc = true;` when `pv`
+// initialises the accumulator itself on its first key tile.
+template <class P>
+constexpr bool zeroes_acc() {
+  if constexpr (requires { P::zeroes_acc; })
+    return P::zeroes_acc;
+  else
+    return false;
+}
+
 template <class P>
 void dense_run(const DenseJob& job, int workers) {
   const int hd = static_cast<int>(job.head_dim);
@@ -169,7 +181,12 @@ void dense_run(const DenseJob& job, int workers) {
       // an int32: the mask is applied with 32-bit lane compares.
       const int64_t row_limit0 = job.causal ? (q0 + diag) : (int64_t(1) << 30);
       const bool empty = job.causal && (row_limit0 + nrows - 1) < 0;
-      std::memset(acc, 0, sizeof(float) * static_cast<size_t>(arows) * hd);
+      // A policy whose `pv` zeroes the accumulator on its first key tile (the
+      // AMX kernel's tile_zero) does not need this, and at head_dim 128 it is
+      // 16 KB of stores per work item. Detected rather than declared so the
+      // other policies are untouched.
+      if constexpr (!zeroes_acc<P>())
+        std::memset(acc, 0, sizeof(float) * static_cast<size_t>(arows) * hd);
       for (int r = 0; r < nrows; ++r) {
         m[r] = -std::numeric_limits<float>::infinity();
         l[r] = 0.0f;
@@ -202,7 +219,11 @@ void dense_run(const DenseJob& job, int workers) {
             P::softmax(logits, sub, nk, c, m + r0, l + r0, alpha);
             for (int r = 0; r < sub; ++r) {
               const float a = alpha[r];
-              if (a == 1.0f) continue;
+              // a == 1 is a no-op; a == 0 only happens on the first tile that
+              // contributes (the running max was -inf), where the accumulator
+              // is still exactly zero -- scaling it is 16 KB of stores for
+              // nothing, and 1.10x at 256:16:128 when it was skipped.
+              if (a == 1.0f || a == 0.0f) continue;
               float* dst = acc + (r0 + r) * hd;
               for (int d = 0; d < hd; ++d) dst[d] *= a;
             }
@@ -287,15 +308,34 @@ void store_run(const PagedJob& job, int workers) {
 
 template <class P>
 void paged_run(const PagedJob& job, int workers) {
+  const bool do_store = job.do_store;
   const int64_t tasks = job.num_seqs * job.num_heads;
   const size_t aux = P::aux_bytes(static_cast<int>(job.head_dim));
   const uint64_t key = key_mix(static_cast<uint64_t>(job.head_dim),
                                31 + 977 * job.dtype);
   char* ws = workspace(key, static_cast<size_t>(workers) * aux);
-#pragma omp parallel for num_threads(workers) schedule(static)
-  for (int64_t t = 0; t < tasks; ++t) {
-    P::attend_head(job, t / job.num_heads, t % job.num_heads,
-                   ws + static_cast<size_t>(omp_get_thread_num()) * aux);
+  // Store and attend share one region: a second fork-join costs ~1.1 us, which
+  // is a sixth of the whole call at batch 1. MHA needs no barrier (a task
+  // stores and then reads its own head's slice); GQA/MQA does, because the
+  // query heads of one group are different tasks and one of them may read a
+  // slice another is still writing.
+  const bool barrier = job.num_heads != job.num_kv_heads;
+#pragma omp parallel num_threads(workers)
+  {
+    if (do_store) {
+#pragma omp for schedule(static)
+      for (int64_t t = 0; t < tasks; ++t) {
+        if (job.slots[t / job.num_heads] < 0) continue;
+        P::store_head(job, t / job.num_heads, t % job.num_heads);
+      }
+      if (barrier) {
+#pragma omp barrier
+      }
+    }
+#pragma omp for schedule(static)
+    for (int64_t t = 0; t < tasks; ++t)
+      P::attend_head(job, t / job.num_heads, t % job.num_heads,
+                     ws + static_cast<size_t>(omp_get_thread_num()) * aux);
   }
 }
 

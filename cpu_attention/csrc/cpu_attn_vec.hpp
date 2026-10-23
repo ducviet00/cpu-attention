@@ -121,10 +121,14 @@ inline __m512 exp2v_page(__m512 x) {
                         _mm512_set1_ps(6.9335938e-1f));
     p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f));
   } else {
-    p = _mm512_set1_ps(1.3392112e-3f);
-    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(9.6180963e-3f));
-    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(5.5503282e-2f));
-    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(2.4022652e-1f));
+    // Taylor to degree 6 on |r| <= 0.5: truncation 1.2e-7, against the degree-5
+    // minimax's 3.4e-6, which was the whole of the fp32 paged error budget
+    // (a 17-key output read 1.2e-6 against a naive fp32 reference).
+    p = _mm512_set1_ps(1.5403530e-4f);
+    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.3333558e-3f));
+    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(9.6181291e-3f));
+    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(5.5504109e-2f));
+    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(2.4022651e-1f));
     p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(6.9314718e-1f));
     p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f));
   }
@@ -172,6 +176,13 @@ struct Dense {
     static const int k = env_int("CPU_ATTENTION_KT", 256, 32, KTMAX);
     return k;
   }
+  // Profiling only (`CPU_ATTENTION_VEC_MODE`): 1 skips the pack, 2 Q@K^T,
+  // 4 the softmax, 8 P@V. The skipped phase still leaves defined memory behind
+  // so the next one cannot trap on a signalling NaN; the output is garbage.
+  static int mode() {
+    static const int m = env_int("CPU_ATTENTION_VEC_MODE", 0, 0, 15);
+    return m;
+  }
   static int rq(int64_t seq_q, int hd) {
     static const int fixed = env_int("CPU_ATTENTION_RQ", 0, 0, 512);
     if (fixed) return static_cast<int>(std::min<int64_t>(fixed, seq_q));
@@ -210,6 +221,7 @@ struct Dense {
   // 16 dims at a time: a 16x16 transpose is four shuffle stages and one 64-byte
   // store per output row, against 11-15 GB/s for torch's element-wise permute.
   static void pack(const DenseJob& job, int64_t b, int64_t kvh, char* slab) {
+    if (mode() & 1) return;
     const int64_t pad = pad_of(job.seq_k);
     const char* ksrc =
         static_cast<const char*>(job.k) + (b * job.kb + kvh * job.kh) * ESZ;
@@ -282,7 +294,11 @@ struct Dense {
                  const char* q_base, int nrows, int64_t k0, int nkeys,
                  int64_t row_limit0, float* logits) {
     const int kt = kt_();
-    const int64_t pad = pad_of(job.seq_k);
+    if (mode() & 2) {
+      for (int r = 0; r < nrows; ++r)
+        std::memset(logits + r * kt, 0, sizeof(float) * nkeys);
+      return;
+    }
     const int64_t qt = job.qt;
     const int64_t kend = k0 + nkeys;
     const int64_t lim = std::min(kend, row_limit0 + 1);
@@ -339,21 +355,21 @@ struct Dense {
     }
   }
 
-  // Online-softmax step over one kt-wide row tile: `logits` is scaled in place
-  // by c (= scale*log2e) and replaced by the probabilities.
+  // Online-softmax step over one kt-wide row tile: `logits` is replaced by the
+  // probabilities. The scale is folded into the exponential instead of being
+  // written back in the max pass: one fewer full pass over the tile per step
+  // (9.0 -> 5.8 us of the 4096-key fp32 softmax in tests/bench_vec_prims.cpp).
   static void softmax(float* logits, int nrows, int nkeys, float c, float* m,
                       float* l, float* alpha) {
     const int kt = kt_();
     const __m512 vc = _mm512_set1_ps(c);
+    if (mode() & 4) return;
     for (int r = 0; r < nrows; ++r) {
       float* p = logits + r * kt;
       __m512 mx = _mm512_set1_ps(-INFINITY);
-      for (int j = 0; j < nkeys; j += LANES) {
-        const __m512 s = _mm512_mul_ps(ld16(p + j), vc);
-        st16(p + j, s);
-        mx = _mm512_max_ps(mx, s);
-      }
-      const float mxv = _mm512_reduce_max_ps(mx);
+      for (int j = 0; j < nkeys; j += LANES)
+        mx = _mm512_max_ps(mx, ld16(p + j));
+      const float mxv = _mm512_reduce_max_ps(mx) * c;
       const float mo = m[r];
       float mn, a;
       if (mxv == -INFINITY) {
@@ -376,7 +392,7 @@ struct Dense {
       const __m512 vmn = _mm512_set1_ps(mn);
       __m512 sum = _mm512_setzero_ps();
       for (int j = 0; j < nkeys; j += LANES) {
-        const __m512 e = exp2v(_mm512_sub_ps(ld16(p + j), vmn));
+        const __m512 e = exp2v(_mm512_fmsub_ps(ld16(p + j), vc, vmn));
         st16(p + j, e);
         sum = _mm512_add_ps(sum, e);
       }
@@ -389,6 +405,7 @@ struct Dense {
                  int64_t k0, int nkeys, const float* p, int nrows,
                  float* acc) {
     const int kt = kt_();
+    if (mode() & 8) return;
     const char* vs = slab + pad_of(job.seq_k) * HD * ESZ;
     for (int dc = 0; dc < HD; dc += 32) {
       __m512 c[RQT][2];
@@ -486,6 +503,11 @@ struct Paged {
   // Same store as the vec policy: fp32 K[hd][page] / V[page][hd], bf16
   // K[hd/2][page][2] / V[page][hd].
   static void store_head(const PagedJob& job, int64_t seq, int64_t head) {
+    // `head` is a *query* head: k/v arrive kv-headed (the engine's projection
+    // emits one row per kv head), so the source index is the kv head. Every
+    // query head of a group writes the same bytes to the same slot; the Python
+    // layer orders GQA stores before any attend so the duplicate writes cannot
+    // race with a reader.
     const int64_t group = job.num_heads / job.num_kv_heads;
     const int64_t kvh = head / group;
     const int64_t slot = job.slots[seq];
@@ -496,9 +518,9 @@ struct Paged {
     char* vp = static_cast<char*>(job.v_cache) + base;
     const int64_t kvst = kv_stride_of(job);
     const char* ks =
-        static_cast<const char*>(job.k) + (seq * kvst + head * HD) * ESZ;
+        static_cast<const char*>(job.k) + (seq * kvst + kvh * HD) * ESZ;
     const char* vs =
-        static_cast<const char*>(job.v) + (seq * kvst + head * HD) * ESZ;
+        static_cast<const char*>(job.v) + (seq * kvst + kvh * HD) * ESZ;
     if constexpr (BF) {
       for (int d = 0; d < HD; ++d)
         std::memcpy(kp + (((d / 2) * job.page + off) * 2 + (d & 1)) * ESZ,

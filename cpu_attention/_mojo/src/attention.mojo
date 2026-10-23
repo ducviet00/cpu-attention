@@ -135,7 +135,10 @@ def _store_head[
         block_size * head_dim
     )
     var off = slot % block_size
-    var src = token * job.kv_stride + head * head_dim
+    # `head` is the query head; k/v arrive kv-headed, so the source row is the
+    # kv head (`dst_head`). The Python layer orders a GQA store before any
+    # attend, so the duplicate writes from one group cannot race a reader.
+    var src = token * job.kv_stride + dst_head * head_dim
     var k_src = _ptr[Scalar[dtype]](job.k).unsafe_offset(src)
     var v_src = _ptr[Scalar[dtype]](job.v).unsafe_offset(src)
     comptime if NEON_DOT and dtype == DType.bfloat16 and tile % LANES == 0:

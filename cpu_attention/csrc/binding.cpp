@@ -98,6 +98,88 @@ PyObject* py_attention(PyObject*, PyObject* args) {
   Py_RETURN_NONE;
 }
 
+// Paged plan: the 14 constants of a geometry, so a call marshals only the data
+// pointers and the two token strides. At batch 1 the whole call is 7 us, and
+// the 23-argument long form costs 0.68 us of it in `PyArg_ParseTuple` alone.
+enum {
+  Q_MAGIC = 0,
+  Q_NSEQ,
+  Q_NHEADS,
+  Q_NKV,
+  Q_HD,
+  Q_PAGE,
+  Q_BTSTRIDE,
+  Q_OUTSTRIDE,
+  Q_DTYPE,
+  Q_SCALE,
+  Q_WORKERS,
+  Q_DOSTORE,
+  Q_N
+};
+
+PyObject* py_paged_make_plan(PyObject*, PyObject* args) {
+  unsigned long long addr;
+  long long nseq, nheads, nkv, hd, page, btstride, outstride, dtype, workers,
+      do_store;
+  double scale;
+  if (!PyArg_ParseTuple(args, "KLLLLLLLLdLL", &addr, &nseq, &nheads, &nkv, &hd,
+                        &page, &btstride, &outstride, &dtype, &scale, &workers,
+                        &do_store))
+    return nullptr;
+  int64_t* p = reinterpret_cast<int64_t*>(addr);
+  p[Q_MAGIC] = kPlanMagic;
+  p[Q_NSEQ] = nseq;
+  p[Q_NHEADS] = nheads;
+  p[Q_NKV] = nkv;
+  p[Q_HD] = hd;
+  p[Q_PAGE] = page;
+  p[Q_BTSTRIDE] = btstride;
+  p[Q_OUTSTRIDE] = outstride;
+  p[Q_DTYPE] = dtype;
+  p[Q_SCALE] = f2i(static_cast<float>(scale));
+  p[Q_WORKERS] = workers;
+  p[Q_DOSTORE] = do_store;
+  Py_RETURN_NONE;
+}
+
+PyObject* py_paged_forward(PyObject*, PyObject* args) {
+  unsigned long long addr, q, k, v, kc, vc, out, slots, bt, lens;
+  long long qstride, kvstride;
+  double scale;
+  if (!PyArg_ParseTuple(args, "KKKKKKKKKKLLd", &addr, &q, &k, &v, &kc, &vc,
+                        &out, &slots, &bt, &lens, &qstride, &kvstride, &scale))
+    return nullptr;
+  const int64_t* p = reinterpret_cast<const int64_t*>(addr);
+  if (p[Q_MAGIC] != kPlanMagic) {
+    PyErr_SetString(PyExc_RuntimeError, "paged_forward: stale plan buffer");
+    return nullptr;
+  }
+  PagedJob job;
+  job.q = reinterpret_cast<const void*>(q);
+  job.k = reinterpret_cast<const void*>(k);
+  job.v = reinterpret_cast<const void*>(v);
+  job.k_cache = reinterpret_cast<void*>(kc);
+  job.v_cache = reinterpret_cast<void*>(vc);
+  job.out = reinterpret_cast<void*>(out);
+  job.slots = reinterpret_cast<const int64_t*>(slots);
+  job.block_table = reinterpret_cast<const int32_t*>(bt);
+  job.lens = reinterpret_cast<const int32_t*>(lens);
+  job.num_seqs = p[Q_NSEQ];
+  job.num_heads = p[Q_NHEADS];
+  job.num_kv_heads = p[Q_NKV];
+  job.head_dim = p[Q_HD];
+  job.page = p[Q_PAGE];
+  job.bt_stride = p[Q_BTSTRIDE];
+  job.out_stride = p[Q_OUTSTRIDE];
+  job.q_stride = qstride;
+  job.kv_stride = kvstride;
+  job.scale = static_cast<float>(scale);
+  job.dtype = static_cast<int>(p[Q_DTYPE]);
+  attn::attention_entry(job, static_cast<int>(p[Q_WORKERS]),
+                        p[Q_DOSTORE] != 0, true);
+  Py_RETURN_NONE;
+}
+
 PyObject* py_dense_make_plan(PyObject*, PyObject* args) {
   unsigned long long addr;
   long long batch, seq_q, seq_k, heads, kv_heads, hd, dtype, causal;
@@ -239,6 +321,10 @@ PyMethodDef kMethods[] = {
      "dense attention, long form"},
     {"dense_make_plan", py_dense_make_plan, METH_VARARGS,
      "fill a per-geometry plan buffer"},
+    {"paged_make_plan", py_paged_make_plan, METH_VARARGS,
+     "fill a per-geometry paged plan buffer"},
+    {"paged_forward", py_paged_forward, METH_VARARGS,
+     "paged attention from a plan buffer"},
     {"dense_forward", py_dense_forward, METH_VARARGS,
      "dense attention from a plan buffer"},
     {"backend", py_backend, METH_NOARGS, "backend name"},

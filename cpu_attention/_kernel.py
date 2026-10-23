@@ -259,6 +259,9 @@ def _call(
     return out
 
 
+_PAGED_BUFS = []
+"""Plan buffers held for the process: the C++ closures capture their address."""
+
 _PAGED_PLANS = threading.local()
 """Per-thread geometry -> fast call, for the paged path.
 
@@ -287,35 +290,63 @@ def _paged_plan(query, key, value, k_cache, page_table, do_store):
     # A flat tuple of small ints: the hash is as cheap as it gets, and no
     # `.stride()` tuple is built. The two token strides are read per call
     # instead (two C calls), which keeps a strided query correct.
+    # `_BACKEND` is in the key because the closures below capture the selected
+    # extension entry at build time: without it, switching backends in one
+    # process (the A/B harness does) keeps calling the first backend, and a
+    # bf16 cache built for one layout is then read with the other one.
     k = (nseq, nheads, hd, kvh, page, npages, _DTYPE_CODES[query.dtype],
-         workers, do_store)
+         workers, do_store, _BACKEND)
     fn = plans.get(k)
     if fn is None:
-        args = [
-            0, 0, 0, 0, 0, 0, 0, 0, 0,
-            nseq, nheads, kvh, hd, page, npages, 0, 0, nheads * hd,
-            _DTYPE_CODES[query.dtype], 0.0, workers, do_store, True,
-        ]
-        attention = _attention()
-        store = do_store
+        if _BACKEND == "cpp":
+            # The C++ extension keeps the geometry in a plan buffer, so a call
+            # marshals only pointers and two strides: `paged_forward` is 13
+            # arguments against the long form's 22, and the parse is a fifth of
+            # a batch-1 call.
+            make = _entry("paged_make_plan")
+            fwd = _entry("paged_forward")
+            pbuf = torch.empty(12, dtype=torch.int64)
+            addr = pbuf.data_ptr()
+            make(addr, nseq, nheads, kvh, hd, page, npages, nheads * hd,
+                 _DTYPE_CODES[query.dtype], 0.0, workers, int(bool(do_store)))
 
-        def fn(out, query, key, value, k_cache, v_cache, slots, block_table,
-               lens, scale):
-            a = args
-            a[0] = query.data_ptr()
-            a[3] = k_cache.data_ptr()
-            a[4] = v_cache.data_ptr()
-            a[5] = out.data_ptr()
-            a[7] = block_table.data_ptr()
-            a[8] = lens.data_ptr()
-            a[15] = query.stride(0)
-            a[19] = scale
-            if store:
-                a[1] = key.data_ptr()
-                a[2] = value.data_ptr()
-                a[6] = slots.data_ptr()
-                a[16] = key.stride(0)
-            attention(*a)
+            def fn(out, query, key, value, k_cache, v_cache, slots, block_table,
+                   lens, scale):
+                fwd(addr, query.data_ptr(),
+                    key.data_ptr() if key is not None else 0,
+                    value.data_ptr() if value is not None else 0,
+                    k_cache.data_ptr(), v_cache.data_ptr(), out.data_ptr(),
+                    slots.data_ptr() if slots is not None else 0,
+                    block_table.data_ptr(), lens.data_ptr(), query.stride(0),
+                    key.stride(0) if key is not None else 0, scale)
+
+            _PAGED_BUFS.append(pbuf)
+        else:
+            args = [
+                0, 0, 0, 0, 0, 0, 0, 0, 0,
+                nseq, nheads, kvh, hd, page, npages, 0, 0, nheads * hd,
+                _DTYPE_CODES[query.dtype], 0.0, workers, do_store, True,
+            ]
+            attention = _attention()
+            store = do_store
+
+            def fn(out, query, key, value, k_cache, v_cache, slots, block_table,
+                   lens, scale):
+                a = args
+                a[0] = query.data_ptr()
+                a[3] = k_cache.data_ptr()
+                a[4] = v_cache.data_ptr()
+                a[5] = out.data_ptr()
+                a[7] = block_table.data_ptr()
+                a[8] = lens.data_ptr()
+                a[15] = query.stride(0)
+                a[19] = scale
+                if store:
+                    a[1] = key.data_ptr()
+                    a[2] = value.data_ptr()
+                    a[6] = slots.data_ptr()
+                    a[16] = key.stride(0)
+                attention(*a)
 
         if len(plans) > 64:
             plans.clear()
@@ -324,11 +355,30 @@ def _paged_plan(query, key, value, k_cache, page_table, do_store):
 
 
 def _paged(
-    query, key, value, k_cache, v_cache, slots, page_table, lens, scale, do_store
+    query, key, value, k_cache, v_cache, slots, page_table, lens, scale, do_store,
+    out=None,
 ):
-    """Run one kernel call, allocating the output (geometry already checked)."""
+    """Run one kernel call (geometry already checked).
+
+    Allocates the output unless `out` is given: `torch.empty` is 1.3 us, which
+    is a fifth of a batch-1 call and the reason the scorecard's batch-1 rows
+    read badly against a reference whose output is preallocated.
+    """
+    if out is None:
+        out = torch.empty(query.shape, dtype=query.dtype)
     fn = _paged_plan(query, key, value, k_cache, page_table, do_store)
-    out = torch.empty(query.shape, dtype=query.dtype)
+    if do_store and key is not None and query.shape[1] != k_cache.shape[1]:
+        # GQA/MQA: the query heads of one group are different tasks, so a reader
+        # could overtake another head's store. Two calls put every store before
+        # every attend. MHA (the engine's models) keeps the single call, and its
+        # 24-calls-per-step path never pays this.
+        store = _paged_plan(query, key, value, k_cache, page_table, True)
+        attend = _paged_plan(query, None, None, k_cache, page_table, False)
+        store(out, query, key, value, k_cache, v_cache, slots, page_table, lens,
+              scale)
+        attend(out, query, None, None, k_cache, v_cache, None, page_table, lens,
+               scale)
+        return out
     fn(out, query, key, value, k_cache, v_cache, slots, page_table, lens, scale)
     return out
 
@@ -1253,7 +1303,7 @@ def _cpp_plan(q, k, v, scale, causal):
     cont = q.is_contiguous()
     # A contiguous tensor's strides follow from its shape, so the common case
     # (a fresh q/k/v from flash_attn_func) builds no stride tuples.
-    key = (q.shape, k.shape, cont, causal, q.dtype, workers,
+    key = (q.shape, k.shape, cont, causal, q.dtype, workers, scale,
            cont or (q.stride(), k.stride(), v.stride()))
     addr = plans.get(key)
     if addr is None:
