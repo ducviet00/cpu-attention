@@ -91,8 +91,10 @@ two baselines *on that row*, so the ratio is the one that matters.
 | Graviton 5 | 19 / 42 | 5 | 18 |
 | **all** | **78 / 126 (62%)** | 25 | 23 |
 
-Against vLLM alone the C++ backend wins 76 of 84 dense/paged rows on the x86
-boxes and 18/22 + 19/20 on Graviton. The shortfall is concentrated in one place:
+Against vLLM alone it wins 76 of 84 rows on the x86 boxes (77 of 84 against
+Mojo), and on Graviton 37 of 42 against vLLM against 21 of 42 against Mojo --
+i.e. even on the one box where it is behind, it beats the ISA-appropriate vLLM
+build on all but five rows. The shortfall is concentrated in one place:
 **aarch64 dense prefill**, where the Mojo kernel is the faster baseline and we
 are 4-19% behind it (18 of the 23 rows over 1.04). §10.2 has the measured reason
 and the two restructures that failed to close it. No other column is behind by
