@@ -259,28 +259,78 @@ def _call(
     return out
 
 
+_PAGED_PLANS = threading.local()
+"""Per-thread geometry -> fast call, for the paged path.
+
+The engine calls `self_attention`/`cross_attention` 24 times a decode step with
+the same geometry, and at batch 1 / ctx 256 the whole call is 7 us: reading a
+`.shape` and three `.stride()` tuples per call is a third of that. The plan holds
+the 14 constant arguments and patches only the data pointers, so a call is one
+`torch.empty`, six `data_ptr()`s and the extension call.
+
+Correctness of the key: shapes plus, for a strided tensor, the strides. A
+contiguous tensor's strides follow from its shape, so the common case (a fresh
+contiguous q and cache) builds no stride tuples at all.
+"""
+
+
+def _paged_plan(query, key, value, k_cache, page_table, do_store):
+    """The fast call for this geometry, building it on the first call."""
+    plans = getattr(_PAGED_PLANS, "p", None)
+    if plans is None:
+        plans = _PAGED_PLANS.p = {}
+    nseq, nheads, hd = query.shape
+    kvh = k_cache.shape[1]
+    page = k_cache.shape[2]
+    npages = page_table.shape[1]
+    workers = _workers(nseq * nheads, npages)
+    # A flat tuple of small ints: the hash is as cheap as it gets, and no
+    # `.stride()` tuple is built. The two token strides are read per call
+    # instead (two C calls), which keeps a strided query correct.
+    k = (nseq, nheads, hd, kvh, page, npages, _DTYPE_CODES[query.dtype],
+         workers, do_store)
+    fn = plans.get(k)
+    if fn is None:
+        args = [
+            0, 0, 0, 0, 0, 0, 0, 0, 0,
+            nseq, nheads, kvh, hd, page, npages, 0, 0, nheads * hd,
+            _DTYPE_CODES[query.dtype], 0.0, workers, do_store, True,
+        ]
+        attention = _attention()
+        store = do_store
+
+        def fn(out, query, key, value, k_cache, v_cache, slots, block_table,
+               lens, scale):
+            a = args
+            a[0] = query.data_ptr()
+            a[3] = k_cache.data_ptr()
+            a[4] = v_cache.data_ptr()
+            a[5] = out.data_ptr()
+            a[7] = block_table.data_ptr()
+            a[8] = lens.data_ptr()
+            a[15] = query.stride(0)
+            a[19] = scale
+            if store:
+                a[1] = key.data_ptr()
+                a[2] = value.data_ptr()
+                a[6] = slots.data_ptr()
+                a[16] = key.stride(0)
+            attention(*a)
+
+        if len(plans) > 64:
+            plans.clear()
+        plans[k] = fn
+    return fn
+
+
 def _paged(
     query, key, value, k_cache, v_cache, slots, page_table, lens, scale, do_store
 ):
     """Run one kernel call, allocating the output (geometry already checked)."""
-    out = torch.empty(
-        (query.shape[0], query.shape[1], query.shape[2]),
-        dtype=query.dtype,
-        device=query.device,
-    )
-    return _call(
-        query,
-        key,
-        value,
-        k_cache,
-        v_cache,
-        out,
-        slots,
-        page_table,
-        lens,
-        scale,
-        do_store,
-    )
+    fn = _paged_plan(query, key, value, k_cache, page_table, do_store)
+    out = torch.empty(query.shape, dtype=query.dtype)
+    fn(out, query, key, value, k_cache, v_cache, slots, page_table, lens, scale)
+    return out
 
 
 _LLC = None
@@ -1200,12 +1250,22 @@ def _cpp_plan(q, k, v, scale, causal):
     batch, seq_q, heads, hd = q.shape
     kv_heads = k.shape[2]
     workers = _workers(batch * heads * -(-seq_q // 64), 8)
-    key = (q.shape, q.stride(), k.stride(), v.stride(), causal, q.dtype,
-           float(scale), workers)
+    cont = q.is_contiguous()
+    # A contiguous tensor's strides follow from its shape, so the common case
+    # (a fresh q/k/v from flash_attn_func) builds no stride tuples.
+    key = (q.shape, k.shape, cont, causal, q.dtype, workers,
+           cont or (q.stride(), k.stride(), v.stride()))
     addr = plans.get(key)
     if addr is None:
         make_plan, _ = _cpp_entries()
-        qs, ks, vs = q.stride(), k.stride(), v.stride()
+        if cont:
+            # [batch, seq, heads, hd] row-major.
+            ks3 = kv_heads * hd
+            qs = (seq_q * heads * hd, heads * hd, hd, 1)
+            ks = (k.shape[1] * ks3, ks3, hd, 1)
+            vs = ks
+        else:
+            qs, ks, vs = q.stride(), k.stride(), v.stride()
         buf = torch.empty(24, dtype=torch.int64)
         make_plan(
             buf.data_ptr(), batch, seq_q, k.shape[1], heads, kv_heads, hd,
