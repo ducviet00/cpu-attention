@@ -1,5 +1,38 @@
 # ARM (Graviton 5, m9g.2xlarge, Neoverse-V3) dense kernel
 
+## Round 7 — fp32 hi/lo bf16 `bfmmla`: measured at 1.2%, reverted
+
+Implemented as a compile-time `DOT` branch of the fp32 policy (`DenseF32<HD, KTC,
+DOT>`, the scalar path kept instantiable behind `CPU_ATTENTION_F32FMA=1`): K
+packed as two bf16 planes (`hi = bf16(x)`, `lo = bf16(x-hi)`) in the same
+position-paired 64-key-tile form the bf16 policy uses, Q split from the caller's
+fp32 tensor into hi/lo operand panels once per tile, and the Q@K^T panel taking
+three products (`hi*hi + hi*lo + lo*hi`, `lo*lo` dropped at 2^-16). Two bf16
+planes are exactly one fp32 plane, so `slab_bytes`, the V offset, the softmax and
+`pv` are all unchanged.
+
+* **Parity: `test_dense` 65/65** — the hi/lo rounding is not the problem.
+* **Speed: 2048:8:64 fp32 9177.0 -> 9064.1 us, 0.988x (1.2%).** Alternating-
+  process protocol, min of 5 rounds, one process per sample.
+
+**Why it is not the 1.1-1.25x of the round-2 costing.** That costing assumed the
+instruction cut (23.5 -> 18 per row-key in `qk`) would convert at the fp32
+kernel's achieved IPC. It does not, because the two instructions have different
+issue ceilings here: fp32 achieves **2.25 4-wide FMAs/cycle** (14.2
+cycles/row-key for 32 FMAs) while `bfmmla` sustains **1.88-2.5/cycle** (measured
+per phase, round 2). So 12 `bfmmla`/row-key cost 5-6.4 cycles against the 7.1
+that 16 fp32 FMAs cost -- about **1.2x on the matmul, not 1.33x** -- and the
+split doubles the operand *load count* (a 16-byte group now carries 4 dims of 2
+keys instead of 4 dims of 4), which takes most of the 1.2x back. Extending the
+same treatment to P@V would add ~1.5-2%, not 10%.
+
+Reverted under the "a novelty that does not beat baseline by 3-5% is reverted and
+recorded" rule; re-verified after the revert (`test_dense` 65/65, paged sweep
+504/504, worst bf16 1.70 ulp / fp32 1.61e-06). fp32 stays at 0.962-1.123 vs Mojo,
+0.877-1.055 vs vLLM, and it is at its floor: **14.2 cycles/row-key = 32 fp32 FMAs
+at 2.25/cycle, demonstrated by the fact that replacing a quarter of those
+instructions with 3x-denser ones moves the total by 1.2%.**
+
 ## Round 5 — the Cauchy-Schwarz bounded base: implemented, parity fails, reverted
 
 Implemented for bf16 exactly as specified, and it does *not* pass parity, so it
