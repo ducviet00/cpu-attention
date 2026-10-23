@@ -151,18 +151,31 @@ inline __m512i interleave_bf16x2(__m256i a, __m256i b) {
 // 2^x for x in [-127, 127]: degree-5 polynomial on the fraction, exponent by
 // insertion. The positive side is reachable because the online softmax may hold
 // its running max below the tile max by up to kMaxSlack (the FA4 rule).
+// `FAST` is the bf16 form: degree 2 (relative error 2.3e-3) against a bf16 store
+// two instructions later (~4e-3), measured neutral-to-better on the whole call
+// and inside the same 3e-2 gate. fp32 keeps degree 5.
+template <bool FAST>
 inline __m512 exp2v(__m512 x) {
+  // Only the negative clamp is needed: a masked lane arrives as -inf and must
+  // underflow to +0, while the positive side is bounded by the running-max
+  // slack (<= 16 log2 units) by construction.
   x = _mm512_max_ps(x, _mm512_set1_ps(-127.0f));
-  x = _mm512_min_ps(x, _mm512_set1_ps(127.0f));
   const __m512 n =
       _mm512_roundscale_ps(x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
   const __m512 r = _mm512_sub_ps(x, n);
-  __m512 p = _mm512_set1_ps(1.3392112e-3f);
-  p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(9.6180963e-3f));
-  p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(5.5503282e-2f));
-  p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(2.4022652e-1f));
-  p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(6.9314718e-1f));
-  p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f));
+  __m512 p;
+  if constexpr (FAST) {
+    p = _mm512_fmadd_ps(_mm512_set1_ps(2.3473140e-1f), r,
+                        _mm512_set1_ps(6.9335938e-1f));
+    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f));
+  } else {
+    p = _mm512_set1_ps(1.3392112e-3f);
+    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(9.6180963e-3f));
+    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(5.5503282e-2f));
+    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(2.4022652e-1f));
+    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(6.9314718e-1f));
+    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f));
+  }
   const __m512i e = _mm512_slli_epi32(
       _mm512_add_epi32(_mm512_cvtps_epi32(n), _mm512_set1_epi32(127)), 23);
   return _mm512_mul_ps(p, _mm512_castsi512_ps(e));
@@ -235,11 +248,23 @@ struct Dense {
   // Running-max slack in log2 units. 1 = the exact max (a rescale whenever the
   // tile max moves at all); 8 = vLLM/FA4's threshold, which keeps the rescale
   // (and the driver's 32*head_dim scalar multiplies) off most super-tiles at the
-  // cost of exp2 arguments up to +8 (P up to 256, still finite and still bf16).
+  // cost of exp2 arguments up to +8 (P up to 256, still finite, still bf16, and
+  // the error class is unchanged because bf16 rounding is relative).
+  // Measured on m8i, min of 21, everything else fixed: slack=8 is 4-12% faster
+  // at 256:16:128 (bf16 333 -> 292, fp32 691 -> 609), 2-4% at 1024:8:64 /
+  // 1024:16:128, and 1-2% at 4096:16:128.
   static float max_slack() {
     static const float v = static_cast<float>(
-        env_int("CPU_ATTENTION_AMX_SLACK", 1, 1, 16));
+        env_int("CPU_ATTENTION_AMX_SLACK", 8, 1, 16));
     return v;
+  }
+
+  // Profiling only: `CPU_ATTENTION_AMX_MODE` skips phases so one call can be
+  // attributed between them (the same instrument the Mojo tree uses).
+  // 1 = pack, 2 = Q@K^T, 4 = softmax, 8 = P@V. Results are garbage when set.
+  static int mode() {
+    static const int m = env_int("CPU_ATTENTION_AMX_MODE", 0, 0, 15);
+    return m;
   }
 
   static int kt_() {
@@ -288,6 +313,7 @@ struct Dense {
   //       V -> [key block 32][dim chunk 16][key pair][dim]   (1 KB per tile)
   // -------------------------------------------------------------------------
   static void pack(const DenseJob& job, int64_t b, int64_t kvh, char* slab) {
+    if (mode() & 1) return;
     const int64_t seq_k = job.seq_k;
     const int64_t pad = pad_of(seq_k);
     const char* ksrc =
@@ -410,6 +436,7 @@ struct Dense {
   static void qk(const DenseJob& job, const char* slab, int64_t, int64_t,
                  const char* q_base, int nrows, int64_t k0, int nkeys,
                  int64_t row_limit0, float* logits) {
+    if (mode() & 2) return;
     const int kt = kt_();
     const bf16* kbase = reinterpret_cast<const bf16*>(slab);
     char* const extra = reinterpret_cast<char*>(logits);
@@ -533,6 +560,7 @@ struct Dense {
   // -------------------------------------------------------------------------
   static void softmax(float* logits, int nrows, int nkeys, float c, float* m,
                       float* l, float* alpha) {
+    if (mode() & 4) { for (int r = 0; r < nrows; ++r) { m[r] = 0.f; l[r] = 1.f; alpha[r] = 1.f; } return; }
     const int kt = kt_();
     bf16* const prob =
         reinterpret_cast<bf16*>(reinterpret_cast<char*>(logits) + PROB_OFF);
@@ -546,12 +574,14 @@ struct Dense {
       bf16* pp = prob + static_cast<int64_t>(r) * KTMAX;
       bf16* pl = prob_lo + static_cast<int64_t>(r) * KTMAX;
       __m512 mx = _mm512_set1_ps(-INFINITY);
-      for (int j = 0; j < nkeys; j += 16) {
-        const __m512 s = _mm512_mul_ps(_mm512_loadu_ps(p + j), vc);
-        _mm512_storeu_ps(p + j, s);
-        mx = _mm512_max_ps(mx, s);
-      }
-      const float mxv = _mm512_reduce_max_ps(mx);
+      // The max pass only reads: the scale stays folded into the exponential
+      // (`fma(logit, c, -m)` below). Writing the scaled logits back costs a
+      // whole 32 KB store + reload per super-tile and the buffer is already
+      // past L1 at kt=256.
+#pragma GCC unroll 4
+      for (int j = 0; j < nkeys; j += 16)
+        mx = _mm512_max_ps(mx, _mm512_loadu_ps(p + j));
+      const float mxv = _mm512_reduce_max_ps(mx) * c;
       const float mo = m[r];
       float mn, a;
       if (mxv == -INFINITY) {
@@ -560,8 +590,12 @@ struct Dense {
         mn = mo;
         a = 1.0f;
       } else if (mo == -INFINITY) {
+        // First tile of this work item. The driver has already zeroed the
+        // accumulator, so scaling it by 0 or by 1 is the same arithmetic --
+        // and `a == 1` is what makes the driver skip its scalar 32*head_dim
+        // pass, which is a whole 16 KB sweep per work item at head_dim 128.
         mn = mxv;
-        a = 0.0f;
+        a = 1.0f;
       } else if (mxv > mo + slack) {
         mn = mxv;
         // `mo`/`mn` are already in log2 units (the logits were scaled by
@@ -588,8 +622,11 @@ struct Dense {
       }
       const __m512 vmn = _mm512_set1_ps(mn);
       __m512 sum = _mm512_setzero_ps();
+#pragma GCC unroll 2
       for (int j = 0; j < nkeys; j += 16) {
-        const __m512 e = exp2v(_mm512_sub_ps(_mm512_loadu_ps(p + j), vmn));
+        // e = 2^(c*logit - m): one fma, no separate scaling pass.
+        const __m512 e =
+            exp2v<BF>(_mm512_fmsub_ps(_mm512_loadu_ps(p + j), vc, vmn));
         sum = _mm512_add_ps(sum, e);
         const __m256i h = cvt_bf16x16(e);
         _mm256_storeu_si256(reinterpret_cast<__m256i*>(pp + j), h);
@@ -612,6 +649,7 @@ struct Dense {
   // -------------------------------------------------------------------------
   static void pv(const DenseJob& job, const char* slab, int64_t, int64_t,
                  int64_t k0, int nkeys, const float* p, int nrows, float* acc) {
+    if (mode() & 8) return;
     const bf16* const prob =
         reinterpret_cast<const bf16*>(reinterpret_cast<const char*>(p) + PROB_OFF);
     const bf16* const prob_lo = prob + static_cast<int64_t>(RQT) * KTMAX;
