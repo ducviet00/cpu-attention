@@ -1,0 +1,25 @@
+/home/ubuntu/cpu-attention/.venv/lib/python3.14/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+threads=8 causal=True vllm=/home/ubuntu/vllm_cpu_build/vllm_cpu_attn_bench.so isa=neon
+S=  128 H= 8 D= 64 bf16: ours     21.1 (med     21.5) sdpa     49.1 vllm     22.0  o/vllm  0.96 (med  0.95)  o/sdpa  0.43  ctrl  1.00  d(ours) 9.1e-03 d(vllm) 9.1e-03 d(sdpa) 9.1e-03
+S=  128 H= 8 D= 64 fp32: ours     41.8 (med     42.8) sdpa    152.0 vllm     46.0  o/vllm  0.91 (med  0.89)  o/sdpa  0.27  ctrl  1.00  d(ours) 9.5e-07 d(vllm) 5.4e-07 d(sdpa) 4.8e-07
+S=  512 H= 8 D= 64 bf16: ours    206.4 (med    216.1) sdpa    533.3 vllm    229.6  o/vllm  0.90 (med  0.91)  o/sdpa  0.39  ctrl  0.99  d(ours) 6.9e-03 d(vllm) 6.9e-03 d(sdpa) 6.9e-03
+S=  512 H= 8 D= 64 fp32: ours    519.8 (med    552.8) sdpa   1730.3 vllm    594.6  o/vllm  0.87 (med  0.92)  o/sdpa  0.30  ctrl  1.02  d(ours) 1.2e-06 d(vllm) 1.2e-06 d(sdpa) 1.2e-06
+S= 1024 H= 8 D= 64 bf16: ours    798.7 (med    820.5) sdpa   1461.2 vllm    909.1  o/vllm  0.88 (med  0.89)  o/sdpa  0.55  ctrl  1.00  d(ours) 8.0e-03 d(vllm) 8.0e-03 d(sdpa) 8.0e-03
+S= 1024 H= 8 D= 64 fp32: ours   2083.8 (med   2124.3) sdpa   4656.6 vllm   2258.9  o/vllm  0.92 (med  0.94)  o/sdpa  0.45  ctrl  1.00  d(ours) 1.1e-06 d(vllm) 8.2e-07 d(sdpa) 5.4e-07
+S= 2048 H= 8 D= 64 bf16: ours   3118.0 (med   3181.9) sdpa   4740.4 vllm   3410.3  o/vllm  0.91 (med  0.93)  o/sdpa  0.66  ctrl  1.00  d(ours) 7.6e-03 d(vllm) 7.6e-03 d(sdpa) 7.6e-03
+S= 2048 H= 8 D= 64 fp32: ours   8266.0 (med   8297.4) sdpa  14666.1 vllm   8918.9  o/vllm  0.93 (med  0.93)  o/sdpa  0.56  ctrl  0.99  d(ours) 1.3e-06 d(vllm) 7.5e-07 d(sdpa) 6.0e-07
+S= 4096 H= 8 D= 64 bf16: ours  12575.5 (med  13234.6) sdpa  17195.6 vllm  13673.6  o/vllm  0.92 (med  0.97)  o/sdpa  0.73  ctrl  1.01  d(ours) 5.6e-03 d(vllm) 5.6e-03 d(sdpa) 5.6e-03
+S= 4096 H= 8 D= 64 fp32: ours  33271.5 (med  33902.1) sdpa  49874.5 vllm  34379.7  o/vllm  0.97 (med  0.98)  o/sdpa  0.67  ctrl  1.00  d(ours) 1.3e-06 d(vllm) 7.7e-07 d(sdpa) 6.0e-07
+S=  256 H=16 D=128 bf16: ours    188.4 (med    204.8) sdpa    480.4 vllm    207.5  o/vllm  0.91 (med  0.96)  o/sdpa  0.39  ctrl  0.98  d(ours) 8.3e-03 d(vllm) 8.5e-03 d(sdpa) 7.7e-03
+S=  256 H=16 D=128 fp32: ours    524.0 (med    535.2) sdpa   1338.4 vllm    665.6  o/vllm  0.79 (med  0.79)  o/sdpa  0.39  ctrl  0.99  d(ours) 1.8e-06 d(vllm) 1.7e-06 d(sdpa) 8.3e-07
+S= 1024 H=16 D=128 bf16: ours   2726.6 (med   2784.0) sdpa   4819.4 vllm   2863.2  o/vllm  0.95 (med  0.97)  o/sdpa  0.57  ctrl  1.00  d(ours) 9.0e-03 d(vllm) 9.8e-03 d(sdpa) 9.0e-03
+S= 1024 H=16 D=128 fp32: ours   7841.5 (med   7909.1) sdpa  14339.2 vllm   9618.0  o/vllm  0.82 (med  0.82)  o/sdpa  0.55  ctrl  1.00  d(ours) 1.5e-06 d(vllm) 1.5e-06 d(sdpa) 5.4e-07
+S= 2048 H=16 D=128 bf16: ours  11077.9 (med  11177.3) sdpa  16171.8 vllm  11069.1  o/vllm  1.00 (med  1.00)  o/sdpa  0.69  ctrl  1.01  d(ours) 8.2e-03 d(vllm) 9.3e-03 d(sdpa) 8.2e-03
+S= 2048 H=16 D=128 fp32: ours  32297.7 (med  32465.0) sdpa  46278.6 vllm  36514.1  o/vllm  0.88 (med  0.89)  o/sdpa  0.70  ctrl  1.00  d(ours) 1.7e-06 d(vllm) 2.0e-06 d(sdpa) 7.7e-07
+S= 4096 H=16 D=128 bf16: ours  43920.8 (med  44056.8) sdpa  57203.6 vllm  42734.9  o/vllm  1.03 (med  1.03)  o/sdpa  0.77  ctrl  1.00  d(ours) 9.5e-03 d(vllm) 9.7e-03 d(sdpa) 8.1e-03
+S= 4096 H=16 D=128 fp32: ours 141154.1 (med 141956.2) sdpa 161896.8 vllm 143273.6  o/vllm  0.99 (med  0.99)  o/sdpa  0.87  ctrl  1.00  d(ours) 1.7e-06 d(vllm) 2.0e-06 d(sdpa) 1.1e-06
+S=  512 H=32 D=128 bf16: ours   1421.7 (med   1462.9) sdpa   3723.1 vllm   1505.9  o/vllm  0.94 (med  0.96)  o/sdpa  0.38  ctrl  1.01  d(ours) 8.7e-03 d(vllm) 8.2e-03 d(sdpa) 8.3e-03
+S=  512 H=32 D=128 fp32: ours   4052.3 (med   4274.0) sdpa  10736.3 vllm   4883.2  o/vllm  0.83 (med  0.87)  o/sdpa  0.38  ctrl  1.01  d(ours) 2.3e-06 d(vllm) 1.6e-06 d(sdpa) 7.2e-07
+S= 1024 H= 8 D= 32 bf16: ours    529.5 (med    535.1) sdpa   1011.6 vllm    630.4  o/vllm  0.84 (med  0.83)  o/sdpa  0.52  ctrl  0.99  d(ours) 5.9e-03 d(vllm) 5.8e-03 d(sdpa) 5.6e-03
+S= 1024 H= 8 D= 32 fp32: ours   1200.5 (med   1215.5) sdpa   2625.4 vllm   1319.7  o/vllm  0.91 (med  0.91)  o/sdpa  0.46  ctrl  1.00  d(ours) 8.6e-07 d(vllm) 7.5e-07 d(sdpa) 7.7e-07

@@ -1,0 +1,18 @@
+/home/ubuntu/cpu-attention/.venv/lib/python3.14/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+threads=4 vllm=/home/ubuntu/vllm_cpu_build/vllm_cpu_attn_bench_amx.so isa=amx
+
+causal=True   us (ratios are ours/baseline: <1 = we win)
+  S=  128 H= 8 D= 64 bf16:        40 us (sdpa       76, vllm       33)   o/sdpa  0.53  o/vllm  1.21   [ 416 GFLOP/s]  min o/vllm  1.25  d=1.6e-02
+  S=  512 H= 8 D= 64 bf16:       344 us (sdpa      719, vllm      261)   o/sdpa  0.48  o/vllm  1.32   [ 779 GFLOP/s]  min o/vllm  1.33  d=7.8e-03
+  S= 1024 H= 8 D= 64 bf16:      1144 us (sdpa     2158, vllm      865)   o/sdpa  0.53  o/vllm  1.32   [ 938 GFLOP/s]  min o/vllm  0.94  d=1.6e-02
+  S= 2048 H= 8 D= 64 bf16:      2232 us (sdpa     4287, vllm     2643)   o/sdpa  0.52  o/vllm  0.84   [1925 GFLOP/s]  min o/vllm  0.86  d=1.6e-02
+  S= 4096 H= 8 D= 64 bf16:      8571 us (sdpa    12986, vllm    10371)   o/sdpa  0.66  o/vllm  0.83   [2004 GFLOP/s]  min o/vllm  0.80  d=7.8e-03
+  S=  256 H=16 D=128 bf16:       236 us (sdpa      377, vllm      204)   o/sdpa  0.63  o/vllm  1.16   [1137 GFLOP/s]  min o/vllm  1.06  d=1.6e-02
+  S= 1024 H=16 D=128 bf16:      1879 us (sdpa     3123, vllm     1895)   o/sdpa  0.60  o/vllm  0.99   [2285 GFLOP/s]  min o/vllm  1.01  d=1.6e-02
+  S= 2048 H=16 D=128 bf16:      7081 us (sdpa    11806, vllm     6960)   o/sdpa  0.60  o/vllm  1.02   [2426 GFLOP/s]  min o/vllm  0.94  d=7.8e-03
+  S= 4096 H=16 D=128 bf16:     26272 us (sdpa    38750, vllm    26033)   o/sdpa  0.68  o/vllm  1.01   [2616 GFLOP/s]  min o/vllm  0.97  d=1.6e-02
+  S=  512 H=32 D=128 bf16:      1195 us (sdpa     2177, vllm     1160)   o/sdpa  0.55  o/vllm  1.03   [1797 GFLOP/s]  min o/vllm  1.02  d=1.6e-02
+  S= 1024 H= 8 D= 32 bf16:       535 us (sdpa     1016, vllm      600)   o/sdpa  0.53  o/vllm  0.89   [1003 GFLOP/s]  min o/vllm  0.88  d=1.6e-02
+
+wrote /home/ubuntu/audit/logs/repo-x86-amx-2.json

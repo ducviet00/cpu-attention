@@ -1,0 +1,29 @@
+/home/ubuntu/cpu-attention/.venv/lib/python3.14/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+threads=8 vllm=/home/ubuntu/vllm_cpu_build/vllm_cpu_attn_bench.so isa=neon
+
+causal=True   us (ratios are ours/baseline: <1 = we win)
+  S=  128 H= 8 D= 64 bf16:        22 us (sdpa       50, vllm       22)   o/sdpa  0.45  o/vllm  1.00   [ 754 GFLOP/s]  min o/vllm  0.97  d=1.6e-02
+  S=  128 H= 8 D= 64 fp32:        43 us (sdpa      154, vllm       48)   o/sdpa  0.28  o/vllm  0.90   [ 387 GFLOP/s]  min o/vllm  0.92  d=1.4e-06
+  S=  512 H= 8 D= 64 bf16:       214 us (sdpa      552, vllm      235)   o/sdpa  0.39  o/vllm  0.91   [1256 GFLOP/s]  min o/vllm  0.89  d=7.8e-03
+  S=  512 H= 8 D= 64 fp32:       543 us (sdpa     1745, vllm      599)   o/sdpa  0.31  o/vllm  0.91   [ 494 GFLOP/s]  min o/vllm  0.89  d=1.5e-06
+  S= 1024 H= 8 D= 64 bf16:       812 us (sdpa     1474, vllm      913)   o/sdpa  0.55  o/vllm  0.89   [1323 GFLOP/s]  min o/vllm  0.88  d=7.8e-03
+  S= 1024 H= 8 D= 64 fp32:      2100 us (sdpa     4653, vllm     2306)   o/sdpa  0.45  o/vllm  0.91   [ 511 GFLOP/s]  min o/vllm  0.91  d=1.1e-06
+  S= 2048 H= 8 D= 64 bf16:      3215 us (sdpa     4783, vllm     3451)   o/sdpa  0.67  o/vllm  0.93   [1336 GFLOP/s]  min o/vllm  0.93  d=7.8e-03
+  S= 2048 H= 8 D= 64 fp32:      8375 us (sdpa    14704, vllm     8733)   o/sdpa  0.57  o/vllm  0.96   [ 513 GFLOP/s]  min o/vllm  0.95  d=9.4e-07
+  S= 4096 H= 8 D= 64 bf16:     12761 us (sdpa    18035, vllm    13594)   o/sdpa  0.71  o/vllm  0.94   [1346 GFLOP/s]  min o/vllm  0.93  d=1.6e-02
+  S= 4096 H= 8 D= 64 fp32:     33788 us (sdpa    50174, vllm    35683)   o/sdpa  0.67  o/vllm  0.95   [ 508 GFLOP/s]  min o/vllm  0.95  d=9.8e-07
+  S=  256 H=16 D=128 bf16:       217 us (sdpa      488, vllm      217)   o/sdpa  0.44  o/vllm  1.00   [1238 GFLOP/s]  min o/vllm  1.01  d=1.6e-02
+  S=  256 H=16 D=128 fp32:       542 us (sdpa     1363, vllm      674)   o/sdpa  0.40  o/vllm  0.81   [ 495 GFLOP/s]  min o/vllm  0.80  d=1.7e-06
+  S= 1024 H=16 D=128 bf16:      2799 us (sdpa     4854, vllm     2869)   o/sdpa  0.58  o/vllm  0.98   [1534 GFLOP/s]  min o/vllm  0.97  d=1.6e-02
+  S= 1024 H=16 D=128 fp32:      8286 us (sdpa    14815, vllm     9495)   o/sdpa  0.56  o/vllm  0.87   [ 518 GFLOP/s]  min o/vllm  0.87  d=2.0e-06
+  S= 2048 H=16 D=128 bf16:     11109 us (sdpa    16859, vllm    11045)   o/sdpa  0.66  o/vllm  1.01   [1547 GFLOP/s]  min o/vllm  0.99  d=1.6e-02
+  S= 2048 H=16 D=128 fp32:     31940 us (sdpa    46307, vllm    36888)   o/sdpa  0.69  o/vllm  0.87   [ 538 GFLOP/s]  min o/vllm  0.86  d=1.8e-06
+  S= 4096 H=16 D=128 bf16:     43506 us (sdpa    57580, vllm    43309)   o/sdpa  0.76  o/vllm  1.00   [1580 GFLOP/s]  min o/vllm  1.00  d=7.8e-03
+  S= 4096 H=16 D=128 fp32:    142495 us (sdpa   162177, vllm   144058)   o/sdpa  0.88  o/vllm  0.99   [ 482 GFLOP/s]  min o/vllm  0.99  d=1.5e-06
+  S=  512 H=32 D=128 bf16:      1477 us (sdpa     3757, vllm     1523)   o/sdpa  0.39  o/vllm  0.97   [1454 GFLOP/s]  min o/vllm  0.96  d=1.6e-02
+  S=  512 H=32 D=128 fp32:      4880 us (sdpa    10776, vllm     4888)   o/sdpa  0.45  o/vllm  1.00   [ 440 GFLOP/s]  min o/vllm  0.85  d=1.9e-06
+  S= 1024 H= 8 D= 32 bf16:       546 us (sdpa     1028, vllm      637)   o/sdpa  0.53  o/vllm  0.86   [ 983 GFLOP/s]  min o/vllm  0.85  d=7.8e-03
+  S= 1024 H= 8 D= 32 fp32:      1213 us (sdpa     2664, vllm     1331)   o/sdpa  0.46  o/vllm  0.91   [ 443 GFLOP/s]  min o/vllm  0.91  d=8.3e-07
+
+wrote /home/ubuntu/audit/logs/repo-arm-3.json

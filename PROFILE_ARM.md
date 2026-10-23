@@ -1,5 +1,10 @@
 # ARM profile + vLLM `csrc/cpu` source read
 
+> **Historical profile (third campaign, pre-merge tree).** The counters and
+> per-phase numbers are from the tree of that campaign; the merged tree's
+> whole-call numbers are in `docs/AUDIT.md` and `docs/STATUS.md`.
+
+
 Box: `m9g.2xlarge` (Graviton 5 / Neoverse-V3, 8 cores, ASIMD + `bf16`, L1d 512 KiB,
 **L2 2 MiB/core**, L3 48 MiB). Clock **3.28 GHz** (inferred below), single core,
 `taskset -c 3`, `OMP_NUM_THREADS=1`.

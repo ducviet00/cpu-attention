@@ -7,13 +7,18 @@ as `attn_backend="mojo"`. Read this before touching the kernel; the root
 
 > **Status of this file (2026-10-23, fourth campaign: Intel Xeon).**
 > `docs/STATUS.md` is the scoreboard and this session's falsification ledger.
+> **`docs/AUDIT.md` (2026-10-23) is an independent re-measurement** on fresh
+> m9g (Graviton 5) and m8i (Xeon 6975P-C) boxes, with a naive fp32 reference
+> and its own harness in `audit/`. It corrects the numbers below where marked.
 > What the x86 fourth campaign changed, and where the kernel now stands:
 >
 > * **The AMX work item is one (batch, kv head)**: a thread packs that head's
 >   K/V and then attends every query block of it, so there is no phase barrier
 >   and the head's 32 KB of packed operands stay in L1 (`dense_amx.mojo`,
->   `per_head`). Worth 1.47x at 128:8:64, 1.29x at 512:8:64, 1.16x at
->   256:16:128. `mode & 512` forces the old phase-split order for an in-process
+>   `per_head`). Re-measured 2026-10-23: **1.16x at 128:8:64, 1.17x at
+>   512:8:64, 1.14x at 256:16:128** (the older 1.47/1.29/1.16 was measured on
+>   the previous x86 box and overstates the short rows by 20-30%; long rows are
+>   1.00-1.08x). `mode & 512` forces the old phase-split order for an in-process
 >   A/B -- use it before touching dispatch.
 > * **The AMX call entry takes five arguments**, not 36: `dense_amx_plan` reads
 >   the geometry out of an int64 buffer that `_kernel._amx_plan_buffer` builds
@@ -34,8 +39,10 @@ as `attn_backend="mojo"`. Read this before touching the kernel; the root
 >   A probe that runs one thread cannot settle an inner-loop change here.
 > * **vLLM's AMX build is the bf16 bar** on an AMX box; VEC is the fp32 bar.
 >   `CPU_ATTENTION_AMX2=1` selects a second kernel (`dense_amx_v2.mojo`, agent A)
->   that is 0.93-0.99 against v1 as v1 was before the per-head item, and 1.46x
->   slower than v1 as it is now.
+>   that is **1.51x slower** than v1 at 128:8:64 (older 1.46x) and reaches
+>   parity or a 3-5% win on the long rows; the older "0.93-0.99 elsewhere" did
+>   not reproduce on m8i. Re-measured AMX speedup over the AVX-512 path is
+>   **2.8-9.8x**, not 4-9.6x: 2.80x at 128:8:64 and 3.18x at 1024:8:32.
 >
 > **Status of this file (2026-10-22, after the third dense-attention
 > campaign, ARM/Graviton).** `docs/STATUS.md` is the current scoreboard and the
@@ -108,10 +115,14 @@ Two kernels, compile-time per-ISA paths (AVX512-BF16 `vdpbf16ps` + fp32 P@V on
 x86; NEON `bfdot` QK **and** P@V on ARM): the paged decoder step
 (`attention.mojo`) and dense attention (`dense.mojo`, `flash_attn_func`, §4a —
 vLLM has no cache-free kernel to port, so that one is built from vLLM's
-structure). Paged is bit-identical to `csrc/` on x86, ≤1e-3 on ARM (bf16
-probabilities); dense is ≤4e-6 vs SDPA in fp32 and ~1 bf16 ulp in bf16, and is
-1.3-2.5x SDPA on bf16 / 1.0-2.0x on fp32 (§9.4). Beats `csrc/` at `cross b8/ctx256` by 1.4× on
-the 4-core Xeon and 2.0× on Graviton 5, parity-or-better elsewhere. It runs on
+structure). Paged: bf16 output matches `csrc/` to **0-2 bf16 ulp** on x86
+(bit-identical at b1/ctx256, one ulp at b8/ctx1024) and to ≤1e-3 on ARM;
+fp32 agrees to 1.5-2.6e-7. Dense: fp32 is ≤4e-6 vs SDPA on ARM but
+**3.1-7.7e-5 on x86 AMX** (hi/lo splitting), and bf16 is ~1 ulp;
+**every row beats SDPA by 1.1-4.7x** across the 22-row matrix. At `cross
+b8/ctx256` bf16 it beats `csrc/` by **1.4-1.7x on the 4-core Xeon and
+2.3-2.4x on Graviton 5**; b1 traffic and x86 fp32 paged are not always wins
+(`docs/AUDIT.md` §3, §5). It runs on
 torch's own OpenMP pool (`GOMP_parallel`), which makes the engine **faster than
 the vendored C++ backend end to end** on the laptop: 392-396 vs 364-377 tok/s at
 8x128 (§9.3), 29.8 vs 90.7 µs per attention call at b8/ctx256 (§7).
@@ -233,9 +244,13 @@ ported file-for-file.
 
 - **Work item = `qt` consecutive query rows of one (batch, head), swept over the
   whole key range**, so the `head_dim`-wide output accumulator stays in
-  registers and K/V are read once per row block. `qt = 4` for every head dim
-  (`CPU_ATTENTION_QT` overrides): `qt * head_dim` above ~512 elements spills the
-  accumulator, and 8 was 20-40% slower than 4, 2 was worse still.
+  registers and K/V are read once per row block. `qt` is chosen by
+  `_kernel._qt_for` per (ISA, dtype, head_dim, seq_k) — 4-10 on x86, 8 on ARM
+  for the L1-tile kernels; `CPU_ATTENTION_QT` overrides it. `qt * head_dim`
+  above ~512 elements spills the register accumulator, which is why the
+  register path caps near 4-8 rows and the rest use the L1-accumulator
+  kernels. Re-measured 2026-10-23: fp32 `qt=8` is 1.45-1.61x over qt4 on ARM;
+  bf16 6/8/12/16 are within 1-3% at every tested shape.
 - **K is transposed first** (`dense_transpose`, blocked 16 tokens = one 64-byte
   store, 40-70 GB/s against 11-15 GB/s for `torch.permute(...).contiguous()`;
   the Python side just allocates the scratch). That is what lets one
@@ -292,11 +307,18 @@ transpose pass for 1-2% of the call. Plus `_exp2_fast` (magic-constant rounding
 `std.math.exp`'s ~22, which was **20% of the call**; the clamp at -127 makes
 masked lanes exactly 0 via exponent underflow, and one `fmaxnm` removes the
 "no visible key" special case) and `_vmax` as a single `fmaxnm`.
-Result: **2.2-3.2x**, 331 -> 853 GFLOP/s (D=64) and 348 -> 1093 (D=128); bf16
-now beats SDPA at every D=128 size and up to S=1024 at D=64.
+The campaign's result was **2.2-3.2x**, 331 -> 853 GFLOP/s (D=64) and 348 ->
+1093 (D=128) at the time; it left the kernel **1.44-1.8x behind vLLM**. That is
+history: re-measured 2026-10-23 on m9g (8 threads) the merged tree is
+**0.79-1.02 vs vLLM** and **1.34-1.59 TFLOP/s** at the long rows, with bf16
+0.87-1.01 and fp32 0.79-0.98 (`docs/AUDIT.md` §2). A 41-round run puts 9-10 of
+11 bf16 rows and 11 of 11 fp32 rows below 1, the bf16 D=128 long rows at
+0.99-1.01. The residue analysis below is from the superseded campaign; the
+numbers are kept because the mechanism (operand loads, spill traffic) is still
+the right place to look if the remaining 0-5% on those rows matters.
 
-Still open, measured, not guessed: we are **1.44-1.8x behind vLLM** (and 5-13%
-behind SDPA at D=64/S>=2048). Their `.so` runs 2 `bfmmla`/cycle where we run
+At the time the explanation was: we are 5-13% behind SDPA at D=64/S>=2048,
+their `.so` runs 2 `bfmmla`/cycle where we run
 1.2-1.35, and they issue ~16 instructions per row-key against our ~21 at IPC
 3.7 vs 2.6. About 300 instructions per 16-key tile are **spill traffic**:
 `qt/2 * sub/2` 2x2 tiles plus the softmax working set exactly fill the
@@ -484,7 +506,7 @@ ones; this is the list, so nobody re-implements them:
 
 | need | stdlib |
 |---|---|
-| vector width, ISA detection | `simd_width_of[DType.float32]()`, `CompilationTarget.is_x86()/has_neon()/_has_feature["avx512bf16"|"bf16"]()` |
+| vector width, ISA detection | `simd_width_of[DType.float32]()`, `CompilationTarget.is_x86()/has_neon()/_has_feature["avx512bf16"\|"bf16"]()` |
 | buffers a pointer-based kernel reads | `stack_allocation[N, dtype]()` (`std.memory`) |
 | typed pointer arithmetic | `MutPointer[T, MutUntrackedOrigin](unsafe_from_address=...)`, `.unsafe_offset`, `.unsafe_load[width=N](off)`, `.unsafe_store[width=N](off, v)` |
 | lane index vector for masks | `iota[DType.int32, N](start)` (`std.math`) |
@@ -752,14 +774,16 @@ shown to be already done by the compiler. In order of what actually paid:
 | one-row-pair / L1-staged logits / pipelining | -11% / 0% / -11% | falsified |
 | KV splits, GQA packing, mask-by-range, probs aliasing | <=4%, not needed for MHA | rejected |
 | lane-indexed FMA (vLLM's `vfmaq_laneq_f32`) | **already emitted**: 100 of 360 `fmla` in the ARM fp32 kernel are `fmla v.4s, v.4s, vN.s[k]` | nothing to do |
-| AMX (16x16 bf16 tiles) | **4-9.6x on bf16** (`cpu_attention/_csrc/dense_amx.c`) | done for bf16; see below on Mojo vs C |
+| AMX (16x16 bf16 tiles) | **2.8-9.8x on bf16** (`cpu_attention/_csrc/dense_amx.c`); 4-9.6x from 512 keys up | done for bf16; see below on Mojo vs C |
 
-So: on x86 and ARM the kernel is **at or ahead of SDPA nearly everywhere**
-(Graviton 17/22, laptop 11/12, Xeon 4/22 where bf16 SDPA has AMX), and
-**1.2-2.3x behind vLLM**. The remainder is fused-loop IPC (1.4 vs 2.9) that five
-restructuring attempts failed to recover, so "beat vLLM" needs either the AMX
-shim (Xeon bf16 only) or a from-scratch vLLM-shaped kernel whose two independent
-prototypes both lost 20-26%.
+So: on x86 and ARM the kernel is **at or ahead of SDPA everywhere we measured**
+(22/22 on both boxes; o/sdpa 0.28-0.87 on ARM, 0.21-0.79 on x86) and roughly
+**at parity with vLLM** (ARM 0.79-1.02, x86 bf16 0.80-1.02, x86 fp32 0.51-1.13)
+— the "1.2-2.3x behind vLLM" and the "Graviton 17/22, Xeon 4/22" counts belong
+to the pre-AMX/pre-`bfmmla` tree and were superseded by the fourth campaign
+(`docs/AUDIT.md` §1-§5). The remainder is fused-loop IPC (1.4 vs 2.9), and the
+two from-scratch vLLM-shaped prototypes both lost 20-26%; "beat vLLM" now means
+winning the last few percent on the D=128 long rows, not a structural gap.
 
 
 11. **Dense kernel (laptop, 8 threads, causal, `tests/bench_dense.py`)**: bf16 is
@@ -775,27 +799,36 @@ prototypes both lost 20-26%.
 
 ## 10. Final three-box numbers (ratio `mojo/vllm`, <1 = faster)
 
-`benchmarks/attn_backend.py --mode kernel` + `benchmarks/kernel_ab.py`, two runs
-each, threads = physical cores, workers = `_workers()`. Measured with the old
-private pool; the libgomp switch removes ~4 µs of dispatch per call (a few % of
-the short-context rows, nothing at 1024), so treat these as slightly
-conservative for the current tree:
+The Ryzen row is the original `benchmarks/attn_backend.py --mode kernel` +
+`benchmarks/kernel_ab.py` run (two runs, old private pool). The two server rows
+were re-measured on 2026-10-23 with the independent harness (`docs/AUDIT.md`
+§3, §5): 15 rounds, bf16, **min (median)**, page 32 on x86 / 16 on ARM, each
+backend staging its own cache layout:
 
 | box (threads/workers) | self b8/256 | cross b8/256 | self b8/1024 | cross b8/1024 | self b32/1024 |
 |---|---:|---:|---:|---:|---:|
 | Ryzen 7840H (8/8) | 0.76-0.88 | 1.02-1.18 | 0.84-0.92 | 0.92-0.96 | 0.86 |
-| Xeon 6975P-C (4/4) | 0.67-0.70 | 0.71-0.84 | 0.89-0.90 | 1.00-1.02 | 0.85-0.90 |
-| Graviton 5 (8/8) | 0.43-0.48 | 0.43-0.51 | 0.60-0.79 | 0.65-0.77 | 0.86-0.95 |
+| Xeon 6975P-C (4/4) | 0.53 (0.79) | 0.59 (0.87) | 0.92 (0.90) | 0.97 (0.94) | 0.66 (0.76) |
+| Graviton 5 (8/8) | 0.35 (0.38) | 0.44 (0.47) | 0.69 (0.74) | 0.76 (0.80) | 0.89 (0.92) |
 
-Absolute µs at `cross b8/enc256`: Xeon 116.7/114.4 → 82.5/85.5; Graviton
-65.9/65.6 → 33.6/33.3; Ryzen 29.6/32.5 → 32.8/38.3 (parity). The laptop is
-*faster in absolute terms* than the Xeon because it has 8 full-speed cores and
-32 MB L3 vs a 4-core cloud slice; the repo already records that ordering for
-decode GEMMs. What matters is the ratio on the same box.
+The Xeon `b8/256` row has a 1.7x min-to-median spread; treat it as "1.3-1.9x
+faster", not a two-decimal band. The table is bf16; **fp32 paged loses on x86**
+at b8/256 (1.04-1.13), b8/1024 (1.15-1.20) and b1/4096 (1.08-1.11), and wins on
+ARM (0.37-0.84). At b1 nothing is guaranteed: x86 is 0.77-0.82 (self) and
+0.85-1.20 (cross), ARM 0.59-1.12 (self) and 0.73-1.51 (cross).
 
-Config findings worth remembering: on the Xeon `block_size=128` is ~9% faster at
-ctx 1024 (a `Config`/CLI knob, not a kernel change); on Graviton the aarch64
-default of 16 is also the C++ kernel's best point (67 vs 76 µs at block 32).
+Absolute µs at `cross b8/enc256` bf16: Xeon 82.5/85.5 with the old pool →
+**67.3 min / 106 median** now; Graviton 33.6/33.3 → **34.2 min (block 16) /
+32.6 (block 32)**. The laptop is *faster in absolute terms* than the Xeon
+because it has 8 full-speed cores and 32 MB L3 vs a 4-core cloud slice; the
+repo already records that ordering for decode GEMMs. What matters is the ratio
+on the same box.
+
+Config findings worth remembering: on the previous Xeon box `block_size=128`
+measured ~9% faster at ctx 1024 (a `Config`/CLI knob, not a kernel change); on
+Graviton the aarch64 default of 16 is the C++ kernel's best point (67 vs 76 µs
+at block 32), while for our kernel block 32 is mixed — better at b32/1024
+(0.79 vs 0.94) and worse at b8/1024 (0.82 vs 0.76).
 
 ## 11. Failure modes we hit (each has a regression test now)
 
@@ -816,8 +849,9 @@ default of 16 is also the C++ kernel's best point (67 vs 76 µs at block 32).
    `tile % LANES == 0`). A mismatch shows up as bit-exact-but-wrong results for
    one dtype or block size only.
 4. **bf16 probabilities on ARM** (only place parity with `csrc` is given up):
-   ≤1e-3 vs the fp32 reference, matching `csrc`'s ARM `prob_buffer_t`. x86 stays
-   bit-identical (`max|diff| 0.0`).
+   ≤1e-3 vs the fp32 reference, matching `csrc`'s ARM `prob_buffer_t`. x86
+   matches `csrc` to 0-2 ulp (exact at b1/ctx256, one ulp at b8/ctx1024 from a
+   different summation order; re-measured 2026-10-23, `docs/AUDIT.md` §6).
 5. **Engine tests can be blind.** `../fast-encdec/tests/test_cpu_attention.py`'s token comparison is
    degenerate on the tiny model; the standalone test against a scalar fp32
    reference is the real gate. Keep both.
@@ -842,6 +876,17 @@ default of 16 is also the C++ kernel's best point (67 vs 76 µs at block 32).
    `S=1024/H=16/D=128`, which was the whole reason fp32 lost that shape. The
    blocked Mojo pass (16 tokens per 64-byte store) does it at 40-70 GB/s.
 
+10. **AMX: `_drop_workspace()` does not clear the AMX call plans.** The plan
+    buffer holds the packed K/V addresses; `clear_scratch()` pops
+    `_AMX_PLANS`, but `_drop_workspace()` (called by `_dense_plan` when the
+    non-AMX workspace exceeds 24 MB) frees the buffers without popping the
+    plans. Toggling `CPU_ATTENTION_AMX` off and on in one process then
+    SIGSEGVs at `_kernel.py:844` (reproduced by `audit/audit_amx_ab.py
+    --which onoff`, 7 shapes in). The shipped path never runs the non-AMX
+    dense kernel once AMX is on, so only the A/B toggler is exposed; run
+    `onoff` one shape per process until the pop is added to
+    `_drop_workspace()`. The `v1v2` and `mode & 512` A/Bs are clean.
+
 11b. **`exp` on a SIMD is not a polynomial in this stdlib.** `std.math.exp`
    costs ~22 instructions per vector here (`~36 cycles/lane` in the x86 worker's
    measurement, which made it 58% of *their* kernel). `_vexp` in `dense.mojo`
@@ -856,8 +901,16 @@ default of 16 is also the C++ kernel's best point (67 vs 76 µs at block 32).
 | box | IP | notes |
 |---|---|---|
 | Ryzen 7840H (dev) | local | 8 physical/16 SMT, avx512_bf16, 32 MB L3; repo `.venv` or `~/.venvs/torch-cpu` |
-| Xeon 6975P-C | `ubuntu@13.210.181.255` | 8 vCPU = **4 physical cores**, `avx512_bf16` + `amx_bf16`; `~/venv`; torch default 4 threads |
-| Graviton 5 | `ubuntu@13.236.70.191` | 8 cores, ASIMD + `bf16`; `~/venv`; torch default 8 threads |
+| Xeon 6975P-C | last campaign: `ubuntu@13.210.181.255` | 8 vCPU = **4 physical cores**, `avx512_bf16` + `amx_bf16`; `~/venv`; torch default 4 threads |
+| Graviton 5 | last campaign: `ubuntu@13.236.70.191` | 8 cores, ASIMD + `bf16`; `~/venv`; torch default 8 threads |
+| `m8i.2xlarge` (audit, 2026-10-23) | terminated | same 6975P-C, 4C/8T, on-demand, `ap-southeast-1a`; the x86 numbers in `docs/AUDIT.md` |
+| `m9g.2xlarge` (audit, 2026-10-23) | terminated | Neoverse-V3, 8 cores, spot, `ap-southeast-1a`; the ARM numbers in `docs/AUDIT.md` |
+
+The first three are the campaign's long-lived boxes; the two audit boxes were
+built from the stock Ubuntu 26.04 AMI and terminated. `scripts/setup_box.sh`
+provisions a fresh one and `scripts/box_sync.sh <arch> <host> <dir> --full`
+syncs + builds; expect ~6-10 min from launch to parity. The audit's exact
+commands are in `docs/AUDIT.md` §11 and `audit/README.md`.
 
 - Both checkouts live on the boxes: `~/fast-encdec` and `~/cpu-attention`,
   with the library installed editable into the engine env
@@ -908,10 +961,14 @@ default of 16 is also the C++ kernel's best point (67 vs 76 µs at block 32).
    plus a parity bug). qt=8 at D=64 loses too. The only untried route is a
    Vec16-style *single-loop* softmax over a memory-resident logits buffer
    (vLLM's actual structure, 200-300 lines, softmax only — Q@K^T, P@V and all
-   layouts stay). Expected ~1.2-1.3x, i.e. ~1.15x from vLLM rather than 1.45x.
-5. **Dense: `bfmmla` on ARM for both phases** — **done** (§4b): 2.2-3.2x, 331 ->
-   853 GFLOP/s (D=64), 348 -> 1093 (D=128), bf16 now 1.12-1.57x over SDPA at
-   D=128. What is left of the vLLM gap is item 4 above.
+   layouts stay). Expected ~1.2-1.3x at the time. The merged tree now measures
+   0.99-1.01 on those rows (`docs/AUDIT.md` §2), so there is no 1.45x left to
+   collect; this is no longer the priority.
+5. **Dense: `bfmmla` on ARM for both phases** — **done** (§4b): at the time
+   2.2-3.2x, 331 -> 853 GFLOP/s (D=64), 348 -> 1093 (D=128). The merged tree
+   measures **1.34-1.59 TFLOP/s** at the long rows and **0.79-1.02 vs vLLM**
+   (`docs/AUDIT.md` §2), so this item is closed; what is left is item 4 above
+   on the bf16 D=128 long rows only.
 
 6. **GQA/MQA**: one KV page shared by `q_heads_per_kv` heads would let one task
    amortise the K/V loads over several query heads — and only then does AMX

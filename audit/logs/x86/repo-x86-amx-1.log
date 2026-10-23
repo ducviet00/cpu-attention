@@ -1,0 +1,21 @@
+/home/ubuntu/cpu-attention/.venv/lib/python3.14/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+threads=4 vllm=/home/ubuntu/vllm_cpu_build/vllm_cpu_attn_bench_amx.so isa=amx
+
+causal=True   us (ratios are ours/baseline: <1 = we win)
+  S=  128 H= 8 D= 64 bf16:        32 us (sdpa       62, vllm       29)   o/sdpa  0.52  o/vllm  1.13   [ 518 GFLOP/s]  min o/vllm  0.98  d=1.6e-02
+  S=  512 H= 8 D= 64 bf16:       205 us (sdpa      436, vllm      213)   o/sdpa  0.47  o/vllm  0.96   [1310 GFLOP/s]  min o/vllm  0.93  d=1.6e-02
+  S= 1024 H= 8 D= 64 bf16:       652 us (sdpa     1198, vllm      705)   o/sdpa  0.54  o/vllm  0.92   [1646 GFLOP/s]  min o/vllm  0.91  d=3.1e-02 PARITY-FAIL
+  S= 2048 H= 8 D= 64 bf16:      2223 us (sdpa     4368, vllm     2653)   o/sdpa  0.51  o/vllm  0.84   [1932 GFLOP/s]  min o/vllm  0.86  d=1.6e-02
+  S= 4096 H= 8 D= 64 bf16:      8627 us (sdpa    13194, vllm    10607)   o/sdpa  0.65  o/vllm  0.81   [1991 GFLOP/s]  min o/vllm  0.79  d=1.6e-02
+  S=  256 H=16 D=128 bf16:       274 us (sdpa      523, vllm      210)   o/sdpa  0.52  o/vllm  1.31   [ 981 GFLOP/s]  min o/vllm  1.09  d=1.6e-02
+  S= 1024 H=16 D=128 bf16:      1896 us (sdpa     3148, vllm     1893)   o/sdpa  0.60  o/vllm  1.00   [2265 GFLOP/s]  min o/vllm  1.01  d=1.6e-02
+  S= 2048 H=16 D=128 bf16:      7128 us (sdpa    11725, vllm     6986)   o/sdpa  0.61  o/vllm  1.02   [2410 GFLOP/s]  min o/vllm  0.95  d=1.6e-02
+  S= 4096 H=16 D=128 bf16:     26728 us (sdpa    38033, vllm    26233)   o/sdpa  0.70  o/vllm  1.02   [2571 GFLOP/s]  min o/vllm  1.00  d=1.6e-02
+  S=  512 H=32 D=128 bf16:      1175 us (sdpa     2202, vllm     1155)   o/sdpa  0.53  o/vllm  1.02   [1827 GFLOP/s]  min o/vllm  1.02  d=1.6e-02
+  S= 1024 H= 8 D= 32 bf16:       539 us (sdpa     1029, vllm      609)   o/sdpa  0.52  o/vllm  0.88   [ 997 GFLOP/s]  min o/vllm  0.85  d=1.6e-02
+
+wrote /home/ubuntu/audit/logs/repo-x86-amx-1.json
+
+PARITY FAILURES: 1 rows
+  S=1024 H=8 D=64 bf16 causal=True d=3.12e-02

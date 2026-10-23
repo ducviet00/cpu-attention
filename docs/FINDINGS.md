@@ -1,5 +1,10 @@
 # FINDINGS — independently measured, 2026-10-22 (integrator)
 
+> **Historical (third campaign, `03-3a`).** The merged-tree numbers are in
+> `docs/STATUS.md` and the independent re-measurement in `docs/AUDIT.md`; the
+> harness rules and phase anatomy here are still useful.
+
+
 Everything here was measured today on the shared m9g.2xlarge (Neoverse-V3, 8
 cores, 3.0-3.3 GHz) by the campaign integrator, not inherited. Commands are
 given so any of it can be re-run. If a number here disagrees with your

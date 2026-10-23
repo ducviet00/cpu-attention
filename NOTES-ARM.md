@@ -1,5 +1,10 @@
 # NOTES-ARM.md — ARM (Graviton 5 / Neoverse-V3) work log
 
+> **Historical (third campaign, m9g.xlarge).** The merged tree is 21/22 vs
+> vLLM on m9g (`docs/STATUS.md`, `docs/AUDIT.md`); this is the work log that
+> got it there.
+
+
 Ratios are `ours / baseline` (below 1 = we win). Kernel numbers are *thread*-
 cycles per row-key from `scripts/prof/arm/pk.py` (differential `perf stat`), on
 the m9g.xlarge dev box (4 cores). **Check the box is idle first** (`uptime`,

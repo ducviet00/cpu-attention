@@ -1,5 +1,9 @@
 # NOTES-FAST — per-head dispatch, fp32 instruction diet, bf16 short S
 
+> **Historical (`arm-fast` worktree).** The merged tree is 21/22 vs vLLM on
+> m9g (`docs/STATUS.md`, `docs/AUDIT.md`); this is the per-row work log.
+
+
 Session scope: **fp32 at every shape** (make the 1.00-1.05 rows comfortable wins)
 and **bf16 short S** (128/256/512). Worktree `arm-fast`, remote dir `~/arm-b` on
 the shared m9g.2xlarge (8 cores, 48 MB L3). Every number below is measured on

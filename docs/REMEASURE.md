@@ -1,5 +1,11 @@
 # Re-measurement on a fresh instance, 2026-10-23
 
+> **Superseded by `docs/AUDIT.md` (2026-10-23, fourth campaign).** The counts
+> below are the pre-merge `03-3a` tree (18/22 vs vLLM); the merged tree is
+> 21/22 on m9g and the x86 numbers were re-measured on m8i. Keep this file for
+> its falsifications and the harness protocol, not for the row counts.
+
+
 Handover measurement pass: re-measure every claim in `docs/` on a brand-new
 Graviton box and correct what does not reproduce. **No kernel, dispatch or
 threshold was changed** — this file and the corrections it points at are the

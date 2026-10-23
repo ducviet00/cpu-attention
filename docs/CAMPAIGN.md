@@ -1,5 +1,13 @@
 # Dense attention vs SDPA and vLLM: campaign report (2026-10-22)
 
+> **Superseded (2026-10-23).** This is the closing report of the third campaign;
+> its verdict table (ARM 5 wins / 11 losses, x86 unverified) predates the merge
+> of `bfmmla`, the per-head dispatch and the AMX work. The current numbers are
+> in `docs/STATUS.md` and the independent re-measurement in `docs/AUDIT.md`:
+> ARM is 21-22/22 vs vLLM, x86 is 22/22 vs VEC, and bf16 vs vLLM's AMX build is
+> at parity (9/11 by min). The mechanism analysis below is still the right
+> historical account of why the old residue existed.
+
 This is the closing report for the campaign whose objective was: `ours/baseline
 < 1` in both columns (`torch SDPA`, vLLM `csrc/cpu`) on both platforms, for all
 22 rows of `tests/bench_vs_refs.py`, parity green. Ratios are `ours/baseline`;

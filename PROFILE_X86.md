@@ -1,5 +1,10 @@
 # PROFILE_X86 — where the x86 dense kernel's cycles actually go
 
+> **Historical profile (pre-AMX dense kernel, third campaign).** The counters
+> and instruction counts below are for the vector kernel; the current AMX
+> numbers are in `docs/AUDIT.md` and `docs/STATUS.md`.
+
+
 Box: `m8i.2xlarge`, Xeon 6975P-C, 8 vCPU = **4 physical cores**, AVX-512 + `avx512_bf16`
 + `amx_bf16`, 2 MB L2/core, ~3.8 GHz. Ubuntu 26.04, torch 2.14.1+cpu, mojo 1.1.0.
 Protocol: **one thread (`taskset -c 3`, `OMP_NUM_THREADS=1`, `torch.set_num_threads(1)`),

@@ -60,6 +60,12 @@ SVE is **128-bit** on Neoverse-V3 (`/proc/sys/abi/sve_default_vector_length` =
 per core is the ceiling for any bf16 dense attention on this part, and 834
 GFLOP/s for the 4-core m9g.xlarge we measure on.
 
+**2026-10-23 check.** A 4-thread slice of an `m9g.2xlarge` (8 cores, full 48 MiB
+L3) reaches **846 GFLOP/s** bf16 at 4096:16:128, i.e. at the 4 x 208 arithmetic
+ceiling and above the 4-vCPU xlarge's 835, because the slice keeps the whole L3.
+That is a different memory system from the m9g.xlarge the table below was taken
+on; do not use it as a drop-in stand-in (`docs/AUDIT.md` §2).
+
 ## Efficiency per row, ours vs vLLM (bf16, causal, 4 cores)
 
 Efficiency = measured GFLOP/s (exact causal MACs) / 835. Ours and theirs from the

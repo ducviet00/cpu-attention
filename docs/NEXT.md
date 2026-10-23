@@ -1,5 +1,13 @@
 # What is left, and how to pick it up
 
+> **Superseded 2026-10-23 (fourth campaign).** The count below (18/22) is the
+> tree of the third campaign; the merged tree measures **21/22** vs vLLM on
+> m9g (10/11 bf16, 11/11 fp32) and 0.79-1.02 per row (`docs/STATUS.md`,
+> `docs/AUDIT.md`). The x86 section's AMX range is **2.8-9.8x**, and "x86
+> unverified" is resolved: 22/22 vs VEC, bf16 vs vLLM's AMX at parity. This
+> file is still the plan for the rows that remain at the line; read it with
+> those two files.
+
 Written at the end of the third campaign (ARM/Graviton, 2026-10-23) as the
 handover. `docs/STATUS.md` is the scoreboard and the falsification ledger,
 `docs/FINDINGS.md` is the machine data and the harness rules, this file is the
@@ -124,7 +132,8 @@ Then, in order:
 
 * **AMX for bf16 is the one big x86-only lever** and it already exists:
   `dense_amx.mojo` (+ `_csrc/dense_amx.c` as the reference), gated on
-  `amxbf16`, worth 4–9.6x on bf16 in the second campaign. The scorecard's honest
+  `amxbf16`, worth 4–9.6x on bf16 in the second campaign (re-measured
+  **2.8–9.8x** on m8i, `docs/AUDIT.md` §7). The scorecard's honest
   bar for bf16 on an AMX machine is vLLM's AMX build (`verify.sh x86_64` builds
   it), not VEC. fp32 has no AMX kernel in vLLM either, so VEC is that column's
   bar — and our fp32 AMX path is the hi/lo bf16 split, three products, measured
@@ -170,9 +179,9 @@ the pinned vLLM reference `.so`, ~12 min), then `ln -sfn ~/cpu-attention/.venv
 Then reproduce, in this order, and correct the docs where they disagree:
 
 1. `scripts/verify.sh arm64 ubuntu@<ip> . r1` with `RUNS=2` → the 22-row table.
-   Measured on the 2026-10-23 instance: **18/22 vs vLLM on the min in both runs**
-   (20/22 in run 1, 20/22 in a 21-round + control run), all rows `o/sdpa`
-   0.28-0.88. **Absolute µs will differ from the numbers in `STATUS.md`**
+   Measured on the 2026-10-23 third-campaign instance: 18/22 vs vLLM on the
+   min in both runs; the merged tree re-measured 21/22 (`docs/AUDIT.md` §2),
+   all rows `o/sdpa` 0.28-0.88. **Absolute µs will differ from the numbers in `STATUS.md`**
    (different physical host, and these boxes vary 5-10%); the *ratios* are what
    the docs claim, and the remaining rows are all within ±7% of 1.
 2. `tests/bench_phases.py --shapes 128:8:64,256:16:128,512:8:64` → the pack

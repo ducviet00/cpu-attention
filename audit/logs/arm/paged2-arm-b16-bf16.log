@@ -1,0 +1,13 @@
+/home/ubuntu/cpu-attention/.venv/lib/python3.14/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+threads=8 block=16 vllm=/home/ubuntu/vllm_cpu_build/vllm_cpu_attn_bench.so isa=neon
+self  b=1   ctx=256   bf16: ours       8.0 (med       8.3)  vllm       7.3  o/vllm  1.09 (med  1.04)  d(ours) 1.1e-03 d(vllm) 1.2e-03
+cross b=1   ctx=256   bf16: ours       7.4 (med       7.8)  vllm       5.4  o/vllm  1.37 (med  1.30)  d(ours) 1.1e-03 d(vllm) 1.2e-03
+self  b=8   ctx=256   bf16: ours      32.2 (med      35.6)  vllm      92.3  o/vllm  0.35 (med  0.38)  d(ours) 1.3e-03 d(vllm) 1.3e-03
+cross b=8   ctx=256   bf16: ours      34.2 (med      40.0)  vllm      78.4  o/vllm  0.44 (med  0.47)  d(ours) 1.3e-03 d(vllm) 1.3e-03
+self  b=8   ctx=1024  bf16: ours     298.6 (med     336.5)  vllm     434.9  o/vllm  0.69 (med  0.74)  d(ours) 5.5e-04 d(vllm) 6.1e-04
+cross b=8   ctx=1024  bf16: ours     339.1 (med     366.2)  vllm     448.0  o/vllm  0.76 (med  0.80)  d(ours) 5.5e-04 d(vllm) 6.1e-04
+self  b=32  ctx=1024  bf16: ours    1315.4 (med    1377.5)  vllm    1470.7  o/vllm  0.89 (med  0.92)  d(ours) 6.5e-04 d(vllm) 7.7e-04
+cross b=32  ctx=1024  bf16: ours    1442.4 (med    1497.6)  vllm    1536.2  o/vllm  0.94 (med  0.89)  d(ours) 6.5e-04 d(vllm) 7.7e-04
+self  b=1   ctx=4096  bf16: ours     125.7 (med     166.2)  vllm     213.7  o/vllm  0.59 (med  0.73)  d(ours) 2.5e-04 d(vllm) 2.5e-04
+cross b=1   ctx=4096  bf16: ours     138.1 (med     168.3)  vllm     190.0  o/vllm  0.73 (med  0.81)  d(ours) 2.5e-04 d(vllm) 2.5e-04

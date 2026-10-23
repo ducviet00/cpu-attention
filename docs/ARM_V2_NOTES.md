@@ -1,5 +1,10 @@
 # ARM dense kernel, second campaign: what was measured, what died
 
+> **Historical (`arm-v2` branch, pre-merge).** The merged tree measures 21/22
+> vs vLLM on ARM (`docs/STATUS.md`, `docs/AUDIT.md`); this file describes how
+> that tree got there.
+
+
 Branch `arm-v2`, worktree `arm-dense-v2`, rebased onto `main` at `507b41d`.
 Box: m9g.2xlarge (Graviton 5 / Neoverse-V3, 8 cores, 3.28 GHz, L1d 64 KiB 4-way,
 L2 2 MiB/core, L3 48 MiB). Shared with other agents: every number below was

@@ -1,531 +1,195 @@
 # cpu-attention
 
-Paged CPU attention kernels written in Mojo, with **flash-attn's API**
-(`flash_attn_with_kvcache`, `flash_attn_func`) plus the low-level ops a paged
-serving engine needs (`self_attention`, `cross_attention`, `reshape_and_cache`).
-One source file covers x86-64 (AVX512-BF16) and aarch64 (NEON + BF16).
+Paged and dense attention kernels for CPUs, with flash-attn's API. One source
+builds for x86-64 (AVX-512 + AMX) and aarch64 (NEON + BF16). It is the attention
+backend of [fast-encdec](https://github.com/ducviet00/fast-encdec), and it also
+works as a standalone library.
 
-It is the attention backend of
-[fast-encdec](https://github.com/ducviet00/fast-encdec) (`attn_backend="mojo"`),
-which imports it exactly like flash-attn:
-
-```python
-from cpu_attention import flash_attn_with_kvcache, flash_attn_func
-```
-
-## Install
-
-uv is the only tool needed: the Mojo compiler comes from the PyPI `mojo`
-wheel (`build` extra), and torch from the CPU index.
-
-```bash
-uv sync --extra build                              # torch + mojo + this package
-uv run --extra build python scripts/build.py --tests   # -> cpu_attention/_C.so
-uv run python tests/test_flash_api.py              # 35 checks vs SDPA
-```
-
-`scripts/build.py` builds the extension and, with `--tests`, the standalone
-kernel test (11 cases, run immediately). The test binary links libgomp; the
-build script uses torch's bundled `libgomp.so.1` when the system has no copy.
-
-To use it from another project, point that project's environment at this
-checkout (`uv pip install -e . --no-deps`). Without `_C.so`,
-`cpu_attention.is_available()` is False and every entry point raises a clear
-`RuntimeError`; `CPU_ATTENTION_LIB` points the loader at another build, and
-`CPU_ATTENTION_WORKERS` pins the worker count.
-
-## License
-
-Apache-2.0 (see `LICENSE`). The kernel is a port of vLLM's `csrc/cpu` attention
-implementation (Apache-2.0); the Python API mirrors
-[Dao-AILab/flash-attention](https://github.com/Dao-AILab/flash-attention)
-(BSD-3), which is where the argument names and semantics come from.
-
-## What is (and is not) ported
-
-Ported, from the x86 `VEC` implementation (`csrc/cpu/cpu_attn_vec.hpp`) with
-its `TileGemm82` micro-kernel (`csrc/cpu/cpu_attn_impl.hpp`):
-
-* the paged decoder **self-attention** (scatter K/V, then attend) and
-  **cross-attention** over a staged encoder cache,
-* the vLLM page layout and the fp32-accumulate numerics,
-* `reshape_and_cache` in the same transposed-K layout, so both backends share
-  cache tensors and `stage_cross_kv`.
-
-There is a second kernel for the other half of flash-attention — **dense
-attention** (`flash_attn_func`): whole `seqlen_q x seqlen_k` attention on
-contiguous `q`/`k`/`v`, causal (bottom-right aligned) or not, MHA/MQA/GQA,
-fp32/bf16. vLLM has no cache-free attention kernel (its only entry point is the
-paged `cpu_attention_with_kv_cache`), so this one borrows vLLM's *structure*
-(Q-tile of rows held in registers across the K/V sweep, transposed K, online
-softmax) rather than a specific file. See "Dense attention" below.
-
-Not ported (deliberately — the engine never calls them):
-
-* multi-token queries on the *paged* path (chunked prefill), sliding windows,
-  ALiBi, softcap, attention sinks, FP8 KV cache (the paged kernel keeps the
-  `q_heads_per_kv` mapping but BART/Florence-2 are MHA),
-* the `VEC16` / `NEON` / `AMX` / `RVV` / `VSX` / `VXE` ISAs and the vLLM
-  work-item scheduler. One task owns one `(sequence, head)` pair end to end, so
-  there is no KV split, no scratch buffer and no cross-thread reduction.
-
-The contract is the engine's (see `AGENTS.md` invariant 1): **one query token
-per sequence, attending to every cached position**. The query is always the
-last position, so the causal mask is exactly the cache tail.
-
-## Build details
-
-The kernel dispatches on libgomp (`GOMP_parallel`). The extension itself does
-not link it — the symbols resolve when the library is loaded, and `cpu_attention`
-imports torch first, which brings `libgomp.so.1` in — but the standalone test is
-an executable and does need the library at link time, hence `--tests` above.
-`mojo run` cannot run the kernel either (its JIT cannot resolve the OpenMP
-symbols), which is why the build script produces a binary.
-
-`mojo build` targets the **host CPU** (`--print-effective-target` shows
-`znver4 +avx512bf16` on the dev box), so rebuild per machine rather than copying
-the `.so`. In fast-encdec the engine-level checks (`tests/test_cpu_attention.py`)
-and the A/B scripts (`benchmarks/kernel_ab.py`, `benchmarks/attn_backend.py`)
-run against the installed package.
-
-## API
-
-The public entry points mirror `flash_attn`:
-
-```python
-flash_attn_with_kvcache(
-    q,
-    k_cache,
-    v_cache,
-    k=None,
-    v=None,
-    qv=None,
-    rotary_cos=None,
-    rotary_sin=None,
-    cache_seqlens=None,
-    cache_batch_idx=None,
-    cache_leftpad=None,
-    page_table=None,
-    cu_seqlens_q=None,
-    cu_seqlens_k_new=None,
-    max_seqlen_q=None,
-    rotary_seqlens=None,
-    q_descale=None,
-    k_descale=None,
-    v_descale=None,
-    softmax_scale=None,
-    causal=False,
-    window_size=(-1, -1),
-    attention_chunk=0,
-    softcap=0.0,
-    rotary_interleaved=True,
-    scheduler_metadata=None,
-    num_splits=0,
-    pack_gqa=None,
-    sm_margin=0,
-    return_softmax_lse=False,
-    block_table=None,
-    slot_mapping=None,
-    check_inputs=True,
-)
-flash_attn_func(q, k, v, softmax_scale=None, causal=False)
-```
-
-`flash_attn_with_kvcache` accepts every flash-attn argument; what the kernel
-cannot do raises `NotImplementedError` instead of being silently ignored: `qv`,
-`rotary_*`, `cache_leftpad`, `cu_seqlens_*`, `max_seqlen_q`, `*_descale`,
-`window_size`, `softcap`, `attention_chunk`, `return_softmax_lse`, and
-`seqlen > 1` (the paged kernel decodes one query token per sequence — use
-`flash_attn_func` for whole prompts). The tuning hints (`num_splits`,
-`pack_gqa`, `sm_margin`, `scheduler_metadata`, `rotary_interleaved`) are
-accepted and ignored.
-
-On x86 CPUs with **AMX** the dense path is a different kernel:
-`cpu_attention/_mojo/src/dense_amx.mojo`, 32 query rows per work item, K and V
-packed into the AMX operand layouts, one softmax pass per 256-key super-tile, and
-`tdpbf16ps` for both phases — which is worth 4-9.6x over the AVX-512 path and
-takes bf16 from 1.7-6.8x behind torch SDPA on a Xeon to 1.4-2.4x ahead of it.
-It is selected at compile time (`CompilationTarget._has_feature["amx-tile"]`) and
-gated at run time on `arch_prctl(XFEATURE_XTILEDATA)`, so every other CPU, and
-`CPU_ATTENTION_AMX=0`, falls back to the AVX-512/NEON kernels below. The AMX tile
-instructions are emitted from Mojo inline assembly (`amx.mojo`) — a C shim is not
-needed; `AGENTS.md` §14 has the details and the one trap (AT&T operand order puts
-the destination tile last).
-
-`flash_attn_func` keeps flash-attn's dense shape — `q [B, Sq, H, D]`,
-`k`/`v [B, Sk, Hk, D]`, MQA/GQA, bottom-right-aligned `causal`, `softmax_scale` —
-and *drops* the arguments the kernel cannot honour (`dropout_p`, `window_size`,
-`softcap`, `alibi_slopes`, `deterministic`, `return_attn_probs`) instead of
-taking them and raising. `flash_attn_varlen_func` and the packed variants raise
-`NotImplementedError`.
-
-Deliberate differences from flash-attn:
-
-* the cache is this backend's head-major
-  `[num_blocks, nheads_k, page_block_size, headdim]` (`attention.self_cache_shape`),
-  not flash's page-major layout — K is stored transposed inside the page, which
-  is exactly what the bf16 dot products read, so the two are not
-  interchangeable;
-* `causal` is accepted and has no effect: one query at the last cached position
-  keeps every key under the bottom-right-aligned mask;
-* with `k`/`v`, they are written at `cache_seqlens` (the length *before* the
-  write, flash's convention); passing `slot_mapping` writes them at those slots
-  and reads `cache_seqlens` as the length *after* the write, which is what the
-  engine's per-step Context holds.
-
-`check_inputs=False` skips the argument validation. The engine's per-layer path
-calls the thin aliases `self_attention(...)` / `cross_attention(...)` (the same
-kernel call, geometry already checked by the runner): the checked entry point
-costs ~4% end to end at the engine's 24 calls per decode step, ~2% with
-`check_inputs=False`, so the aliases stay on the hot path. `flash_attn_func`
-runs the dense kernel below for any `seqlen_q` (one query token included).
-
-## Design
-
-* **Parallelism: one task per (sequence, head), on torch's own pool.** The work
-  is embarrassingly parallel across heads because every head owns a disjoint
-  slice of the paged cache, so no reduction is needed. 128 tasks at batch 8 /
-  16 heads, and a thread only ever streams its own head's pages, which keeps the
-  access pattern prefetch-friendly. The dispatch is `GOMP_parallel` (libgomp,
-  linked with `-Xlinker -lgomp`), i.e. **the OpenMP pool torch already keeps
-  warm** rather than a second pool of our own: 2.4 µs per region warm and 2.7 µs
-  with a 1 ms gap, against 6.3 µs / 103-140 µs for a private pool that has to be
-  woken (see "Where the time goes"). The kernel is memory-bandwidth-bound, like
-  the C++ one.
-* **Page layout: vLLM's, unchanged.** A page is
-  `[num_blocks, num_kv_heads, block_size * head_dim]` with K stored
-  *transposed* inside the page (`[head_dim, block_size]`, row-major) and V
-  row-major (`[block_size, head_dim]`). Q@K^T then reads one contiguous
-  `block_size`-wide row of K per head dim and accumulates a TILE-wide vector,
-  and P@V reads one contiguous `head_dim`-wide row of V per position. That is
-  also why `reshape_and_cache` writes K column-wise, exactly like the C++
-  kernel.
-* **Tiles, groups and masks.** A page is one 32-token tile (vLLM's
-  `BlockSizeAlignment`, hence `block_size % 32 == 0`; 16 on aarch64 pages). Four
-  pages are scored into one **group** before the online-softmax step, which is
-  how the C++ kernel amortizes its softmax over an L2-sized tile — per *page*
-  softmax bookkeeping is 4x more max/exp/rescale work at short contexts. The
-  last page of a sequence masks positions past `context_lens` with `-3.4e38`
-  (not `-inf`: `exp()` underflows it to 0 and it cannot produce a NaN).
-* **Online softmax per group.** `m_new = max(m, max(group))`,
-  `l = l * exp(m - m_new) + sum(exp(group - m_new))`,
-  `acc = acc * exp(m - m_new) + P @ V`. Probabilities stay in registers; the
-  C++ kernel writes them to a buffer and reloads them as broadcast operands
-  (a 4-byte reload out of a 64-byte store), which costs a store-forwarding
-  stall per position. The C++ kernel also skips the rescale unless the max
-  moves by more than 8 (an FA4 trick); rescaling unconditionally costs
-  `head_dim / 16` multiplies per group.
-* **Q@K^T as AVX512-BF16 dot products** (`llvm.x86.avx512bf16.dpbf16ps.512`,
-  gated on `CompilationTarget` at compile time, fp32 broadcast-FMA otherwise).
-  One instruction folds two head dims into each of 16 position lanes, so the
-  query-key phase takes half the instructions of the widened fp32 form
-  (measured 1.87x on this box: 34 vs 63 ns per 32-position tile). Two bf16
-  values multiplied into fp32 are exact, so this is the same math as widening
-  first — bf16 output stays bit-identical to the C++ kernel. It needs K stored
-  as `[head_dim/2, block_size, 2]` so a `(k[2d], k[2d+1])` pair of one position
-  is contiguous; the portable path keeps the plain `[head_dim, block_size]`
-  layout. Q is not pre-scaled on this path (it would round through bf16);
-  `scale` is applied to the logits instead.
-* **P@V: fp32 on x86, bf16 dot on NEON.** A dot instruction needs the two
-  contracted positions adjacent, so the ARM path stores V position-paired
-  (`[block_size/2, head_dim, 2]`) and rounds the probabilities to bf16 — exactly
-  what `csrc` does on ARM (`prob_buffer_t`). One `bfdot` then retires 8 MACs
-  instead of 4, and the tile's contribution is folded into the fp32 accumulator
-  once per tile. This is the only place the port gives up bit-exactness, and
-  only on ARM (x86 keeps the fp32 P@V and stays bit-identical to `csrc/`).
-* **Strides.** `q`/`k`/`v` arrive as chunks of the fused `qkv_proj` output, so
-  a token sits `3 * d_model` floats apart, not `num_heads * head_dim`. The
-  kernel takes the token strides explicitly, like the C++ entry point does;
-  without that a batch of 2+ sequences reads the wrong rows.
-* **Dispatch.** `head_dim` is a comptime parameter (32/64/128 specializations,
-  anything else raises), `dtype` is fp32 or bf16 (fp16 is rejected — this
-  project's CPUs have no `avx512_fp16`).
-
-## Numerics
-
-bf16 output is bit-identical to the vendored C++ kernel on the engine's
-shapes, and fp32 agrees to ~4e-6 (different summation order, same fp32 math:
-the cache is widened to fp32 and Q is pre-scaled by `1/sqrt(head_dim)`).
+* `flash_attn_with_kvcache` — paged decoder self-attention and cross-attention,
+  one query token per sequence.
+* `flash_attn_func` — dense attention over whole prompts, causal or not.
+* fp32 and bf16, MHA / MQA / GQA, head_dim 32/64/128.
+* Linux, PyTorch, Python ≥ 3.10. The build needs the `mojo` wheel (installed by
+  the `build` extra), not a separate Mojo toolchain.
 
 ## Performance
 
-Kernel call only (Ryzen 7 7840H, 8 threads, bf16, `head_dim` 64, page 32,
-best-of-N over alternating rounds, `benchmarks/kernel_ab.py`). Each column
-includes its own Python/pybind entry point, i.e. what the engine pays per layer.
-`ratio` is Mojo over vLLM, so < 1 is faster (the range spans the two runs and
-the drift-controlled median; one number = all of them agree):
+`ours / vLLM csrc/cpu`, **min** over repeated rounds, `< 1` is faster. Ours
+includes the K/V pack and the output allocation; vLLM's cache is staged before
+the timer, so the ratios are conservative for us.
 
-| shape | vLLM `csrc/` | Mojo | ratio |
+Boxes: **Ryzen 7 7840H** (8 threads), **Graviton 5 `m9g.2xlarge`** (8 cores,
+8 threads), **Xeon 6975P-C `m8i.2xlarge`** (4 cores / 8 threads, 4 threads).
+Xeon bf16 is against vLLM's **AMX** build (its honest bf16 bar); every other
+column is against vLLM's VEC (x86) or NEON (ARM) build.
+
+### Dense attention (`flash_attn_func`), 11 shapes × 2 dtypes
+
+**bf16**
+
+| shape | Ryzen 7840H | Graviton 5 | Xeon 6975P-C |
 |---|---:|---:|---:|
-| self, batch=1 ctx=256 | 15.6 µs | 7.9 µs | 0.41-0.51 |
-| self, batch=8 ctx=256 | 37.4 µs | 20.0 µs | 0.52-0.53 |
-| self, batch=8 ctx=1024 | 445 µs | 383 µs | 0.82-0.86 |
-| self, batch=32 ctx=1024 | 2923 µs | 2410 µs | 0.82 |
-| self, batch=1 ctx=4096 | 87.0 µs | 43.2 µs | 0.48-0.50 |
-| cross, batch=1 ctx=256 | 12.8 µs | 7.4 µs | 0.57-0.58 |
-| cross, batch=8 ctx=256 | 28.5 µs | 19.0 µs | **0.66** |
-| cross, batch=8 ctx=1024 | 449 µs | 364 µs | 0.78-0.81 |
-| cross, batch=32 ctx=1024 | 2769 µs | 2342 µs | 0.85 |
-| cross, batch=1 ctx=4096 | 75.6 µs | 45.2 µs | 0.58-0.60 |
+| 128:8:64 | 0.88 | 0.97 | 0.85 |
+| 512:8:64 | 0.75 | 0.88 | 0.80 |
+| 1024:8:64 | 0.72 | 0.87 | 0.88 |
+| 2048:8:64 | 0.72 | 0.94 | 0.86 |
+| 4096:8:64 | 0.73 | 0.93 | 0.80 |
+| 256:16:128 | 0.88 | 0.89 | 0.98 |
+| 1024:16:128 | 0.89 | 0.94 | 1.01 |
+| 2048:16:128 | 0.92 | 1.00 | 0.95 |
+| 4096:16:128 | 1.07 | 0.99 | 0.98 |
+| 512:32:128 | 0.91 | 0.95 | 1.02 |
+| 1024:8:32 | 0.79 | 0.83 | 0.83 |
 
-Run-to-run spread on this laptop is +-10%, so treat the ratios as bands rather
-than exact values. Since the kernel moved onto torch's OpenMP pool (§ "Where
-the time goes") the short-context rows gained the most — the dispatch used to
-cost 6.3 µs warm / 103-140 µs cold and now costs 2.4 / 2.7 — so the target row
-`cross b8/ctx256` went from 1.07-1.30 to **0.66**. The engine runs one self and
-one cross call per decoder layer, so the per-layer aggregate is 0.7-0.85 of
-vLLM's: ahead at every shape now, widest where the call is short.
+**fp32**
 
-Three-box run — `benchmarks/attn_backend.py --mode kernel` plus
-`benchmarks/kernel_ab.py` (alternating vLLM/Mojo rounds), two runs each, torch
-threads = the box's physical cores, Mojo workers = `_workers()` (the same
-number). Ratio `mojo/vllm`, so < 1 is faster. **These two boxes were measured
-with the old private pool**, so their rows are conservative: the libgomp switch
-removes ~4 µs of dispatch per call, which is 3-15% of the short-context calls
-there (the laptop row above was re-measured and shows the size of the gain):
+| shape | Ryzen 7840H | Graviton 5 | Xeon 6975P-C |
+|---|---:|---:|---:|
+| 128:8:64 | 1.12 | 0.92 | 0.98 |
+| 512:8:64 | 1.04 | 0.88 | 0.62 |
+| 1024:8:64 | 1.00 | 0.92 | 0.60 |
+| 2048:8:64 | 1.03 | 0.92 | 0.56 |
+| 4096:8:64 | 1.07 | 0.97 | 0.55 |
+| 256:16:128 | 0.98 | 0.79 | 0.65 |
+| 1024:16:128 | 1.20 | 0.82 | 0.50 |
+| 2048:16:128 | 1.18 | 0.89 | 0.51 |
+| 4096:16:128 | 1.68 | 0.98 | 0.79 |
+| 512:32:128 | 1.31 | 0.83 | 0.56 |
+| 1024:8:32 | 1.00 | 0.90 | 0.67 |
 
-| box (threads / workers) | self b8/256 | **cross b8/256** | self b8/1024 | cross b8/1024 | self b32/1024 |
-|---|---:|---:|---:|---:|---:|
-| Ryzen 7840H (8 / 8), libgomp | 0.52-0.53 | **0.66** | 0.82-0.86 | 0.78-0.81 | 0.82 |
-| Xeon 6975P-C (4 / 4) | 0.67-0.70 | **0.71-0.84** | 0.89-0.90 | 1.00-1.02 | 0.85-0.90 |
-| Graviton 5 (8 / 8) | 0.43-0.48 | **0.43-0.51** | 0.60-0.79 | 0.65-0.77 | 0.86-0.95 |
+### Paged attention (one token per sequence)
 
-At `b1` the two server boxes are 0.70-0.83 (`self`) and 0.99-1.14 (`cross`); at
-`b1/ctx4096` 0.86-1.09 and 0.77-0.99. On the laptop the same points are 0.41-0.51
-(`self b1/256`), 0.57-0.60 (`cross b1/256`) and 0.48-0.60 at ctx 4096. The
-1024-token rows are memory-roofline bound on both servers (231-298 GB/s measured
-on Graviton, 133 GB/s from L3 on the Xeon) and insensitive to the kernel, which
-is also where the run-to-run spread is largest (+-10-25% on Graviton).
+**bf16**
 
-## Dense attention
+| case | Ryzen 7840H | Graviton 5 | Xeon 6975P-C |
+|---|---:|---:|---:|
+| self b=1 ctx=256 | 1.09 | 1.09 | 0.77 |
+| cross b=1 ctx=256 | 1.33 | 1.37 | 1.20 |
+| self b=8 ctx=256 | 0.81 | 0.35 | 0.53 |
+| cross b=8 ctx=256 | 0.85 | 0.44 | 0.59 |
+| self b=8 ctx=1024 | 0.75 | 0.69 | 0.92 |
+| cross b=8 ctx=1024 | 0.75 | 0.76 | 0.97 |
+| self b=32 ctx=1024 | 0.92 | 0.89 | 0.66 |
+| cross b=32 ctx=1024 | 0.96 | 0.94 | 0.85 |
+| self b=1 ctx=4096 | 0.66 | 0.59 | 0.82 |
+| cross b=1 ctx=4096 | 0.66 | 0.73 | 0.85 |
 
-`flash_attn_func(q, k, v, softmax_scale=None, causal=False)` — one work item owns
-`qt` consecutive query rows of one (batch, head) for the whole key sweep, so its
-online-softmax accumulator lives in registers and K/V are read once per row
-block. Keys are scored `KT_TILE` at a time; for that, K is handed over
-*transposed* (one `reshape/permute` produces it, and the kernel has a blocked
-parallel transpose pass for it, 40-70 GB/s against 11-15 GB/s for
-`torch.permute(...).contiguous()`), which is what lets one broadcast-FMA cover
-64 positions. V stays row-major, so `acc[d] += p[j] * v[j][d]` is one FMA per
-head-dim chunk shared by every row of the block. bf16 runs both phases on the
-2x2 matrix-multiply where one exists (`tdpbf16ps` on AMX, `bfmmla` on NEON) and
-on the bf16 dot instruction (`dpbf16ps` / `bfdot`) with fp32 P@V elsewhere, which
-is why bf16 is **faster than fp32** here — the opposite of a bf16-native kernel
-on AVX-512, which has no native bf16 add/multiply.
+**fp32**
 
-Work items are handed out round-robin over the same libgomp pool: causal masking
-makes the last query rows ~2x more expensive than the first, and a contiguous
-slice per thread leaves half the cores idle at the end of a prefill.
+| case | Ryzen 7840H | Graviton 5 | Xeon 6975P-C |
+|---|---:|---:|---:|
+| self b=1 ctx=256 | 1.11 | 0.89 | 0.46 |
+| cross b=1 ctx=256 | 1.50 | 1.02 | 0.86 |
+| self b=8 ctx=256 | 0.75 | 0.34 | 1.04 |
+| cross b=8 ctx=256 | 0.78 | 0.46 | 1.13 |
+| self b=8 ctx=1024 | 0.95 | 0.86 | 1.20 |
+| cross b=8 ctx=1024 | 0.94 | 0.86 | 1.15 |
+| self b=32 ctx=1024 | 0.99 | 0.80 | 0.87 |
+| cross b=32 ctx=1024 | 1.00 | 0.85 | 1.01 |
+| self b=1 ctx=4096 | 0.90 | 0.87 | 1.08 |
+| cross b=1 ctx=4096 | 0.90 | 0.86 | 1.11 |
 
-Rows per work item is the only axis K and V are reused across, so traffic per
-row-key is `head_dim * sizeof(T) / qt` bytes for Q@K^T and again for P@V, while
-the register file caps `qt * head_dim` near 512 (above that the accumulator has
-to live in L1: `_dense_rows_mem`). The shipped rule is `_kernel._qt_for`, swept
-per (ISA, dtype, head_dim, seqlen) and documented there: on ARM 8 rows for both
-dtypes (the tile kernels keep the logits in L1, so rows are free); on AVX-512
-fp32 6 rows at head_dim 64 and 8-10 at 128, bf16 4 at 64 and 6-8 at 128. Measured,
-interleaved, on the Ryzen: 1.13x at 256x16x128 and 1.25x at 512x32x128 for 6 rows
-over 4, and 1.10x at 1024x8:64 for 6 over 8. `CPU_ATTENTION_QT` overrides it for
-experiments, and it is part of the per-geometry call plan's key so a one-process
-sweep still measures different kernels.
+Ryzen paged uses 40-call blocks; the server paged columns use 15 interleaved
+rounds. See [`TECHNICAL.md`](TECHNICAL.md) for the protocol.
 
-### Against torch SDPA and vLLM
+### The short version
 
-The current table, the measurement protocol and the list of what moved it live in
-`docs/STATUS.md`; it is regenerated from `tests/bench_vs_refs.py --json` with
-`scripts/scorecard.py` (or `scripts/band.py` for a per-row band over repeat runs),
-never typed by hand. The campaign's closing report is `docs/CAMPAIGN.md`, and
-`docs/CEILINGS.md` says how much headroom exists per row before anyone spends
-another session on a schedule tweak. Headline, Ryzen 7 7840H, 8 threads,
-causal, ratios `ours/baseline` (`<1` wins). On the Xeon: **21-22 of 22 rows beat
-vLLM's VEC kernel** (bf16 via AMX `tdpbf16ps`, fp32 via AMX too, by splitting
-each fp32 operand into bf16 hi/lo halves and keeping three products per phase,
-error 5.5-7.6e-5 against a 2e-4 gate), with `128:8:64 fp32` the open row; that
-table has not been re-verified since the shared call-path and ARM changes, see
-`docs/NEXT.md`. On the Graviton (4-core slice): 22 of 22 beat SDPA, **8 of 22
-beat vLLM's NEON kernel** — fp32 wins 7 of 11, bf16 is 1.00-1.26 — and
-`docs/CEILINGS.md` shows why the residue is not a schedule tweak: vLLM spends 95%
-of the measured `bfmmla` ceiling at S=4096/D=128, so those rows are parity at
-best.
+* **Vs torch SDPA**, every dense row on Graviton and Xeon is faster. On Ryzen
+  21 of 22 are; the exception is `4096:16:128` fp32 at 1.04× SDPA.
+* **Dense vs vLLM**: bf16 wins 10/11 on Ryzen (4096:16:128 is 1.07), 10/11 on
+  Graviton (2048:16:128 is 1.00), and 9/11 on Xeon (1024:16:128 and
+  512:32:128 are 1.01/1.02). fp32 wins 11/11 on Graviton and Xeon (0.50-0.98);
+  on Ryzen it is 0.98-1.68 — parity at short contexts, slower at D=128. So
+  fp32 dense is the weak column on the laptop, not on the servers.
+* **Paged**: bf16 wins the batch ≥ 8 rows on all three boxes. `b=1` is mixed:
+  the bf16 cross rows lose on Ryzen and Graviton (1.33/1.37), the fp32 cross
+  loses on Ryzen (1.50), while Xeon wins at b=1 (0.46-0.86). fp32 paged wins
+  on Graviton except cross b=1 (1.02), is mixed on Ryzen (0.75-1.50), and loses
+  at batch 8 on Xeon (1.04-1.20) and at b=1/4096 (1.08-1.11).
 
-The three moves that mattered most, in order, were: **reusing the K/V pack
-workspace** instead of `torch.empty` per call (1.4-1.7x -- the pack was writing
-into freshly faulted pages, and `clear_page_erms` was 16.8% of a whole call);
-**rows per work item** (above); and sending 8x64 fp32 and 8x128 bf16 to the
-L1-accumulator kernels instead of spilling the register accumulator (1.05-1.10x
-and 1.19-1.39x). The older claims in this section -- that per-head-contiguous K/V
-was worth 2.0x, or that the softmax block is 40% of an x86 call -- did not
-survive re-measurement: the ablation in `docs/STATUS.md` puts the softmax at
-8-20% on x86 and 1-5% for the probability round trip.
+Ratios move between runs (duplicate-arm noise 0.92-1.04); a single 9-round run
+is not enough near 1.00. Full per-row bands, protocols and raw data are in
+[`docs/AUDIT.md`](docs/AUDIT.md) and [`docs/STATUS.md`](docs/STATUS.md).
 
-### On Graviton 5 (Neoverse-V3, 8 cores) -- previous campaign, superseded
+## Quick start
 
-The numbers below are from an older tree and are kept only as history; the
-current ARM table is re-measured per session (see `docs/STATUS.md`).
+### Install
 
-The dense kernel was first tuned on AVX-512 and it showed on ARM. bf16 now runs
-both phases on `bfmmla` (the 2x2 bf16 matrix-multiply, which vLLM's NEON kernel
-uses and which `bfdot` does not reach): Q@K^T as 2 rows x 4 dims against 2 keys x
-4 dims, P@V as 2 rows x 4 keys against 2 dims x 4 keys, so the logits *are* the
-Q@K^T accumulators and the softmax runs a row pair at a time. K gets a
-position-paired layout and V a position-major one, both built in the same
-transpose pass; the softmax uses a magic-constant `exp2` (~10 instructions
-instead of `std.math.exp`'s ~22, which was 20% of the call).
-
-Causal, bf16, ours before -> after, against vLLM's `csrc/cpu` NEON kernel and
-torch SDPA (same session, interleaved):
-
-| case | before | after | vLLM | SDPA |
-|---|---:|---:|---:|---:|
-| S=512 H=8 D=64 | 857 | **390** | 236 | 542 |
-| S=1024 H=8 D=64 | 3277 | **1376** | 911 | 1451 |
-| S=2048 H=8 D=64 | 12972 | **5038** | 3417 | 4719 |
-| S=4096 H=8 D=64 | 51467 | **19901** | 13691 | 17397 |
-| S=256 H=16 D=128 | 858 | **386** | 217 | 487 |
-| S=1024 H=16 D=128 | 12824 | **4164** | 2868 | 4829 |
-| S=2048 H=16 D=128 | 49432 | **15715** | 10931 | 17027 |
-| S=512 H=32 D=128 | 6687 | **2371** | 1501 | 3722 |
-
-Rows per work item is the lever that binds on ARM as it does on x86: the fp32
-default used to be 2 rows (the worst measured point), and `qt=6` is
-**1.37-1.39x** on the whole call at D=64 (S=1024/2048) -- that row went from
-0.79x SDPA to **1.15x**. Decoupling `qt` from the bf16 tile geometry was tried and
-rejected (0.86x: 32 logit registers at `RP=4 x NS=8` spill).
-
-That is 2.2-3.2x, and 331 -> 853 GFLOP/s at D=64 / 348 -> 1093 at D=128 (both
-S=2048): **bf16 now beats SDPA at every D=128 size (1.12-1.57x) and up to
-S=1024 at D=64, but is still 1.44-1.8x behind vLLM** and 5-13% behind SDPA at
-D=64/S>=2048. fp32 on ARM is unchanged by this (209-255 GFLOP/s) — there is no
-matrix-multiply instruction for it, so that path needs the same GEMM tiling as
-x86 (`AGENTS.md` §13.3-13.4).
-
-**Read these as bands, not points.** This laptop throttles to ~2.0 GHz under
-sustained AVX-512 (and a second session on the box makes it worse), and the
-fp32 / `D=128` causal ratio measured anywhere from 0.63 to 1.09 for the same
-binary depending on when it ran. Interleaved A/B in one process is the only
-number to trust; `tests/bench_dense.py` blocks per variant, so use it for
-orders of magnitude. Blocking the kernel further is not where the remaining gap
-is: `qt` 2/4/6/8 and a KV-outer (L2-chunked) loop order both measured within 1%
-at `D=128`, and coming level with vLLM there needs a GEMM-tile inner loop
-(`AGENTS.md` §9.9-9.10, §13.3).
-
-Absolute throughput (causal, S=2048): bf16 936 GFLOP/s at H=8/D=64 and 645 at
-H=16/D=128; fp32 700 and 444. For reference, vLLM's `csrc/cpu` `VEC` kernel in
-its chunked-prefill mode reached 915 GFLOP/s fp32 on this box (staged cache, no
-transpose), and torch SDPA 570 — so the bf16 path matches vLLM's fp32 and beats
-it outright once the key transpose is counted in. The one shape where fp32 still
-loses (`H=16 D=128`, mid-size) is the register wall: `qt * head_dim` above ~512
-spills the accumulator, and `qt` cannot grow, so K^T/V are re-read once per 4
-rows.
-
-## End to end (engine)
-
-`benchmarks/benchmark.py --scenarios '256->256'` and
-`benchmarks/benchmark_florence2.py`, dev Ryzen 7840H, 8 threads, one engine per
-process, Mojo and the vendored C++ backend measured in the same session:
-
-BART-large-CNN, batch x 256 generated tokens:
-
-| config | Mojo ms | Mojo tok/s | C++ ms | C++ tok/s | Mojo / C++ | Mojo vs HF |
-|---|---:|---:|---:|---:|---:|---:|
-| batch=1, beams=1, bf16 | 3324 | 77.0 | 3611 | 70.9 | **0.92** | 1.66x |
-| batch=8, beams=1, bf16 | 5060 | 404.7 | 5157 | 397.2 | 0.98 | 1.75x |
-| batch=8, beams=4, bf16 | 7661 | 267.3 | 8054 | 254.3 | 0.95 | 4.16x |
-| batch=8, beams=1, fp32 | 8527 | 240.2 | 8977 | 228.1 | 0.95 | 2.95x |
-
-Florence-2-base on a real 640x480 photo, four tasks (caption / detection /
-referring-expression segmentation / caption-to-phrase grounding), EOS-stopped so
-the output lengths are the tasks' own (13/22/256/22):
-
-| config | Mojo ms | Mojo tok/s | C++ ms | C++ tok/s | Mojo / C++ | Mojo vs HF |
-|---|---:|---:|---:|---:|---:|---:|
-| batch=1, beams=1, bf16 | 398 | 32.7 | 427 | 30.5 | 0.93 | 1.51x |
-| batch=8, beams=1, bf16 | 4344 | 144.1 | 4454 | 140.6 | 0.98 | 2.02x |
-| batch=8, beams=4, bf16 | 4873 | 128.5 | 4953 | 126.4 | 0.98 | 4.99x |
-| batch=8, beams=1, fp32 | 10070 | 62.2 | 10170 | 61.6 | 0.99 | 2.28x |
-
-So end to end the backend is now **ahead of the C++ one on every row**: 2-8% on
-BART (widest at batch 1), 1-7% on Florence-2. Before the move onto torch's
-OpenMP pool it was 3-9% behind on BART and 2-6% on Florence-2; the difference is
-the per-call dispatch (2.4 µs vs 6.3 warm, and no cold wake), which is most of a
-short attention call. Both engines beat HF by 1.5-5x on these points.
-
-## Where the time goes (and what not to redo)
-
-Measured on the Ryzen box with the engine's call pattern, not the microbenchmark.
-
-**The dispatch is the whole story, and it is solved.** An attention call is a
-fine-grained parallel region with ~0.8-1.5 ms of torch GEMMs between calls, so a
-pool that sleeps pays a wake every time. Measured per dispatch:
-
-| dispatch | µs |
-|---|---:|
-| inline, 1 worker (no region) | 0.36 |
-| **`GOMP_parallel` on torch's pool, warm** | **2.4** |
-| **`GOMP_parallel`, 1 ms idle gap, no torch work** | **2.7** |
-| `max.algorithm.parallelize`, private pool, warm | 6.3 |
-| same, 1 ms gap (the engine's cadence) | 103-140 |
-| a hand-rolled spin-then-condvar pool, 1 ms gap | 103 |
-
-The last two rows are why the backend no longer uses MAX's runtime: a private
-pool either sleeps (103-140 µs wake, 24 times per step) or spins (which steals
-GEMM cycles — MAX's default 200 µs spin cost 4.5% end to end and was worse than
-useless). Running the kernel on the pool that *torch* keeps busy between calls
-removes the wake entirely, and it also removes the need for the `max` package:
-the build needs only the `mojo` wheel (uv's `build` extra).
-
-What that is worth, measured in one harness (8 matmuls ~ 0.8 ms between calls,
-i.e. the engine's cadence; per-call numbers include the call itself):
-
-| b8/ctx256 | attention call | GEMM-phase interference |
-|---|---:|---:|
-| C++ backend | 90.7 µs | +25.9 µs |
-| this backend | **29.8-49.6 µs** | +39.2 µs |
-
-And end to end on bart-large-cnn, 8x128 tokens, same session:
-
-| | tok/s |
-|---|---:|
-| this backend, before the dispatch change | 344 |
-| this backend now | **392-396** |
-| C++ backend | 364-377 |
-
-So the backend is now **faster than the C++ one end to end on this laptop**
-(+7.5% at 8x128, +4.8% at batch 1 x 128), and its attention call is ~3x cheaper
-than vLLM's at `cross b8/256`.
-
-Remaining host-side cost, all measured: `torch.empty_like` 0.53 µs, 9
-`data_ptr()` 0.53 µs, pybind with 23 args 0.68 µs, the Python wrapper ~3.1 µs
-(callable and worker override resolved once, one `stride()` per tensor). Tiny
-calls run **inline** (`_workers()` returns 1 when `num_tasks * pages <= 32`:
-24.5 µs vs 31.0 µs at batch 1 / ctx 64); from batch 1 / ctx 128 up the pool wins
-(1.3x), and 8x at batch 8 / ctx 256.
-
-**On a 4-physical-core Granite Rapids box the picture inverts.** The kernel is
-bandwidth-bound (133 GB/s from L3 at this shape, 62-70 GB/s from DRAM, both
-measured by pointing every sequence at one shared page set), the C++ kernel is
-compute-bound at 81 GB/s, and the port beats it on every row at 4 threads —
-self 0.67 / 0.94 / 0.86, cross 0.72 (b8/enc256) / 0.90 (b8/enc1024). There,
-prefetching K/V (3 strides), `GROUP` 2/8 and 6/8 workers were all
-neutral-to-worse; `_workers()` is capped at the physical core count (sysfs,
-cached) — torch already sizes its pool that way, so the cap only matters when
-a parent sets a larger `OMP_NUM_THREADS`. `block_size=128` buys ~9% at ctx=1024
-(config-level: `attn_backend.py --block-size 128`).
-
-## Layout
-
+```bash
+uv sync --extra build                                # torch + mojo + this package
+uv run --extra build python scripts/build.py --tests # build _C.so and run the kernel tests
+uv run python tests/test_flash_api.py                # 35 checks vs SDPA
 ```
-cpu_attention/
-  __init__.py                   public API (flash-attn names + low-level ops)
-  flash_attn_interface.py       flash_attn_with_kvcache / flash_attn_func / rejects
-  ops.py                        self_attention / cross_attention / reshape_and_cache
-  _kernel.py                    .so loader, 23-arg call, worker policy
-  _C.so                         built kernel (gitignored)
-  _mojo/
-scripts/build.py              uv-driven build (mojo wheel from PyPI)
-    src/attention.mojo          the kernel (Job, store, attention, dispatch)
-    src/_C.mojo                 Python extension module (PyInit__C)
-    tests/test_attention.mojo   standalone parity test against a scalar reference
-    tests/bench_qk.mojo         isolated QK micro-benchmark
-tests/test_flash_api.py         flash-shaped API vs an SDPA reference
+
+`CPU_ATTENTION_LIB` points the loader at another build. Without `_C.so`,
+`cpu_attention.is_available()` is `False` and the entry points raise a clear
+`RuntimeError`.
+
+### Use
+
+```python
+import torch
+from cpu_attention import flash_attn_func, flash_attn_with_kvcache
+
+# Dense: q/k/v are [batch, seq, heads, head_dim]
+out = flash_attn_func(q, k, v, causal=True)
+
+# Paged decode: one query token per sequence
+out = flash_attn_with_kvcache(
+    q, k_cache, v_cache,           # q [B,1,H,D], caches [blocks,H,page,D]
+    k=k_new, v=v_new,              # written at cache_seqlens (length before write)
+    cache_seqlens=lens,            # int32 [B]
+    page_table=pages,              # int32 [B, max_blocks]
+)
 ```
+
+For an engine's per-layer path, call the thin aliases directly; they skip the
+argument checks the runner already did:
+
+```python
+from cpu_attention import self_attention, cross_attention
+
+out = self_attention(q, k, v, k_cache, v_cache, slot_mapping,
+                     block_table, context_lens, scale)
+out = cross_attention(q, k_cache, v_cache, block_table, cache_seqlens, scale)
+```
+
+### Get the best performance
+
+1. **Set torch threads to the physical core count.** `torch.set_num_threads(n)`
+   where `n` is sockets × cores, not SMT threads. The kernel runs on torch's
+   OpenMP pool; oversubscribing makes it slower.
+2. **Use bf16.** It is up to 3× faster than fp32 at the long dense rows on the
+   servers (1.1-1.4× on the laptop); fp32 on x86 still goes through AMX (hi/lo
+   split) and is fine at short contexts, but it is not the fast column on ARM
+   or on the laptop.
+3. **Leave the defaults alone on x86.** AMX is on by default and is worth
+   2.8-9.8× over the AVX-512 path. Do not set `CPU_ATTENTION_AMX=0` unless you
+   are A/B testing.
+4. **Use page 32 on x86, page 16 on ARM** (the engine defaults), then measure
+   before changing it.
+5. **Stage cross-attention caches with the active backend.** `fp32/x86` caches
+   are interchangeable with vLLM's; `bf16` caches are not. Use the engine's
+   `stage_cross_kv` (it calls the active backend's `reshape_and_cache`) or
+   `cpu_attention.reshape_and_cache` directly.
+6. **Benchmark on the machine you will ship on**, with `--rounds 41` and a
+   control arm, and judge on the minimum:
+   `python tests/bench_vs_refs.py --vllm <ref.so> --rounds 41 --control`.
+   The independent harness in [`audit/`](audit/) uses a naive fp32 reference.
+
+## Documentation
+
+* [`TECHNICAL.md`](TECHNICAL.md) — design, API details, page layout, numerics,
+  tuning knobs, and historical measurements.
+* [`docs/AUDIT.md`](docs/AUDIT.md) — independent 2026-10-23 audit of every
+  performance claim on the three boxes, with raw data in `audit/logs/`.
+* [`docs/STATUS.md`](docs/STATUS.md) — the scoreboard and the falsification
+  ledger.
+* [`AGENTS.md`](AGENTS.md) — handover notes and language-specific gotchas.
+
+## License
+
+Apache-2.0. The kernel is a port of vLLM's `csrc/cpu` attention implementation
+(Apache-2.0); the Python API mirrors
+[Dao-AILab/flash-attention](https://github.com/Dao-AILab/flash-attention)
+(BSD-3).

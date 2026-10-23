@@ -1,5 +1,10 @@
 # vLLM `csrc/cpu` techniques vs this port
 
+> **Historical (third campaign).** The phase split and the `1.45x` arithmetic
+> predate the fourth campaign's ablation and the AMX kernel; the current
+> scoreboard is `docs/STATUS.md` and the re-measurement `docs/AUDIT.md`. The
+> technique inventory itself is still the map of what upstream does.
+
 An inventory of what upstream does, whether we do it, and what is left. Read
 against upstream `main` (`cpu_attn_impl.hpp` 2291 lines, `cpu_attn_vec.hpp`
 327, `cpu_types_x86.hpp` 1164). Three people derived this independently (the
@@ -45,7 +50,7 @@ an issue-slot one.
 | 11 | bf16 P@V on `bfmmla` with a packed probability buffer (`TokenStride=2`, `row_in_pair`) | `cpu_attn_neon_bfmmla.hpp:330,371-390` | `_dense_rows_bfmmla` (both phases `bfmmla`, packed bf16 panels, linear K + position-major V) | have it |
 | 12 | work items packed by **KV length**, one item accumulating many q-tiles, KV split across threads with a `PartitionReduction` combine | `AttentionScheduler::schedule` `:500-700` | one work item per q-block, round-robin | missing; **not needed** — 8192 tasks are already balanced, and a split buys only locality that a bigger tile gets for free |
 | 13 | GQA: pack all query heads of one KV head into the 8-row tile (`request_q_head_group`) | `:456-470` | no | missing; only pays for GQA models (BART/Florence-2 are MHA) |
-| 14 | AMX: 16x16 tiles, `MaxQHeadNumPerIteration = 32`, `TileGemm224`/`122` | `cpu_attn_amx.hpp:29,215` | no | missing; Xeon-only, bf16-only, 4-8x headroom there |
+| 14 | AMX: 16x16 tiles, `MaxQHeadNumPerIteration = 32`, `TileGemm224`/`122` | `cpu_attn_amx.hpp:29,215` | `dense_amx.mojo` (bf16 and fp32 hi/lo) | **done**; 2.8-9.8x over the vector path on m8i (`docs/AUDIT.md` §7) |
 | 15 | `vec16` variant for `head_dim % 32 != 0` | `cpu_attn_vec16.hpp` | only 32/64/128 | missing, irrelevant to the shapes we run |
 | 16 | no software prefetch in the VEC loop (`vec_op::prefetch` exists at `cpu_types_x86.hpp:1125` but `cpu_attn_*.hpp` never calls it) | — | we do not either | equal — upstream relies on the layout being streamable (#2) |
 

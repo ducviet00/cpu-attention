@@ -1,3 +1,7 @@
+**Historical x86 work log (second/third campaign).** Current numbers are in
+`docs/STATUS.md` and `docs/AUDIT.md`; the corrections below are dated
+2026-10-22.
+
 **Integrator correction (2026-10-22).** The `128:8:64 fp32` result below does
 not reproduce: three focused runs of
 `tests/bench_vs_refs.py --vllm ~/vllm_cpu_build/vllm_cpu_attn_bench.so --isa vec

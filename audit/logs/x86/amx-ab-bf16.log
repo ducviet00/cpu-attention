@@ -1,0 +1,10 @@
+/home/ubuntu/cpu-attention/.venv/lib/python3.14/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+threads=4 dtype=bf16 amx=True which=onoff,v1v2,phase
+S=  128 H= 8 D= 64: amx_on     25.3 amx_off     70.9 v1     24.7 v2     41.6 per_head     29.9 split     36.7  amx_speedup  2.80  v1/v2  1.68  per_head/split  1.23
+S=  512 H= 8 D= 64: amx_on    164.8 amx_off    709.4 v1    165.5 v2    223.8 per_head    195.7 split    221.4  amx_speedup  4.30  v1/v2  1.35  per_head/split  1.13
+S= 1024 H= 8 D= 64: amx_on    643.6 amx_off   2750.8 v1    644.9 v2    667.0 per_head    650.1 split    684.6  amx_speedup  4.27  v1/v2  1.03  per_head/split  1.05
+S= 2048 H= 8 D= 64: amx_on   2282.9 amx_off  12094.3 v1   2275.8 v2   2241.3 per_head   2248.9 split   2354.2  amx_speedup  5.30  v1/v2  0.98  per_head/split  1.05
+S= 4096 H= 8 D= 64: amx_on   8391.8 amx_off  69481.5 v1   8709.4 v2   8241.4 per_head   8341.7 split   8695.2  amx_speedup  8.28  v1/v2  0.95  per_head/split  1.04
+S=  256 H=16 D=128: amx_on    177.6 amx_off    861.9 v1    185.7 v2    256.1 per_head    208.5 split    244.4  amx_speedup  4.85  v1/v2  1.38  per_head/split  1.17
+S= 1024 H=16 D=128: amx_on   1874.8 amx_off  15015.4 v1   1891.3 v2   2020.8 per_head   1883.5 split   2012.0  amx_speedup  8.01  v1/v2  1.07  per_head/split  1.07

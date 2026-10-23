@@ -1,0 +1,23 @@
+/home/ubuntu/cpu-attention/.venv/lib/python3.14/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+threads=4 block=32 vllm=/home/ubuntu/vllm_cpu_build/vllm_cpu_attn_bench.so isa=vec
+self  b=1   ctx=256   bf16: ours      11.6 (med      13.6)  vllm      15.2  o/vllm  0.77 (med  0.80)  d(ours) 9.6e-04 d(vllm) 9.6e-04
+cross b=1   ctx=256   bf16: ours      10.0 (med      11.8)  vllm       8.3  o/vllm  1.20 (med  1.22)  d(ours) 9.6e-04 d(vllm) 9.6e-04
+self  b=8   ctx=256   bf16: ours      63.4 (med     108.0)  vllm     120.3  o/vllm  0.53 (med  0.79)  d(ours) 9.8e-04 d(vllm) 9.8e-04
+cross b=8   ctx=256   bf16: ours      67.3 (med     106.0)  vllm     114.3  o/vllm  0.59 (med  0.87)  d(ours) 9.8e-04 d(vllm) 9.8e-04
+self  b=8   ctx=1024  bf16: ours     426.1 (med     451.5)  vllm     464.9  o/vllm  0.92 (med  0.90)  d(ours) 4.8e-04 d(vllm) 4.8e-04
+cross b=8   ctx=1024  bf16: ours     432.5 (med     444.7)  vllm     446.7  o/vllm  0.97 (med  0.94)  d(ours) 4.8e-04 d(vllm) 4.8e-04
+self  b=32  ctx=1024  bf16: ours    2357.7 (med    2835.9)  vllm    3554.9  o/vllm  0.66 (med  0.76)  d(ours) 8.1e-04 d(vllm) 8.1e-04
+cross b=32  ctx=1024  bf16: ours    2806.3 (med    2898.5)  vllm    3285.8  o/vllm  0.85 (med  0.84)  d(ours) 8.1e-04 d(vllm) 8.1e-04
+self  b=1   ctx=4096  bf16: ours     221.3 (med     251.8)  vllm     271.0  o/vllm  0.82 (med  0.86)  d(ours) 2.1e-04 d(vllm) 2.1e-04
+cross b=1   ctx=4096  bf16: ours     219.5 (med     250.7)  vllm     259.2  o/vllm  0.85 (med  0.94)  d(ours) 2.1e-04 d(vllm) 2.1e-04
+self  b=1   ctx=256   fp32: ours      11.6 (med      14.8)  vllm      25.2  o/vllm  0.46 (med  0.54)  d(ours) 2.1e-07 d(vllm) 2.2e-07
+cross b=1   ctx=256   fp32: ours      11.3 (med      15.4)  vllm      13.1  o/vllm  0.86 (med  0.73)  d(ours) 2.1e-07 d(vllm) 2.2e-07
+self  b=8   ctx=256   fp32: ours     229.2 (med     244.4)  vllm     219.9  o/vllm  1.04 (med  1.09)  d(ours) 3.1e-07 d(vllm) 2.7e-07
+cross b=8   ctx=256   fp32: ours     219.1 (med     237.1)  vllm     193.5  o/vllm  1.13 (med  1.12)  d(ours) 3.1e-07 d(vllm) 2.7e-07
+self  b=8   ctx=1024  fp32: ours     933.2 (med     970.8)  vllm     779.7  o/vllm  1.20 (med  1.10)  d(ours) 2.5e-07 d(vllm) 2.8e-07
+cross b=8   ctx=1024  fp32: ours     845.6 (med     895.5)  vllm     737.3  o/vllm  1.15 (med  1.15)  d(ours) 2.5e-07 d(vllm) 2.8e-07
+self  b=32  ctx=1024  fp32: ours    4160.4 (med    4348.8)  vllm    4783.8  o/vllm  0.87 (med  0.90)  d(ours) 4.5e-07 d(vllm) 3.3e-07
+cross b=32  ctx=1024  fp32: ours    4488.4 (med    4658.7)  vllm    4457.3  o/vllm  1.01 (med  1.00)  d(ours) 4.5e-07 d(vllm) 3.3e-07
+self  b=1   ctx=4096  fp32: ours     477.4 (med     497.5)  vllm     441.8  o/vllm  1.08 (med  1.08)  d(ours) 1.8e-07 d(vllm) 1.7e-07
+cross b=1   ctx=4096  fp32: ours     483.6 (med     496.6)  vllm     434.0  o/vllm  1.11 (med  1.10)  d(ours) 1.8e-07 d(vllm) 1.7e-07
