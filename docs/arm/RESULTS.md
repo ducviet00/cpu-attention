@@ -1,5 +1,44 @@
 # ARM (Graviton 5, m9g.2xlarge, Neoverse-V3) dense kernel
 
+## Round 8 — `m_r` is *correct*; the bounded base fails on a per-row defect
+
+Round 8's qk+softmax fusion (exp on the `bfmmla` accumulator registers, store
+only bf16 P, `pv` untouched) needs an exponent base known before the exp, so it
+is the bounded-base path again. Rather than re-derive the round-6 failure I
+instrumented it: a one-shot `fprintf` in `qk` printing `c`, `max|k|`, `||q_0||`,
+`m_0`, `m_1`, `nrows`. First run:
+
+```
+DBG c=0.18034 kmax=3.92188 q0=7.75614 mb0=5.48560 mb1=6.37037 n=8
+DBG c=0.18034 kmax=3.92188 q0=7.52134 mb0=5.31954 mb1=6.46604 n=8
+```
+
+`max|k|` = 3.92 for 128x64 random bf16, `||q_r||` = 7.5-8.2, `m_r` = 5.3-6.5 and
+monotone across the row pair -- **all correct**. So the round-6 hypothesis
+(`max|k|` reaching `qk` as 0 or NaN, i.e. the slab-tail store/read disagreeing)
+is **falsified**, and the bound itself is fine.
+
+The failing set localises the defect elsewhere, and precisely: **every case with
+more than one query row fails, every single-row (`Sq = 1`) case passes.**
+
+```
+[FAIL] bf16 B=1 Sq=128 Sk=128 H=8/8 D=64 causal=1: 3.164e-01 (tol 3e-02)
+[FAIL] bf16 B=1 Sq=128 Sk=128 H=8/8 D=64 causal=0: 2.246e-01
+[FAIL] bf16 B=1 Sq=64  Sk=96  H=8/8 D=32 causal=1: 5.234e-01
+[FAIL] bf16 B=1 Sq=17  Sk=301 H=4/4 D=64 causal=0: 1.254e-01
+```
+
+`Sq = 17` (rq 16, two chunks) fails, `Sq = 1` passes, and both masks fail --
+so it is the per-row state, not the mask and not the bound. `m_r` for rows 0 and
+1 prints correctly, which leaves the *other* per-row scratch, `psum[r]` (the
+per-tile probability sums that `softmax` flushes into `l`), or the row>0 path of
+the bf16 P store. That is the single remaining hypothesis; the instrumented
+build is reproducible in three edits (64-byte slab tail + `kmax_of`, the `m_r`
+prologue, the in-place exp epilogue) plus the one-line `fprintf`.
+
+Reverted: a kernel failing 24 of 65 parity checks cannot ship. The shipped
+binary is unchanged and re-verified below.
+
 ## Round 7 — fp32 hi/lo bf16 `bfmmla`: measured at 1.2%, reverted
 
 Implemented as a compile-time `DOT` branch of the fp32 policy (`DenseF32<HD, KTC,
