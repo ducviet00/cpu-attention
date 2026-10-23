@@ -423,8 +423,13 @@ on 18 of 22 rows. The measured state is instruction parity and a cycle gap:
 Both structural routes to those cycles were implemented and falsified: the fused
 register panel is 1.52x slower because the *output* accumulator does not fit in
 the register file alongside the logits, and the bounded-max formulation that
-would delete the max pass and its rescale fails parity with an `m_r` defect that
-was not isolated. The fp32 gap is 11% of *achieved* FMA throughput
+would delete the max pass and its rescale fails parity (41/65) on a defect that
+is localised but not fixed: the bound itself is correct when instrumented
+(`max|k|`, `‖q_r‖` and `m_r` all print sane, monotone values), every `Sq == 1`
+case passes, and every multi-row case fails, which leaves the per-tile
+probability sum that `softmax` flushes into `l` as the single suspect — one
+indexing bug in one file, recorded with the instrumented recipe in
+`docs/arm/RESULTS.md`. That is the one open path to these rows. The fp32 gap is 11% of *achieved* FMA throughput
 (2.25 against 2.50 per cycle) at the scalar-pipe roof, and replacing a quarter of
 the instructions with 3x-denser ones moves it 1.2%.
 
