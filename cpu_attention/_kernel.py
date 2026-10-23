@@ -28,25 +28,44 @@ if _BACKEND not in ("mojo", "cpp"):
         f"CPU_ATTENTION_BACKEND must be 'mojo' or 'cpp', not {_BACKEND!r}"
     )
 
-_LIB_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "_C_cpp.so" if _BACKEND == "cpp" else "_C.so",
-)
+_DIR = os.path.dirname(os.path.abspath(__file__))
+_INITIAL_BACKEND = _BACKEND
+_LIB_PATH = os.path.join(_DIR, "_C_cpp.so" if _BACKEND == "cpp" else "_C.so")
 
 
 def backend() -> str:
     """Return the selected backend name (``"mojo"`` or ``"cpp"``)."""
     return _BACKEND
 
+
+def set_backend(name: str) -> None:
+    """Select the backend for later calls (``"mojo"`` or ``"cpp"``).
+
+    Both shared objects stay loaded: the A/B harnesses alternate them inside one
+    process, and plan/scratch caches are keyed per backend so switching never
+    hands one kernel the other's buffer.
+    """
+    global _BACKEND
+    if name not in ("mojo", "cpp"):
+        raise ValueError(f"backend must be 'mojo' or 'cpp', not {name!r}")
+    _BACKEND = name
+
 # The kernel specializes on head_dim at compile time; anything else raises.
 _HEAD_DIMS = {32, 64, 128}
 _DTYPE_CODES = {torch.float32: 0, torch.bfloat16: 1}
 
-_BUILT = None
+_BUILTS = {}
 
 
-def _load():
-    path = os.environ.get("CPU_ATTENTION_LIB", _LIB_PATH)
+def _lib_path(name: str) -> str:
+    if name == _INITIAL_BACKEND and os.environ.get("CPU_ATTENTION_LIB"):
+        return os.environ["CPU_ATTENTION_LIB"]
+    return os.path.join(_DIR, "_C_cpp.so" if name == "cpp" else "_C.so")
+
+
+def _load(name=None):
+    name = name or _BACKEND
+    path = _lib_path(name)
     if not os.path.exists(path):
         return None
     spec = importlib.util.spec_from_file_location("cpu_attention._C", path)
@@ -55,20 +74,35 @@ def _load():
     return mod
 
 
-def module():
-    """Return the compiled kernel module, or None if it is unavailable."""
-    global _BUILT
-    if _BUILT is None:
+def module(name=None):
+    """Return the compiled kernel module for ``name`` (default: the selected
+    backend), or None if it is unavailable."""
+    name = name or _BACKEND
+    if name not in _BUILTS:
         try:
-            _BUILT = _load()
+            _BUILTS[name] = _load(name) or False
         except Exception:  # noqa: BLE001
-            _BUILT = False
-    return _BUILT or None
+            _BUILTS[name] = False
+    return _BUILTS[name] or None
 
 
 def is_available() -> bool:
     """Return True if the compiled kernel is present and loadable."""
     return module() is not None
+
+
+_BOUND = {}
+
+
+def _entry(attr: str):
+    """Bind ``attr`` of the selected backend's module once per backend."""
+    key = (_BACKEND, attr)
+    fn = _BOUND.get(key)
+    if fn is None:
+        mod = require()
+        fn = getattr(mod, attr)
+        _BOUND[key] = fn
+    return fn
 
 
 def require():
@@ -94,15 +128,9 @@ def supported(dtype, block_size: int, head_dim: int) -> bool:
     )
 
 
-_ATTENTION = None
-
-
 def _attention():
-    """Return the extension's single callable, bound once."""
-    global _ATTENTION
-    if _ATTENTION is None:
-        _ATTENTION = require().attention
-    return _ATTENTION
+    """Return the extension's single callable, bound once per backend."""
+    return _entry("attention")
 
 
 _PHYSICAL = None
@@ -231,28 +259,78 @@ def _call(
     return out
 
 
+_PAGED_PLANS = threading.local()
+"""Per-thread geometry -> fast call, for the paged path.
+
+The engine calls `self_attention`/`cross_attention` 24 times a decode step with
+the same geometry, and at batch 1 / ctx 256 the whole call is 7 us: reading a
+`.shape` and three `.stride()` tuples per call is a third of that. The plan holds
+the 14 constant arguments and patches only the data pointers, so a call is one
+`torch.empty`, six `data_ptr()`s and the extension call.
+
+Correctness of the key: shapes plus, for a strided tensor, the strides. A
+contiguous tensor's strides follow from its shape, so the common case (a fresh
+contiguous q and cache) builds no stride tuples at all.
+"""
+
+
+def _paged_plan(query, key, value, k_cache, page_table, do_store):
+    """The fast call for this geometry, building it on the first call."""
+    plans = getattr(_PAGED_PLANS, "p", None)
+    if plans is None:
+        plans = _PAGED_PLANS.p = {}
+    nseq, nheads, hd = query.shape
+    kvh = k_cache.shape[1]
+    page = k_cache.shape[2]
+    npages = page_table.shape[1]
+    workers = _workers(nseq * nheads, npages)
+    # A flat tuple of small ints: the hash is as cheap as it gets, and no
+    # `.stride()` tuple is built. The two token strides are read per call
+    # instead (two C calls), which keeps a strided query correct.
+    k = (nseq, nheads, hd, kvh, page, npages, _DTYPE_CODES[query.dtype],
+         workers, do_store)
+    fn = plans.get(k)
+    if fn is None:
+        args = [
+            0, 0, 0, 0, 0, 0, 0, 0, 0,
+            nseq, nheads, kvh, hd, page, npages, 0, 0, nheads * hd,
+            _DTYPE_CODES[query.dtype], 0.0, workers, do_store, True,
+        ]
+        attention = _attention()
+        store = do_store
+
+        def fn(out, query, key, value, k_cache, v_cache, slots, block_table,
+               lens, scale):
+            a = args
+            a[0] = query.data_ptr()
+            a[3] = k_cache.data_ptr()
+            a[4] = v_cache.data_ptr()
+            a[5] = out.data_ptr()
+            a[7] = block_table.data_ptr()
+            a[8] = lens.data_ptr()
+            a[15] = query.stride(0)
+            a[19] = scale
+            if store:
+                a[1] = key.data_ptr()
+                a[2] = value.data_ptr()
+                a[6] = slots.data_ptr()
+                a[16] = key.stride(0)
+            attention(*a)
+
+        if len(plans) > 64:
+            plans.clear()
+        plans[k] = fn
+    return fn
+
+
 def _paged(
     query, key, value, k_cache, v_cache, slots, page_table, lens, scale, do_store
 ):
     """Run one kernel call, allocating the output (geometry already checked)."""
-    out = torch.empty(
-        (query.shape[0], query.shape[1], query.shape[2]),
-        dtype=query.dtype,
-        device=query.device,
-    )
-    return _call(
-        query,
-        key,
-        value,
-        k_cache,
-        v_cache,
-        out,
-        slots,
-        page_table,
-        lens,
-        scale,
-        do_store,
-    )
+    fn = _paged_plan(query, key, value, k_cache, page_table, do_store)
+    out = torch.empty(query.shape, dtype=query.dtype)
+    fn(out, query, key, value, k_cache, v_cache, slots, page_table, lens, scale)
+    return out
 
 
 _LLC = None
@@ -285,70 +363,49 @@ def _llc_bytes() -> int:
     return _LLC
 
 
-_TRANSPOSE = None
-
 def _transpose_attention():
     """Return the extension's K-transpose entry point, bound once."""
-    global _TRANSPOSE
-    if _TRANSPOSE is None:
-        _TRANSPOSE = require().dense_transpose
-    return _TRANSPOSE
+    return _entry("dense_transpose")
 
 
 _FORWARD = None
 
 
-_FORWARD_PLAN = None
-
-
 def _forward_plan():
     """The fused entry that takes a plan buffer instead of 42 arguments."""
-    global _FORWARD_PLAN
-    if _FORWARD_PLAN is None:
-        entry = getattr(require(), "dense_forward_plan", None)
-        if entry is None:
-            raise RuntimeError(
-                "cpu_attention: _C.so has no dense_forward_plan; rebuild it "
-                "with scripts/build.py"
-            )
-        _FORWARD_PLAN = entry
-    return _FORWARD_PLAN
+    try:
+        return _entry("dense_forward_plan")
+    except AttributeError:
+        raise RuntimeError(
+            "cpu_attention: the mojo kernel has no dense_forward_plan; rebuild "
+            "it with scripts/build.py"
+        ) from None
 
 
 def _forward():
     """Return the extension's fused pack+attention entry point, bound once."""
-    global _FORWARD
-    if _FORWARD is None:
-        _FORWARD = require().dense_forward
-    return _FORWARD
+    return _entry("dense_forward")
 
 
 _FUSE = not os.environ.get("CPU_ATTENTION_NO_FUSE")
 
 
-_DENSE = None
-
-
 def _dense_attention():
     """Return the extension's dense entry point, bound once."""
-    global _DENSE
-    if _DENSE is None:
-        _DENSE = require().dense_attention
-    return _DENSE
+    return _entry("dense_attention")
 
 
-_LANES = None
+_LANES = {}
 
 
 def _lanes() -> int:
     """fp32 lanes per vector in the built kernel (16 on AVX-512, 4 on NEON)."""
-    global _LANES
-    if _LANES is None:
-        _LANES = int(require().dense_lanes())
-    return _LANES
+    if _BACKEND not in _LANES:
+        _LANES[_BACKEND] = int(_entry("dense_lanes")())
+    return _LANES[_BACKEND]
 
 
-_BF16_DOT = None
+_BF16_DOT = {}
 
 
 def _bf16_dot() -> bool:
@@ -358,10 +415,9 @@ def _bf16_dot() -> bool:
     head dim per position otherwise), so the caller has to know which one the
     compiled kernel expects.
     """
-    global _BF16_DOT
-    if _BF16_DOT is None:
-        _BF16_DOT = bool(require().dense_bf16_dot())
-    return _BF16_DOT
+    if _BACKEND not in _BF16_DOT:
+        _BF16_DOT[_BACKEND] = bool(_entry("dense_bf16_dot")())
+    return _BF16_DOT[_BACKEND]
 
 
 _INT8_QK = None
@@ -382,7 +438,7 @@ def _int8_qk() -> bool:
     return _INT8_QK
 
 
-_BFMMLA = None
+_BFMMLA = {}
 
 
 def _bfmmla() -> bool:
@@ -392,10 +448,9 @@ def _bfmmla() -> bool:
     head dims, position-major V over head-dim pairs), so the caller allocates
     both scratch buffers and packs V as well as K.
     """
-    global _BFMMLA
-    if _BFMMLA is None:
-        _BFMMLA = bool(require().dense_bfmmla())
-    return _BFMMLA
+    if _BACKEND not in _BFMMLA:
+        _BFMMLA[_BACKEND] = bool(_entry("dense_bfmmla")())
+    return _BFMMLA[_BACKEND]
 
 
 
@@ -1182,18 +1237,9 @@ geometry, so the Python side only has to hand it the plan; every derived value
 (rows per work item, ISA, worker count) is computed once, on the miss path.
 """
 
-_CPP_MAKE_PLAN = None
-_CPP_FORWARD = None
-
-
 def _cpp_entries():
-    """Bind the C++ plan/forward pair once."""
-    global _CPP_MAKE_PLAN, _CPP_FORWARD
-    if _CPP_MAKE_PLAN is None:
-        mod = require()
-        _CPP_MAKE_PLAN = mod.dense_make_plan
-        _CPP_FORWARD = mod.dense_forward
-    return _CPP_MAKE_PLAN, _CPP_FORWARD
+    """Bind the C++ plan/forward pair once per backend."""
+    return _entry("dense_make_plan"), _entry("dense_forward")
 
 
 def _cpp_plan(q, k, v, scale, causal):
@@ -1204,12 +1250,22 @@ def _cpp_plan(q, k, v, scale, causal):
     batch, seq_q, heads, hd = q.shape
     kv_heads = k.shape[2]
     workers = _workers(batch * heads * -(-seq_q // 64), 8)
-    key = (q.shape, q.stride(), k.stride(), v.stride(), causal, q.dtype,
-           float(scale), workers)
+    cont = q.is_contiguous()
+    # A contiguous tensor's strides follow from its shape, so the common case
+    # (a fresh q/k/v from flash_attn_func) builds no stride tuples.
+    key = (q.shape, k.shape, cont, causal, q.dtype, workers,
+           cont or (q.stride(), k.stride(), v.stride()))
     addr = plans.get(key)
     if addr is None:
         make_plan, _ = _cpp_entries()
-        qs, ks, vs = q.stride(), k.stride(), v.stride()
+        if cont:
+            # [batch, seq, heads, hd] row-major.
+            ks3 = kv_heads * hd
+            qs = (seq_q * heads * hd, heads * hd, hd, 1)
+            ks = (k.shape[1] * ks3, ks3, hd, 1)
+            vs = ks
+        else:
+            qs, ks, vs = q.stride(), k.stride(), v.stride()
         buf = torch.empty(24, dtype=torch.int64)
         make_plan(
             buf.data_ptr(), batch, seq_q, k.shape[1], heads, kv_heads, hd,
