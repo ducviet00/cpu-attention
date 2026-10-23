@@ -165,7 +165,7 @@ def main():
                     def f():
                         _kernel.set_backend(be)
                         if be == "cpp":
-                            return attn.self_attention(q, k_new, v_new, kcc, vcc, slots, blocks, lens, scale)
+                            return attn.self_attention(q, k_new, v_new, kcc, vcc, slots, blocks, lens, scale, out=ocpp)
                         return attn.self_attention(q, k_new, v_new, kcm, vcm, slots, blocks, lens, scale)
                     return f
 
@@ -173,10 +173,14 @@ def main():
                     def f():
                         _kernel.set_backend(be)
                         if be == "cpp":
-                            return attn.cross_attention(q, kcc, vcc, blocks, lens, scale)
+                            return attn.cross_attention(q, kcc, vcc, blocks, lens, scale, out=ocpp)
                         return attn.cross_attention(q, kcm, vcm, blocks, lens, scale)
                     return f
 
+                # vLLM's arm is handed a preallocated output, so the cpp arm
+                # gets one too (docs/CPP_REPORT.md §10.4); the allocating form
+                # is what `tests/bench_cpp.py` used to measure.
+                ocpp = torch.empty_like(q)
                 for op, mk in (("self", arm_self), ("cross", arm_cross)):
                     arms = {"cpp": mk("cpp"), "mojo": mk("mojo"), "ctrl": mk("cpp")}
                     if vllm is not None:

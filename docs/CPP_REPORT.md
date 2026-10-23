@@ -79,6 +79,25 @@ adjacent *keys* per half-lane, so both the V layout (key pairs) and the
 probability buffer (bf16 key pairs, written by the softmax) are pair-formatted.
 That is 2.1x the phase (see §6) and 1.33-1.45x the whole bf16 dense matrix.
 
+## 2a. Where it stands, all three boxes
+
+126 measured rows (42 per box: 22 dense + 20 paged). `best` is the faster of the
+two baselines *on that row*, so the ratio is the one that matters.
+
+| box | rows <= 0.97 of the best | 0.97-1.04 (noise floor) | > 1.04 |
+|---|---:|---:|---:|
+| Ryzen 7 7840H | 30 / 42 | 10 | 2 |
+| Xeon 8581C (4C) | 29 / 42 | 10 | 3 |
+| Graviton 5 | 19 / 42 | 5 | 18 |
+| **all** | **78 / 126 (62%)** | 25 | 23 |
+
+Against vLLM alone the C++ backend wins 76 of 84 dense/paged rows on the x86
+boxes and 18/22 + 19/20 on Graviton. The shortfall is concentrated in one place:
+**aarch64 dense prefill**, where the Mojo kernel is the faster baseline and we
+are 4-19% behind it (18 of the 23 rows over 1.04). §10.2 has the measured reason
+and the two restructures that failed to close it. No other column is behind by
+more than the noise floor.
+
 ## 3. Measurement protocol
 
 * **One process, interleaved, rotated arms, minimum**, with a duplicate `cpp`
@@ -228,16 +247,78 @@ and §10.2 has the measurement that explains it.
 output-allocation convention (Mojo allocates, vLLM does not; ours does not when
 `out=` is passed, which is how this table measures it).
 
-## 6. Xeon (m8i.2xlarge, 4 physical cores, AVX-512 + AMX), `--isa amx` / `vec`
+## 6. Xeon Platinum 8581C (4 physical cores, AVX-512 + AMX), `--isa amx` / `vec`
 
-The Xeon's strength is the AMX dense kernel, which runs 16x16
-tiles and covers **bf16 at 0.74-0.99 of vLLM's own AMX build and fp32 at
-0.49-0.83 of vLLM's VEC build** (`docs/amx/AMX_CPP_REPORT.md`, 41 rounds), i.e.
-the Xeon is the strongest dense column in the project. The paged path routes
-through `vec::paged` (an AMX tile is 16 rows and a decode item is one live query
-row, so a tile kernel is at best parity with the vector one —
-`docs/amx/AMX_PAGED.md` measures it) and lands at 0.57-1.17 of the better vLLM
-build per row.
+4 torch threads, 41 dense / 15 paged rounds, one process, arms rotated, min.
+`OMP_PROC_BIND=spread` is required on this box: it has 8 hardware threads on 4
+cores, libgomp does not pin, and the same binary takes 26 or 65 µs at
+`128:8:64` depending on whether two workers land on siblings — the ratio against
+a *separate* run moves 1.0 -> 1.9 there. Every number below is one process.
+
+The Xeon uses vLLM's AMX build for the bf16 rows and its VEC build for fp32
+(there is no AMX fp32 kernel upstream), and our fp32 rows ride the AMX kernel
+with a bf16 hi/lo split.
+
+### 6.1 Dense (22 rows)
+
+| row | dt | ISA | cpp µs | mojo | vllm | c/m | c/v |
+|---|---|---|---:|---:|---:|---:|---:|
+| 128:8:64 | bf16 | amx | 26.0 | 23.7 | 26.2 | 1.099 | 0.992 |
+| 128:8:64 | fp32 | vec | 47.9 | 43.8 | 56.6 | 1.093 | 0.846 |
+| 512:8:64 | bf16 | amx | 174.4 | 179.0 | 215.8 | 0.974 | 0.808 |
+| 512:8:64 | fp32 | vec | 364.1 | 359.7 | 591.1 | 1.012 | 0.616 |
+| 1024:8:64 | bf16 | amx | 569.0 | 611.2 | 708.5 | 0.931 | 0.803 |
+| 1024:8:64 | fp32 | vec | 1102.7 | 1119.4 | 2244.8 | 0.985 | 0.491 |
+| 2048:8:64 | bf16 | amx | 1953.2 | 2153.0 | 2967.9 | 0.907 | 0.658 |
+| 2048:8:64 | fp32 | vec | 4007.3 | 4146.5 | 7595.4 | 0.966 | 0.528 |
+| 4096:8:64 | bf16 | amx | 7309.7 | 8109.8 | 11195.2 | 0.901 | 0.653 |
+| 4096:8:64 | fp32 | vec | 14869.4 | 15719.5 | 40664.2 | 0.946 | 0.366 |
+| 256:16:128 | bf16 | amx | 174.6 | 192.3 | 198.9 | 0.908 | 0.878 |
+| 256:16:128 | fp32 | vec | 364.5 | 375.4 | 637.2 | 0.971 | 0.572 |
+| 1024:16:128 | bf16 | amx | 1629.9 | 1787.1 | 1925.4 | 0.912 | 0.846 |
+| 1024:16:128 | fp32 | vec | 3863.0 | 3825.3 | 8065.8 | 1.010 | 0.479 |
+| 2048:16:128 | bf16 | amx | 5590.3 | 6054.6 | 7403.7 | 0.923 | 0.755 |
+| 2048:16:128 | fp32 | vec | 13680.1 | 14654.4 | 28300.8 | 0.934 | 0.483 |
+| 4096:16:128 | bf16 | amx | 20842.0 | 23351.8 | 28384.7 | 0.893 | 0.734 |
+| 4096:16:128 | fp32 | vec | 60425.2 | 71282.5 | 126565.4 | 0.848 | 0.477 |
+| 512:32:128 | bf16 | amx | 1029.9 | 1131.6 | 1163.9 | 0.910 | 0.885 |
+| 512:32:128 | fp32 | vec | 2236.6 | 2312.6 | 4185.4 | 0.967 | 0.534 |
+| 1024:8:32 | bf16 | amx | 478.4 | 517.1 | 637.5 | 0.925 | 0.750 |
+| 1024:8:32 | fp32 | vec | 819.8 | 802.3 | 1251.1 | 1.022 | 0.655 |
+
+**22/22 beat vLLM** (0.366-0.992) and **17/22 beat Mojo** (0.848-1.099); the
+five at 1.01-1.10 of Mojo are the short rows (`128:8:64` both dtypes) and three
+fp32 rows at 1.01-1.02. `4096:16:128` fp32 is 0.848 of Mojo and 0.477 of vLLM.
+
+### 6.2 Paged (20 rows)
+
+| case | dt | ISA | cpp µs | mojo | vllm | c/m | c/v |
+|---|---|---|---:|---:|---:|---:|---:|
+| self b=1 ctx=256 | bf16 | amx | 8.8 | 10.7 | 11.9 | 0.824 | 0.742 |
+| cross b=1 ctx=256 | bf16 | amx | 7.4 | 10.0 | 6.5 | 0.743 | 1.147 |
+| self b=8 ctx=256 | bf16 | amx | 56.2 | 93.0 | 111.9 | 0.604 | 0.502 |
+| cross b=8 ctx=256 | bf16 | amx | 53.0 | 92.0 | 99.2 | 0.576 | 0.534 |
+| self b=8 ctx=1024 | bf16 | amx | 356.9 | 378.4 | 359.4 | 0.943 | 0.993 |
+| cross b=8 ctx=1024 | bf16 | amx | 353.7 | 374.1 | 345.5 | 0.945 | 1.024 |
+| self b=32 ctx=1024 | bf16 | amx | 1726.8 | 3126.5 | 2522.6 | 0.552 | 0.685 |
+| cross b=32 ctx=1024 | bf16 | amx | 1653.8 | 3005.7 | 2467.2 | 0.550 | 0.670 |
+| self b=1 ctx=4096 | bf16 | amx | 170.6 | 231.1 | 194.7 | 0.738 | 0.876 |
+| cross b=1 ctx=4096 | bf16 | amx | 157.9 | 213.4 | 188.0 | 0.740 | 0.840 |
+| self b=1 ctx=256 | fp32 | vec | 13.5 | 21.4 | 20.9 | 0.630 | 0.644 |
+| cross b=1 ctx=256 | fp32 | vec | 11.0 | 19.6 | 12.1 | 0.560 | 0.906 |
+| self b=8 ctx=256 | fp32 | vec | 167.5 | 170.5 | 179.8 | 0.982 | 0.932 |
+| cross b=8 ctx=256 | fp32 | vec | 162.3 | 167.3 | 163.5 | 0.970 | 0.993 |
+| self b=8 ctx=1024 | fp32 | vec | 674.1 | 730.2 | 785.7 | 0.923 | 0.858 |
+| cross b=8 ctx=1024 | fp32 | vec | 659.8 | 716.4 | 787.5 | 0.921 | 0.838 |
+| self b=32 ctx=1024 | fp32 | vec | 3573.2 | 4616.7 | 4832.2 | 0.774 | 0.739 |
+| cross b=32 ctx=1024 | fp32 | vec | 3530.0 | 4575.9 | 4694.3 | 0.771 | 0.752 |
+| self b=1 ctx=4096 | fp32 | vec | 308.1 | 329.4 | 327.0 | 0.935 | 0.942 |
+| cross b=1 ctx=4096 | fp32 | vec | 305.8 | 326.6 | 319.8 | 0.936 | 0.956 |
+
+
+**20/20 beat Mojo** (0.550-0.982) and **18/20 beat vLLM** (0.502-1.147); the two
+that lose are `cross b=1/256` (1.147 — a 7 µs call whose duplicate-arm floor is
+±6%) and `cross b=8/1024` bf16 at 1.024.
 
 ## 7. Falsification ledger
 
