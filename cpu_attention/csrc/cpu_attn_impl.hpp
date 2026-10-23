@@ -263,7 +263,16 @@ void dense_run(const DenseJob& job, int workers) {
       for (int r = 0; r < nrows; ++r) {
         char* op = static_cast<char*>(job.out) +
                    (b * job.ob + (q0 + r) * job.ot + h * job.oh) * esz;
-        const float inv = l[r] > 0.0f ? 1.0f / l[r] : 0.0f;
+        // A row whose softmax saw no key at all is exactly zero, and it must be
+        // written without touching the accumulator: with `zeroes_acc` (or a
+        // fully masked item, e.g. seq_q > seq_k) `pv` never ran, so the
+        // accumulator holds the previous work item's bytes and `NaN * 0` is
+        // NaN. Found by tests/fuzz_dense.py case 46 on the AMX box.
+        if (l[r] <= 0.0f) {
+          std::memset(op, 0, static_cast<size_t>(esz) * hd);
+          continue;
+        }
+        const float inv = 1.0f / l[r];
         const float* src = acc + r * hd;
         if (job.dtype == kF32) {
           float* o = reinterpret_cast<float*>(op);

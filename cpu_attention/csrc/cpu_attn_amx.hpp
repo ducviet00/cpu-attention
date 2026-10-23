@@ -69,6 +69,7 @@
 #include <immintrin.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 
 #include "cpu_attn_impl.hpp"
@@ -117,7 +118,26 @@ alignas(64) constexpr TileCfg kTileCfg = make_cfg();
 // thread-pool migration). A tile instruction in INIT state is #UD, so the config
 // is re-established on entry to every tile-using phase instead of being cached
 // in a thread-local flag. ~15 cycles against thousands.
+inline std::atomic<uint32_t> g_tile_gen{1};
+
+inline uint32_t& tl_tile_gen() {
+  static thread_local uint32_t v = 0;
+  return v;
+}
+
 inline void tile_cfg_load() { _tile_loadconfig(&kTileCfg); }
+
+inline void tiles_begin_call() {
+  g_tile_gen.fetch_add(1, std::memory_order_relaxed);
+}
+
+inline void ensure_tiles() {
+  const uint32_t g = g_tile_gen.load(std::memory_order_relaxed);
+  if (tl_tile_gen() != g) {
+    tile_cfg_load();
+    tl_tile_gen() = g;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // vector helpers (the pack and the softmax run on AVX-512, the dots on AMX)
@@ -241,6 +261,8 @@ struct Dense {
   // for. `kt` is a runtime knob (CPU_ATTENTION_KT; 128/256/512 all legal).
   static constexpr int KTMAX = 1024;
   // Largest `rq` the per-thread buffers are laid out for (env RQ sweep).
+  // 64 rows x head_dim floats is 32 KB at D=128, which still fits the 48 KB L1d;
+  // 128 rows measured no better and doubles the workspace.
   static constexpr int AROWS = 64;
   // Keys per step in both phases (two 16-key tile columns).
   static constexpr int KSTEP = 32;
@@ -276,22 +298,32 @@ struct Dense {
 
   // Profiling only: `CPU_ATTENTION_AMX_MODE` skips phases so one call can be
   // attributed between them (the same instrument the Mojo tree uses).
-  // 1 = pack, 2 = Q@K^T, 4 = softmax, 8 = P@V. Results are garbage when set.
+  // 1 = pack, 2 = Q@K^T, 4 = softmax, 8 = P@V, 16 = the Q hi/lo panel build
+  // inside Q@K^T, 32 = the causal/padding mask. Results are garbage when set.
+  //
+  // This is also the phase-ablation instrument for `docs/xeon/ablate2.py`: the
+  // Mojo backend reads the same variable in Python *at import*, the C++ kernel
+  // reads it lazily on its first call, so setting it after the import ablates
+  // only this kernel and leaves the Mojo arm as a drift reference in the same
+  // process.
   static int mode() {
-    static const int m = env_int("CPU_ATTENTION_AMX_MODE", 0, 0, 15);
+    static const int m = env_int("CPU_ATTENTION_AMX_MODE", 0, 0, 63);
     return m;
   }
 
   static int kt_() {
-    static const int k = env_int("CPU_ATTENTION_KT", 256, 32, KTMAX);
+    static const int k = env_int("CPU_ATTENTION_KT", BF ? 256 : 512, 32, KTMAX);
     return k & ~31;
   }
 
   static int rq(int64_t seq_q, int hd) {
     static const int fixed = env_int("CPU_ATTENTION_RQ", 0, 0, 512);
-    const int want = fixed > 0 ? fixed : RQT;
+    const int want = fixed > 0 ? fixed : 64;
+    // `AROWS` is what the accumulator and the m/l arrays are laid out for, and
+    // `acc_rows` rounds up to RQT, so the clamp has to be on the rounded value.
+    const int cap = AROWS / RQT * RQT;
     return static_cast<int>(
-        std::min<int64_t>(want, std::max<int64_t>(seq_q, 1)));
+        std::min<int64_t>(std::min(want, cap), std::max<int64_t>(seq_q, 1)));
   }
 
   static int acc_rows(int rq) { return ((rq + RQT - 1) / RQT) * RQT; }
@@ -299,6 +331,7 @@ struct Dense {
   static size_t aux_bytes(int rq, int hd) {
     (void)rq;
     (void)hd;
+    tiles_begin_call();
     return PANEL_OFF + PANEL_MAX;
   }
 
@@ -464,7 +497,7 @@ struct Dense {
     const char* a_hi = q_base;
     const char* a_lo = nullptr;
     int astride = static_cast<int>(job.qt * ESZ);
-    if (!BF || nrows < RQT) {
+    if ((!BF || nrows < RQT) && !(mode() & 16)) {
       for (int r = 0; r < RQT; ++r) {
         const char* s = q_base + static_cast<int64_t>(r) * job.qt * ESZ;
         bf16* d = panel + static_cast<int64_t>(r) * HD;
@@ -495,9 +528,14 @@ struct Dense {
       a_hi = reinterpret_cast<const char*>(panel);
       if constexpr (!BF) a_lo = reinterpret_cast<const char*>(panel_lo);
       astride = HD * 2;
+    } else if (!BF || nrows < RQT) {
+      // profiling (mode & 16): keep the pointers valid, skip the conversion.
+      a_hi = reinterpret_cast<const char*>(panel);
+      if constexpr (!BF) a_lo = reinterpret_cast<const char*>(panel_lo);
+      astride = HD * 2;
     }
 
-    tile_cfg_load();
+    ensure_tiles();
     const int64_t lim = std::min<int64_t>(k0 + nkeys, row_limit0 + 1);
     const __m512i lane =
         _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
@@ -548,7 +586,7 @@ struct Dense {
       _tile_stored(6, lp + 16 * kt, kt * 4);
       _tile_stored(7, lp + 16 * kt + 16, kt * 4);
 
-      if (jj + KSTEP > lim) {
+      if (jj + KSTEP > lim && !(mode() & 32)) {
         // Boundary step: per row, keys past its causal limit and past the key
         // range become -inf. The store above already happened, so a NaN coming
         // out of a padded K tile is overwritten rather than propagated.
@@ -671,7 +709,7 @@ struct Dense {
     const bf16* const vbase =
         reinterpret_cast<const bf16*>(slab) + k_elems(job.seq_k);
     (void)nrows;
-    tile_cfg_load();
+    ensure_tiles();
     for (int dc = 0; dc < DC16; dc += 2) {
       float* c0 = acc + dc * 16;
       float* c1 = acc + 16 * HD + dc * 16;
