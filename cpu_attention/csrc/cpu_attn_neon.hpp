@@ -157,7 +157,7 @@ inline size_t round64(size_t n) { return (n + 63) & ~size_t(63); }
 template <int HD>
 struct DenseF32 {
   static constexpr int RQT = 8;
-  static constexpr int KT = 256;
+  static constexpr int KT = HD == 128 ? 1024 : 256;
   static constexpr int RQ = HD == 128 ? 32 : 64;
   static constexpr int AROWS = ((RQ + RQT - 1) / RQT) * RQT;
 
@@ -422,7 +422,7 @@ struct DenseF32 {
 template <int HD>
 struct DenseBF {
   static constexpr int RQT = 8;
-  static constexpr int KT = 256;
+  static constexpr int KT = HD == 128 ? 1024 : 256;
   static constexpr int RQ = HD == 128 ? 32 : 64;
   static constexpr int AROWS = ((RQ + RQT - 1) / RQT) * RQT;
   static constexpr int DG = HD / 4;   // head-dim groups of 4
