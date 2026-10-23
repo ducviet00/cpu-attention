@@ -473,7 +473,8 @@ struct Dense {
         if constexpr (BF) {
           uint32_t* pp0 = pairs_of(logits) +
                           static_cast<size_t>(r) * (kt_() / 2);
-          std::memset(pp0, 0, sizeof(uint32_t) * static_cast<size_t>(nkeys + 1) / 2);
+          std::memset(pp0, 0,
+                      sizeof(uint32_t) * static_cast<size_t>(nkeys + 1) / 2);
         } else {
           for (int j = 0; j < nkeys; j += LANES)
             st16(p + j, _mm512_setzero_ps());
@@ -504,11 +505,10 @@ struct Dense {
   }
 
   // acc[nrows][HD] += p[nrows][nkeys] @ V[k0, k0+nkeys)
-  // acc[nrows][HD] += p[nrows][nkeys] @ V[k0, k0+nkeys)
   //
   // bf16 runs `dpbf16ps` with the contraction on keys: one instruction
   // multiplies a broadcast key-pair probability by 16 dims of two adjacent keys
-  // and accumulates 32 MACs against 16 for an fp32 FMA. That is 2.1x the phase
+  // and accumulates 32 MACs against 16 for an fp32 FMA. That is 2.05x the phase
   // (tests/bench_vec_prims.cpp, 'pv_fma') and it is why P@V was 56% of the
   // 2048:16:128 bf16 call. The accumulator is a 32-dim chunk (two zmm per row)
   // so eight rows plus the operands stay inside 32 registers.

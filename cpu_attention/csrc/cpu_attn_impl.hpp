@@ -111,11 +111,18 @@ size_t workspace_bytes();
 // elements. `row_limit0` is the last key row 0 may see, and row r sees
 // `row_limit0 + r` (bottom-right-aligned causal).
 //
-// Optional policy member: `static constexpr bool zeroes_acc = true;` when `pv`
-// initialises the accumulator itself on its first key tile.
-// Optional policy member: floats the logits tile is followed by before the
-// accumulator starts (the vec bf16 policy keeps one packed probability pair per
-// key-pair per row there). Zero for every other policy.
+// Optional policy members, all detected rather than declared by the other
+// policies:
+//   static constexpr bool zeroes_acc = true;
+//       `pv` initialises the accumulator itself on its first key tile, so the
+//       driver's memset is dead work.
+//   static size_t logit_aux_floats(int kt);
+//       floats that follow the logits tile before the accumulator starts (the
+//       vec bf16 policy keeps one packed probability pair per key pair per row).
+//   static void store_bf16(char* dst, const float* src, int hd, float inv);
+//       a vectorised output epilogue; the default scalar loop is 1.6 us of a
+//       27 us call at 128:8:64 because `f32_to_bf16`'s NaN branch stops GCC
+//       from vectorising it.
 template <class P>
 constexpr size_t logit_aux_floats(int kt) {
   if constexpr (requires { P::logit_aux_floats(kt); })
@@ -124,10 +131,6 @@ constexpr size_t logit_aux_floats(int kt) {
     return 0;
 }
 
-// Optional policy member: `static void store_bf16(char* dst, const float* src,
-// int hd, float inv)` writing `hd` rounded bf16 outputs. The default is a scalar
-// loop whose NaN branch (`f32_to_bf16`) stops GCC from vectorising; at
-// 128:8:64 the scalar form is 1.6 us of a 27 us call.
 template <class P>
 inline void store_bf16(char* dst, const float* src, int hd, float inv) {
   if constexpr (requires { P::store_bf16(dst, src, hd, inv); }) {
