@@ -24,6 +24,14 @@ void store(const PagedJob&, int);
 namespace amx {
 bool available();
 void dense(const DenseJob&, int);
+// The paged kernel lives in this TU because it is the fastest AVX-512 paged
+// path on the box `available()` is true for, but it is not a tile kernel: an
+// AMX tile is 16 rows and a decode item is one live query row (31 useful
+// MAC/cycle against `dpbf16ps`'s 32), so `docs/amx/AMX_PAGED.md` measures it and
+// keeps the vector form. Routing paged here is a per-dtype loop-shape choice --
+// dim-outer Q@K^T with 64 keys per step for bf16 -- not an ISA change.
+void paged(const PagedJob&, int);
+void store(const PagedJob&, int);
 }  // namespace amx
 }  // namespace attn
 #elif defined(__aarch64__)
@@ -105,9 +113,10 @@ int pick_paged_isa() {
   if (forced != nullptr) {
     if (forced[0] == 's') return kIsaScalar;
     if (forced[0] == 'v') return kIsaVec;
-    if (forced[0] == 'a') return kIsaNeon;  // amx is dense-only
+    if (forced[0] == 'a') return kIsaAmx;
   }
 #if defined(__x86_64__)
+  if (amx::available()) return kIsaAmx;
   if (vec::available()) return kIsaVec;
 #elif defined(__aarch64__)
   if (neon::available()) return kIsaNeon;
@@ -152,6 +161,8 @@ void attention_entry(const PagedJob& job, int workers, bool do_store,
     if (isa == kIsaVec) {
 #if defined(__x86_64__)
       vec::store(job, workers);
+    } else if (isa == kIsaAmx) {
+      amx::store(job, workers);
 #endif
 #if defined(__aarch64__)
     } else if (isa == kIsaNeon) {
@@ -165,6 +176,8 @@ void attention_entry(const PagedJob& job, int workers, bool do_store,
     if (isa == kIsaVec) {
 #if defined(__x86_64__)
       vec::paged(job, workers);
+    } else if (isa == kIsaAmx) {
+      amx::paged(job, workers);
 #endif
 #if defined(__aarch64__)
     } else if (isa == kIsaNeon) {
