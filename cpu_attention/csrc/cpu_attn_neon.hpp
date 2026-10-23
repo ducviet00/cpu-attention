@@ -158,16 +158,21 @@ struct DenseF32 {
   static constexpr int RQT = 8;
   static constexpr int KT = 256;
   static constexpr int RQ = HD == 128 ? 32 : 64;
+  static constexpr int AROWS = ((RQ + RQT - 1) / RQT) * RQT;
 
+  static int kt_() { return KT; }
   static int rq(int64_t, int) { return RQ; }
+  // `pv` runs its row loop over the whole register tile, so the accumulator is
+  // sized for roundup(rq, RQT) rows even when the last block is short.
+  static int acc_rows(int rq_) { return ((rq_ + RQT - 1) / RQT) * RQT; }
 
   static size_t slab_bytes(int64_t seq_k, int) {
     return static_cast<size_t>(2) * pad_of(seq_k) * HD * 4;
   }
-  // [logits RQT*KT f32][acc RQ*HD f32][m,l,alpha][tmax RQT][P_T KT*RQT f32]
+  // [logits RQT*KT f32][acc AROWS*HD f32][m,l,alpha RQ][tmax RQT][P_T]
   static size_t aux_bytes(int, int) {
     return round64(static_cast<size_t>(RQT) * KT * 4 +
-                   static_cast<size_t>(RQ) * HD * 4 +
+                   static_cast<size_t>(AROWS) * HD * 4 +
                    static_cast<size_t>(RQ) * 3 * 4 +
                    static_cast<size_t>(RQT) * 4 + 64 +
                    static_cast<size_t>(KT) * RQT * 4);
@@ -177,7 +182,7 @@ struct DenseF32 {
   // locates them.
   static float* tmax_of(float* logits) {
     return logits + static_cast<size_t>(RQT) * KT +
-           static_cast<size_t>(RQ) * HD + static_cast<size_t>(RQ) * 3;
+           static_cast<size_t>(AROWS) * HD + static_cast<size_t>(RQ) * 3;
   }
   static float* pof(float* logits) { return tmax_of(logits) + RQT + 16; }
 
@@ -214,7 +219,7 @@ struct DenseF32 {
   }
 
   // logits[r][j] = sum_d q[r][d] * K[d][k0+j], -inf past each row's limit.
-  static void qk(const DenseJob& job, const char* slab, int64_t, int64_t,
+  static void qk(const DenseJob& job, const char* slab, int64_t b, int64_t kvh,
                  const char* q_base, int nrows, int64_t k0, int nkeys,
                  int64_t row_limit0, float* logits) {
     const int64_t pad = pad_of(job.seq_k);
@@ -297,7 +302,6 @@ struct DenseF32 {
         const int r = r0 + k;
         const float mxv = tm[r] * c;  // c > 0: max(c*x) == c*max(x)
         const float mo = m[r];
-        float v;
         if (mxv == kNegInf) {
           mn[k] = mo;
           av[k] = 1.0f;
@@ -350,7 +354,7 @@ struct DenseF32 {
     }
   }
 
-  static void pv(const DenseJob& job, const char* slab, int64_t, int64_t,
+  static void pv(const DenseJob& job, const char* slab, int64_t b, int64_t kvh,
                  int64_t k0, int nkeys, const float* logits, int nrows,
                  float* acc) {
     const float* pt = pof(const_cast<float*>(logits));
@@ -390,20 +394,23 @@ struct DenseBF {
   static constexpr int RQT = 8;
   static constexpr int KT = 256;
   static constexpr int RQ = HD == 128 ? 32 : 64;
+  static constexpr int AROWS = ((RQ + RQT - 1) / RQT) * RQT;
   static constexpr int DG = HD / 4;   // head-dim groups of 4
   static constexpr int KG = KT / 4;   // 4-key groups per tile
   static constexpr int RP = RQT / 2;  // row pairs
 
+  static int kt_() { return KT; }
   static int rq(int64_t, int) { return RQ; }
+  static int acc_rows(int rq_) { return ((rq_ + RQT - 1) / RQT) * RQT; }
 
   static size_t slab_bytes(int64_t seq_k, int) {
     return static_cast<size_t>(pad_of(seq_k)) * HD * 2 * 2;
   }
-  // [logits RQT*KT f32][acc RQ*HD f32][m,l,alpha][Qpack RQT*HD bf16]
-  // [P RP*KG*8 bf16]
+  // [logits RQT*KT f32][acc AROWS*HD f32][m,l,alpha RQ][tmax RQT]
+  // [Qpack RQT*HD bf16][P RP*KG*8 bf16]
   static size_t aux_bytes(int, int) {
     return round64(static_cast<size_t>(RQT) * KT * 4 +
-                   static_cast<size_t>(RQ) * HD * 4 +
+                   static_cast<size_t>(AROWS) * HD * 4 +
                    static_cast<size_t>(RQ) * 3 * 4 +
                    static_cast<size_t>(RQT) * 4 + 64 +
                    static_cast<size_t>(RQT) * HD * 2 +
@@ -411,7 +418,7 @@ struct DenseBF {
   }
   static float* tmax_of(float* logits) {
     return logits + static_cast<size_t>(RQT) * KT +
-           static_cast<size_t>(RQ) * HD + static_cast<size_t>(RQ) * 3;
+           static_cast<size_t>(AROWS) * HD + static_cast<size_t>(RQ) * 3;
   }
   static char* qpack_of(float* logits) {
     return reinterpret_cast<char*>(tmax_of(logits) + RQT + 16);
@@ -464,7 +471,7 @@ struct DenseBF {
     }
   }
 
-  static void qk(const DenseJob& job, const char* slab, int64_t, int64_t,
+  static void qk(const DenseJob& job, const char* slab, int64_t b, int64_t kvh,
                  const char* q_base, int nrows, int64_t k0, int nkeys,
                  int64_t row_limit0, float* logits) {
     const int64_t pad = pad_of(job.seq_k);
@@ -596,7 +603,7 @@ struct DenseBF {
     }
   }
 
-  static void pv(const DenseJob& job, const char* slab, int64_t, int64_t,
+  static void pv(const DenseJob& job, const char* slab, int64_t b, int64_t kvh,
                  int64_t k0, int nkeys, const float* logits, int nrows,
                  float* acc) {
     const char* pt = pof(const_cast<float*>(logits));
@@ -972,129 +979,6 @@ struct PagedBF {
   }
 };
 
-// ---------------------------------------------------------------------------
-// dense driver
-// ---------------------------------------------------------------------------
-// A copy of `dense_run` with one change: the key sweep stops at the last key any
-// row of the block can see (`row_limit0 + nrows`) instead of always walking
-// `seq_k`. Without it a causal call does twice the work of a kernel that bounds
-// its k-tile by the query row -- vLLM and this repo's Mojo kernel both do. The
-// three-line change this wants in `cpu_attn_impl.hpp` is in the handover report.
-template <class P>
-void dense_run_bounded(const DenseJob& job, int workers) {
-  const int hd = static_cast<int>(job.head_dim);
-  const int64_t group = job.heads / job.kv_heads;
-  const int rq = P::rq(job.seq_q, hd);
-  const int64_t nqb = (job.seq_q + rq - 1) / rq;
-  const int64_t nbh = job.batch * job.kv_heads;
-  const int64_t heads_total = job.batch * job.heads;
-  const size_t slab = P::slab_bytes(job.seq_k, hd);
-  const size_t aux = P::aux_bytes(rq, hd);
-  const bool fuse = (group == 1) && (nbh >= workers) && (nbh % workers == 0);
-  const size_t cells = fuse ? static_cast<size_t>(workers) : nbh;
-  const uint64_t key = 0xA24BAED4963EE407ull ^
-                       (static_cast<uint64_t>(job.seq_k) * 0x100000001B3ull) ^
-                       (static_cast<uint64_t>(hd) << 40) ^
-                       (static_cast<uint64_t>(job.dtype) << 56) ^
-                       (static_cast<uint64_t>(job.heads) << 24) ^
-                       (static_cast<uint64_t>(job.batch) << 8) ^
-                       (static_cast<uint64_t>(rq) << 1) ^
-                       static_cast<uint64_t>(slab ^ aux);
-  char* ws = workspace(key, cells * slab + static_cast<size_t>(workers) * aux);
-  char* aux_base = ws + cells * slab;
-  const int64_t diag = job.seq_k - job.seq_q;
-  const float c = job.scale * kLog2e;
-  const int esz = elem_size(job.dtype);
-
-#pragma omp parallel num_threads(workers)
-  {
-    const int tid = omp_get_thread_num();
-    char* my_aux = aux_base + static_cast<size_t>(tid) * aux;
-    float* logits = reinterpret_cast<float*>(my_aux);
-    float* acc = logits + static_cast<size_t>(P::RQT) * P::KT;
-    float* m = acc + static_cast<size_t>(rq) * hd;
-    float* l = m + rq;
-    float* alpha = l + rq;
-
-    auto attend = [&](int64_t b, int64_t h, int64_t qb, const char* sl) {
-      const int64_t q0 = qb * rq;
-      const int nrows = static_cast<int>(std::min<int64_t>(rq, job.seq_q - q0));
-      const char* qp = static_cast<const char*>(job.q) +
-                       (b * job.qb + q0 * job.qt + h * job.qh) * esz;
-      const int64_t row_limit0 = job.causal ? (q0 + diag) : (int64_t(1) << 30);
-      const bool empty = job.causal && (row_limit0 + nrows - 1) < 0;
-      std::memset(acc, 0, sizeof(float) * nrows * hd);
-      for (int r = 0; r < nrows; ++r) {
-        m[r] = -std::numeric_limits<float>::infinity();
-        l[r] = 0.0f;
-      }
-      // Last key any row of this block can see, plus one.
-      const int64_t kend = job.causal
-                               ? std::min<int64_t>(job.seq_k, row_limit0 + nrows)
-                               : job.seq_k;
-      if (!empty) {
-        for (int64_t k0 = 0; k0 < kend; k0 += P::KT) {
-          const int nkeys =
-              static_cast<int>(std::min<int64_t>(P::KT, job.seq_k - k0));
-          for (int r0 = 0; r0 < nrows; r0 += P::RQT) {
-            const int sub = std::min<int>(P::RQT, nrows - r0);
-            P::qk(job, sl, b, h / group,
-                  qp + static_cast<int64_t>(r0) * job.qt * esz, sub, k0, nkeys,
-                  row_limit0 + r0, logits);
-            P::softmax(logits, sub, nkeys, c, m + r0, l + r0, alpha);
-            for (int r = 0; r < sub; ++r) {
-              const float a = alpha[r];
-              if (a == 1.0f) continue;
-              float* dst = acc + (r0 + r) * hd;
-              for (int d = 0; d < hd; ++d) dst[d] *= a;
-            }
-            P::pv(job, sl, b, h / group, k0, nkeys, logits, sub, acc + r0 * hd);
-          }
-        }
-      }
-      for (int r = 0; r < nrows; ++r) {
-        char* op = static_cast<char*>(job.out) +
-                   (b * job.ob + (q0 + r) * job.ot + h * job.oh) * esz;
-        const float inv = l[r] > 0.0f ? 1.0f / l[r] : 0.0f;
-        const float32x4_t vi = vdupq_n_f32(inv);
-        const float* src = acc + r * hd;
-        if (job.dtype == kF32) {
-          float* o = reinterpret_cast<float*>(op);
-          for (int d = 0; d < hd; d += 4) stf(o + d, vmulq_f32(ldf(src + d), vi));
-        } else {
-          char* o = op;
-          for (int d = 0; d < hd; d += 4)
-            stb4(o + d * 2, vcvt_bf16_f32(vmulq_f32(ldf(src + d), vi)));
-        }
-      }
-    };
-
-    if (fuse) {
-#pragma omp for schedule(static)
-      for (int64_t i = 0; i < nbh; ++i) {
-        char* sl = ws + static_cast<size_t>(tid) * slab;
-        const int64_t b = i / job.kv_heads, kvh = i % job.kv_heads;
-        P::pack(job, b, kvh, sl);
-        for (int64_t qb = 0; qb < nqb; ++qb) attend(b, kvh, qb, sl);
-      }
-    } else {
-#pragma omp for schedule(static)
-      for (int64_t i = 0; i < nbh; ++i)
-        P::pack(job, i / job.kv_heads, i % job.kv_heads,
-                ws + static_cast<size_t>(i) * slab);
-#pragma omp for schedule(dynamic, 1)
-      for (int64_t t = 0; t < heads_total * nqb; ++t) {
-        const int64_t hp = t / nqb, qb_raw = t % nqb;
-        const int64_t qb =
-            (qb_raw & 1) ? (nqb - 1 - (qb_raw >> 1)) : (qb_raw >> 1);
-        const int64_t b = hp / job.heads, h = hp % job.heads;
-        attend(b, h, qb,
-               ws + static_cast<size_t>(b * job.kv_heads + h / group) * slab);
-      }
-    }
-  }
-}
-
 }  // namespace
 
 bool available() {
@@ -1103,7 +987,7 @@ bool available() {
 }
 
 void dense(const DenseJob& job, int workers) {
-#define ATTN_DN(DT, HD) dense_run_bounded<Dense##DT<HD>>(job, workers)
+#define ATTN_DN(DT, HD) dense_run<Dense##DT<HD>>(job, workers)
   if (job.dtype == kF32) {
     if (job.head_dim == 32) ATTN_DN(F32, 32);
     else if (job.head_dim == 64) ATTN_DN(F32, 64);
