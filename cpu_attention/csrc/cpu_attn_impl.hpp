@@ -89,8 +89,11 @@ size_t workspace_bytes();
 // Policy interface (all static, all `P::`):
 //
 //   static constexpr int RQT;   // query rows per register tile (1..16)
-//   static constexpr int KT;    // keys per kv tile == logits width
+//   static int kt_();           // keys per kv tile == logits width
 //   static int rq(int64_t seq_q, int hd);  // rows per work item
+//   static int acc_rows(int rq);           // rows the accumulator is sized for
+//                                          // (>= roundup(rq, RQT): `pv` runs its
+//                                          // row loop over the whole tile)
 //   static size_t slab_bytes(int64_t seq_k, int hd);
 //   static size_t aux_bytes(int rq, int hd);   // acc/m/l + logits, one thread
 //   static void pack(const DenseJob&, int64_t b, int64_t kvh, char* slab);
@@ -111,6 +114,7 @@ void dense_run(const DenseJob& job, int workers) {
   const int hd = static_cast<int>(job.head_dim);
   const int64_t group = job.heads / job.kv_heads;
   const int rq = P::rq(job.seq_q, hd);
+  const int arows = P::acc_rows(rq);
   const int64_t nqb = (job.seq_q + rq - 1) / rq;
   const int64_t nbh = job.batch * job.kv_heads;
   const int64_t heads_total = job.batch * job.heads;
@@ -119,16 +123,26 @@ void dense_run(const DenseJob& job, int workers) {
 
   // One slab per thread is enough when the thread packs the head it then
   // attends; otherwise every (batch, kv head) needs its own.
-  const bool fuse =
-      (group == 1) && (nbh >= workers) && (nbh % workers == 0);
+  //
+  // Which one wins is a cache question, not a code question. Fused keeps a
+  // thread's K/V in its own L2 (and skips the barrier), but the threads then
+  // work on *different* heads, so the working set is `workers` heads' worth of
+  // K/V: past the LLC that is DRAM-bound (4096:16:128 fp32 is 4 MB per head,
+  // 32 MB across 8 threads, against a 16 MB L3 -- 1.6x slower than sharing).
+  // Split packs every head once and the task order (consecutive query blocks of
+  // one head, dynamic scheduling) makes the concurrent threads share one head's
+  // slab through L3.
+  const size_t per_thread_set = slab * static_cast<size_t>(workers);
+  const int fuse_env = env_int("CPU_ATTENTION_FUSE", -1, -1, 1);
+  const bool fuse_ok =
+      (group == 1) && (nbh >= workers) && (nbh % workers == 0) &&
+      per_thread_set <= static_cast<size_t>(last_level_cache_bytes()) * 3 / 5;
+  const bool fuse = fuse_env < 0 ? fuse_ok : (fuse_env != 0);
   const size_t cells = fuse ? static_cast<size_t>(workers) : nbh;
-  const uint64_t key = 0x9E3779B97F4A7C15ull ^
-                       (static_cast<uint64_t>(job.seq_k) * 0x100000001B3ull) ^
-                       (static_cast<uint64_t>(hd) << 40) ^
-                       (static_cast<uint64_t>(job.dtype) << 56) ^
-                       (static_cast<uint64_t>(job.heads) << 24) ^
-                       (static_cast<uint64_t>(job.batch) << 8) ^
-                       static_cast<uint64_t>(rq);
+  uint64_t key = key_mix(static_cast<uint64_t>(job.seq_k),
+                         static_cast<uint64_t>(hd) + 977 * job.dtype);
+  key = key_mix(key, static_cast<uint64_t>(job.batch + 31 * job.heads +
+                                          131 * job.kv_heads + 7919 * rq));
   char* ws = workspace(key, cells * slab + static_cast<size_t>(workers) * aux);
   char* aux_base = ws + cells * slab;
   const int64_t diag = job.seq_k - job.seq_q;
@@ -139,9 +153,10 @@ void dense_run(const DenseJob& job, int workers) {
   {
     const int tid = omp_get_thread_num();
     char* my_aux = aux_base + static_cast<size_t>(tid) * aux;
+    const int kt = P::kt_();
     float* logits = reinterpret_cast<float*>(my_aux);
-    float* acc = logits + static_cast<size_t>(P::RQT) * P::KT;
-    float* m = acc + static_cast<size_t>(rq) * hd;
+    float* acc = logits + static_cast<size_t>(P::RQT) * kt;
+    float* m = acc + static_cast<size_t>(arows) * hd;
     float* l = m + rq;
     float* alpha = l + rq;
 
@@ -154,28 +169,44 @@ void dense_run(const DenseJob& job, int workers) {
       // an int32: the mask is applied with 32-bit lane compares.
       const int64_t row_limit0 = job.causal ? (q0 + diag) : (int64_t(1) << 30);
       const bool empty = job.causal && (row_limit0 + nrows - 1) < 0;
-      std::memset(acc, 0, sizeof(float) * nrows * hd);
+      std::memset(acc, 0, sizeof(float) * static_cast<size_t>(arows) * hd);
       for (int r = 0; r < nrows; ++r) {
         m[r] = -std::numeric_limits<float>::infinity();
         l[r] = 0.0f;
       }
       if (!empty) {
-        for (int64_t k0 = 0; k0 < job.seq_k; k0 += P::KT) {
+        // Stop at the last row's causal limit, and skip a query chunk whose own
+        // limit is behind the tile: without this a causal call computes every
+        // key of every tile for every row, up to 5x the useful work at rq=32.
+        const int64_t kend =
+            job.causal ? std::min(job.seq_k, row_limit0 + nrows) : job.seq_k;
+        for (int64_t k0 = 0; k0 < kend; k0 += kt) {
           const int nkeys =
-              static_cast<int>(std::min<int64_t>(P::KT, job.seq_k - k0));
+              static_cast<int>(std::min<int64_t>(kt, job.seq_k - k0));
           for (int r0 = 0; r0 < nrows; r0 += P::RQT) {
             const int sub = std::min<int>(P::RQT, nrows - r0);
-            P::qk(job, sl, b, h / group, qp + static_cast<int64_t>(r0) * job.qt * esz,
-                  sub, k0, nkeys, row_limit0 + r0, logits);
-            P::softmax(logits, sub, nkeys, c, m + r0, l + r0, alpha);
+            // Skip only when the chunk's *last* row cannot see this tile; an
+            // earlier row of the block may still have keys inside it.
+            if (job.causal && row_limit0 + r0 + sub - 1 < k0) continue;
+            // Exact per-chunk key bound: the chunk's last row can see key
+            // `row_limit0 + r0 + sub - 1`, so the boundary tile shrinks instead
+            // of running the full tile and masking it.
+            const int nk = job.causal
+                               ? static_cast<int>(std::min<int64_t>(
+                                     nkeys, row_limit0 + r0 + sub - k0))
+                               : nkeys;
+            if (nk <= 0) continue;
+            P::qk(job, sl, b, h / group,
+                  qp + static_cast<int64_t>(r0) * job.qt * esz, sub, k0, nk,
+                  row_limit0 + r0, logits);
+            P::softmax(logits, sub, nk, c, m + r0, l + r0, alpha);
             for (int r = 0; r < sub; ++r) {
               const float a = alpha[r];
               if (a == 1.0f) continue;
               float* dst = acc + (r0 + r) * hd;
               for (int d = 0; d < hd; ++d) dst[d] *= a;
             }
-            P::pv(job, sl, b, h / group, k0, nkeys, logits, sub,
-                  acc + r0 * hd);
+            P::pv(job, sl, b, h / group, k0, nk, logits, sub, acc + r0 * hd);
           }
         }
       }
@@ -258,9 +289,8 @@ template <class P>
 void paged_run(const PagedJob& job, int workers) {
   const int64_t tasks = job.num_seqs * job.num_heads;
   const size_t aux = P::aux_bytes(static_cast<int>(job.head_dim));
-  const uint64_t key = 0x2545F4914F6CDD1Dull ^
-                       (static_cast<uint64_t>(job.head_dim) << 32) ^
-                       static_cast<uint64_t>(job.dtype);
+  const uint64_t key = key_mix(static_cast<uint64_t>(job.head_dim),
+                               31 + 977 * job.dtype);
   char* ws = workspace(key, static_cast<size_t>(workers) * aux);
 #pragma omp parallel for num_threads(workers) schedule(static)
   for (int64_t t = 0; t < tasks; ++t) {

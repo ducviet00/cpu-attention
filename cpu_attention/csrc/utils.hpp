@@ -93,6 +93,35 @@ inline float exp2_poly2(float x) {
 
 constexpr float kLog2e = 1.4426950408889634f;
 
+// splitmix64: a geometry is folded into one 64-bit key for the workspace. The
+// fields are mixed, not shifted into disjoint bits -- a plain `field << 24 |
+// field << 8` collides for real geometry pairs, and a collision hands one shape
+// another's buffer.
+inline uint64_t mix64(uint64_t x) {
+  x += 0x9E3779B97F4A7C15ull;
+  x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+  x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+  return x ^ (x >> 31);
+}
+
+inline uint64_t key_mix(uint64_t a, uint64_t b) {
+  return mix64(a * 0x100000001B3ull + 0x9E3779B97F4A7C15ull + mix64(b));
+}
+
+// Environment override, read once. Tuning knobs are part of the plan in the
+// Mojo tree too (`CPU_ATTENTION_QT`), and a sweep is the only way to pick them
+// on a box that is not the one the defaults were measured on.
+inline int env_int(const char* name, int fallback, int lo, int hi) {
+  const char* v = std::getenv(name);
+  int got = fallback;
+  if (v != nullptr && v[0] != 0) {
+    got = std::atoi(v);
+    if (got < lo) got = lo;
+    if (got > hi) got = hi;
+  }
+  return got;
+}
+
 // ---------------------------------------------------------------------------
 // buffers
 // ---------------------------------------------------------------------------

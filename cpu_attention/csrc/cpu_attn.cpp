@@ -101,6 +101,12 @@ bool env_off(const char* name) {
 }
 
 int pick_paged_isa() {
+  const char* forced = std::getenv("CPU_ATTENTION_ISA");
+  if (forced != nullptr) {
+    if (forced[0] == 's') return kIsaScalar;
+    if (forced[0] == 'v') return kIsaVec;
+    if (forced[0] == 'a') return kIsaNeon;  // amx is dense-only
+  }
 #if defined(__x86_64__)
   if (vec::available()) return kIsaVec;
 #elif defined(__aarch64__)
@@ -114,6 +120,14 @@ int pick_paged_isa() {
 // the vector path. fp32 rides the same kernel with the operands split into bf16
 // hi/lo halves and three products per phase (error 3-8e-5, gate 2e-4).
 int pick_dense_isa(const DenseJob& job) {
+  // CPU_ATTENTION_ISA=scalar|vec|amx pins the dense kernel for an A/B; the
+  // paged path follows the same lever through pick_paged_isa.
+  const char* forced = std::getenv("CPU_ATTENTION_ISA");
+  if (forced != nullptr) {
+    if (forced[0] == 's') return kIsaScalar;
+    if (forced[0] == 'v') return kIsaVec;
+    if (forced[0] == 'a') return kIsaAmx;
+  }
 #if defined(__x86_64__)
   if (amx::available() && !env_off("CPU_ATTENTION_AMX")) {
     const bool fp32 = job.dtype == kF32;
