@@ -113,6 +113,17 @@ size_t workspace_bytes();
 //
 // Optional policy member: `static constexpr bool zeroes_acc = true;` when `pv`
 // initialises the accumulator itself on its first key tile.
+// Optional policy member: floats the logits tile is followed by before the
+// accumulator starts (the vec bf16 policy keeps one packed probability pair per
+// key-pair per row there). Zero for every other policy.
+template <class P>
+constexpr size_t logit_aux_floats(int kt) {
+  if constexpr (requires { P::logit_aux_floats(kt); })
+    return P::logit_aux_floats(kt);
+  else
+    return 0;
+}
+
 template <class P>
 constexpr bool zeroes_acc() {
   if constexpr (requires { P::zeroes_acc; })
@@ -167,7 +178,8 @@ void dense_run(const DenseJob& job, int workers) {
     char* my_aux = aux_base + static_cast<size_t>(tid) * aux;
     const int kt = P::kt_();
     float* logits = reinterpret_cast<float*>(my_aux);
-    float* acc = logits + static_cast<size_t>(P::RQT) * kt;
+    float* acc = logits + static_cast<size_t>(P::RQT) * kt +
+                 logit_aux_floats<P>(kt);
     float* m = acc + static_cast<size_t>(arows) * hd;
     float* l = m + rq;
     float* alpha = l + rq;

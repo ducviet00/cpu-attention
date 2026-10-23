@@ -185,23 +185,37 @@ def main():
                         args.isa, False, None, "auto")
                     vout = torch.empty_like(q)
 
+                # Every arm gets a preallocated output, including ours: the
+                # vLLM entry takes one, and at batch 1 `torch.empty` is 1.3 us
+                # of a 7 us call. `--alloc-out` measures the allocating form.
+                ocpp = torch.empty_like(q)
+                omojo = torch.empty_like(q)
+
                 def arm_self(be):
-                    def f():
-                        _kernel.set_backend(be)
-                        if be == "cpp":
+                    if be == "cpp":
+                        def f():
+                            _kernel.set_backend(be)
                             return attn.self_attention(q, k_new, v_new, kcc, vcc,
                                                        slots, blocks, lens,
-                                                       scale)
+                                                       scale, out=ocpp)
+                        return f
+
+                    def f():
+                        _kernel.set_backend(be)
                         return attn.self_attention(q, k_new, v_new, kcm, vcm,
                                                    slots, blocks, lens, scale)
                     return f
 
                 def arm_cross(be):
+                    if be == "cpp":
+                        def f():
+                            _kernel.set_backend(be)
+                            return attn.cross_attention(q, kcc, vcc, blocks,
+                                                        lens, scale, out=ocpp)
+                        return f
+
                     def f():
                         _kernel.set_backend(be)
-                        if be == "cpp":
-                            return attn.cross_attention(q, kcc, vcc, blocks,
-                                                        lens, scale)
                         return attn.cross_attention(q, kcm, vcm, blocks, lens,
                                                     scale)
                     return f

@@ -59,6 +59,31 @@ inline __m512bh load_pair_bf16(const void* p) {
   return r;
 }
 
+// Two 16-lane bf16 rows (dim-major within a row) interleaved into the key-pair
+// form `dpbf16ps` contracts for P@V: (a0,b0,a1,b1,...,a15,b15), one 64-byte
+// store. The two source rows are 32 bytes each, so they are joined into one
+// zmm and permuted with a 16-bit index vector.
+inline void store_key_pair(char* dst, const void* row_a, const void* row_b) {
+  const __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row_a));
+  const __m256i b = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(row_b));
+  __m512i ab = _mm512_castsi256_si512(a);
+  ab = _mm512_inserti64x4(ab, b, 1);
+  // (a0,b0,a1,b1,...): 0,16,1,17,... as 16-bit lane indices.
+  const __m512i idx = _mm512_set_epi16(
+      31, 15, 30, 14, 29, 13, 28, 12, 27, 11, 26, 10, 25, 9, 24, 8, 23, 7, 22,
+      6, 21, 5, 20, 4, 19, 3, 18, 2, 17, 1, 16, 0);
+  _mm512_storeu_si512(dst, _mm512_permutexvar_epi16(idx, ab));
+}
+
+// One 32-bit word (a bf16 pair) broadcast to all 32 half-lanes: the A operand of
+// `dpbf16ps` for P@V, where the contraction runs over two adjacent keys.
+inline __m512bh bcast_word(const void* p) {
+  const __m512i i = _mm512_set1_epi32(*static_cast<const int*>(p));
+  __m512bh r;
+  std::memcpy(&r, &i, 64);
+  return r;
+}
+
 // fp32 -> bf16, 16 lanes, as a bit pattern the stores can take.
 inline __m256i pack_bf16_16(__m512 v) {
   const __m256bh h = _mm512_cvtneps_pbh(v);
@@ -214,7 +239,24 @@ struct Dense {
   }
   static size_t aux_bytes(int rq, int hd) {
     const size_t rows = static_cast<size_t>(acc_rows(rq));
-    return static_cast<size_t>(RQT) * KTMAX * 4 + rows * hd * 4 + rows * 3 * 4;
+    // logits (fp32) | probability pairs (bf16, one 32-bit word per key pair) |
+    // accumulator | m, l, alpha.
+    return static_cast<size_t>(RQT) * KTMAX * (BF ? 6 : 4) + rows * hd * 4 +
+           rows * 3 * 4;
+  }
+  // bf16 stores probabilities as key pairs (what `dpbf16ps` contracts); fp32
+  // keeps them fp32 in the logits buffer. The pair buffer sits between the
+  // logits tile and the accumulator, which is what `logit_aux_floats` tells the
+  // driver; pv finds it from the logits base it is handed.
+  static size_t logit_aux_floats(int kt) {
+    return BF ? static_cast<size_t>(RQT) * kt / 2 : 0;
+  }
+  static uint32_t* pairs_of(float* logits) {
+    return reinterpret_cast<uint32_t*>(logits + static_cast<size_t>(RQT) * kt_());
+  }
+  static const uint32_t* pairs_of(const float* logits) {
+    return reinterpret_cast<const uint32_t*>(
+        logits + static_cast<size_t>(RQT) * kt_());
   }
 
   // K -> [hd][pad] (bf16: [hd/2][pad][2]); V -> [pad][hd]. One pass, 16 tokens x
@@ -261,15 +303,48 @@ struct Dense {
           }
         }
       }
-      for (int64_t t = 0; t < tn; ++t)
-        std::memcpy(vdst + (t0 + t) * HD * ESZ, vsrc + (t0 + t) * job.vt * ESZ,
-                    HD * ESZ);
+      if constexpr (BF) {
+        // V goes to [key/2][hd][2]: one 64-byte store holds 16 dims of two
+        // adjacent keys, which is the pair `dpbf16ps` contracts in P@V. That is
+        // worth 2.1x on the phase (tests/bench_vec_prims.cpp, pv_dot32).
+        for (int64_t t = 0; t < tn; t += 2) {
+          const char* a = vsrc + (t0 + t) * job.vt * ESZ;
+          const bool have_b = (t + 1) < tn;
+          const char* b = have_b ? a + job.vt * ESZ : nullptr;
+          char* dst = vdst + ((t0 + t) >> 1) * (HD * 2) * ESZ;
+          for (int64_t d0 = 0; d0 < HD; d0 += 16) {
+            if (have_b) {
+              store_key_pair(dst + d0 * 2 * ESZ, a + d0 * ESZ, b + d0 * ESZ);
+            } else {
+              // The last key of an odd-length sequence has no partner. It still
+              // has to be written in *pair* order, interleaved with zeros: a
+              // plain copy would put dim d+1 in the slot of key pair (d, d+1).
+              static const char zeros[32] = {0};
+              store_key_pair(dst + d0 * 2 * ESZ, a + d0 * ESZ, zeros);
+            }
+          }
+        }
+      } else {
+        for (int64_t t = 0; t < tn; ++t)
+          std::memcpy(vdst + (t0 + t) * HD * ESZ,
+                      vsrc + (t0 + t) * job.vt * ESZ, HD * ESZ);
+      }
     }
     // Zero the padding so a masked lane never reads a NaN left by an earlier
     // geometry (or runs past the slab).
     if (job.seq_k < pad) {
       const int64_t tail = pad - job.seq_k;
-      std::memset(vdst + job.seq_k * HD * ESZ, 0, tail * HD * ESZ);
+      if constexpr (BF) {
+        // Pair units: the first key without a partner is (seq_k + 1) / 2, and
+        // the pair region is pad / 2 keys wide.
+        const int64_t from = (job.seq_k + 1) >> 1;
+        const int64_t pairs = (pad >> 1) - from;
+        if (pairs > 0)
+          std::memset(vdst + from * (HD * 2) * ESZ, 0,
+                      pairs * (HD * 2) * ESZ);
+      } else {
+        std::memset(vdst + job.seq_k * HD * ESZ, 0, tail * HD * ESZ);
+      }
       // Only the 16-lane group holding the last key can be read partially; the
       // rest of the padding is never addressed because the key loop stops at
       // the causal limit. Zero the dead lanes of that group so a NaN left by an
@@ -386,14 +461,34 @@ struct Dense {
       alpha[r] = a;
       l[r] *= a;
       if (mn == -INFINITY) {
-        for (int j = 0; j < nkeys; j += LANES) st16(p + j, _mm512_setzero_ps());
+        // No visible key in this tile: zero what P@V reads.
+        if constexpr (BF) {
+          uint32_t* pp0 = pairs_of(logits) +
+                          static_cast<size_t>(r) * (kt_() / 2);
+          std::memset(pp0, 0, sizeof(uint32_t) * static_cast<size_t>(nkeys + 1) / 2);
+        } else {
+          for (int j = 0; j < nkeys; j += LANES)
+            st16(p + j, _mm512_setzero_ps());
+        }
         continue;
       }
       const __m512 vmn = _mm512_set1_ps(mn);
       __m512 sum = _mm512_setzero_ps();
+      // bf16 P@V contracts two adjacent keys per `dpbf16ps` half-lane, so the
+      // probabilities are written as bf16 pairs there (`_mm512_cvtneps_pbh`
+      // already emits (p0,p1),(p2,p3),... in key order). fp32 keeps fp32
+      // probabilities and a plain FMA P@V: a bf16 hi/lo split would cost three
+      // products, i.e. 1.5x the instructions of fp32 FMA on this ISA.
+      uint32_t* pp = BF ? pairs_of(logits) + static_cast<size_t>(r) * (kt_() / 2)
+                        : nullptr;
       for (int j = 0; j < nkeys; j += LANES) {
         const __m512 e = exp2v(_mm512_fmsub_ps(ld16(p + j), vc, vmn));
-        st16(p + j, e);
+        if constexpr (BF) {
+          const __m256i h = pack_bf16_16(e);
+          _mm256_storeu_si256(reinterpret_cast<__m256i*>(pp + (j >> 1)), h);
+        } else {
+          st16(p + j, e);
+        }
         sum = _mm512_add_ps(sum, e);
       }
       l[r] += _mm512_reduce_add_ps(sum);
@@ -401,12 +496,22 @@ struct Dense {
   }
 
   // acc[nrows][HD] += p[nrows][nkeys] @ V[k0, k0+nkeys)
+  // acc[nrows][HD] += p[nrows][nkeys] @ V[k0, k0+nkeys)
+  //
+  // bf16 runs `dpbf16ps` with the contraction on keys: one instruction
+  // multiplies a broadcast key-pair probability by 16 dims of two adjacent keys
+  // and accumulates 32 MACs against 16 for an fp32 FMA. That is 2.1x the phase
+  // (tests/bench_vec_prims.cpp, "pv_dot32") and it is why P@V was 56% of the
+  // 2048:16:128 bf16 call. The accumulator is a 32-dim chunk (two zmm per row)
+  // so eight rows plus the operands stay inside 32 registers.
   static void pv(const DenseJob& job, const char* slab, int64_t, int64_t,
                  int64_t k0, int nkeys, const float* p, int nrows,
                  float* acc) {
     const int kt = kt_();
     if (mode() & 8) return;
     const char* vs = slab + pad_of(job.seq_k) * HD * ESZ;
+    const uint32_t* pp = BF ? pairs_of(p) : nullptr;
+    const int half = kt / 2;
     for (int dc = 0; dc < HD; dc += 32) {
       __m512 c[RQT][2];
 #pragma GCC unroll 16
@@ -414,21 +519,32 @@ struct Dense {
         c[r][0] = ld16(acc + r * HD + dc);
         c[r][1] = ld16(acc + r * HD + dc + 16);
       }
-      for (int j = 0; j < nkeys; ++j) {
-        const char* v = vs + ((k0 + j) * HD + dc) * ESZ;
-        __m512 v0, v1;
-        if constexpr (BF) {
-          v0 = widen_bf16(v);
-          v1 = widen_bf16(v + 32);
-        } else {
-          v0 = ld16(v);
-          v1 = ld16(v + 64);
-        }
+      if constexpr (BF) {
+        for (int j = 0; j < nkeys; j += 2) {
+          const char* v = vs + (((k0 + j) >> 1) * HD + dc) * 2 * ESZ;
+          const __m512bh v0 = load_pair_bf16(v);
+          const __m512bh v1 = load_pair_bf16(v + 64);
+          // The probability pairs are tile-local (the softmax wrote one tile),
+          // while V is addressed by the global key.
+          const int word = j >> 1;
 #pragma GCC unroll 16
-        for (int r = 0; r < RQT; ++r) {
-          const __m512 pr = _mm512_set1_ps(p[r * kt + j]);
-          c[r][0] = _mm512_fmadd_ps(pr, v0, c[r][0]);
-          c[r][1] = _mm512_fmadd_ps(pr, v1, c[r][1]);
+          for (int r = 0; r < RQT; ++r) {
+            const __m512bh pa = bcast_word(pp + r * half + word);
+            c[r][0] = _mm512_dpbf16_ps(c[r][0], pa, v0);
+            c[r][1] = _mm512_dpbf16_ps(c[r][1], pa, v1);
+          }
+        }
+      } else {
+        for (int j = 0; j < nkeys; ++j) {
+          const char* v = vs + ((k0 + j) * HD + dc) * ESZ;
+          const __m512 v0 = ld16(v);
+          const __m512 v1 = ld16(v + 64);
+#pragma GCC unroll 16
+          for (int r = 0; r < RQT; ++r) {
+            const __m512 pr = _mm512_set1_ps(p[r * kt + j]);
+            c[r][0] = _mm512_fmadd_ps(pr, v0, c[r][0]);
+            c[r][1] = _mm512_fmadd_ps(pr, v1, c[r][1]);
+          }
         }
       }
 #pragma GCC unroll 16
