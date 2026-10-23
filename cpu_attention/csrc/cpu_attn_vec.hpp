@@ -156,6 +156,19 @@ struct Dense {
   // sized for roundup(rq, RQT) rows.
   static int acc_rows(int rq) { return ((rq + RQT - 1) / RQT) * RQT; }
   static int64_t pad_of(int64_t seq_k) { return (seq_k + 63) & ~int64_t(63); }
+  // K^T is blocked every 64 keys: `[tile][hd][64]` (bf16 `[tile][hd/2][64][2]`).
+  // One dimension's 64 positions are contiguous, so a Q@K^T sweep touches four
+  // dimensions per 4 KB page; a plain `[hd][seq_k]` transpose strides `seq_k*4`
+  // bytes between dimensions and takes a TLB miss on every load. Both vLLM and
+  // the Mojo tree block their K^T for this reason, and it is most of the fp32
+  // D=128 gap here.
+  static inline int64_t k_off(int64_t jj, int d) {
+    return (jj >> 6) * (int64_t(HD) * 64) + int64_t(d) * 64 + (jj & 63);
+  }
+  static inline int64_t kb_off(int64_t jj, int d2) {
+    return ((jj >> 6) * (int64_t(HD / 2) * 64) + int64_t(d2) * 64 + (jj & 63)) *
+           2;
+  }
   static size_t slab_bytes(int64_t seq_k, int hd) {
     return static_cast<size_t>(2 * pad_of(seq_k) * hd) * ESZ;
   }
@@ -187,11 +200,11 @@ struct Dense {
           transpose16x16_f32(r);
           if constexpr (BF) {
             for (int d = 0; d < 16; d += 2)
-              store_pair_bf16(kdst + (((d0 + d) / 2 * pad + t0) * 2) * ESZ,
-                              r[d], r[d + 1]);
+              store_pair_bf16(kdst + kb_off(t0, (d0 + d) / 2) * ESZ, r[d],
+                              r[d + 1]);
           } else {
             for (int d = 0; d < 16; ++d)
-              st16(kdst + ((d0 + d) * pad + t0) * 4, r[d]);
+              st16(kdst + k_off(t0, d0 + d) * 4, r[d]);
           }
         }
       } else {
@@ -199,10 +212,10 @@ struct Dense {
           const char* s = ksrc + (t0 + t) * job.kt * ESZ;
           for (int64_t d = 0; d < HD; ++d) {
             if constexpr (BF) {
-              std::memcpy(kdst + ((d / 2 * pad + t0 + t) * 2 + (d & 1)) * ESZ,
+              std::memcpy(kdst + (kb_off(t0 + t, d / 2) + (d & 1)) * ESZ,
                           s + d * ESZ, ESZ);
             } else {
-              std::memcpy(kdst + ((d * pad) + t0 + t) * ESZ, s + d * ESZ, ESZ);
+              std::memcpy(kdst + k_off(t0 + t, d) * ESZ, s + d * ESZ, ESZ);
             }
           }
         }
@@ -216,13 +229,20 @@ struct Dense {
     if (job.seq_k < pad) {
       const int64_t tail = pad - job.seq_k;
       std::memset(vdst + job.seq_k * HD * ESZ, 0, tail * HD * ESZ);
-      const int dgroups = BF ? HD / 2 : HD;
-      for (int d2 = 0; d2 < dgroups; ++d2) {
-        if constexpr (BF) {
-          std::memset(kdst + ((d2 * pad + job.seq_k) * 2) * ESZ, 0,
-                      tail * 2 * ESZ);
-        } else {
-          std::memset(kdst + (d2 * pad + job.seq_k) * ESZ, 0, tail * ESZ);
+      // Only the 16-lane group holding the last key can be read partially; the
+      // rest of the padding is never addressed because the key loop stops at
+      // the causal limit. Zero the dead lanes of that group so a NaN left by an
+      // earlier geometry cannot poison a masked dot product.
+      const int tailn = static_cast<int>((16 - (job.seq_k & 15)) & 15);
+      if (tailn) {
+        for (int d = 0; d < HD; ++d) {
+          if constexpr (BF) {
+            // Both dims of the pair are adjacent, so one store covers them.
+            std::memset(kdst + kb_off(job.seq_k, d / 2) * ESZ, 0,
+                        tailn * 2 * ESZ);
+          } else {
+            std::memset(kdst + k_off(job.seq_k, d) * ESZ, 0, tailn * ESZ);
+          }
         }
       }
     }
@@ -250,7 +270,7 @@ struct Dense {
       for (int r = 0; r < RQT; ++r) c[r] = _mm512_setzero_ps();
       if constexpr (BF) {
         for (int d2 = 0; d2 < HD / 2; ++d2) {
-          const __m512bh kb = load_pair_bf16(slab + ((d2 * pad + jj) * 2) * 2);
+          const __m512bh kb = load_pair_bf16(slab + kb_off(jj, d2) * ESZ);
 #pragma GCC unroll 16
           for (int r = 0; r < RQT; ++r) {
             const int rr = r < nrows ? r : nrows - 1;
@@ -261,7 +281,7 @@ struct Dense {
         }
       } else {
         for (int d = 0; d < HD; ++d) {
-          const __m512 kb = ld16(slab + ((d * pad) + jj) * 4);
+          const __m512 kb = ld16(slab + k_off(jj, d) * ESZ);
 #pragma GCC unroll 16
           for (int r = 0; r < RQT; ++r) {
             const int rr = r < nrows ? r : nrows - 1;
