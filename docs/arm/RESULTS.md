@@ -1,5 +1,62 @@
 # ARM (Graviton 5, m9g.2xlarge, Neoverse-V3) dense kernel
 
+## Round 4 — the fused register panel, implemented and falsified
+
+Rewrote `DenseBF`'s three phases into one register-panel loop (branch saved in
+the transcript; reverted, so the shipped file is round 3's). What was built:
+`qk` packs the chunk's Q into the bf16 (row pair, dim group) operand panel and
+records `q_base`/`lim0`/`nrows` in the policy's own aux area; `softmax`
+records `m`/`l`/`c` and sets `alpha = 1` so the shared driver skips its rescale;
+`pv` runs the panel loop -- 8-key Q@K^T panel into 16 `bfmmla` registers, per-row
+mask, per-row max on the accumulators, lazy online update (the accumulator is
+rescaled only when the running max actually moves), `exp2` in place, straight
+to bf16 P registers (`zip_lo`/`zip_hi` + `vcvt_bf16_f32`), then P@V from those
+registers with eight head dims per pass. No 4-byte logits buffer and no second
+pass over it.
+
+Measured with the alternating-process protocol (5 rounds, one process per
+sample, variants rotated), against the shipped kernel:
+
+| shape | shipped | fused panel | ratio |
+|---|---:|---:|---:|
+| 2048:8:64 bf16 | 3442.4 us | 5248.2 us | **1.525x slower** |
+| 128:8:64 bf16 | 26.3 us | 33.4 us | **1.270x slower** |
+
+It also failed 5 of 65 `test_dense` checks (my panel masking), but the
+performance verdict settles it: there is no point debugging a kernel that is
+50% slower. Reverted; `test_dense` 65/65 and `test_paged_sweep` 504/504 again
+(worst bf16 1.89 ulp, fp32 1.62e-06), and the shipped binary re-confirms at
+3426-3445 us.
+
+**Why it loses, with the number that makes it structural.** The logits panel
+fits in registers; the *output* accumulator does not (8 rows x 64 dims = 128
+fp32 values). So the panel loop has to load and store the accumulator once per
+panel per dim pass: at an 8-key panel that is `2 * (HD/dcp) * (RQT*dcp/4)`
+register accesses per `RQT * W` row-keys = **4 accumulator loads/stores per
+row-key**, against the **0.125** the shipped structure pays (it touches the
+accumulator once per 256-key tile). The logits + P round trip it removes costs
+1.75. Net: 4.0 - 1.75 = **+2.4 memory instructions per row-key**, and the
+measured 1.52x is that plus the loss of the tile-wide rescale amortisation.
+A 16-key panel is the widest that still fits 32 registers (4 row pairs x 8 key
+pairs = 32 logit registers, leaving nothing for Q/K/V; 16 keys only fits with
+`RQT = 4`, i.e. 2 row pairs), and it would halve the accumulator traffic to
+2/rk -- still above the 1.75 it replaces, while `RQT = 4` doubles the K/V bytes
+and measured **1.302x slower** on its own (round 1).
+
+**The only formulation left** that removes the logits round trip without paying
+the accumulator round trip is to delete the tile-wide max, so P can be written
+in a single pass from a *fixed* per-row exponent base: bound `max |c q_r . k_j|`
+by Cauchy-Schwarz from `max_j |k_j|` (accumulated during the pack, which already
+touches every element) and `||q_r||`, and use `m_r = c * ||q_r|| * max|k|` for
+the whole call. Then `l` is a plain sum, the accumulator is never rescaled, and
+`qk` writes bf16 P directly (one pass, no logits store, no softmax read). The
+cost is a looser base (~sqrt(D) x the true max, so probabilities ~1e-9 instead
+of ~1) which is inside fp32's range, and the risk is the bound being violated by
+a non-random input, which would overflow `exp2` to +inf and produce NaN. That is
+the next thing to try, and it is a `pack` + `qk` change only.
+
+---
+
 ## Round 3
 
 ### 1. `tests/test_paged_sweep.py` is 504/504 — the round-2 failure was the stale oracle
