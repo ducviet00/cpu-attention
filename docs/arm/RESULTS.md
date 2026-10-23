@@ -1,5 +1,97 @@
 # ARM (Graviton 5, m9g.2xlarge, Neoverse-V3) dense kernel
 
+## Round 3
+
+### 1. `tests/test_paged_sweep.py` is 504/504 — the round-2 failure was the stale oracle
+
+Round 2 reported 336/504 and traced it to the box's `_C.so` still carrying the
+GQA store bug (its error on the first GQA case was bit-identical to the buggy
+`head * HD` read). The box's venv has `mojo` but not on `PATH`, so
+`scripts/build.py` bailed with "mojo not found"; with
+`PATH=$PWD/.venv/bin:$PATH` it builds:
+
+```
++ .venv/bin/mojo build cpu_attention/_mojo/src/_C.mojo --emit shared-lib -o cpu_attention/_C.so ...
+built cpu_attention/_C.so
+paged sweep: 504/504 within tolerance
+  worst fp32 1.37e-06 at (32, 16, 16, 16, 17, 1, True)
+  worst bf16 1.96 ulp at (128, 64, 16, 8, 33, 3, False)
+```
+
+The bf16 worst case is 1.96 against a 2.0 ulp gate — passing, but with no
+margin; the two backends disagree by ~2 bf16 ulp at the peak output on
+`hd128/page64/16q-8kv`.
+
+### 2. bf16 K pack: four keys per step (-3.1% on `128:8:64`)
+
+Two adjacent key pairs of one dim group are 16 bytes apart in the packed K^T
+tile, so 4 keys of one dim group are 32 contiguous bytes: two 16-byte stores
+instead of four 8-byte ones, and half as many loop iterations. `pad` is a
+multiple of 64 and `t0` a multiple of 4, so a step never straddles a tile.
+Alternating-process A/B, min of 5 rounds, `128:8:64 bf16`: **26.1 -> 25.3 us
+(0.969x)**. In the 41-round matrix: 25.0 -> 24.8 us and `cpp/vllm` 1.114 ->
+1.094 on that row.
+
+The V pack was left alone: its 4-byte `memcpy` per key needs a 4x4 bf16
+transpose to widen, and the shuffle cost (~20 instructions per 32 bytes against
+~24 for two of the current groups) makes it a ~20% win on that loop rather than
+the 2x the store width suggests. Not worth a rewrite on its own.
+
+### 3. Round-3 matrix (41 rounds, `ctrl/mojo` tracks `cpp` within 0.005)
+
+| dense row | dtype | cpp us | mojo us | vllm us | cpp/mojo | cpp/vllm |
+|---|---|---:|---:|---:|---:|---:|
+| 128:8:64 | bf16 | 24.8 | 21.0 | 22.6 | 1.177 | 1.094 |
+| 128:8:64 | fp32 | 43.0 | 42.2 | 46.0 | 1.017 | 0.934 |
+| 512:8:64 | bf16 | 236.5 | 196.6 | 234.5 | 1.203 | 1.009 |
+| 512:8:64 | fp32 | 582.7 | 523.1 | 589.3 | 1.114 | 0.989 |
+| 1024:8:64 | bf16 | 870.0 | 775.2 | 907.6 | 1.122 | 0.958 |
+| 1024:8:64 | fp32 | 2297.7 | 2078.0 | 2240.4 | 1.106 | 1.025 |
+| 2048:8:64 | bf16 | 3451.6 | 3151.8 | 3531.8 | 1.095 | 0.977 |
+| 2048:8:64 | fp32 | 9118.9 | 8191.9 | 8913.2 | 1.113 | 1.023 |
+| 4096:8:64 | bf16 | 13448.2 | 12566.8 | 14050.0 | 1.070 | 0.957 |
+| 4096:8:64 | fp32 | 36466.2 | 33415.6 | 34561.0 | 1.091 | 1.055 |
+| 256:16:128 | bf16 | 218.9 | 188.9 | 211.9 | 1.159 | 1.033 |
+| 256:16:128 | fp32 | 576.9 | 526.2 | 658.1 | 1.096 | 0.877 |
+| 1024:16:128 | bf16 | 2869.5 | 2714.9 | 2921.5 | 1.057 | 0.982 |
+| 1024:16:128 | fp32 | 8641.6 | 7928.9 | 9539.6 | 1.090 | 0.906 |
+| 2048:16:128 | bf16 | 11141.3 | 10873.0 | 11426.6 | 1.025 | 0.975 |
+| 2048:16:128 | fp32 | 33906.8 | 31391.1 | 37037.4 | 1.080 | 0.916 |
+| 4096:16:128 | bf16 | 43901.1 | 42958.4 | 45205.0 | 1.022 | 0.971 |
+| 4096:16:128 | fp32 | 135061.0 | 140133.3 | 144047.2 | **0.964** | 0.938 |
+| 512:32:128 | bf16 | 1552.4 | 1441.6 | 1541.5 | 1.077 | 1.007 |
+| 512:32:128 | fp32 | 4631.6 | 4124.5 | 4818.9 | 1.123 | 0.961 |
+| 1024:8:32 | bf16 | 585.8 | 523.9 | 638.8 | 1.118 | 0.917 |
+| 1024:8:32 | fp32 | 1288.5 | 1183.3 | 1321.4 | 1.089 | 0.979 |
+
+Bands: dense `cpp/mojo` **0.964-1.203**, `cpp/vllm` **0.877-1.094**; 9/22 rows
+<= 0.97 against vLLM, 1/22 against Mojo. Paged: `cpp/mojo` **0.476-1.012**,
+`cpp/vllm` **0.245-1.036**, **19/20 at <= 1.0** (the one row over is
+`cross b=1 ctx=256 bf16` at 1.036, where Mojo reads 1.46 — the preallocated
+-output asymmetry). `d_cpp` <= 8.7e-3 dense bf16 / 2.5e-6 dense fp32 / 1.3e-3
+paged bf16 / 4.8e-7 paged fp32.
+
+### 4. What is left, per row
+
+Nothing shipped this round for B (the fused bf16 register panel) or C (fp32
+hi/lo); the costings from round 2 stand. The rows still over 0.97 are:
+
+| row | cpp/mojo | cycles/row-key (ours / Mojo) | instructions/row-key (ours / Mojo) | floor |
+|---|---:|---|---|---|
+| 512:8:64 bf16 | 1.203 | 5.4 / 4.7 | 18.6 / 18.3 | 3.2 (`bfmmla` 2.5/cycle) |
+| 128:8:64 bf16 | 1.177 | 12.9 / 11.0 (fixed cost ~1/3 of the call) | — | pack + fork-join |
+| 256:16:128 bf16 | 1.159 | 5.2 / 4.5 | — | 3.2 |
+| 1024:8:32 bf16 | 1.118 | 5.5 / 4.9 | — | 1.6 (4 `bfmmla`/rk) |
+| fp32 D=64 (5 rows) | 1.09-1.11 | 14.2 / 12.7 | 52 / 49 | 14.2 = 32 FMA at 2.25/cycle |
+
+The bf16 rows are at instruction parity with Mojo and lose on cycles only, which
+is the logits round trip that the `qk -> softmax -> pv` contract forces; the fp32
+rows are at the scalar-pipe roof (32 FMAs/row-key, 2.25/cycle achieved, i.e. the
+FMA stream is the whole runtime) and only the hi/lo `bfmmla` restructure moves
+them, at the 1.1-1.25x projection of round 2.
+
+---
+
 ## Round 2 (same box, branch `cpp-arm-dense`)
 
 Two things were done and one lever was costed out with the kernel's own measured

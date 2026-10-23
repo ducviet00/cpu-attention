@@ -543,16 +543,20 @@ struct DenseBF {
     char* kd = slab;
     char* vd = slab + pad * HD * 2;
     const bfloat16x4_t zero = vdup_n_bf16(0);
-    for (int64_t kp = 0; kp < pad / 2; ++kp) {
-      const int64_t t0 = 2 * kp;
+    // Four keys per step: two adjacent key pairs of one dim group are 16 bytes
+    // apart in the packed tile, so their 32 bytes go out as two 16-byte stores
+    // instead of four 8-byte ones. `pad` is a multiple of 64 and t0 a multiple
+    // of 4, so a step never straddles a K^T tile.
+    for (int64_t t0 = 0; t0 < pad; t0 += 4) {
       for (int dg = 0; dg < DG; ++dg) {
-        const bfloat16x4_t lo =
-            t0 < n ? ldb4(ks + (t0 * job.kt + dg * 4) * 2) : zero;
-        const bfloat16x4_t hi =
-            (t0 + 1) < n ? ldb4(ks + ((t0 + 1) * job.kt + dg * 4) * 2) : zero;
+        bfloat16x4_t r[4];
+        for (int t = 0; t < 4; ++t)
+          r[t] = (t0 + t) < n
+                     ? ldb4(ks + ((t0 + t) * job.kt + dg * 4) * 2)
+                     : zero;
         char* dst = kd + kb_grp(t0, dg) * 16;
-        stb4(dst, lo);
-        stb4(dst + 8, hi);
+        stb(dst, vcombine_bf16(r[0], r[1]));
+        stb(dst + 16, vcombine_bf16(r[2], r[3]));
       }
     }
     const int64_t kg_n = pad / 4;
