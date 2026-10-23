@@ -1,10 +1,18 @@
-"""Loader and call plumbing for the Mojo attention kernels.
+"""Loader and call plumbing for the attention kernels.
 
-The kernel is built from ``cpu_attention/_mojo`` into ``cpu_attention/_C.so``
-by ``uv run --extra build python scripts/build.py``. Set ``CPU_ATTENTION_LIB``
-to point at another build. Everything here is optional: without the shared
-library (or on an unsupported configuration) :func:`is_available` is False and
-every entry point raises ``RuntimeError``.
+Two backends, one Python API:
+
+* ``mojo`` (default) -- built from ``cpu_attention/_mojo`` into
+  ``cpu_attention/_C.so`` by ``uv run --extra build python scripts/build.py``;
+* ``cpp`` -- built from ``cpu_attention/csrc`` into ``cpu_attention/_C_cpp.so``
+  by ``uv run --extra build python scripts/build_cpp.py``.
+
+``CPU_ATTENTION_BACKEND=cpp`` selects the second one. Both shared objects can be
+loaded in one process, which is what the A/B harnesses do. Set
+``CPU_ATTENTION_LIB`` to point at another build of the selected backend.
+Everything here is optional: without the shared library (or on an unsupported
+configuration) :func:`is_available` is False and every entry point raises
+``RuntimeError``.
 """
 
 import importlib.util
@@ -14,7 +22,21 @@ import threading
 
 import torch
 
-_LIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_C.so")
+_BACKEND = os.environ.get("CPU_ATTENTION_BACKEND", "mojo").lower()
+if _BACKEND not in ("mojo", "cpp"):
+    raise ValueError(
+        f"CPU_ATTENTION_BACKEND must be 'mojo' or 'cpp', not {_BACKEND!r}"
+    )
+
+_LIB_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "_C_cpp.so" if _BACKEND == "cpp" else "_C.so",
+)
+
+
+def backend() -> str:
+    """Return the selected backend name (``"mojo"`` or ``"cpp"``)."""
+    return _BACKEND
 
 # The kernel specializes on head_dim at compile time; anything else raises.
 _HEAD_DIMS = {32, 64, 128}
@@ -53,9 +75,10 @@ def require():
     """Return the compiled kernel module, raising RuntimeError if unavailable."""
     mod = module()
     if mod is None:
+        script = "build_cpp.py" if _BACKEND == "cpp" else "build.py"
         raise RuntimeError(
-            "cpu_attention: the Mojo kernel is not built; run "
-            "`uv run --extra build python scripts/build.py` (or set "
+            f"cpu_attention: the {_BACKEND} kernel is not built; run "
+            f"`uv run --extra build python scripts/{script}` (or set "
             "CPU_ATTENTION_LIB)"
         )
     return mod
@@ -1151,6 +1174,70 @@ def _dense_plan(key, q, k, v, causal):
     return plan
 
 
+_CPP_PLANS = threading.local()
+"""Per-thread dense plans for the C++ backend: geometry -> (buffer, address).
+
+The C++ side keeps the workspace (packed K/V, accumulators) keyed on the same
+geometry, so the Python side only has to hand it the plan; every derived value
+(rows per work item, ISA, worker count) is computed once, on the miss path.
+"""
+
+_CPP_MAKE_PLAN = None
+_CPP_FORWARD = None
+
+
+def _cpp_entries():
+    """Bind the C++ plan/forward pair once."""
+    global _CPP_MAKE_PLAN, _CPP_FORWARD
+    if _CPP_MAKE_PLAN is None:
+        mod = require()
+        _CPP_MAKE_PLAN = mod.dense_make_plan
+        _CPP_FORWARD = mod.dense_forward
+    return _CPP_MAKE_PLAN, _CPP_FORWARD
+
+
+def _cpp_plan(q, k, v, scale, causal):
+    """The plan address for this geometry, building it on the first call."""
+    plans = getattr(_CPP_PLANS, "p", None)
+    if plans is None:
+        plans = _CPP_PLANS.p = {}
+    batch, seq_q, heads, hd = q.shape
+    kv_heads = k.shape[2]
+    workers = _workers(batch * heads * -(-seq_q // 64), 8)
+    key = (q.shape, q.stride(), k.stride(), v.stride(), causal, q.dtype,
+           float(scale), workers)
+    addr = plans.get(key)
+    if addr is None:
+        make_plan, _ = _cpp_entries()
+        qs, ks, vs = q.stride(), k.stride(), v.stride()
+        buf = torch.empty(24, dtype=torch.int64)
+        make_plan(
+            buf.data_ptr(), batch, seq_q, k.shape[1], heads, kv_heads, hd,
+            _DTYPE_CODES[q.dtype], int(bool(causal)), float(scale),
+            qs[0], qs[1], qs[2], ks[0], ks[1], ks[2], vs[0], vs[1], vs[2],
+            seq_q * heads * hd, heads * hd, hd, workers,
+        )
+        if len(plans) > 64:
+            plans.clear()
+        addr = buf.data_ptr()
+        # The buffer has to outlive the address, so hold it next to the key.
+        plans[key] = addr
+        _CPP_BUFS.append(buf)
+    return addr
+
+
+_CPP_BUFS = []
+
+
+def _dense_cpp(q, k, v, scale: float, causal: bool):
+    """Dense attention through the C++ backend: one call, five arguments."""
+    _, forward = _cpp_entries()
+    out = torch.empty(q.shape, dtype=q.dtype)
+    forward(_cpp_plan(q, k, v, scale, causal), q.data_ptr(), k.data_ptr(),
+            v.data_ptr(), out.data_ptr())
+    return out
+
+
 def _dense(q, k, v, scale: float, causal: bool, geom=None):
     """Run the dense kernel over contiguous-``head_dim`` q/k/v (already checked).
 
@@ -1173,6 +1260,8 @@ def _dense(q, k, v, scale: float, causal: bool, geom=None):
     left. It is not worth it: that is 1.5% of a 51 us call at S=128 and nothing
     above it.
     """
+    if _BACKEND == "cpp":
+        return _dense_cpp(q, k, v, scale, causal)
     out = _amx_dense(q, k, v, scale, causal)
     if out is not None:
         return out
