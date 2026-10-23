@@ -124,6 +124,20 @@ constexpr size_t logit_aux_floats(int kt) {
     return 0;
 }
 
+// Optional policy member: `static void store_bf16(char* dst, const float* src,
+// int hd, float inv)` writing `hd` rounded bf16 outputs. The default is a scalar
+// loop whose NaN branch (`f32_to_bf16`) stops GCC from vectorising; at
+// 128:8:64 the scalar form is 1.6 us of a 27 us call.
+template <class P>
+inline void store_bf16(char* dst, const float* src, int hd, float inv) {
+  if constexpr (requires { P::store_bf16(dst, src, hd, inv); }) {
+    P::store_bf16(dst, src, hd, inv);
+  } else {
+    bf16* o = reinterpret_cast<bf16*>(dst);
+    for (int d = 0; d < hd; ++d) o[d] = f32_to_bf16(src[d] * inv);
+  }
+}
+
 template <class P>
 constexpr bool zeroes_acc() {
   if constexpr (requires { P::zeroes_acc; })
@@ -252,8 +266,7 @@ void dense_run(const DenseJob& job, int workers) {
           float* o = reinterpret_cast<float*>(op);
           for (int d = 0; d < hd; ++d) o[d] = src[d] * inv;
         } else {
-          bf16* o = reinterpret_cast<bf16*>(op);
-          for (int d = 0; d < hd; ++d) o[d] = f32_to_bf16(src[d] * inv);
+          store_bf16<P>(op, src, hd, inv);
         }
       }
     };

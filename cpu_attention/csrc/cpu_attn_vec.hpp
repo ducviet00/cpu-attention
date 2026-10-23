@@ -237,6 +237,14 @@ struct Dense {
   static size_t slab_bytes(int64_t seq_k, int hd) {
     return static_cast<size_t>(2 * pad_of(seq_k) * hd) * ESZ;
   }
+  // bf16 output: one 32-byte store per 16 dims (`_mm512_cvtneps_pbh` is
+  // round-to-nearest-even, the same as `f32_to_bf16`).
+  static void store_bf16(char* dst, const float* src, int hd, float inv) {
+    const __m512 vi = _mm512_set1_ps(inv);
+    for (int d = 0; d < hd; d += 16)
+      _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + d * 2),
+                          pack_bf16_16(_mm512_mul_ps(ld16(src + d), vi)));
+  }
   static size_t aux_bytes(int rq, int hd) {
     const size_t rows = static_cast<size_t>(acc_rows(rq));
     // logits (fp32) | probability pairs (bf16, one 32-bit word per key pair) |

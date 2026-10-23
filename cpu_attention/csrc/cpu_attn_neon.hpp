@@ -69,6 +69,18 @@ inline void stb4(void* p, bfloat16x4_t v) {
   vst1_bf16(static_cast<bfloat16_t*>(p), v);
 }
 
+// bf16 output of `hd` floats scaled by `inv`: one 16-byte store per 8 dims.
+// `vcvt_bf16_f32` rounds to nearest even, the same as the scalar
+// `f32_to_bf16`, and the vector form is 2.5x the scalar loop (which the NaN
+// branch in `f32_to_bf16` keeps GCC from vectorising).
+inline void store_bf16_out(char* dst, const float* src, int hd, float inv) {
+  const float32x4_t vi = vdupq_n_f32(inv);
+  for (int d = 0; d < hd; d += 8)
+    stb(dst + d * 2,
+        vcombine_bf16(vcvt_bf16_f32(vmulq_f32(vld1q_f32(src + d), vi)),
+                      vcvt_bf16_f32(vmulq_f32(vld1q_f32(src + d + 4), vi))));
+}
+
 // Two adjacent bf16 (a head-dim pair of one key, or a key pair of one
 // probability row) broadcast to all four fp32 lanes: the A operand of bfdot.
 inline bfloat16x8_t dup_pair(const void* p) {
@@ -157,6 +169,9 @@ inline size_t round64(size_t n) { return (n + 63) & ~size_t(63); }
 template <int HD, int KTC>
 struct DenseF32 {
   static constexpr int RQT = 8;
+  static void store_bf16(char* dst, const float* src, int hd, float inv) {
+    store_bf16_out(dst, src, hd, inv);
+  }
   static constexpr int KTMAXV = 2048;
 
   static constexpr int kt_() { return KTC; }
@@ -476,6 +491,9 @@ struct DenseF32 {
 template <int HD, int KTC>
 struct DenseBF {
   static constexpr int RQT = 8;
+  static void store_bf16(char* dst, const float* src, int hd, float inv) {
+    store_bf16_out(dst, src, hd, inv);
+  }
   static constexpr int KTMAXV = 2048;
   static constexpr int DG = HD / 4;   // head-dim groups of 4
   static constexpr int RP = RQT / 2;  // row pairs
