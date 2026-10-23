@@ -314,7 +314,7 @@ struct Dense {
       if constexpr (BF) {
         // V goes to [key/2][hd][2]: one 64-byte store holds 16 dims of two
         // adjacent keys, which is the pair `dpbf16ps` contracts in P@V. That is
-        // worth 2.1x on the phase (tests/bench_vec_prims.cpp, pv_dot32).
+        // worth 2.05x on the phase (tests/bench_vec_prims.cpp, pv_fma).
         for (int64_t t = 0; t < tn; t += 2) {
           const char* a = vsrc + (t0 + t) * job.vt * ESZ;
           const bool have_b = (t + 1) < tn;
@@ -509,7 +509,7 @@ struct Dense {
   // bf16 runs `dpbf16ps` with the contraction on keys: one instruction
   // multiplies a broadcast key-pair probability by 16 dims of two adjacent keys
   // and accumulates 32 MACs against 16 for an fp32 FMA. That is 2.1x the phase
-  // (tests/bench_vec_prims.cpp, "pv_dot32") and it is why P@V was 56% of the
+  // (tests/bench_vec_prims.cpp, 'pv_fma') and it is why P@V was 56% of the
   // 2048:16:128 bf16 call. The accumulator is a 32-dim chunk (two zmm per row)
   // so eight rows plus the operands stay inside 32 registers.
   static void pv(const DenseJob& job, const char* slab, int64_t, int64_t,

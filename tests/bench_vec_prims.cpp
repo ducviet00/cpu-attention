@@ -29,6 +29,55 @@ char* workspace(uint64_t, size_t bytes) {
 
 namespace {
 
+namespace {
+inline void st16v(void* p, __m512 v) { _mm512_storeu_ps(p, v); }
+inline __m512 ld16v(const void* p) { return _mm512_loadu_ps(p); }
+inline __m512 widen(const void* p) {
+  const __m256i raw = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p));
+  return _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(raw), 16));
+}
+
+// The P@V the bf16 policy used before the key-pair layout: fp32 FMA over
+// widened V, which is what the shipped `dpbf16ps` form replaced. Same output
+// buffer, same 32-dim chunk; only the multiply changes.
+template <int HD>
+double bench_pv_fma(const float* p, const char* v, int64_t nkeys, int kt,
+                    float* acc, int iters) {
+  const int RQT = 8;
+  double best = 1e30;
+  for (int r = 0; r < 3; ++r) {
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < iters; ++i) {
+      for (int dc = 0; dc < HD; dc += 32) {
+        __m512 c[RQT][2];
+        for (int j = 0; j < RQT; ++j) {
+          c[j][0] = ld16v(acc + j * HD + dc);
+          c[j][1] = ld16v(acc + j * HD + dc + 16);
+        }
+        for (int64_t j = 0; j < nkeys; ++j) {
+          const char* vv = v + (j * HD + dc) * 2;
+          const __m512 v0 = widen(vv);
+          const __m512 v1 = widen(vv + 32);
+          for (int k = 0; k < RQT; ++k) {
+            const __m512 pr = _mm512_set1_ps(p[k * kt + j]);
+            c[k][0] = _mm512_fmadd_ps(pr, v0, c[k][0]);
+            c[k][1] = _mm512_fmadd_ps(pr, v1, c[k][1]);
+          }
+        }
+        for (int j = 0; j < RQT; ++j) {
+          st16v(acc + j * HD + dc, c[j][0]);
+          st16v(acc + j * HD + dc + 16, c[j][1]);
+        }
+      }
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    const double sec = std::chrono::duration<double>(t1 - t0).count() / iters;
+    if (sec < best) best = sec;
+  }
+  return best;
+}
+}  // namespace
+
 template <int DT, int HD>
 void run(int64_t seq_k, int rows, int iters) {
   using P = vec::Dense<DT, HD>;
@@ -43,7 +92,10 @@ void run(int64_t seq_k, int rows, int iters) {
   (void)esz;
   std::vector<float> qbuf(static_cast<size_t>(rows) * HD, 0.01f);
   const int kt = P::kt_();
-  std::vector<float> logits(static_cast<size_t>(P::RQT) * kt);
+  // The bf16 policy keeps its probability pairs between the logits tile and the
+  // accumulator (`logit_aux_floats`), so the tile needs that space too.
+  std::vector<float> logits(static_cast<size_t>(P::RQT) * kt +
+                            P::logit_aux_floats(kt));
   std::vector<float> acc(static_cast<size_t>(P::acc_rows(rows)) * HD);
   std::vector<float> ml(static_cast<size_t>(P::acc_rows(rows)) * 3);
   DenseJob job;
@@ -86,6 +138,16 @@ void run(int64_t seq_k, int rows, int iters) {
   const double t1 = bench("qk", 0);
   const double t2 = bench("softmax", 2);
   const double t3 = bench("pv", 1);
+  // Same P@V as bf16 runs it now (`dpbf16ps`, key pairs) against the fp32 FMA
+  // form, so the 2.1x that decided the layout is reproducible here.
+  if constexpr (DT == kBF16) {
+    // The shipped bf16 P@V is the `dpbf16ps` form, so `pv` above is that one;
+    // this is the fp32-FMA-over-widened-V body it replaced.
+    std::vector<char> vb(slab_bytes, 1);
+    const double t4 = bench_pv_fma<HD>(logits.data(), vb.data(), seq_k, kt,
+                                       acc.data(), iters);
+    std::printf(" pv_fma %5.1f us  dpbf16ps/fma %.2fx", t4 * 1e6, t4 / t3);
+  }
   // zmm FMAs: qk = rows*keys*HD/16, pv = the same, softmax ~ 3 ops per pair/16.
   const double qk_fma = pairs_per_tile * HD / 16.0;
   const double pv_fma = pairs_per_tile * HD / 16.0;

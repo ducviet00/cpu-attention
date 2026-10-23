@@ -9,7 +9,6 @@ are strided chunks of a fused projection (what the engine actually passes).
     CPU_ATTENTION_BACKEND=mojo python tests/test_paged_sweep.py
 """
 
-import argparse
 import itertools
 import os
 import sys
@@ -91,10 +90,7 @@ def run_case(batch, ctx, heads, kvh, hd, page, dtype, strided, seed):
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--limited", action="store_true",
-                    help="one shape per (hd, page, gqa) instead of all")
-    args = ap.parse_args()
+    # No options: the sweep is the point.
     torch.manual_seed(0)
     torch.set_num_threads(8)
     print(f"backend {_kernel.backend()}", flush=True)
@@ -106,9 +102,8 @@ def main():
     # fp32-accurate reference legitimately disagrees by ~4e-3); fp32 against the
     # naive fp32 reference in absolute terms.
     other = "mojo" if _kernel.backend() == "cpp" else "cpp"
-    shapes = ([(1, 1, False), (17, 1, True), (33, 3, False),
-               (256, 2, True), (257, 1, False), (1024, 1, True),
-               (2049, 2, False)] if not args.limited else [(256, 2, True)])
+    shapes = [(1, 1, False), (17, 1, True), (33, 3, False), (256, 2, True),
+              (257, 1, False), (1024, 1, True), (2049, 2, False)]
     for hd, page, (heads, kvh) in itertools.product(
         (32, 64, 128), (16, 32, 48, 64), ((16, 16), (16, 8), (16, 4))
     ):

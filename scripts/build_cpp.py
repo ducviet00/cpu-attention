@@ -85,11 +85,12 @@ def main() -> None:
     print(f"built {LIB} in {time.time() - t0:.1f}s")
 
     if "--test" in sys.argv:
-        sys.path.insert(0, ROOT)
-        os.environ.setdefault("CPU_ATTENTION_BACKEND", "cpp")
-        subprocess.run([sys.executable, os.path.join(ROOT, "tests",
-                                                     "test_cpp_smoke.py")],
-                       check=True)
+        # Parity smoke: the dense suite covers the plan entry, GQA, masks and
+        # both dtypes; the flash-shaped API covers the paged path.
+        env = dict(os.environ, CPU_ATTENTION_BACKEND="cpp", PYTHONPATH=ROOT)
+        for script in ("tests/test_dense.py", "tests/test_flash_api.py"):
+            subprocess.run([sys.executable, os.path.join(ROOT, script)],
+                           check=True, env=env)
 
 
 if __name__ == "__main__":
