@@ -568,3 +568,29 @@ reproduce is: `pack` accumulates `max|k|` into a 64-byte slab tail,
 `qk` computes `m_r` per row and exponentiates its 2x2 `bfmmla` accumulators into
 the bf16 P operand layout (`stb(dst, combine(cvt(ev0), cvt(od0)))`,
 `stb(dst+16, ...)`), `softmax` flushes the per-row sums, `pv` unchanged.
+
+
+## Round 9 (primary, on `main`): the phase ablation, and what it rules out
+
+`CPU_ATTENTION_NEON_MODE` (bits 1/2/4/8 skip pack / Q@K^T / softmax / P@V) added
+to both NEON dense policies. `1024:16:128` fp32, one process, 25 rounds:
+
+| share | value |
+|---|---|
+| driver + epilogue (all phases skipped) | 696 us = 8% |
+| pack | 154 us = 2% |
+| Q@K^T | 4088 us = 48% |
+| softmax | ~0 |
+| P@V | 5296 us = 62% |
+
+and `1024:8:64` bf16: 310 us (35%) of driver+`qk`, 237 us (27%) softmax, 296 us
+(34%) P@V.
+
+Measured against that: the FA4 -8 rescale slack is +1.7-2.3% on bf16 and -0.6-0.8%
+on fp32 (net zero, reverted -- the fp32 floor is the epilogue's stores, not the
+rescale), pack prefetching is neutral, and `rq` 512 -> 64 is neutral. The fp32
+FMA peak on this core is **~4 vector FMAs/cycle** (measured: 0.085 ns per
+instruction), so the kernel's 2.25/cycle is ~56% of the roof rather than the roof
+itself -- but the ablation puts both matmul phases near their share of the call,
+so the residue is the inter-phase stalls that the fused-panel and bounded-base
+attempts both failed to remove.

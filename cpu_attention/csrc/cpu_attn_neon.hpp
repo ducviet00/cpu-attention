@@ -50,6 +50,14 @@ namespace {
 // ---------------------------------------------------------------------------
 constexpr float kNegInf = -INFINITY;
 
+// Profiling only (`CPU_ATTENTION_NEON_MODE`): 1 skips the pack, 2 Q@K^T, 4 the
+// softmax, 8 P@V. The skipped phase leaves defined memory behind; results are
+// garbage and timings only.
+inline int neon_mode() {
+  static const int m = env_int("CPU_ATTENTION_NEON_MODE", 0, 0, 15);
+  return m;
+}
+
 inline float32x4_t ldf(const void* p) {
   return vld1q_f32(static_cast<const float*>(p));
 }
@@ -230,6 +238,7 @@ struct DenseF32 {
   }
 
   static void pack(const DenseJob& job, int64_t b, int64_t kvh, char* slab) {
+    if (neon_mode() & 1) return;
     const int64_t pad = pad_of(job.seq_k);
     const int64_t n = job.seq_k;
     const float* ks =
@@ -270,6 +279,11 @@ struct DenseF32 {
     const int64_t qt = job.qt;
     const float* kd = reinterpret_cast<const float*>(slab);
     const int64_t kend = k0 + nkeys;
+    if (neon_mode() & 2) {
+      for (int r = 0; r < nrows; ++r)
+        std::memset(logits + r * KT, 0, sizeof(float) * nkeys);
+      return;
+    }
     const int64_t lim = std::min<int64_t>(row_limit0, kend - 1);
     const int32x4_t lane = lane_idx();
     const float32x4_t ninf = vdupq_n_f32(kNegInf);
@@ -374,7 +388,7 @@ struct DenseF32 {
           mn[k] = mxv;
           av[k] = 0.0f;
         } else {
-          mn[k] = mo > mxv ? mo : mxv;
+          mn[k] = mxv;
           av[k] = std::exp2(mo - mn[k]);
         }
         m[r] = mn[k];
@@ -458,6 +472,7 @@ struct DenseF32 {
     const float* pt = pof(const_cast<float*>(logits));
     const float* vd =
         reinterpret_cast<const float*>(slab) + pad_of(job.seq_k) * HD;
+    if (neon_mode() & 8) return;
     for (int dc = 0; dc < HD; dc += 8) {
       float32x4_t a[RQT][2];
       if (k0 == 0) {
@@ -564,6 +579,7 @@ struct DenseBF {
   // K -> [tile][HD/4][32 pairs][8]: four head dims of two adjacent keys.
   // V -> [HD/2][pad/4][8]: two head dims of four adjacent keys.
   static void pack(const DenseJob& job, int64_t b, int64_t kvh, char* slab) {
+    if (neon_mode() & 1) return;
     const int64_t pad = pad_of(job.seq_k);
     const int64_t n = job.seq_k;
     const char* ks =
@@ -709,6 +725,7 @@ struct DenseBF {
     const float* tmv = tmax_of(logits);
     const float32x4_t vc = vdupq_n_f32(c);
     const float32x4_t zero = vdupq_n_f32(0.0f);
+    if (neon_mode() & 4) return;
     for (int r0 = 0; r0 < nrows; r0 += 2) {
       const int r1 = r0 + 1 < RQT ? r0 + 1 : r0;
       float mn[2], av[2];
@@ -724,7 +741,7 @@ struct DenseBF {
           mn[k] = mxv;
           av[k] = 0.0f;
         } else {
-          mn[k] = mo > mxv ? mo : mxv;
+          mn[k] = mxv;
           av[k] = std::exp2(mo - mn[k]);
         }
         m[r] = mn[k];
@@ -829,6 +846,7 @@ struct DenseBF {
     const int64_t pad = pad_of(job.seq_k);
     const int64_t vs = (pad / 4) * 16;  // one key group of one dim pair
     const char* vd = slab + pad * HD * 2 + (k0 / 4) * 16;
+    if (neon_mode() & 8) return;
     // Eight head dims per pass: the accumulator is 4 row pairs x 4 dim pairs =
     // 16 registers, which leaves room for the operands. Sixteen dims per pass
     // would halve the number of sweeps over V but needs 32 accumulator

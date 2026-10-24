@@ -344,6 +344,9 @@ are worth reading before touching an inner loop.
 | pack K^T as `[hd][seq_k]` (no 64-key blocking) | **1.17x slower** at 4096:16:128 fp32 | `seq_k*4` bytes between dims is a TLB miss per load. |
 | 1/2/4 workers for the b=1 paged rows | 19.8 / 12.9 / 8.8 µs against **7.3 at 8** | the pool always wins above 32 KV positions per call. |
 | keep the *fused register panel* on aarch64 (logits in registers, no round trip) | **1.52x slower** | the logits fit in registers but the *output* accumulator does not, so panel-looping pays 4 accumulator load/stores per row-key against 0.125 for the tile loop. |
+| aarch64: FA4's -8 rescale slack in the NEON softmax | bf16 +1.7-2.3%, fp32 -0.6-0.8%, net ~0, reverted | the driver's rescale is not where the fp32 8% floor goes: the epilogue's output stores dominate it. |
+| aarch64: source prefetch in the bf16 pack (the walk is 1 KB-strided) | neutral (1.001-1.004) | already prefetched by the hardware; the pack is not latency-bound at these sizes. |
+| aarch64: `rq` 512 -> 64 and 128 -> 64 (accumulator 128 KB vs 16 KB at D=64) | 0.990-1.008 | the accumulator is L2-resident either way, and 8-dim `pv` passes stream it. |
 | aarch64: delete the fp32 logits round trip (Cauchy-Schwarz fixed base, `qk` writes bf16 P and the row sums, `softmax` becomes a flush) | parity 65/65 + fuzz 80/80 + paged 504/504 after the bound was fixed, but **3-8% slower on all 11 bf16 dense rows** (e.g. 2048:8:64 3404 -> 3556 µs), reverted | the round trip was not the bottleneck. Moving the exponentials into `qk`'s epilogue leaves only four chains in flight inside a register-tight loop, where the tuned separate pass runs eight and hides the ~6-link `exp2` chain; the saved 8 B/row-key of logits traffic is worth less than the exposed latency. The bound itself needed `max_j||k_j||` (key norms), not `max|k_d|` -- a single large component does not bound a dot product, and with the element max `|q.k|` exceeded the bound by 12% on 3 of 128 rows. |
 | a Cauchy-Schwarz fixed base for the row max on aarch64 (delete the max pass and the rescale, `qk` writes bf16 P itself) | implemented twice, **never passed parity**, reverted | the bound itself is now *verified exact*: `max|k|` accumulated in `pack`, `||q_r||` from the query row, and `m_r` match a Python reference to 5 digits for all 8 heads of a 128-key D=64 case, and `qk`'s per-row probability sums match too. The first version read `||q_r||` out of the packed Q group, where one 16-byte group holds *both* rows of a row pair, so the bound was 1.4x too large; fixing that left a second, unisolated defect in the `qk`-writes-P -> `pv`-reads-P handoff: for 3 of 8 heads the P@V numerator is wrong (row sums -7.6 against -14.2 exact) while `l` is right, identically with 1 worker and with both dispatch orders, so it is not a race. One row-mapping bug stands between this variant and being measurable; the recipe (pack kmax, the `m_r` prologue, the in-place exp epilogue) is in `docs/arm/RESULTS.md`. |
 | fp32 via bf16 `bfmmla` hi/lo on aarch64 | **1.2%** (9177 -> 9064 µs at 2048:8:64) | `bfmmla` issues at 1.88-2.5/cycle against the scalar FMA's 2.25, so 3x the products at 2x the density nets out, and the doubled operand loads take the rest. |
@@ -362,6 +365,11 @@ are worth reading before touching an inner loop.
 * **x86 AMX:** both matmul phases at 55-87% of the `tdpbf16ps` roof; the softmax
   is the largest single phase at D=64 (45% of a call), the pack is DRAM-bound
   (21 GB/s on one thread, 60-111 on four), and `kt=256` beat 128/512.
+* **aarch64 NEON, in-situ phase ablation** (`CPU_ATTENTION_NEON_MODE`, bits
+  1/2/4/8 skip pack / Q@K^T / softmax / P@V): at `1024:16:128` fp32 the call is
+  8% driver + epilogue, 2% pack, 48% `qk`, 62% `pv` (the shares sum past 100%
+  because skipping a phase also removes its downstream data-dependence); at
+  `1024:8:64` bf16 it is 27% softmax and 34% P@V on top of that floor.
 * **aarch64 NEON:** bf16 dense is at 18.6 instructions/row-key against Mojo's
   18.3 and 5.4 cycles against 4.7; the 8 `bfmmla`/row-key are 3.7 of those
   cycles against a 3.2-cycle issue floor. fp32 is at 14.2 cycles/row-key = 32
