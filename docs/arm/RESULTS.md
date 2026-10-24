@@ -536,3 +536,35 @@ What that leaves, per row:
   V pack for bf16 still moves 4 bytes per store (four `memcpy` of 4 bytes per
   16-byte group); at 128 keys it is ~2.6 us of a 25.6 us call. A two-dim-pair
   pack would halve it (~5% of that row) and nothing more.
+
+
+## Round 8 (primary, on `main`): the bounded base, re-verified and reverted
+
+The bound is correct. Instrumented on the box with a Python reference of the
+same formula (`p = exp2((q.k)*c - m_r)`, `c = scale*log2e`,
+`m_r = c*||q_r||*max|k|`), for `Sq=Sk=128, H=8, D=64`, non-causal, seed 0:
+
+| head | kmax | exact sum(r0) | kernel sum(r0) |
+|---|---:|---:|---:|
+| 0 | 4.4062 | 1.5819 | 1.58198 |
+| 1 | 3.6875 | 4.6891 | 4.68932 |
+| 2 | 3.6875 | 8.6169 | 8.61731 |
+| 4 | 3.6094 | 8.6401 | 8.64054 |
+| 7 | 3.8906 | 2.6342 | 2.6343 |
+
+So `pack`'s `max|k|`, the `||q_r||` prologue and the in-place exponential are
+all right. (An earlier version read `||q_r||` from the packed Q group, where one
+16-byte group holds *both* rows of a row pair -- the bound came out 1.4x too
+large and every probability silently shrank; reading the query row directly
+fixes it.)
+
+What still fails is the handoff to P@V: heads 1, 4 and 6 of that case give an
+output 0.06-0.25 wrong while their `qk` sums are exact, and the implied
+numerator (`out * l`) is up to half the exact one for some rows. It reproduces
+identically with one worker, and with `CPU_ATTENTION_FUSE=0` and `=1`, so it is
+a deterministic row-mapping bug in `qk`-writes-P -> `pv`-reads-P, not a race.
+That is the one open path to the aarch64 dense rows; everything needed to
+reproduce is: `pack` accumulates `max|k|` into a 64-byte slab tail,
+`qk` computes `m_r` per row and exponentiates its 2x2 `bfmmla` accumulators into
+the bf16 P operand layout (`stb(dst, combine(cvt(ev0), cvt(od0)))`,
+`stb(dst+16, ...)`), `softmax` flushes the per-row sums, `pv` unchanged.
