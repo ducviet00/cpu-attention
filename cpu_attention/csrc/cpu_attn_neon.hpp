@@ -169,6 +169,10 @@ inline size_t round64(size_t n) { return (n + 63) & ~size_t(63); }
 template <int HD, int KTC>
 struct DenseF32 {
   static constexpr int RQT = 8;
+  // `pv` writes the accumulator on its first key tile, so the driver's memset of
+  // `acc_rows * hd` floats per work item is dead work: 256 KB per call at
+  // 128:8:64 (a quarter of the row) and 3-11% at 2048-4096 keys.
+  static constexpr bool zeroes_acc = true;
   static void store_bf16(char* dst, const float* src, int hd, float inv) {
     store_bf16_out(dst, src, hd, inv);
   }
@@ -456,9 +460,16 @@ struct DenseF32 {
         reinterpret_cast<const float*>(slab) + pad_of(job.seq_k) * HD;
     for (int dc = 0; dc < HD; dc += 8) {
       float32x4_t a[RQT][2];
-      for (int r = 0; r < RQT; ++r) {
-        a[r][0] = ldf(acc + r * HD + dc);
-        a[r][1] = ldf(acc + r * HD + dc + 4);
+      if (k0 == 0) {
+        for (int r = 0; r < RQT; ++r) {
+          a[r][0] = vdupq_n_f32(0.0f);
+          a[r][1] = vdupq_n_f32(0.0f);
+        }
+      } else {
+        for (int r = 0; r < RQT; ++r) {
+          a[r][0] = ldf(acc + r * HD + dc);
+          a[r][1] = ldf(acc + r * HD + dc + 4);
+        }
       }
       // Pointer walk: the V row of the next key is `HD` floats on and the P
       // panel's next key is `RQT`, so neither the key index nor the (key, dim)
@@ -491,6 +502,7 @@ struct DenseF32 {
 template <int HD, int KTC>
 struct DenseBF {
   static constexpr int RQT = 8;
+  static constexpr bool zeroes_acc = true;  // see DenseF32
   static void store_bf16(char* dst, const float* src, int hd, float inv) {
     store_bf16_out(dst, src, hd, inv);
   }
@@ -823,11 +835,16 @@ struct DenseBF {
     // registers and spills 1.16x slower (measured).
     for (int dc = 0; dc < HD; dc += 8) {
       float32x4_t a[RP][4];
-      for (int rp = 0; rp < RP; ++rp) {
-        const int r0 = 2 * rp, r1 = 2 * rp + 1;
-        for (int i = 0; i < 4; ++i)
-          a[rp][i] = vcombine_f32(vld1_f32(acc + r0 * HD + dc + 2 * i),
-                                  vld1_f32(acc + r1 * HD + dc + 2 * i));
+      if (k0 == 0) {
+        for (int rp = 0; rp < RP; ++rp)
+          for (int i = 0; i < 4; ++i) a[rp][i] = vdupq_n_f32(0.0f);
+      } else {
+        for (int rp = 0; rp < RP; ++rp) {
+          const int r0 = 2 * rp, r1 = 2 * rp + 1;
+          for (int i = 0; i < 4; ++i)
+            a[rp][i] = vcombine_f32(vld1_f32(acc + r0 * HD + dc + 2 * i),
+                                    vld1_f32(acc + r1 * HD + dc + 2 * i));
+        }
       }
       // Both operands advance by one 16-byte group per four keys, so the walk is
       // two pointers and an add per group. Recomputing the V address from
