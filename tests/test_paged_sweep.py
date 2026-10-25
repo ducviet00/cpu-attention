@@ -109,7 +109,10 @@ def main():
     ):
         for ctx, batch, strided in shapes:
             for dtype in (torch.float32, torch.bfloat16):
-                seed = hash((batch, ctx, heads, kvh, hd, page, dtype)) & 0xffff
+                # Python hashes dtype objects by address, so the old seed changed
+                # with ASLR. A failing case must reproduce in a fresh process.
+                seed = (batch * 3 + ctx * 5 + heads * 7 + kvh * 11 +
+                        hd * 13 + page * 17 + int(dtype == torch.bfloat16))
                 got, got_x, ref = run_case(batch, ctx, heads, kvh, hd, page,
                                            dtype, strided, seed)
                 # Same case and the same tensors through the other backend.
@@ -120,7 +123,7 @@ def main():
                 if dtype == torch.float32:
                     err = max((got.float() - ref).abs().max().item(),
                               (got_x.float() - ref).abs().max().item())
-                    tol = 2e-6
+                    tol = 1e-6
                 else:
                     # bfs ulps at the row's peak output: one ulp of a bf16 value
                     # near `peak` is `peak * 2^-8`, which is the scale the
@@ -141,7 +144,7 @@ def main():
                     print(f"FAIL hd={hd} page={page} h={heads}/{kvh} ctx={ctx} "
                           f"b={batch} strided={strided} "
                           f"{'fp32' if dtype == torch.float32 else 'bf16'}: "
-                          f"{err:.3e} > {'2e-6' if dtype == torch.float32 else '2 ulp'}",
+                           f"{err:.3e} > {'1e-6' if dtype == torch.float32 else '2 ulp'}",
                           flush=True)
     print(f"paged sweep: {cases - bad}/{cases} within tolerance")
     print(f"  worst fp32 {worst[torch.float32]:.2e} at {worst_at.get(torch.float32)}")

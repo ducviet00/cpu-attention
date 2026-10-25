@@ -713,8 +713,16 @@ struct Paged {
         cv = _mm512_dpbf16_ps(cv, bcast_pair(q + di * 4), load_pair_bf16(kp + di * krow));
     } else {
       const float* qf = reinterpret_cast<const float*>(q);
-      for (int di = 0; di < NDIM; ++di)
-        cv = _mm512_fmadd_ps(_mm512_set1_ps(qf[di]), ld16(kp + di * krow), cv);
+      // One long FMA chain pays the latency of every dimension. Four partial
+      // dots overlap those loads and reduce rounding error at head_dim 128.
+      __m512 c0 = _mm512_setzero_ps(), c1 = c0, c2 = c0, c3 = c0;
+      for (int di = 0; di < NDIM; di += 4) {
+        c0 = _mm512_fmadd_ps(_mm512_set1_ps(qf[di]), ld16(kp + di * krow), c0);
+        c1 = _mm512_fmadd_ps(_mm512_set1_ps(qf[di + 1]), ld16(kp + (di + 1) * krow), c1);
+        c2 = _mm512_fmadd_ps(_mm512_set1_ps(qf[di + 2]), ld16(kp + (di + 2) * krow), c2);
+        c3 = _mm512_fmadd_ps(_mm512_set1_ps(qf[di + 3]), ld16(kp + (di + 3) * krow), c3);
+      }
+      cv = _mm512_add_ps(_mm512_add_ps(c0, c1), _mm512_add_ps(c2, c3));
     }
     if (jj + 16 <= len) {
       st16(out, cv);

@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <vector>
 
 #include "cpu_attn.hpp"
@@ -59,7 +60,7 @@ void store(const PagedJob&, int);
 namespace {
 struct Slot {
   uint64_t key;
-  char* ptr;
+  std::unique_ptr<char, decltype(&std::free)> ptr;
   size_t bytes;
 };
 thread_local std::vector<Slot> g_slots;
@@ -69,26 +70,24 @@ constexpr size_t kWorkspaceCap = size_t(1536) << 20;
 char* workspace(uint64_t key, size_t bytes) {
   for (auto& s : g_slots) {
     if (s.key == key) {
-      if (s.bytes >= bytes) return s.ptr;
-      std::free(s.ptr);
-      s.ptr = static_cast<char*>(aligned_alloc64(bytes));
+      if (s.bytes >= bytes) return s.ptr.get();
+      s.ptr.reset(static_cast<char*>(aligned_alloc64(bytes)));
       s.bytes = bytes;
-      return s.ptr;
+      return s.ptr.get();
     }
   }
   size_t total = 0;
   for (const auto& s : g_slots) total += s.bytes;
   if (total + bytes > kWorkspaceCap) {
-    for (auto& s : g_slots) std::free(s.ptr);
     g_slots.clear();
   }
   char* p = static_cast<char*>(aligned_alloc64(bytes));
-  g_slots.push_back(Slot{key, p, bytes});
+  // The owning slot also frees its buffer when the calling Python thread exits.
+  g_slots.push_back(Slot{key, {p, &std::free}, bytes});
   return p;
 }
 
 void workspace_clear() {
-  for (auto& s : g_slots) std::free(s.ptr);
   g_slots.clear();
 }
 
@@ -108,17 +107,16 @@ bool env_off(const char* name) {
   return v != nullptr && v[0] == '0' && v[1] == '\0';
 }
 
-int pick_paged_isa() {
+int pick_paged_isa(int dtype) {
   const char* forced = std::getenv("CPU_ATTENTION_ISA");
-  if (forced != nullptr) {
-    if (forced[0] == 's') return kIsaScalar;
-    if (forced[0] == 'v') return kIsaVec;
-    if (forced[0] == 'a') return kIsaAmx;
-  }
+  if (forced && std::strcmp(forced, "scalar") == 0) return kIsaScalar;
 #if defined(__x86_64__)
-  if (amx::available()) return kIsaAmx;
+  if (dtype == kBF16 && !cpu().avx512bf16) return kIsaScalar;
+  if ((!forced || std::strcmp(forced, "amx") == 0) && amx::available())
+    return kIsaAmx;
   if (vec::available()) return kIsaVec;
 #elif defined(__aarch64__)
+  if (dtype == kBF16 && !cpu().bf16) return kIsaScalar;
   if (neon::available()) return kIsaNeon;
 #endif
   return kIsaScalar;
@@ -132,13 +130,11 @@ int pick_dense_isa(const DenseJob& job) {
   // CPU_ATTENTION_ISA=scalar|vec|amx pins the dense kernel for an A/B; the
   // paged path follows the same lever through pick_paged_isa.
   const char* forced = std::getenv("CPU_ATTENTION_ISA");
-  if (forced != nullptr) {
-    if (forced[0] == 's') return kIsaScalar;
-    if (forced[0] == 'v') return kIsaVec;
-    if (forced[0] == 'a') return kIsaAmx;
-  }
+  if (forced && std::strcmp(forced, "scalar") == 0) return kIsaScalar;
 #if defined(__x86_64__)
-  if (amx::available() && !env_off("CPU_ATTENTION_AMX")) {
+  if (job.dtype == kBF16 && !cpu().avx512bf16) return kIsaScalar;
+  if ((!forced || std::strcmp(forced, "amx") == 0) &&
+      amx::available() && !env_off("CPU_ATTENTION_AMX")) {
     const bool fp32 = job.dtype == kF32;
     if (!fp32 || !env_off("CPU_ATTENTION_AMX_FP32")) {
       if (amx_init()) return kIsaAmx;
@@ -146,6 +142,7 @@ int pick_dense_isa(const DenseJob& job) {
   }
   if (vec::available()) return kIsaVec;
 #elif defined(__aarch64__)
+  if (job.dtype == kBF16 && !cpu().bf16) return kIsaScalar;
   if (neon::available()) return kIsaNeon;
 #endif
   (void)job;
@@ -155,8 +152,9 @@ int pick_dense_isa(const DenseJob& job) {
 }  // namespace
 
 void attention_entry(const PagedJob& job, int workers, bool do_store,
-                     bool do_attend) {
-  const int isa = pick_paged_isa();
+                      bool do_attend) {
+  workers = std::max(1, std::min({workers, physical_cores(), omp_get_max_threads()}));
+  const int isa = pick_paged_isa(job.dtype);
   // The attend entry takes the store with it when both are asked for: one
   // OpenMP region instead of two (the second fork-join is ~1.1 us, a sixth of a
   // batch-1 call). `shape_only` below is the store-only form reshape_and_cache
@@ -204,6 +202,7 @@ int dense_isa_name() {
 }
 
 void dense_entry(const DenseJob& job, int workers) {
+  workers = std::max(1, std::min({workers, physical_cores(), omp_get_max_threads()}));
   const int isa = pick_dense_isa(job);
   if (isa == kIsaAmx) {
 #if defined(__x86_64__)

@@ -185,10 +185,11 @@ def _workers(num_tasks: int, pages: int = 1) -> int:
     it is 8x. The cap at the *physical* core count matters on SMT boxes (8
     workers on a 4-core Xeon: 1.5x slower at ctx 1024); torch already sizes its
     pool that way, so it only bites when a parent sets a larger
-    ``OMP_NUM_THREADS``. ``CPU_ATTENTION_WORKERS`` overrides everything.
+    ``OMP_NUM_THREADS``. ``CPU_ATTENTION_WORKERS`` selects within that cap.
     """
     if _OVERRIDE:
-        return max(1, min(int(_OVERRIDE), num_tasks))
+        return max(1, min(int(_OVERRIDE), num_tasks, _physical_cores(),
+                          torch.get_num_threads()))
     workers = min(torch.get_num_threads(), _physical_cores(), num_tasks)
     if workers > 1 and num_tasks * pages <= 32:
         return 1
@@ -265,9 +266,6 @@ def _call(
     return out
 
 
-_PAGED_BUFS = []
-"""Plan buffers held for the process: the C++ closures capture their address."""
-
 _PAGED_PLANS = threading.local()
 """Per-thread geometry -> fast call, for the paged path.
 
@@ -317,7 +315,7 @@ def _paged_plan(query, key, value, k_cache, page_table, do_store):
                  _DTYPE_CODES[query.dtype], 0.0, workers, int(bool(do_store)))
 
             def fn(out, query, key, value, k_cache, v_cache, slots, block_table,
-                   lens, scale):
+                   lens, scale, _keep=pbuf):
                 fwd(addr, query.data_ptr(),
                     key.data_ptr() if key is not None else 0,
                     value.data_ptr() if value is not None else 0,
@@ -326,7 +324,6 @@ def _paged_plan(query, key, value, k_cache, page_table, do_store):
                     block_table.data_ptr(), lens.data_ptr(), query.stride(0),
                     key.stride(0) if key is not None else 0, scale)
 
-            _PAGED_BUFS.append(pbuf)
         else:
             args = [
                 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -373,17 +370,17 @@ def _paged(
     if out is None:
         out = torch.empty(query.shape, dtype=query.dtype)
     fn = _paged_plan(query, key, value, k_cache, page_table, do_store)
-    if do_store and key is not None and query.shape[1] != k_cache.shape[1]:
+    if (_BACKEND == "mojo" and do_store and key is not None and
+            query.shape[1] != k_cache.shape[1]):
         # GQA/MQA: the query heads of one group are different tasks, so a reader
         # could overtake another head's store. Two calls put every store before
         # every attend. MHA (the engine's models) keeps the single call, and its
         # 24-calls-per-step path never pays this.
-        store = _paged_plan(query, key, value, k_cache, page_table, True)
+        from .ops import reshape_and_cache
+
+        reshape_and_cache(key, value, k_cache, v_cache, slots)
         attend = _paged_plan(query, None, None, k_cache, page_table, False)
-        store(out, query, key, value, k_cache, v_cache, slots, page_table, lens,
-              scale)
-        attend(out, query, None, None, k_cache, v_cache, None, page_table, lens,
-               scale)
+        attend(out, query, None, None, k_cache, v_cache, None, page_table, lens, scale)
         return out
     fn(out, query, key, value, k_cache, v_cache, slots, page_table, lens, scale)
     return out
