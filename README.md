@@ -12,8 +12,8 @@ works as a standalone library.
 * Two interchangeable kernels behind one API: a C++ backend in
   `cpu_attention/csrc/` and the original Mojo kernel in
   `cpu_attention/_mojo/`. `CPU_ATTENTION_BACKEND=auto|cpp|mojo` selects one;
-  `auto` (the default) is `cpp` on x86-64 and `mojo` on aarch64, which is where
-  each measured ahead — see [`docs/CPP_REPORT.md`](docs/CPP_REPORT.md). Both
+  The default stays `mojo` pending the full C++ acceptance scorecard. Explicit
+  `auto` selects `cpp` on x86-64 and `mojo` on aarch64. Both
   shared objects load in one process, so `tests/bench_cpp.py` A/Bs them.
 * Linux, PyTorch, Python ≥ 3.10. The Mojo backend's build needs the `mojo` wheel
   (installed by the `build` extra), not a separate Mojo toolchain; the C++ one

@@ -23,13 +23,9 @@ import threading
 
 import torch
 
-# `auto` resolves per architecture, and the split is measured rather than
-# assumed: the C++ backend is ahead of the Mojo kernel on all 22 dense rows and
-# 19 of 20 paged rows on the x86 boxes, while on aarch64 its dense prefill is
-# 1.02-1.19 of Mojo's (its paged path is still 20/20 ahead there, so
-# `CPU_ATTENTION_BACKEND=cpp` remains the right choice for a paged-heavy
-# workload). docs/CPP_REPORT.md §10.2 has the cycle and instruction counts.
-_CHOSEN = os.environ.get("CPU_ATTENTION_BACKEND", "auto").lower()
+# Keep Mojo as the default until the full cross-ISA scorecard passes. Explicit
+# `auto` retains the earlier architecture-specific choice for existing callers.
+_CHOSEN = os.environ.get("CPU_ATTENTION_BACKEND", "mojo").lower()
 if _CHOSEN == "auto":
     _CHOSEN = "cpp" if platform.machine() in ("x86_64", "AMD64") else "mojo"
 if _CHOSEN not in ("mojo", "cpp"):

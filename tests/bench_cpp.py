@@ -14,6 +14,7 @@ always kept as the noise floor.
 import argparse
 import json
 import os
+import platform
 import sys
 
 import torch
@@ -69,17 +70,37 @@ def one(name, fn, rounds, warmup=2):
     return C.stats(out)
 
 
+def time_arms(arms, rounds, calls):
+    # Blocks keep short laptop calls in one power state. Divide every sample,
+    # including the duplicate control, by the same number of calls.
+    def block(fn):
+        def run():
+            for _ in range(calls):
+                fn()
+        return run
+
+    samples = C.time_arms({n: block(fn) for n, fn in arms.items()}, rounds)
+    return {n: [x / calls for x in xs] for n, xs in samples.items()}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--vllm", default=os.environ.get("VLLM_REF", ""))
     ap.add_argument("--isa", default=os.environ.get("VLLM_ISA", "vec"))
-    ap.add_argument("--rounds", type=int, default=21)
-    ap.add_argument("--paged-rounds", type=int, default=15)
+    ap.add_argument("--rounds", type=int, default=41)
+    ap.add_argument("--paged-rounds", type=int, default=41)
     ap.add_argument("--block", type=int, default=32)
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--only", default="dense,paged")
+    ap.add_argument("--dtype", choices=("bf16", "fp32", "both"), default="both")
+    ap.add_argument("--preallocated-out", action="store_true",
+                    help="give BOTH paged backends out= (default: both allocate)")
+    ap.add_argument("--block-calls", type=int, default=1,
+                    help="calls per timed arm; use 40 for short laptop calls")
     ap.add_argument("--json", default="")
     args = ap.parse_args()
+    if min(args.rounds, args.paged_rounds, args.block_calls) < 1:
+        ap.error("rounds and block-calls must be positive")
 
     if args.threads:
         torch.set_num_threads(args.threads)
@@ -90,6 +111,24 @@ def main():
           f"vllm={'yes' if vllm else '-'}", flush=True)
     rows = []
     dtypes = [(torch.bfloat16, "bf16"), (torch.float32, "fp32")]
+    dtypes = [(dt, tag) for dt, tag in dtypes
+              if args.dtype in ("both", tag)]
+    torch.manual_seed(0)
+
+    def save(row):
+        row.update(threads=torch.get_num_threads(), isa=args.isa,
+                   machine=platform.machine(), rounds=(args.rounds
+                       if row["kind"] == "dense" else args.paged_rounds),
+                   block_calls=args.block_calls,
+                   output="preallocated" if row["kind"] == "paged" and
+                       args.preallocated_out else "allocated",
+                   loadavg=os.getloadavg(),
+                   samples_us=s)
+        rows.append(row)
+        # A spot preemption must not destroy all preceding rows.
+        if args.json:
+            with open(args.json, "w") as f:
+                json.dump(rows, f, indent=1)
 
     if "dense" in args.only:
         for seq, heads, dim in DENSE:
@@ -130,7 +169,7 @@ def main():
                     arms["vllm"] = (lambda: vllm.cpu_attention_with_kv_cache(
                         qf, kc, vc, out, qsl, lens, scale, True, None, -1, bt,
                         0.0, meta, None, None, 1.0, 1.0, "auto"))
-                s = C.time_arms(arms, args.rounds)
+                s = time_arms(arms, args.rounds, args.block_calls)
                 st = {n: C.stats(x) for n, x in s.items()}
                 ref = None
                 _kernel.set_backend("cpp")
@@ -141,7 +180,8 @@ def main():
                        "cpp_us": st["cpp"]["min"], "cpp_med": st["cpp"]["median"],
                        "mojo_us": st["mojo"]["min"],
                        "mojo_med": st["mojo"]["median"],
-                       "ctrl_us": st["ctrl"]["min"],
+                        "ctrl_us": st["ctrl"]["min"],
+                       "ctrl_med": st["ctrl"]["median"],
                        "d_cpp": (got.float() - ref).abs().max().item()}
                 if "vllm" in st:
                     row.update(vllm_us=st["vllm"]["min"],
@@ -160,7 +200,9 @@ def main():
                              f"{row['cpp/vllm']:5.3f} mojo/vllm "
                              f"{row['mojo/vllm']:5.3f}")
                 print(line + f"  d {row['d_cpp']:.1e}", flush=True)
-                rows.append(row)
+                if not row["d_cpp"] <= (3e-2 if tag == "bf16" else 2e-4):
+                    raise AssertionError(f"dense parity failed: {row}")
+                save(row)
 
     if "paged" in args.only:
         for dtype, tag in dtypes:
@@ -185,39 +227,30 @@ def main():
                         args.isa, False, None, "auto")
                     vout = torch.empty_like(q)
 
-                # Every arm gets a preallocated output, including ours: the
-                # vLLM entry takes one, and at batch 1 `torch.empty` is 1.3 us
-                # of a 7 us call. `--alloc-out` measures the allocating form.
+                # Allocation policy must be identical for cpp and Mojo. vLLM's
+                # output remains preallocated, as in the original audit.
                 ocpp = torch.empty_like(q)
                 omojo = torch.empty_like(q)
 
                 def arm_self(be):
-                    if be == "cpp":
-                        def f():
-                            _kernel.set_backend(be)
-                            return attn.self_attention(q, k_new, v_new, kcc, vcc,
-                                                       slots, blocks, lens,
-                                                       scale, out=ocpp)
-                        return f
-
+                    kk, vv = (kcc, vcc) if be == "cpp" else (kcm, vcm)
+                    out = (ocpp if be == "cpp" else omojo) \
+                        if args.preallocated_out else None
                     def f():
                         _kernel.set_backend(be)
-                        return attn.self_attention(q, k_new, v_new, kcm, vcm,
-                                                   slots, blocks, lens, scale)
+                        return attn.self_attention(q, k_new, v_new, kk, vv,
+                                                   slots, blocks, lens, scale,
+                                                   out=out)
                     return f
 
                 def arm_cross(be):
-                    if be == "cpp":
-                        def f():
-                            _kernel.set_backend(be)
-                            return attn.cross_attention(q, kcc, vcc, blocks,
-                                                        lens, scale, out=ocpp)
-                        return f
-
+                    kk, vv = (kcc, vcc) if be == "cpp" else (kcm, vcm)
+                    out = (ocpp if be == "cpp" else omojo) \
+                        if args.preallocated_out else None
                     def f():
                         _kernel.set_backend(be)
-                        return attn.cross_attention(q, kcm, vcm, blocks, lens,
-                                                    scale)
+                        return attn.cross_attention(q, kk, vv, blocks, lens,
+                                                    scale, out=out)
                     return f
 
                 for op, mk in (("self", arm_self), ("cross", arm_cross)):
@@ -240,7 +273,7 @@ def main():
                                     None, -1, blocks, 0.0, meta, None, None,
                                     1.0, 1.0, "auto")
                         arms["vllm"] = vf
-                    s = C.time_arms(arms, args.paged_rounds)
+                    s = time_arms(arms, args.paged_rounds, args.block_calls)
                     st = {n: C.stats(x) for n, x in s.items()}
                     _kernel.set_backend("cpp")
                     got = (attn.self_attention(q, k_new, v_new, kcc, vcc, slots,
@@ -256,7 +289,8 @@ def main():
                            "cpp_med": st["cpp"]["median"],
                            "mojo_us": st["mojo"]["min"],
                            "mojo_med": st["mojo"]["median"],
-                           "ctrl_us": st["ctrl"]["min"],
+                            "ctrl_us": st["ctrl"]["min"],
+                            "ctrl_med": st["ctrl"]["median"],
                            "d_cpp": (got.float() - ref).abs().max().item()}
                     if "vllm" in st:
                         row.update(vllm_us=st["vllm"]["min"],
@@ -274,7 +308,9 @@ def main():
                                  f"{row['cpp/vllm']:5.3f} mojo/vllm "
                                  f"{row['mojo/vllm']:5.3f}")
                     print(line + f"  d {row['d_cpp']:.1e}", flush=True)
-                    rows.append(row)
+                    if tag == "fp32" and not row["d_cpp"] <= 1e-6:
+                        raise AssertionError(f"paged parity failed: {row}")
+                    save(row)
 
     if args.json:
         with open(args.json, "w") as f:

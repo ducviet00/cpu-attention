@@ -5,8 +5,16 @@ Python API (`flash_attn_func`, `flash_attn_with_kvcache`, and the engine aliases
 `self_attention` / `cross_attention` / `reshape_and_cache`). `CPU_ATTENTION_BACKEND`
 selects one, both shared objects load in one process, and `tests/bench_cpp.py`
 alternates them for an in-process A/B. `CPU_ATTENTION_BACKEND=auto` (the
-default) picks `cpp` on x86-64 and stays on `mojo` on aarch64: see
+explicit option) picks `cpp` on x86-64 and stays on `mojo` on aarch64: see
 "Known exceptions" §10.2 for the measured reason.
+
+The 2026-10-26 continuation keeps **Mojo as the default** until the user's full
+acceptance criteria pass. The historical tables below do not establish that:
+only 62% of their rows beat both baselines, and the old paged harness gave C++
+`out=` while Mojo allocated despite §3 claiming otherwise. The corrected
+`tests/bench_cpp.py` defaults to allocating for both, offers
+`--preallocated-out` for both, records raw samples and median/control, and
+writes JSON after every row. Old paged ratios are not acceptance evidence.
 
 ```bash
 uv run --extra build python scripts/build_cpp.py           # -> cpu_attention/_C_cpp.so
