@@ -273,6 +273,9 @@ struct Dense {
   static void pack(const DenseJob& job, int64_t b, int64_t kvh, char* slab) {
     if (mode() & 1) return;
     const int64_t pad = pad_of(job.seq_k);
+    // `slab` is an untyped char destination, so GCC otherwise assumes its
+    // stores may alias `job` and reloads both strides for every vector load.
+    const int64_t kstride = job.kt * ESZ, vstride = job.vt * ESZ;
     const char* ksrc =
         static_cast<const char*>(job.k) + (b * job.kb + kvh * job.kh) * ESZ;
     const char* vsrc =
@@ -285,7 +288,7 @@ struct Dense {
         for (int64_t d0 = 0; d0 < HD; d0 += 16) {
           __m512 r[16];
           for (int i = 0; i < 16; ++i) {
-            const char* s = ksrc + (t0 + i) * job.kt * ESZ + d0 * ESZ;
+            const char* s = ksrc + (t0 + i) * kstride + d0 * ESZ;
             r[i] = BF ? widen_bf16(s) : ld16(s);
           }
           transpose16x16_f32(r);
@@ -300,7 +303,7 @@ struct Dense {
         }
       } else {
         for (int64_t t = 0; t < tn; ++t) {
-          const char* s = ksrc + (t0 + t) * job.kt * ESZ;
+          const char* s = ksrc + (t0 + t) * kstride;
           for (int64_t d = 0; d < HD; ++d) {
             if constexpr (BF) {
               std::memcpy(kdst + (kb_off(t0 + t, d / 2) + (d & 1)) * ESZ,
@@ -316,9 +319,9 @@ struct Dense {
         // adjacent keys, which is the pair `dpbf16ps` contracts in P@V. That is
         // worth 2.05x on the phase (tests/bench_vec_prims.cpp, pv_fma).
         for (int64_t t = 0; t < tn; t += 2) {
-          const char* a = vsrc + (t0 + t) * job.vt * ESZ;
+          const char* a = vsrc + (t0 + t) * vstride;
           const bool have_b = (t + 1) < tn;
-          const char* b = have_b ? a + job.vt * ESZ : nullptr;
+          const char* b = have_b ? a + vstride : nullptr;
           char* dst = vdst + ((t0 + t) >> 1) * (HD * 2) * ESZ;
           for (int64_t d0 = 0; d0 < HD; d0 += 16) {
             if (have_b) {
@@ -335,7 +338,7 @@ struct Dense {
       } else {
         for (int64_t t = 0; t < tn; ++t)
           std::memcpy(vdst + (t0 + t) * HD * ESZ,
-                      vsrc + (t0 + t) * job.vt * ESZ, HD * ESZ);
+                      vsrc + (t0 + t) * vstride, HD * ESZ);
       }
     }
     // Zero the padding so a masked lane never reads a NaN left by an earlier
