@@ -45,12 +45,12 @@ def ref_attention(q, k, v, causal, block=128, dtype=torch.float32):
     return out
 
 
-def ref_decode(q, k, v):
+def ref_decode(q, k, v, dtype=torch.float32):
     """One query token per sequence: q [B,H,D], k/v [B,H,S,D] -> [B,H,D]."""
     scale = q.shape[-1] ** -0.5
-    scores = torch.einsum("bhd,bhsd->bhs", q.float(), k.float()) * scale
+    scores = torch.einsum("bhd,bhsd->bhs", q.to(dtype), k.to(dtype)) * scale
     p = torch.softmax(scores, dim=-1)
-    return torch.einsum("bhs,bhsd->bhd", p, v.float())
+    return torch.einsum("bhs,bhsd->bhd", p, v.to(dtype))
 
 
 def stats(samples):

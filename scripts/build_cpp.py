@@ -66,25 +66,33 @@ def main() -> None:
     for name, extra in units:
         src = os.path.join(SRC, name)
         if not os.path.exists(src):
-            if name == "amx.cpp":
-                # No AMX file yet: compile a stub so the dispatch links.
-                src = os.path.join(build, "amx_stub.cpp")
-                with open(src, "w") as f:
-                    f.write('#include "cpu_attn_amx.hpp"\n')
-            else:
-                raise SystemExit(f"build_cpp: missing {src}")
+            raise SystemExit(f"build_cpp: missing {src}")
         obj = os.path.join(build, name.replace(".cpp", ".o"))
         cmd = [cxx, *BASE, *extra, "-I", SRC, "-c", src, "-o", obj]
         print("+", " ".join(cmd))
         subprocess.run(cmd, check=True)
         objs.append(obj)
 
-    cmd = [cxx, "-shared", "-o", LIB, *objs, "-fopenmp"]
+    # Replacing the inode keeps an already-loaded A/B arm valid during a build.
+    # Linking straight into LIB can truncate executable pages in another process.
+    pending = os.path.join(build, f"_C_cpp.{os.getpid()}.so")
+    cmd = [cxx, "-shared", "-o", pending, *objs, "-fopenmp"]
     print("+", " ".join(cmd))
-    subprocess.run(cmd, check=True)
+    try:
+        subprocess.run(cmd, check=True)
+        os.replace(pending, LIB)
+    finally:
+        if os.path.exists(pending):
+            os.unlink(pending)
     print(f"built {LIB} in {time.time() - t0:.1f}s")
 
     if "--test" in sys.argv:
+        isa_test = os.path.join(build, "test_cpu_isa")
+        subprocess.run([cxx, *BASE, "-I", SRC,
+                        os.path.join(ROOT, "tests", "test_cpu_isa.cpp"),
+                        os.path.join(build, "cpu_isa.o"), "-o", isa_test],
+                       check=True)
+        subprocess.run([isa_test], check=True)
         # Parity smoke: the dense suite covers the plan entry, GQA, masks and
         # both dtypes; the flash-shaped API covers the paged path.
         env = dict(os.environ, CPU_ATTENTION_BACKEND="cpp", PYTHONPATH=ROOT)

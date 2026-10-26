@@ -35,7 +35,8 @@ def strided_chunk(t, proj_width):
     return buf[:, :, :proj_width].view(t.shape[0], 1, proj_width)
 
 
-def run_case(batch, ctx, heads, kvh, hd, page, dtype, strided, seed):
+def run_case(batch, ctx, heads, kvh, hd, page, dtype, strided, seed,
+             reference_dtype=torch.float32):
     # Both backends must see the same tensors, so the data comes from a seed
     # rather than from the global generator.
     torch.manual_seed(seed)
@@ -85,7 +86,7 @@ def run_case(batch, ctx, heads, kvh, hd, page, dtype, strided, seed):
     if group > 1:
         kk = kk.repeat_interleave(group, dim=1)
         vv = vv.repeat_interleave(group, dim=1)
-    ref = C.ref_decode(q.reshape(batch, heads, hd).float(), kk, vv)
+    ref = C.ref_decode(q.reshape(batch, heads, hd), kk, vv, dtype=reference_dtype)
     return got, got_x, ref
 
 
@@ -95,6 +96,7 @@ def main():
     torch.set_num_threads(8)
     print(f"backend {_kernel.backend()}", flush=True)
     cases = bad = 0
+    reference_checks = 0
     worst = {torch.float32: 0.0, torch.bfloat16: 0.0}
     worst_at = {}
     # bf16 is judged against the other backend in bf16 ulps (the shipped x86
@@ -124,6 +126,24 @@ def main():
                     err = max((got.float() - ref).abs().max().item(),
                               (got_x.float() - ref).abs().max().item())
                     tol = 1e-6
+                    if err > tol:
+                        # A sequential fp32 dot in the reference can itself lose
+                        # more than the gate (seen on Axion at D=128/33 keys).
+                        # Keep that comparison, but resolve it against fp64,
+                        # never by widening the kernel's absolute tolerance.
+                        _, _, truth = run_case(batch, ctx, heads, kvh, hd, page,
+                                               dtype, strided, seed,
+                                               reference_dtype=torch.float64)
+                        ref_err = (ref.double() - truth).abs().max().item()
+                        if ref_err > tol:
+                            raw_err = err
+                            err = max((got.double() - truth).abs().max().item(),
+                                      (got_x.double() - truth).abs().max().item())
+                            reference_checks += 1
+                            print(f"[reference precision] hd={hd} page={page} "
+                                  f"ctx={ctx}: kernel/fp32={raw_err:.3e}, "
+                                  f"fp32/fp64={ref_err:.3e}, "
+                                  f"kernel/fp64={err:.3e}", flush=True)
                 else:
                     # bfs ulps at the row's peak output: one ulp of a bf16 value
                     # near `peak` is `peak * 2^-8`, which is the scale the
@@ -147,6 +167,7 @@ def main():
                            f"{err:.3e} > {'1e-6' if dtype == torch.float32 else '2 ulp'}",
                           flush=True)
     print(f"paged sweep: {cases - bad}/{cases} within tolerance")
+    print(f"  fp64-resolved reference precision cases: {reference_checks}")
     print(f"  worst fp32 {worst[torch.float32]:.2e} at {worst_at.get(torch.float32)}")
     print(f"  worst bf16 {worst[torch.bfloat16]:.2f} ulp at "
           f"{worst_at.get(torch.bfloat16)}")

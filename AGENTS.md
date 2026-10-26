@@ -95,8 +95,9 @@ as `attn_backend="mojo"`. Read this before touching the kernel; the root
 ## 0a. There is a second backend now: `cpu_attention/csrc/` (C++)
 
 The Mojo kernel in `cpu_attention/_mojo` is still the oracle and is still the
-default on aarch64, but the C++ backend in `cpu_attention/csrc/` is what runs by
-default on x86-64 (`CPU_ATTENTION_BACKEND=auto|cpp|mojo`). It has the same Python
+default on both architectures pending the full acceptance scorecard. Explicit
+`CPU_ATTENTION_BACKEND=auto` selects C++ on x86-64 and Mojo on aarch64;
+`CPU_ATTENTION_BACKEND=cpp|mojo` pins either backend. C++ has the same Python
 API, the same parity gates and a much better dense/paged matrix there.
 `docs/CPP_REPORT.md` is its scoreboard, design and falsification ledger; read it
 before touching `csrc/`. File map:

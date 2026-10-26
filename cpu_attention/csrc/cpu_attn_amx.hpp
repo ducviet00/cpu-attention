@@ -251,6 +251,9 @@ __attribute__((always_inline)) inline void transpose16x16(__m512* r) {
 template <int DT, int HD>
 struct Dense {
   static constexpr bool BF = DT == kBF16;
+  // P@V starts with tile_zero. The driver handles rows with no visible key
+  // without reading the untouched accumulator.
+  static constexpr bool zeroes_acc = true;
   static constexpr int ESZ = BF ? 2 : 4;
   // One packed operand slot holds the bf16 tile and, for fp32, its lo half.
   static constexpr int NLO = BF ? 1 : 2;

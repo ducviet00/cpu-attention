@@ -4,8 +4,8 @@
 Python API (`flash_attn_func`, `flash_attn_with_kvcache`, and the engine aliases
 `self_attention` / `cross_attention` / `reshape_and_cache`). `CPU_ATTENTION_BACKEND`
 selects one, both shared objects load in one process, and `tests/bench_cpp.py`
-alternates them for an in-process A/B. `CPU_ATTENTION_BACKEND=auto` (the
-explicit option) picks `cpp` on x86-64 and stays on `mojo` on aarch64: see
+alternates them for an in-process A/B. Explicit `CPU_ATTENTION_BACKEND=auto`
+picks `cpp` on x86-64 and stays on `mojo` on aarch64: see
 "Known exceptions" §10.2 for the measured reason.
 
 The 2026-10-26 continuation keeps **Mojo as the default** until the user's full
@@ -485,3 +485,87 @@ Boxes: Ryzen 7 7840H (8 cores, no AMX), Graviton 5 `m9g.2xlarge` (8 cores,
 NEON+BF16), Xeon `m8i.2xlarge` (4 cores / 8 threads, AVX-512 + AMX). vLLM is
 pinned at `db3b0f0`; `scripts/box_setup_cpp.sh` provisions a fresh box with the
 pinned build, both backends and the reference.
+
+## 12. Continuation, 2026-10-26
+
+**The acceptance target is not yet met; Mojo remains the default.** The complete
+checkpoint tables, min/median/control and raw samples are in
+[`cpp-20261026/SCORECARD.md`](cpp-20261026/SCORECARD.md) and the adjacent JSON.
+The new boxes are Google Axion **Neoverse-V2** (8 cores) and GCP C4 **Xeon
+Platinum 8581C** (4C/8T), not the Graviton 5 / 6975P-C audit machines. The first
+C4 was spot-preempted; its results were copied locally before the loss.
+
+### Correctness and call-path fixes
+
+* BF16 CPUID was read from leaf 7 subleaf **0** instead of **1**. Dispatch now
+  checks the real feature before using a bf16 kernel; a forced ISA cannot bypass
+  hardware support. `tests/test_cpu_isa.cpp` checks against the compiler detector.
+* GQA cache stores now run once per KV head, not once per query head. MHA stores
+  and attends in the same work item; GQA has the required store/attend barrier.
+  The old Python GQA workaround also performed an unnecessary first attention.
+* Dense plans include **all** Q/K/V strides, including contiguous Q with strided
+  K or V. The extended dense suite is **82/82** on Ryzen, Axion and C4; the engine
+  integration suite also passes. Plan tensors and C++ workspaces have owning
+  lifetimes rather than leaking when their thread or cache entry disappears.
+* `_drop_workspace()` invalidates Mojo AMX plans with the scratch pointers they
+  contain, closing the audit's on/off/on use-after-free.
+* Paged fp32 uses four partial dot products and a degree-6 exponential. Ryzen
+  strict sweep: **504/504**, worst fp32 `8.34e-7`; C4: **504/504**, `7.75e-7`.
+  Axion: **504/504**, worst `8.05e-7`, with one explicitly reported reference
+  precision resolution (below). Dense fuzz remains **80/80**, plus 24 stray-read
+  probes, on all three boxes.
+* `empty_like(..., memory_format=contiguous_format)` is 0.632 µs against 1.222 µs
+  for shape/dtype `empty` in an interleaved local probe. Both backends benefit.
+  Dense C++ reuses the public wrapper's already-read geometry instead of reading
+  it a second time. The default remains Mojo pending the full scorecard.
+
+### The strict reference discrepancy
+
+For Axion `HD=128, page=32, ctx=33, batch=3`, the original naive fp32 reference
+is **1.831e-6 from fp64 truth**. C++ is **2.496e-7** from truth, Mojo
+**3.213e-7**, yet their differences from the fp32 reference are 1.788e-6 and
+1.907e-6. Changing the kernel to imitate that reference would worsen it.
+The sweep keeps the fp32 comparison, reports it, and resolves a reference that
+itself exceeds the gate against fp64 with the **unchanged 1e-6 absolute gate**.
+The independent reference still defaults to fp32; no comparison is discarded.
+
+The literal ARM bf16 `1e-3` absolute-to-real-valued-truth requirement is not
+possible for every supported input with bf16 output: the Axion sweep has 77/252
+cases where rounding the exact output to bf16 already exceeds that limit (worst
+floor `6.63e-3`). This is distinct from bf16-to-backend parity and is not claimed
+as a passing gate. Raw errors are retained; tolerance was not increased.
+
+### New measured changes and falsifications
+
+Every ratio below is **new / old**, interleaved in one process with a duplicate
+arm. ISA subagents stopped on an external subscription limit; their uncommitted
+files, builds and raw JSON were recovered and validated by the primary.
+
+| change | result | decision |
+|---|---|---|
+| VEC fp32 paged, four partial dimension sums | 0.924 at b1/256; other cases 0.990–1.022; strict error below 1e-6 | retained for accuracy and short calls |
+| VEC dense pack, hoist K/V token strides out of untyped stores | 0.929 at 1024:16:128, 0.913 at 512:32:128; long rows neutral | retained, `6331121` |
+| VEC fp32 dense register tile, 8 → 12 rows | **1.095–1.236** at D=128 | reverted |
+| VEC fp32 paged, dim-outer QK on D=64 | 0.984 short; **1.033** at b8/1024; other long rows 1.013 | reverted |
+| VEC bf16 paged, paired V + bf16 P@V | parity 504/504; Ryzen short rows **0.842–0.888**, but b1/4096 **1.274–1.282**; Xeon **0.938–1.002** | reverted; an initial fp32-only A/B did not exercise this change, so the archived rerun uses bf16 and separately staged caches |
+| NEON fp32 mask/max outside the QK register loop | **0.901–0.971**, bit-identical | retained |
+| NEON bf16 vector V pack | **0.936** short, 0.972 at S=512, 0.986–0.996 long; bit-identical | retained |
+| NEON bf16 degree-2 dense exponential | 0.927–0.988 after the short-row control; dense/fuzz pass | retained |
+| NEON bf16 register tile, 8 → 12 rows | **1.20–1.34** | reverted |
+| NEON bf16 register tile, 8 → 10 rows | 0.954–1.000; control 0.994–1.005 | retained after parity |
+| AMX vector bf16 output epilogue | 0.954–0.958 at 128:8:64; long rows mostly control floor | retained |
+| AMX skip the driver's accumulator clear (P@V already zeroes its tiles) | 101-round A/B: bf16 128:8:64 **0.958**, 512:8:64 **0.969**; outputs bit-identical, dense/fuzz pass | retained |
+| AMX probability row stride, KTMAX → actual kt | generally neutral; fp32 512:8:64 **1.045**, 1024:8:64 **1.022** | reverted |
+| NEON fp32 P@V, 8 → 12 output dimensions per pass | initial D=128 long rows 0.959–0.963; 101-round production-shaped repeats **1.013–1.057**, despite bit-identical outputs | reverted; initial gain did not survive the actual dispatch/code generation |
+
+The final primary tree contains no paired-V, compact-probability or 12-dimension
+P@V experiment. It retains the measured pack-stride fix, the recovered ISA wins,
+the AMX clear removal, correctness fixes and the corrected harness. The build now
+atomically replaces `_C_cpp.so`, so rebuilding cannot truncate executable pages
+that an existing A/B process still has mapped. `--test` also runs the ISA check.
+
+The archived complete scorecard has **82/126 clear wins**, 33 noise-band rows and
+11 losses; it is a checkpoint, not an extrapolation of the later isolated A/Bs.
+The exact Graviton 5 / Xeon 6975P-C matrix was not rerun in this continuation.
+Remaining work is the unresolved short AMX / b1 cross rows and the final few
+percent on ARM dense. No default flip or completed-goal claim is made.
