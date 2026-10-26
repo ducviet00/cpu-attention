@@ -286,22 +286,22 @@ def _paged_plan(query, key, value, k_cache, page_table, do_store):
     plans = getattr(_PAGED_PLANS, "p", None)
     if plans is None:
         plans = _PAGED_PLANS.p = {}
-    nseq, nheads, hd = query.shape
-    kvh = k_cache.shape[1]
-    page = k_cache.shape[2]
+    query_shape = query.shape
+    cache_shape = k_cache.shape
     npages = page_table.shape[1]
-    workers = _workers(nseq * nheads, npages)
-    # A flat tuple of small ints: the hash is as cheap as it gets, and no
-    # `.stride()` tuple is built. The two token strides are read per call
-    # instead (two C calls), which keeps a strided query correct.
+    # Token strides are patched per call, not cached. Worker policy is evaluated
+    # only on a miss; both thread settings stay in the key so a change is safe.
     # `_BACKEND` is in the key because the closures below capture the selected
     # extension entry at build time: without it, switching backends in one
     # process (the A/B harness does) keeps calling the first backend, and a
     # bf16 cache built for one layout is then read with the other one.
-    k = (nseq, nheads, hd, kvh, page, npages, _DTYPE_CODES[query.dtype],
-         workers, do_store, _BACKEND)
+    k = (query_shape, cache_shape, npages, query.dtype, torch.get_num_threads(),
+         _OVERRIDE, do_store, _BACKEND)
     fn = plans.get(k)
     if fn is None:
+        nseq, nheads, hd = query_shape
+        kvh, page = cache_shape[1:3]
+        workers = _workers(nseq * nheads, npages)
         if _BACKEND == "cpp":
             # The C++ extension keeps the geometry in a plan buffer, so a call
             # marshals only pointers and two strides: `paged_forward` is 13
@@ -368,7 +368,7 @@ def _paged(
     read badly against a reference whose output is preallocated.
     """
     if out is None:
-        out = torch.empty(query.shape, dtype=query.dtype)
+        out = torch.empty_like(query, memory_format=torch.contiguous_format)
     fn = _paged_plan(query, key, value, k_cache, page_table, do_store)
     if (_BACKEND == "mojo" and do_store and key is not None and
             query.shape[1] != k_cache.shape[1]):
@@ -603,6 +603,9 @@ def _drop_workspace() -> None:
     plans = getattr(_SCRATCH, "plans", None)
     if plans is not None:
         plans.clear()
+    # AMX plans contain raw addresses into the same scratch tensors. Clearing
+    # only the non-AMX plans made an on/off/on A/B reuse freed memory.
+    _AMX_PLANS.__dict__.pop("p", None)
 
 
 def _scratch(kind, shape, dtype):
@@ -641,9 +644,6 @@ def scratch_bytes() -> int:
 def clear_scratch() -> None:
     """Drop this thread's workspace buffers (tests, or after a shape sweep)."""
     _drop_workspace()
-    # The AMX call plans hold the workspace addresses; a stale plan would feed
-    # the kernel a freed buffer.
-    _AMX_PLANS.__dict__.pop("p", None)
 
 
 _QT_ENV = os.environ.get("CPU_ATTENTION_QT")
@@ -1295,34 +1295,28 @@ def _cpp_entries():
     return _entry("dense_make_plan"), _entry("dense_forward")
 
 
-def _cpp_plan(q, k, v, scale, causal):
+def _cpp_plan(q, k, v, scale, causal, geom=None):
     """The plan address for this geometry, building it on the first call."""
     plans = getattr(_CPP_PLANS, "p", None)
     if plans is None:
         plans = _CPP_PLANS.p = {}
-    batch, seq_q, heads, hd = q.shape
-    kv_heads = k.shape[2]
+    if geom is None:
+        geom = (q.shape, q.stride(), k.stride(), v.stride(), q.dtype)
+    qshape, qs, ks, vs, dtype = geom
+    batch, seq_q, heads, hd = qshape
+    kshape = k.shape
+    kv_heads = kshape[2]
     workers = _workers(batch * heads * -(-seq_q // 64), 8)
-    cont = q.is_contiguous()
-    # A contiguous tensor's strides follow from its shape, so the common case
-    # (a fresh q/k/v from flash_attn_func) builds no stride tuples.
-    key = (q.shape, k.shape, cont, causal, q.dtype, workers, scale,
-           cont or (q.stride(), k.stride(), v.stride()))
-    addr = plans.get(key)
-    if addr is None:
+    # The public wrapper already read every stride. A contiguous Q says nothing
+    # about K or V: mixed contiguous/strided inputs need their own plan too.
+    key = (qshape, kshape, qs, ks, vs, dtype, causal, workers, scale)
+    cached = plans.get(key)
+    if cached is None:
         make_plan, _ = _cpp_entries()
-        if cont:
-            # [batch, seq, heads, hd] row-major.
-            ks3 = kv_heads * hd
-            qs = (seq_q * heads * hd, heads * hd, hd, 1)
-            ks = (k.shape[1] * ks3, ks3, hd, 1)
-            vs = ks
-        else:
-            qs, ks, vs = q.stride(), k.stride(), v.stride()
         buf = torch.empty(24, dtype=torch.int64)
         make_plan(
-            buf.data_ptr(), batch, seq_q, k.shape[1], heads, kv_heads, hd,
-            _DTYPE_CODES[q.dtype], int(bool(causal)), float(scale),
+            buf.data_ptr(), batch, seq_q, kshape[1], heads, kv_heads, hd,
+            _DTYPE_CODES[dtype], int(bool(causal)), float(scale),
             qs[0], qs[1], qs[2], ks[0], ks[1], ks[2], vs[0], vs[1], vs[2],
             seq_q * heads * hd, heads * hd, hd, workers,
         )
@@ -1330,19 +1324,15 @@ def _cpp_plan(q, k, v, scale, causal):
             plans.clear()
         addr = buf.data_ptr()
         # The buffer has to outlive the address, so hold it next to the key.
-        plans[key] = addr
-        _CPP_BUFS.append(buf)
-    return addr
+        plans[key] = cached = (buf, addr)
+    return cached[1]
 
 
-_CPP_BUFS = []
-
-
-def _dense_cpp(q, k, v, scale: float, causal: bool):
+def _dense_cpp(q, k, v, scale: float, causal: bool, geom=None):
     """Dense attention through the C++ backend: one call, five arguments."""
-    _, forward = _cpp_entries()
-    out = torch.empty(q.shape, dtype=q.dtype)
-    forward(_cpp_plan(q, k, v, scale, causal), q.data_ptr(), k.data_ptr(),
+    forward = _entry("dense_forward")
+    out = torch.empty_like(q, memory_format=torch.contiguous_format)
+    forward(_cpp_plan(q, k, v, scale, causal, geom), q.data_ptr(), k.data_ptr(),
             v.data_ptr(), out.data_ptr())
     return out
 
@@ -1370,7 +1360,7 @@ def _dense(q, k, v, scale: float, causal: bool, geom=None):
     above it.
     """
     if _BACKEND == "cpp":
-        return _dense_cpp(q, k, v, scale, causal)
+        return _dense_cpp(q, k, v, scale, causal, geom)
     out = _amx_dense(q, k, v, scale, causal)
     if out is not None:
         return out
@@ -1396,7 +1386,7 @@ def _dense(q, k, v, scale: float, causal: bool, geom=None):
      vt_ptr, v_ptr_packed, ks_ptr, ks_bh, k0, k1, k2, v0, v1, v2,
      qb, qtok, qh, vb, vtok, vh, ob, otok, oh, pack_workers,
      _kt, _vt, _ks, _pbuf) = plan
-    out = torch.empty(geom[0], dtype=geom[4])
+    out = torch.empty_like(q, memory_format=torch.contiguous_format)
     q_ptr = q.data_ptr()
     k_ptr = k.data_ptr()
     v_ptr = v_ptr_packed if v_ptr_packed else v.data_ptr()

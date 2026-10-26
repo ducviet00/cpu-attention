@@ -102,6 +102,21 @@ def main() -> int:
         2e-4,
     )
 
+    # Q can be contiguous while K and V have independent token/head strides.
+    # Reuse the contiguous plan first: keying strides only on Q hid this bug.
+    for dtype, tol in ((torch.float32, 2e-4), (torch.bfloat16, 3e-2)):
+        q = torch.randn(2, 9, 4, 32, dtype=dtype)
+        k = torch.randn(2, 34, 2, 32, dtype=dtype)[:, ::2]
+        v = torch.randn(2, 17, 4, 32, dtype=dtype)[:, :, ::2]
+        for causal in (False, True):
+            want = _reference(q, k, v, causal, 32**-0.5)
+            for name, kk, vv in (("contiguous", k.contiguous(), v.contiguous()),
+                                 ("K-strided", k, v.contiguous()),
+                                 ("V-strided", k.contiguous(), v),
+                                 ("KV-strided", k, v)):
+                check(f"{dtype} mixed-stride {name} causal={causal}",
+                      attn.flash_attn_func(q, kk, vv, causal=causal), want, tol)
+
     # A fully masked row must be zero, not NaN (flash-attn's contract).
     q = torch.randn(1, 4, 2, 32)
     k = torch.randn(1, 2, 2, 32)
@@ -122,6 +137,15 @@ def main() -> int:
     # different geometry. Both are silent numeric corruption, so they are tested
     # rather than argued about.
     import cpu_attention._kernel as K
+
+    K._AMX_PLANS.p = {"sentinel": object()}
+    K._drop_workspace()
+    checks += 1
+    if not getattr(K._AMX_PLANS, "p", None):
+        print("[OK] workspace eviction invalidates AMX plans")
+    else:
+        fails += 1
+        print("[FAIL] workspace eviction left stale AMX plans")
 
     for dtype, tol in ((torch.float32, 2e-4), (torch.bfloat16, 3e-2)):
         a = [torch.randn(1, 300, 4, 64, dtype=dtype) for _ in range(3)]

@@ -115,16 +115,24 @@ inline float32x4_t exp2v(float32x4_t x) {
   const float32x4_t r = vsubq_f32(x, n);
   // Horner with FMA: p = c_hi, then p = c_next + p*r.
   float32x4_t p;
-  if constexpr (DEG >= 5) {
+  if constexpr (DEG >= 6) {
+    p = vdupq_n_f32(1.5403530e-4f);
+    p = vfmaq_f32(vdupq_n_f32(1.3333558e-3f), p, r);
+    p = vfmaq_f32(vdupq_n_f32(9.6181291e-3f), p, r);
+    p = vfmaq_f32(vdupq_n_f32(5.5504109e-2f), p, r);
+    p = vfmaq_f32(vdupq_n_f32(2.4022651e-1f), p, r);
+  } else if constexpr (DEG >= 5) {
     p = vdupq_n_f32(1.3392112e-3f);
     p = vfmaq_f32(vdupq_n_f32(9.6180963e-3f), p, r);
     p = vfmaq_f32(vdupq_n_f32(5.5503282e-2f), p, r);
     p = vfmaq_f32(vdupq_n_f32(2.4022652e-1f), p, r);
+  } else if constexpr (DEG == 2) {
+    p = vdupq_n_f32(2.3473140e-1f);
   } else {
     p = vdupq_n_f32(5.587586976e-2f);
     p = vfmaq_f32(vdupq_n_f32(2.422964968e-1f), p, r);
   }
-  p = vfmaq_f32(vdupq_n_f32(6.9314718e-1f), p, r);
+  p = vfmaq_f32(vdupq_n_f32(DEG == 2 ? 6.9335938e-1f : 6.9314718e-1f), p, r);
   p = vfmaq_f32(vdupq_n_f32(1.0f), p, r);
   const int32x4_t e =
       vshlq_n_s32(vaddq_s32(vcvtq_s32_f32(n), vdupq_n_s32(127)), 23);
@@ -170,6 +178,30 @@ inline float32x4_t zip_hi(float32x4_t a, float32x4_t b) {
 inline int64_t pad_of(int64_t seq_k) { return (seq_k + 63) & ~int64_t(63); }
 
 inline size_t round64(size_t n) { return (n + 63) & ~size_t(63); }
+
+template <int RQT, int KT>
+inline void mask_and_max(float* logits, int nrows, int nkeys, int64_t k0,
+                         int64_t row_limit0, float* tmax) {
+  const float32x4_t ninf = vdupq_n_f32(kNegInf);
+  const int32x4_t lane = lane_idx();
+  for (int r = 0; r < RQT; ++r) {
+    const int64_t limit = row_limit0 + std::min(r, nrows - 1) - k0 + 1;
+    const int valid = static_cast<int>(std::clamp<int64_t>(limit, 0, nkeys));
+    float* row = logits + r * KT;
+    float32x4_t mx = ninf;
+    int j = 0;
+    for (; j + 8 <= valid; j += 8)
+      mx = vmaxq_f32(mx, vmaxq_f32(ldf(row + j), ldf(row + j + 4)));
+    for (; j < nkeys; j += 4) {
+      const int32x4_t idx = vaddq_s32(vdupq_n_s32(j), lane);
+      const float32x4_t x = vbslq_f32(vcgeq_s32(idx, vdupq_n_s32(valid)),
+                                     ninf, ldf(row + j));
+      stf(row + j, x);
+      mx = vmaxq_f32(mx, x);
+    }
+    tmax[r] = hmax(mx);
+  }
+}
 
 // ===========================================================================
 // dense fp32
@@ -275,26 +307,19 @@ struct DenseF32 {
                  const char* q_base, int nrows, int64_t k0, int nkeys,
                  int64_t row_limit0, float* logits) {
     const int KT = kt_();
-    const int64_t pad = pad_of(job.seq_k);
     const int64_t qt = job.qt;
     const float* kd = reinterpret_cast<const float*>(slab);
-    const int64_t kend = k0 + nkeys;
     if (neon_mode() & 2) {
       for (int r = 0; r < nrows; ++r)
         std::memset(logits + r * KT, 0, sizeof(float) * nkeys);
       return;
     }
-    const int64_t lim = std::min<int64_t>(row_limit0, kend - 1);
-    const int32x4_t lane = lane_idx();
-    const float32x4_t ninf = vdupq_n_f32(kNegInf);
     // RQT is a compile-time trip count on purpose: rows past `nrows` read the
     // last real row again (no out-of-bounds load, no NaN) and are stored into
     // the logits tile, which the softmax then ignores. That keeps every
     // accumulator index constant, which is the difference between sixteen
     // registers and sixteen stack slots.
     const int rclamp = nrows - 1;
-    float32x4_t tmax[RQT];
-    for (int r = 0; r < RQT; ++r) tmax[r] = vdupq_n_f32(kNegInf);
     for (int j = 0; j < nkeys; j += 8) {
       const int64_t jj = k0 + j;
       float32x4_t c[RQT][2];
@@ -321,46 +346,13 @@ struct DenseF32 {
           c[r][1] = vfmaq_laneq_f32(c[r][1], kv[7], qv, 3);
         }
       }
-      // Row r sees keys <= row_limit0 + r, so from row `rsplit` on the panel is
-      // wholly visible and only the rows below it need the blend. When the panel
-      // runs past the chunk's last key (`kend-1`) the chunk bound is what masks,
-      // and that one does not grow with r: every row needs it.
-      const bool nomask = jj + 7 <= lim;
-      const int rsplit =
-          nomask ? 0
-                 : (jj + 7 <= kend - 1
-                        ? static_cast<int>(jj + 7 -
-                                           std::min<int64_t>(row_limit0,
-                                                             kend - 1))
-                        : RQT);
-      if (rsplit <= 0) {
-        for (int r = 0; r < RQT; ++r) {
-          stf(logits + r * KT + j, c[r][0]);
-          stf(logits + r * KT + j + 4, c[r][1]);
-          tmax[r] = vmaxq_f32(tmax[r], vmaxq_f32(c[r][0], c[r][1]));
-        }
-      } else {
-        const int32x4_t idx0 =
-            vaddq_s32(vdupq_n_s32(static_cast<int32_t>(jj)), lane);
-        const int32x4_t idx1 =
-            vaddq_s32(vdupq_n_s32(static_cast<int32_t>(jj + 4)), lane);
-        for (int r = 0; r < RQT; ++r) {
-          float32x4_t a0 = c[r][0], a1 = c[r][1];
-          if (r < rsplit) {
-            const int32_t lr = static_cast<int32_t>(std::min<int64_t>(
-                row_limit0 + (r < nrows ? r : rclamp), kend - 1));
-            const int32x4_t lv = vdupq_n_s32(lr);
-            a0 = vbslq_f32(vcgtq_s32(idx0, lv), ninf, a0);
-            a1 = vbslq_f32(vcgtq_s32(idx1, lv), ninf, a1);
-          }
-          stf(logits + r * KT + j, a0);
-          stf(logits + r * KT + j + 4, a1);
-          tmax[r] = vmaxq_f32(tmax[r], vmaxq_f32(a0, a1));
-        }
+      for (int r = 0; r < RQT; ++r) {
+        stf(logits + r * KT + j, c[r][0]);
+        stf(logits + r * KT + j + 4, c[r][1]);
       }
     }
-    float* tm = tmax_of(logits);
-    for (int r = 0; r < RQT; ++r) tm[r] = hmax(tmax[r]);
+    mask_and_max<RQT, KT>(logits, nrows, nkeys, k0, row_limit0,
+                          tmax_of(logits));
   }
 
   // Scales the tile by c and turns it into probabilities, transposed into the P
@@ -516,7 +508,7 @@ struct DenseF32 {
 // ===========================================================================
 template <int HD, int KTC>
 struct DenseBF {
-  static constexpr int RQT = 8;
+  static constexpr int RQT = 10;
   static constexpr bool zeroes_acc = true;  // see DenseF32
   static void store_bf16(char* dst, const float* src, int hd, float inv) {
     store_bf16_out(dst, src, hd, inv);
@@ -608,19 +600,22 @@ struct DenseBF {
     const int64_t kg_n = pad / 4;
     for (int64_t kg = 0; kg < kg_n; ++kg) {
       const int64_t t0 = 4 * kg;
-      for (int dp = 0; dp < HD / 2; ++dp) {
-        uint32_t w[4] = {0u, 0u, 0u, 0u};
+      for (int d = 0; d < HD; d += 8) {
+        uint16x8_t r[4];
         for (int t = 0; t < 4; ++t)
-          if (t0 + t < n)
-            std::memcpy(&w[t], vs + ((t0 + t) * job.vt + 2 * dp) * 2, 4);
-        // w[t] = (v[t][2dp], v[t][2dp+1]); the group wants the four keys of one
-        // head dim contiguous (column-major over the contraction).
-        const uint16x8_t vv = vreinterpretq_u16_u32(vld1q_u32(w));
-        char* dst = vd + (dp * kg_n + kg) * 16;
-        vst1_u16(reinterpret_cast<uint16_t*>(dst),
-                 vuzp1_u16(vget_low_u16(vv), vget_high_u16(vv)));
-        vst1_u16(reinterpret_cast<uint16_t*>(dst + 8),
-                 vuzp2_u16(vget_low_u16(vv), vget_high_u16(vv)));
+          r[t] = t0 + t < n
+                     ? vld1q_u16(reinterpret_cast<const uint16_t*>(
+                           vs + ((t0 + t) * job.vt + d) * 2))
+                     : vdupq_n_u16(0);
+        const uint32x4_t a = vreinterpretq_u32_u16(vzip1q_u16(r[0], r[1]));
+        const uint32x4_t b = vreinterpretq_u32_u16(vzip2q_u16(r[0], r[1]));
+        const uint32x4_t c = vreinterpretq_u32_u16(vzip1q_u16(r[2], r[3]));
+        const uint32x4_t e = vreinterpretq_u32_u16(vzip2q_u16(r[2], r[3]));
+        char* dst = vd + ((d / 2) * kg_n + kg) * 16;
+        vst1q_u32(reinterpret_cast<uint32_t*>(dst), vzip1q_u32(a, c));
+        vst1q_u32(reinterpret_cast<uint32_t*>(dst + kg_n * 16), vzip2q_u32(a, c));
+        vst1q_u32(reinterpret_cast<uint32_t*>(dst + kg_n * 32), vzip1q_u32(b, e));
+        vst1q_u32(reinterpret_cast<uint32_t*>(dst + kg_n * 48), vzip2q_u32(b, e));
       }
     }
   }
@@ -764,9 +759,9 @@ struct DenseBF {
         const bool z0 = mn[0] == kNegInf, z1 = mn[1] == kNegInf;
         for (int j = 0; j < nkeys; j += 4) {
           const float32x4_t e0 =
-              z0 ? zero : exp2v<3>(vfmaq_f32(vmn0, vc, ldf(p0 + j)));
+               z0 ? zero : exp2v<2>(vfmaq_f32(vmn0, vc, ldf(p0 + j)));
           const float32x4_t e1 =
-              z1 ? zero : exp2v<3>(vfmaq_f32(vmn1, vc, ldf(p1 + j)));
+               z1 ? zero : exp2v<2>(vfmaq_f32(vmn1, vc, ldf(p1 + j)));
           s0 = vaddq_f32(s0, e0);
           s1 = vaddq_f32(s1, e1);
           stb(dst + (j / 4) * 16,
@@ -780,14 +775,14 @@ struct DenseBF {
         // instructions' worth of work). Eight chains in flight is what closes
         // that gap.
         for (; j + 16 <= nkeys; j += 16) {
-          const float32x4_t c0 = exp2v<3>(vfmaq_f32(vmn0, vc, ldf(p0)));
-          const float32x4_t d0 = exp2v<3>(vfmaq_f32(vmn1, vc, ldf(p1)));
-          const float32x4_t c1 = exp2v<3>(vfmaq_f32(vmn0, vc, ldf(p0 + 4)));
-          const float32x4_t d1 = exp2v<3>(vfmaq_f32(vmn1, vc, ldf(p1 + 4)));
-          const float32x4_t c2 = exp2v<3>(vfmaq_f32(vmn0, vc, ldf(p0 + 8)));
-          const float32x4_t d2 = exp2v<3>(vfmaq_f32(vmn1, vc, ldf(p1 + 8)));
-          const float32x4_t c3 = exp2v<3>(vfmaq_f32(vmn0, vc, ldf(p0 + 12)));
-          const float32x4_t d3 = exp2v<3>(vfmaq_f32(vmn1, vc, ldf(p1 + 12)));
+          const float32x4_t c0 = exp2v<2>(vfmaq_f32(vmn0, vc, ldf(p0)));
+          const float32x4_t d0 = exp2v<2>(vfmaq_f32(vmn1, vc, ldf(p1)));
+          const float32x4_t c1 = exp2v<2>(vfmaq_f32(vmn0, vc, ldf(p0 + 4)));
+          const float32x4_t d1 = exp2v<2>(vfmaq_f32(vmn1, vc, ldf(p1 + 4)));
+          const float32x4_t c2 = exp2v<2>(vfmaq_f32(vmn0, vc, ldf(p0 + 8)));
+          const float32x4_t d2 = exp2v<2>(vfmaq_f32(vmn1, vc, ldf(p1 + 8)));
+          const float32x4_t c3 = exp2v<2>(vfmaq_f32(vmn0, vc, ldf(p0 + 12)));
+          const float32x4_t d3 = exp2v<2>(vfmaq_f32(vmn1, vc, ldf(p1 + 12)));
           p0 += 16;
           p1 += 16;
           s0 = vaddq_f32(s0, c0);
@@ -805,10 +800,10 @@ struct DenseBF {
           dst += 64;
         }
         for (; j + 8 <= nkeys; j += 8) {
-          const float32x4_t a0 = exp2v<3>(vfmaq_f32(vmn0, vc, ldf(p0)));
-          const float32x4_t a1 = exp2v<3>(vfmaq_f32(vmn1, vc, ldf(p1)));
-          const float32x4_t b0 = exp2v<3>(vfmaq_f32(vmn0, vc, ldf(p0 + 4)));
-          const float32x4_t b1 = exp2v<3>(vfmaq_f32(vmn1, vc, ldf(p1 + 4)));
+          const float32x4_t a0 = exp2v<2>(vfmaq_f32(vmn0, vc, ldf(p0)));
+          const float32x4_t a1 = exp2v<2>(vfmaq_f32(vmn1, vc, ldf(p1)));
+          const float32x4_t b0 = exp2v<2>(vfmaq_f32(vmn0, vc, ldf(p0 + 4)));
+          const float32x4_t b1 = exp2v<2>(vfmaq_f32(vmn1, vc, ldf(p1 + 4)));
           p0 += 8;
           p1 += 8;
           s0 = vaddq_f32(s0, a0);
@@ -823,8 +818,8 @@ struct DenseBF {
         // and the extra keys carry a ~1e-38 probability because their logits
         // were masked to -inf.
         for (; j < nkeys; j += 4) {
-          const float32x4_t a0 = exp2v<3>(vfmaq_f32(vmn0, vc, ldf(p0)));
-          const float32x4_t a1 = exp2v<3>(vfmaq_f32(vmn1, vc, ldf(p1)));
+          const float32x4_t a0 = exp2v<2>(vfmaq_f32(vmn0, vc, ldf(p0)));
+          const float32x4_t a1 = exp2v<2>(vfmaq_f32(vmn1, vc, ldf(p1)));
           p0 += 4;
           p1 += 4;
           s0 = vaddq_f32(s0, a0);
@@ -1009,21 +1004,27 @@ struct PagedF32 {
       // Q@K^T for the whole step: 4 key groups of 4 keys per 16-key unit.
       float32x4_t lg[NK / 4];
       for (int i = 0; i < NK / 4; ++i) lg[i] = vdupq_n_f32(0.0f);
-      for (int d0 = 0; d0 < HD; d0 += 4) {
-        const float32x4_t qv = ldf(q + d0);
-        for (int g = 0; g < tiles; ++g) {
-          const float* kb = reinterpret_cast<const float*>(kbase[g]) + boff[g];
+      for (int g = 0; g < tiles; ++g) {
+        float32x4_t c[4][4];
+        for (int h = 0; h < 4; ++h)
+          for (int d = 0; d < 4; ++d) c[h][d] = vdupq_n_f32(0.0f);
+        const float* kb = reinterpret_cast<const float*>(kbase[g]) + boff[g];
+        for (int d0 = 0; d0 < HD; d0 += 4) {
+          const float32x4_t qv = ldf(q + d0);
           for (int h = 0; h < 4; ++h) {
             float32x4_t k0 = ldf(kb + (d0 + 0) * job.page + 4 * h);
-            lg[0 + 4 * g + h] = vfmaq_laneq_f32(lg[0 + 4 * g + h], k0, qv, 0);
+            c[h][0] = vfmaq_laneq_f32(c[h][0], k0, qv, 0);
             k0 = ldf(kb + (d0 + 1) * job.page + 4 * h);
-            lg[0 + 4 * g + h] = vfmaq_laneq_f32(lg[0 + 4 * g + h], k0, qv, 1);
+            c[h][1] = vfmaq_laneq_f32(c[h][1], k0, qv, 1);
             k0 = ldf(kb + (d0 + 2) * job.page + 4 * h);
-            lg[0 + 4 * g + h] = vfmaq_laneq_f32(lg[0 + 4 * g + h], k0, qv, 2);
+            c[h][2] = vfmaq_laneq_f32(c[h][2], k0, qv, 2);
             k0 = ldf(kb + (d0 + 3) * job.page + 4 * h);
-            lg[0 + 4 * g + h] = vfmaq_laneq_f32(lg[0 + 4 * g + h], k0, qv, 3);
+            c[h][3] = vfmaq_laneq_f32(c[h][3], k0, qv, 3);
           }
         }
+        for (int h = 0; h < 4; ++h)
+          lg[4 * g + h] = vaddq_f32(vaddq_f32(c[h][0], c[h][1]),
+                                    vaddq_f32(c[h][2], c[h][3]));
       }
       const int64_t gvalid = std::min<int64_t>(NK, len - pos);
       for (int i = 0; i < NK / 4; ++i) {
@@ -1055,7 +1056,7 @@ struct PagedF32 {
       const float32x4_t vmn = vdupq_n_f32(-mn);
       float32x4_t sum = vdupq_n_f32(0.0f);
       for (int i = 0; i < NK / 4; ++i) {
-        const float32x4_t e = exp2v<5>(vfmaq_f32(vmn, vc, lg[i]));
+        const float32x4_t e = exp2v<6>(vfmaq_f32(vmn, vc, lg[i]));
         stf(pbuf + 4 * i, e);
         sum = vaddq_f32(sum, e);
       }

@@ -328,6 +328,17 @@ struct Dense {
 
   static int acc_rows(int rq) { return ((rq + RQT - 1) / RQT) * RQT; }
 
+  // Use the native bf16 conversion rather than the scalar converter's bit
+  // operations and NaN handling, even when the compiler vectorises that loop.
+  static void store_bf16(char* dst, const float* src, int hd, float inv) {
+    const __m512 scale = _mm512_set1_ps(inv);
+    for (int d = 0; d < HD; d += 16) {
+      const __m256i out = cvt_bf16x16(
+          _mm512_mul_ps(_mm512_loadu_ps(src + d), scale));
+      _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + d * 2), out);
+    }
+  }
+
   static size_t aux_bytes(int rq, int hd) {
     (void)rq;
     (void)hd;
