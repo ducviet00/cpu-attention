@@ -24,7 +24,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--vllm", default=os.environ.get("VLLM_REF", ""))
     ap.add_argument("--isa", default=os.environ.get("VLLM_ISA", "vec"))
-    ap.add_argument("--rounds", type=int, default=21)
+    ap.add_argument("--rounds", type=int, default=41)
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--cooldown", type=float, default=1.0,
                     help="seconds between rows, so the core can come out of "
@@ -44,10 +44,14 @@ def main():
             if args.threads:
                 cmd += ["--threads", str(args.threads)]
             out = subprocess.run(cmd, capture_output=True, text=True)
+            if out.returncode:
+                raise RuntimeError(f"row failed ({cmd}):\n{out.stdout}\n{out.stderr}")
             line = out.stdout.strip().splitlines()
             print(line[-1] if line else out.stderr[-400:], flush=True)
-            args.json and rows.append(json.loads(
-                json.dumps(_row_from(out.stdout))))
+            rows.append(_row_from(out.stdout))
+            if args.json:
+                with open(args.json, "w") as f:
+                    json.dump(rows, f, indent=1)
             subprocess.run(["sleep", str(args.cooldown)])
     if args.json:
         with open(args.json, "w") as f:

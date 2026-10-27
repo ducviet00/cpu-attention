@@ -142,13 +142,21 @@ PyObject* py_paged_make_plan(PyObject*, PyObject* args) {
   Py_RETURN_NONE;
 }
 
-PyObject* py_paged_forward(PyObject*, PyObject* args) {
-  unsigned long long addr, q, k, v, kc, vc, out, slots, bt, lens;
-  long long qstride, kvstride;
-  double scale;
-  if (!PyArg_ParseTuple(args, "KKKKKKKKKKLLd", &addr, &q, &k, &v, &kc, &vc,
-                        &out, &slots, &bt, &lens, &qstride, &kvstride, &scale))
+PyObject* py_paged_forward(PyObject*, PyObject* const* args, Py_ssize_t nargs) {
+  if (nargs != 13) {
+    PyErr_Format(PyExc_TypeError, "paged_forward expected 13 arguments, got %zd",
+                 nargs);
     return nullptr;
+  }
+  // FASTCALL avoids building a tuple for every decoder layer. Keep conversions
+  // checked: a bad address argument must fail before the plan is dereferenced.
+  unsigned long long ptrs[10];
+  for (int i = 0; i < 10; ++i) ptrs[i] = PyLong_AsUnsignedLongLong(args[i]);
+  const auto [addr, q, k, v, kc, vc, out, slots, bt, lens] = ptrs;
+  const long long qstride = PyLong_AsLongLong(args[10]);
+  const long long kvstride = PyLong_AsLongLong(args[11]);
+  const double scale = PyFloat_AsDouble(args[12]);
+  if (PyErr_Occurred()) return nullptr;
   const int64_t* p = reinterpret_cast<const int64_t*>(addr);
   if (p[Q_MAGIC] != kPlanMagic) {
     PyErr_SetString(PyExc_RuntimeError, "paged_forward: stale plan buffer");
@@ -217,10 +225,16 @@ PyObject* py_dense_make_plan(PyObject*, PyObject* args) {
   Py_RETURN_NONE;
 }
 
-PyObject* py_dense_forward(PyObject*, PyObject* args) {
-  unsigned long long addr, q, k, v, out;
-  if (!PyArg_ParseTuple(args, "KKKKK", &addr, &q, &k, &v, &out))
+PyObject* py_dense_forward(PyObject*, PyObject* const* args, Py_ssize_t nargs) {
+  if (nargs != 5) {
+    PyErr_Format(PyExc_TypeError, "dense_forward expected 5 arguments, got %zd",
+                 nargs);
     return nullptr;
+  }
+  unsigned long long ptrs[5];
+  for (int i = 0; i < 5; ++i) ptrs[i] = PyLong_AsUnsignedLongLong(args[i]);
+  const auto [addr, q, k, v, out] = ptrs;
+  if (PyErr_Occurred()) return nullptr;
   const int64_t* p = reinterpret_cast<const int64_t*>(addr);
   if (p[P_MAGIC] != kPlanMagic) {
     PyErr_SetString(PyExc_RuntimeError, "dense_forward: stale plan buffer");
@@ -323,9 +337,13 @@ PyMethodDef kMethods[] = {
      "fill a per-geometry plan buffer"},
     {"paged_make_plan", py_paged_make_plan, METH_VARARGS,
      "fill a per-geometry paged plan buffer"},
-    {"paged_forward", py_paged_forward, METH_VARARGS,
+    {"paged_forward", reinterpret_cast<PyCFunction>(
+                          reinterpret_cast<void (*)()>(py_paged_forward)),
+     METH_FASTCALL,
      "paged attention from a plan buffer"},
-    {"dense_forward", py_dense_forward, METH_VARARGS,
+    {"dense_forward", reinterpret_cast<PyCFunction>(
+                          reinterpret_cast<void (*)()>(py_dense_forward)),
+     METH_FASTCALL,
      "dense attention from a plan buffer"},
     {"backend", py_backend, METH_NOARGS, "backend name"},
     {"isa", py_isa, METH_NOARGS, "the ISA the dense path selects"},

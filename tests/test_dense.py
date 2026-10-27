@@ -255,6 +255,27 @@ def main() -> int:
     else:
         print(f"[OK] plan-buffer entry is bit-identical on {abi_cases} cases")
 
+    if K.backend() == "cpp":
+        mod = K.module()
+        stale = torch.zeros(24, dtype=torch.int64)
+        bad_calls = [
+            (mod.dense_forward, ()),
+            (mod.dense_forward, ("bad", 0, 0, 0, 0)),
+            (mod.dense_forward, (-1, 0, 0, 0, 0)),
+            (mod.dense_forward, (stale.data_ptr(), 0, 0, 0, 0)),
+            (mod.paged_forward, ()),
+            (mod.paged_forward, (stale.data_ptr(), *([0] * 11), 1.0)),
+        ]
+        for entry, args in bad_calls:
+            checks += 1
+            try:
+                entry(*args)
+            except (TypeError, OverflowError, RuntimeError):
+                print("[OK] raw entry rejects bad arguments before reading a plan")
+            else:
+                fails += 1
+                print("[FAIL] raw entry accepted invalid arguments")
+
     print(f"cpu_attention dense: {checks - fails}/{checks} checks passed")
     return fails
 

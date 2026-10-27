@@ -13,6 +13,7 @@ absolute numbers are taken while the core is cool.
 import argparse
 import json
 import os
+import platform
 import sys
 
 import torch
@@ -66,8 +67,14 @@ def dense_row(seq, heads, dim, dtype, vllm, isa, rounds, bsz=64):
            "dtype": "bf16" if dtype == torch.bfloat16 else "fp32",
            "cpp_us": st["cpp"]["min"], "cpp_med": st["cpp"]["median"],
            "mojo_us": st["mojo"]["min"], "mojo_med": st["mojo"]["median"],
-           "ctrl_us": st["ctrl"]["min"],
-           "d_cpp": (got.float() - ref).abs().max().item()}
+            "ctrl_us": st["ctrl"]["min"],
+            "ctrl_med": st["ctrl"]["median"],
+            "samples_us": s, "rounds": rounds,
+            "threads": torch.get_num_threads(), "machine": platform.machine(),
+            "loadavg": os.getloadavg(), "isa": isa, "output": "allocated",
+            "d_cpp": (got.float() - ref).abs().max().item()}
+    if not row["d_cpp"] <= (3e-2 if dtype == torch.bfloat16 else 2e-4):
+        raise AssertionError(f"dense parity failed: {row}")
     if "vllm" in st:
         row["vllm_us"] = st["vllm"]["min"]
         row["vllm_med"] = st["vllm"]["median"]
@@ -87,7 +94,7 @@ def main():
     ap.add_argument("--dtype", default="fp32", choices=("fp32", "bf16"))
     ap.add_argument("--vllm", default=os.environ.get("VLLM_REF", ""))
     ap.add_argument("--isa", default=os.environ.get("VLLM_ISA", "vec"))
-    ap.add_argument("--rounds", type=int, default=21)
+    ap.add_argument("--rounds", type=int, default=41)
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--json", default="")
     args = ap.parse_args()
