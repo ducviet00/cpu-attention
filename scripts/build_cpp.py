@@ -13,6 +13,10 @@ Per-ISA flags, as required by the intrinsics each file uses:
   amx.cpp    the above plus -mamx-tile -mamx-bf16 -mamx-int8
   neon.cpp   -march=armv8.2-a+bf16+i8mm
 Everything else is compiled baseline, so the fallback paths stay portable.
+
+binding.cpp also sees torch's headers and the module links torch's libraries:
+the paged decode entry reads tensors directly (see its comment), so the build
+belongs to the torch it was made with. Rebuild after upgrading torch.
 """
 
 import os
@@ -46,6 +50,15 @@ def arch() -> str:
     raise SystemExit(f"build_cpp: unsupported machine {m}")
 
 
+def torch_paths():
+    """torch's include dirs, library dir and C++ ABI flag."""
+    import torch
+    from torch.utils import cpp_extension
+
+    return (cpp_extension.include_paths(), cpp_extension.library_paths()[0],
+            int(torch._C._GLIBCXX_USE_CXX11_ABI))
+
+
 def main() -> None:
     t0 = time.time()
     a = arch()
@@ -56,7 +69,10 @@ def main() -> None:
 
     # (source, extra flags)
     pyinc = sysconfig.get_paths()["include"]
-    units = [("cpu_attn.cpp", []), ("binding.cpp", ["-I", pyinc]),
+    torch_inc, torch_lib, torch_abi = torch_paths()
+    binding = ["-I", pyinc, *(f for p in torch_inc for f in ("-isystem", p)),
+               f"-D_GLIBCXX_USE_CXX11_ABI={torch_abi}"]
+    units = [("cpu_attn.cpp", []), ("binding.cpp", binding),
              ("cpu_isa.cpp", []), ("scalar.cpp", [])]
     if a == "x86_64":
         units += [("vec.cpp", X86_VEC), ("amx.cpp", X86_AMX)]
@@ -76,7 +92,8 @@ def main() -> None:
     # Replacing the inode keeps an already-loaded A/B arm valid during a build.
     # Linking straight into LIB can truncate executable pages in another process.
     pending = os.path.join(build, f"_C_cpp.{os.getpid()}.so")
-    cmd = [cxx, "-shared", "-o", pending, *objs, "-fopenmp"]
+    cmd = [cxx, "-shared", "-o", pending, *objs, "-fopenmp", f"-L{torch_lib}",
+           f"-Wl,-rpath,{torch_lib}", "-ltorch_python", "-ltorch_cpu", "-lc10"]
     print("+", " ".join(cmd))
     try:
         subprocess.run(cmd, check=True)

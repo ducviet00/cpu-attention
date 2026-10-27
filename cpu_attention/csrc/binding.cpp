@@ -1,8 +1,9 @@
-// Python binding: the plain CPython C API, no torch and no pybind.
+// Python binding: the CPython C API, no pybind.
 //
-// Tensors never cross the boundary -- the Python side owns them and passes
-// `data_ptr()` integers, so this file has no dependency on libtorch's ABI and
-// the module loads in any process.
+// Most entries take `data_ptr()` integers. The paged decode entry
+// (`paged_call`) takes the tensors themselves, because at batch 1 reading them
+// from Python was 40% of the call; that one entry ties the module to the torch
+// it was built against (the build links that torch's libraries).
 //
 // Two entries exist for the dense path:
 //   dense_make_plan + dense_forward   five arguments per call, the geometry
@@ -12,7 +13,12 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
+#include <ATen/Parallel.h>
+#include <ATen/ops/empty.h>
+#include <torch/csrc/autograd/python_variable.h>
+
 #include <cstring>
+#include <vector>
 
 #include "cpu_attn.hpp"
 #include "cpu_isa.hpp"
@@ -98,94 +104,198 @@ PyObject* py_attention(PyObject*, PyObject* args) {
   Py_RETURN_NONE;
 }
 
-// Paged plan: the 14 constants of a geometry, so a call marshals only the data
-// pointers and the two token strides. At batch 1 the whole call is 7 us, and
-// the 23-argument long form costs 0.68 us of it in `PyArg_ParseTuple` alone.
-enum {
-  Q_MAGIC = 0,
-  Q_NSEQ,
-  Q_NHEADS,
-  Q_NKV,
-  Q_HD,
-  Q_PAGE,
-  Q_BTSTRIDE,
-  Q_OUTSTRIDE,
-  Q_DTYPE,
-  Q_SCALE,
-  Q_WORKERS,
-  Q_DOSTORE,
-  Q_N
+// The engine's per-layer paged entry, reading the tensors themselves.
+//
+// At batch 1 a decode call is ~4.6 us and 1.8 us of it was Python: a plan key
+// built from three `.shape` reads and hashed, six `data_ptr()`s, a stride and
+// `torch.empty_like`. Here those are field loads, the geometry cache is a
+// per-thread linear scan, and the output comes from `at::empty`.
+//
+// The worker count stays a Python policy (`_kernel._workers`): a geometry this
+// thread has not seen returns NotImplemented, Python registers it with
+// `paged_register`, and calls again.
+struct PagedGeom {
+  int64_t nseq, nheads, nkv, hd, page, npages;
+  int dtype, threads;
+  bool store;
+  int workers;
+  bool same(const PagedGeom& o) const {
+    return nseq == o.nseq && nheads == o.nheads && nkv == o.nkv &&
+           hd == o.hd && page == o.page && npages == o.npages &&
+           dtype == o.dtype && threads == o.threads && store == o.store;
+  }
 };
+thread_local std::vector<PagedGeom> t_paged;
 
-PyObject* py_paged_make_plan(PyObject*, PyObject* args) {
-  unsigned long long addr;
-  long long nseq, nheads, nkv, hd, page, btstride, outstride, dtype, workers,
-      do_store;
-  double scale;
-  if (!PyArg_ParseTuple(args, "KLLLLLLLLdLL", &addr, &nseq, &nheads, &nkv, &hd,
-                        &page, &btstride, &outstride, &dtype, &scale, &workers,
-                        &do_store))
-    return nullptr;
-  int64_t* p = reinterpret_cast<int64_t*>(addr);
-  p[Q_MAGIC] = kPlanMagic;
-  p[Q_NSEQ] = nseq;
-  p[Q_NHEADS] = nheads;
-  p[Q_NKV] = nkv;
-  p[Q_HD] = hd;
-  p[Q_PAGE] = page;
-  p[Q_BTSTRIDE] = btstride;
-  p[Q_OUTSTRIDE] = outstride;
-  p[Q_DTYPE] = dtype;
-  p[Q_SCALE] = f2i(static_cast<float>(scale));
-  p[Q_WORKERS] = workers;
-  p[Q_DOSTORE] = do_store;
-  Py_RETURN_NONE;
+int dtype_code(const at::Tensor& t) {
+  switch (t.scalar_type()) {
+    case at::kFloat: return attn::kF32;
+    case at::kBFloat16: return attn::kBF16;
+    default: return -1;
+  }
 }
 
-PyObject* py_paged_forward(PyObject*, PyObject* const* args, Py_ssize_t nargs) {
-  if (nargs != 13) {
-    PyErr_Format(PyExc_TypeError, "paged_forward expected 13 arguments, got %zd",
+const at::Tensor* tensor_arg(PyObject* o, const char* name) {
+  if (!THPVariable_Check(o)) {
+    PyErr_Format(PyExc_TypeError, "paged_call: %s must be a tensor", name);
+    return nullptr;
+  }
+  return &THPVariable_Unpack(o);
+}
+
+// Geometry of (q, k_cache, block_table) plus the calling thread's torch thread
+// count, so `torch.set_num_threads` re-runs the worker policy.
+bool paged_geom(PyObject* q, PyObject* kc, PyObject* bt, bool store,
+                PagedGeom* g) {
+  const at::Tensor* tq = tensor_arg(q, "query");
+  const at::Tensor* tk = tq ? tensor_arg(kc, "k_cache") : nullptr;
+  const at::Tensor* tb = tk ? tensor_arg(bt, "block_table") : nullptr;
+  if (!tb) return false;
+  if (tq->dim() != 3 || tk->dim() != 4 || tb->dim() != 2) {
+    PyErr_SetString(PyExc_ValueError,
+                    "paged_call: query [seqs, heads, dim], cache [pages, kv "
+                    "heads, page, dim], block_table [seqs, pages]");
+    return false;
+  }
+  g->nseq = tq->size(0);
+  g->nheads = tq->size(1);
+  g->hd = tq->size(2);
+  g->nkv = tk->size(1);
+  g->page = tk->size(2);
+  g->npages = tb->size(1);
+  g->dtype = dtype_code(*tq);
+  g->threads = at::get_num_threads();
+  g->store = store;
+  return true;
+}
+
+PyObject* py_paged_register(PyObject*, PyObject* const* args, Py_ssize_t nargs) {
+  if (nargs != 5) {
+    PyErr_Format(PyExc_TypeError, "paged_register expected 5 arguments, got %zd",
                  nargs);
     return nullptr;
   }
-  // FASTCALL avoids building a tuple for every decoder layer. Keep conversions
-  // checked: a bad address argument must fail before the plan is dereferenced.
-  unsigned long long ptrs[10];
-  for (int i = 0; i < 10; ++i) ptrs[i] = PyLong_AsUnsignedLongLong(args[i]);
-  const auto [addr, q, k, v, kc, vc, out, slots, bt, lens] = ptrs;
-  const long long qstride = PyLong_AsLongLong(args[10]);
-  const long long kvstride = PyLong_AsLongLong(args[11]);
-  const double scale = PyFloat_AsDouble(args[12]);
+  PagedGeom g;
+  if (!paged_geom(args[0], args[1], args[2], PyObject_IsTrue(args[3]) == 1, &g))
+    return nullptr;
+  g.workers = static_cast<int>(PyLong_AsLong(args[4]));
   if (PyErr_Occurred()) return nullptr;
-  const int64_t* p = reinterpret_cast<const int64_t*>(addr);
-  if (p[Q_MAGIC] != kPlanMagic) {
-    PyErr_SetString(PyExc_RuntimeError, "paged_forward: stale plan buffer");
+  if (t_paged.size() >= 64) t_paged.clear();
+  t_paged.push_back(g);
+  Py_RETURN_NONE;
+}
+
+// paged_call(q, k, v, k_cache, v_cache, slots, block_table, lens, scale, out)
+// k/v/slots are None for cross attention; out is None to allocate. Layouts are
+// checked, not assumed: heads and dims contiguous, any token stride (the
+// engine's q/k/v are chunks of one fused projection).
+PyObject* py_paged_call(PyObject*, PyObject* const* args, Py_ssize_t nargs) {
+  if (nargs != 10) {
+    PyErr_Format(PyExc_TypeError, "paged_call expected 10 arguments, got %zd",
+                 nargs);
     return nullptr;
   }
+  const bool store = args[1] != Py_None;
+  PagedGeom g;
+  if (!paged_geom(args[0], args[3], args[6], store, &g)) return nullptr;
+  const PagedGeom* plan = nullptr;
+  for (const PagedGeom& e : t_paged)
+    if (e.same(g)) {
+      plan = &e;
+      break;
+    }
+  if (!plan) Py_RETURN_NOTIMPLEMENTED;
+
+  const at::Tensor& q = THPVariable_Unpack(args[0]);
+  const at::Tensor* kc = tensor_arg(args[3], "k_cache");
+  const at::Tensor* vc = kc ? tensor_arg(args[4], "v_cache") : nullptr;
+  const at::Tensor* lens = vc ? tensor_arg(args[7], "context_lens") : nullptr;
+  if (!lens) return nullptr;
+  const at::Tensor& bt = THPVariable_Unpack(args[6]);
+  const char* bad = nullptr;
+  if (g.dtype < 0 || dtype_code(*kc) != g.dtype || dtype_code(*vc) != g.dtype)
+    bad = "query and caches must share one dtype, float32 or bfloat16";
+  else if (q.stride(2) != 1 || q.stride(1) != g.hd)
+    bad = "query heads/dims must be contiguous";
+  else if (!kc->is_contiguous() || !vc->is_contiguous() ||
+           !vc->sizes().equals(kc->sizes()))
+    bad = "k_cache and v_cache must be contiguous and the same shape";
+  else if (bt.scalar_type() != at::kInt || bt.stride(1) != 1 ||
+           lens->scalar_type() != at::kInt || !lens->is_contiguous() ||
+           lens->numel() < g.nseq)
+    bad = "block_table and context_lens must be int32";
+  if (bad) {
+    PyErr_Format(PyExc_ValueError, "paged_call: %s", bad);
+    return nullptr;
+  }
+
   PagedJob job;
-  job.q = reinterpret_cast<const void*>(q);
-  job.k = reinterpret_cast<const void*>(k);
-  job.v = reinterpret_cast<const void*>(v);
-  job.k_cache = reinterpret_cast<void*>(kc);
-  job.v_cache = reinterpret_cast<void*>(vc);
-  job.out = reinterpret_cast<void*>(out);
-  job.slots = reinterpret_cast<const int64_t*>(slots);
-  job.block_table = reinterpret_cast<const int32_t*>(bt);
-  job.lens = reinterpret_cast<const int32_t*>(lens);
-  job.num_seqs = p[Q_NSEQ];
-  job.num_heads = p[Q_NHEADS];
-  job.num_kv_heads = p[Q_NKV];
-  job.head_dim = p[Q_HD];
-  job.page = p[Q_PAGE];
-  job.bt_stride = p[Q_BTSTRIDE];
-  job.out_stride = p[Q_OUTSTRIDE];
-  job.q_stride = qstride;
-  job.kv_stride = kvstride;
+  if (store) {
+    const at::Tensor* k = tensor_arg(args[1], "key");
+    const at::Tensor* v = k ? tensor_arg(args[2], "value") : nullptr;
+    const at::Tensor* slots = v ? tensor_arg(args[5], "slot_mapping") : nullptr;
+    if (!slots) return nullptr;
+    // One token stride serves both: they are chunks of the same projection.
+    if (dtype_code(*k) != g.dtype || dtype_code(*v) != g.dtype ||
+        k->dim() != 3 || !k->sizes().equals(v->sizes()) ||
+        k->size(0) != g.nseq || k->size(1) != g.nkv || k->size(2) != g.hd ||
+        k->stride(2) != 1 || k->stride(1) != g.hd ||
+        v->stride(2) != 1 || v->stride(1) != g.hd ||
+        v->stride(0) != k->stride(0) || slots->scalar_type() != at::kLong ||
+        !slots->is_contiguous() || slots->numel() < g.nseq) {
+      PyErr_SetString(PyExc_ValueError,
+                      "paged_call: key/value must be [seqs, kv heads, dim] "
+                      "with one token stride, slot_mapping int64");
+      return nullptr;
+    }
+    job.k = k->data_ptr();
+    job.v = v->data_ptr();
+    job.slots = slots->data_ptr<int64_t>();
+    job.kv_stride = k->stride(0);
+  }
+
+  PyObject* out_obj = args[9];
+  at::Tensor fresh;
+  const at::Tensor* out;
+  if (out_obj == Py_None) {
+    fresh = at::empty({g.nseq, g.nheads, g.hd}, q.options());
+    out = &fresh;
+  } else {
+    out = tensor_arg(out_obj, "out");
+    if (!out) return nullptr;
+    if (dtype_code(*out) != g.dtype || !out->is_contiguous() ||
+        !out->sizes().equals(q.sizes())) {
+      PyErr_SetString(PyExc_ValueError,
+                      "paged_call: out must be a contiguous tensor shaped and "
+                      "typed like query");
+      return nullptr;
+    }
+  }
+  const double scale = PyFloat_AsDouble(args[8]);
+  if (PyErr_Occurred()) return nullptr;
+
+  job.q = q.data_ptr();
+  job.k_cache = kc->data_ptr();
+  job.v_cache = vc->data_ptr();
+  job.out = out->data_ptr();
+  job.block_table = bt.data_ptr<int32_t>();
+  job.lens = lens->data_ptr<int32_t>();
+  job.num_seqs = g.nseq;
+  job.num_heads = g.nheads;
+  job.num_kv_heads = g.nkv;
+  job.head_dim = g.hd;
+  job.page = g.page;
+  job.bt_stride = bt.stride(0);
+  job.q_stride = q.stride(0);
+  job.out_stride = g.nheads * g.hd;
   job.scale = static_cast<float>(scale);
-  job.dtype = static_cast<int>(p[Q_DTYPE]);
-  attn::attention_entry(job, static_cast<int>(p[Q_WORKERS]),
-                        p[Q_DOSTORE] != 0, true);
-  Py_RETURN_NONE;
+  job.dtype = g.dtype;
+  attn::attention_entry(job, plan->workers, store, true);
+  if (out_obj != Py_None) {
+    Py_INCREF(out_obj);
+    return out_obj;
+  }
+  return THPVariable_Wrap(std::move(fresh));
 }
 
 PyObject* py_dense_make_plan(PyObject*, PyObject* args) {
@@ -335,12 +445,14 @@ PyMethodDef kMethods[] = {
      "dense attention, long form"},
     {"dense_make_plan", py_dense_make_plan, METH_VARARGS,
      "fill a per-geometry plan buffer"},
-    {"paged_make_plan", py_paged_make_plan, METH_VARARGS,
-     "fill a per-geometry paged plan buffer"},
-    {"paged_forward", reinterpret_cast<PyCFunction>(
-                          reinterpret_cast<void (*)()>(py_paged_forward)),
+    {"paged_call", reinterpret_cast<PyCFunction>(
+                       reinterpret_cast<void (*)()>(py_paged_call)),
      METH_FASTCALL,
-     "paged attention from a plan buffer"},
+     "paged attention from tensors; NotImplemented for an unregistered geometry"},
+    {"paged_register", reinterpret_cast<PyCFunction>(
+                           reinterpret_cast<void (*)()>(py_paged_register)),
+     METH_FASTCALL,
+     "register a paged geometry's worker count for this thread"},
     {"dense_forward", reinterpret_cast<PyCFunction>(
                           reinterpret_cast<void (*)()>(py_dense_forward)),
      METH_FASTCALL,

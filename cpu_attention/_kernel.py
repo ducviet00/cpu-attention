@@ -267,7 +267,10 @@ def _call(
 
 
 _PAGED_PLANS = threading.local()
-"""Per-thread geometry -> fast call, for the paged path.
+"""Per-thread geometry -> fast call, for the Mojo paged path.
+
+(The C++ backend keeps the same per-thread cache inside the extension:
+`paged_call` / `paged_register`.)
 
 The engine calls `self_attention`/`cross_attention` 24 times a decode step with
 the same geometry, and at batch 1 / ctx 256 the whole call is 7 us: reading a
@@ -302,54 +305,31 @@ def _paged_plan(query, key, value, k_cache, page_table, do_store):
         nseq, nheads, hd = query_shape
         kvh, page = cache_shape[1:3]
         workers = _workers(nseq * nheads, npages)
-        if _BACKEND == "cpp":
-            # The C++ extension keeps the geometry in a plan buffer, so a call
-            # marshals only pointers and two strides: `paged_forward` is 13
-            # arguments against the long form's 22, and the parse is a fifth of
-            # a batch-1 call.
-            make = _entry("paged_make_plan")
-            fwd = _entry("paged_forward")
-            pbuf = torch.empty(12, dtype=torch.int64)
-            addr = pbuf.data_ptr()
-            make(addr, nseq, nheads, kvh, hd, page, npages, nheads * hd,
-                 _DTYPE_CODES[query.dtype], 0.0, workers, int(bool(do_store)))
+        args = [
+            0, 0, 0, 0, 0, 0, 0, 0, 0,
+            nseq, nheads, kvh, hd, page, npages, 0, 0, nheads * hd,
+            _DTYPE_CODES[query.dtype], 0.0, workers, do_store, True,
+        ]
+        attention = _attention()
+        store = do_store
 
-            def fn(out, query, key, value, k_cache, v_cache, slots, block_table,
-                   lens, scale, _keep=pbuf):
-                fwd(addr, query.data_ptr(),
-                    key.data_ptr() if key is not None else 0,
-                    value.data_ptr() if value is not None else 0,
-                    k_cache.data_ptr(), v_cache.data_ptr(), out.data_ptr(),
-                    slots.data_ptr() if slots is not None else 0,
-                    block_table.data_ptr(), lens.data_ptr(), query.stride(0),
-                    key.stride(0) if key is not None else 0, scale)
-
-        else:
-            args = [
-                0, 0, 0, 0, 0, 0, 0, 0, 0,
-                nseq, nheads, kvh, hd, page, npages, 0, 0, nheads * hd,
-                _DTYPE_CODES[query.dtype], 0.0, workers, do_store, True,
-            ]
-            attention = _attention()
-            store = do_store
-
-            def fn(out, query, key, value, k_cache, v_cache, slots, block_table,
-                   lens, scale):
-                a = args
-                a[0] = query.data_ptr()
-                a[3] = k_cache.data_ptr()
-                a[4] = v_cache.data_ptr()
-                a[5] = out.data_ptr()
-                a[7] = block_table.data_ptr()
-                a[8] = lens.data_ptr()
-                a[15] = query.stride(0)
-                a[19] = scale
-                if store:
-                    a[1] = key.data_ptr()
-                    a[2] = value.data_ptr()
-                    a[6] = slots.data_ptr()
-                    a[16] = key.stride(0)
-                attention(*a)
+        def fn(out, query, key, value, k_cache, v_cache, slots, block_table,
+               lens, scale):
+            a = args
+            a[0] = query.data_ptr()
+            a[3] = k_cache.data_ptr()
+            a[4] = v_cache.data_ptr()
+            a[5] = out.data_ptr()
+            a[7] = block_table.data_ptr()
+            a[8] = lens.data_ptr()
+            a[15] = query.stride(0)
+            a[19] = scale
+            if store:
+                a[1] = key.data_ptr()
+                a[2] = value.data_ptr()
+                a[6] = slots.data_ptr()
+                a[16] = key.stride(0)
+            attention(*a)
 
         if len(plans) > 64:
             plans.clear()
@@ -367,6 +347,20 @@ def _paged(
     is a fifth of a batch-1 call and the reason the scorecard's batch-1 rows
     read badly against a reference whose output is preallocated.
     """
+    if _BACKEND == "cpp":
+        # The C++ entry reads the tensors and allocates `out` itself; it knows
+        # every geometry this thread registered (see `paged_call`).
+        call = _entry("paged_call")
+        res = call(query, key, value, k_cache, v_cache, slots, page_table, lens,
+                   scale, out)
+        if res is NotImplemented:
+            nseq, nheads = query.shape[:2]
+            npages = page_table.shape[1]
+            _entry("paged_register")(query, k_cache, page_table, do_store,
+                                     _workers(nseq * nheads, npages))
+            res = call(query, key, value, k_cache, v_cache, slots, page_table,
+                       lens, scale, out)
+        return res
     if out is None:
         # Paged queries have contiguous heads/dims; a fused-projection token
         # gap is compacted by empty_like without a memory-format keyword.

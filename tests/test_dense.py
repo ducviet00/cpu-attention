@@ -263,8 +263,9 @@ def main() -> int:
             (mod.dense_forward, ("bad", 0, 0, 0, 0)),
             (mod.dense_forward, (-1, 0, 0, 0, 0)),
             (mod.dense_forward, (stale.data_ptr(), 0, 0, 0, 0)),
-            (mod.paged_forward, ()),
-            (mod.paged_forward, (stale.data_ptr(), *([0] * 11), 1.0)),
+            (mod.paged_call, ()),
+            (mod.paged_call, (*([0] * 9), None)),
+            (mod.paged_register, (0, 0, 0, False, 1)),
         ]
         for entry, args in bad_calls:
             checks += 1
