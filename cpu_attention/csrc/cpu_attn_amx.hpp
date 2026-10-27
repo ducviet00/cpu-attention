@@ -636,6 +636,76 @@ struct Dense {
     const float slack = max_slack();
     const int ntail = ((nkeys + KSTEP - 1) & ~(KSTEP - 1));
 
+    if (nrows == RQT) {
+      // Four independent rows hide the exponential's dependency chain without
+      // changing either the online maxima or the probability rounding order.
+      for (int r0 = 0; r0 < RQT; r0 += 4) {
+        __m512 mx[4], base[4], sum[4];
+#pragma GCC unroll 4
+        for (int rr = 0; rr < 4; ++rr)
+          mx[rr] = _mm512_set1_ps(-INFINITY);
+        for (int j = 0; j < nkeys; j += 16) {
+#pragma GCC unroll 4
+          for (int rr = 0; rr < 4; ++rr)
+            mx[rr] = _mm512_max_ps(mx[rr], _mm512_loadu_ps(
+                logits + static_cast<int64_t>(r0 + rr) * kt + j));
+        }
+#pragma GCC unroll 4
+        for (int rr = 0; rr < 4; ++rr) {
+          const int r = r0 + rr;
+          const float mxv = _mm512_reduce_max_ps(mx[rr]) * c;
+          const float mo = m[r];
+          float mn, a;
+          if (mxv == -INFINITY) {
+            mn = mo;
+            a = 1.0f;
+          } else if (mo == -INFINITY) {
+            mn = mxv;
+            a = 1.0f;
+          } else if (mxv > mo + slack) {
+            mn = mxv;
+            a = std::exp2(mo - mn);
+          } else {
+            mn = mo;
+            a = 1.0f;
+          }
+          m[r] = mn;
+          alpha[r] = a;
+          l[r] *= a;
+          base[rr] = _mm512_set1_ps(mn == -INFINITY ? 0.0f : mn);
+          sum[rr] = _mm512_setzero_ps();
+        }
+        for (int j = 0; j < nkeys; j += 16) {
+#pragma GCC unroll 4
+          for (int rr = 0; rr < 4; ++rr) {
+            const int r = r0 + rr;
+            const __m512 e = exp2v<BF>(_mm512_fmsub_ps(
+                _mm512_loadu_ps(logits + static_cast<int64_t>(r) * kt + j),
+                vc, base[rr]));
+            sum[rr] = _mm512_add_ps(sum[rr], e);
+            const __m256i h = cvt_bf16x16(e);
+            _mm256_storeu_si256(reinterpret_cast<__m256i*>(
+                prob + static_cast<int64_t>(r) * KTMAX + j), h);
+            if constexpr (!BF)
+              _mm256_storeu_si256(reinterpret_cast<__m256i*>(
+                  prob_lo + static_cast<int64_t>(r) * KTMAX + j),
+                  cvt_bf16x16(_mm512_sub_ps(e, widen_bf16x16(h))));
+          }
+        }
+#pragma GCC unroll 4
+        for (int rr = 0; rr < 4; ++rr) {
+          const int r = r0 + rr;
+          l[r] += _mm512_reduce_add_ps(sum[rr]);
+          for (int j = nkeys; j < ntail; ++j) {
+            prob[static_cast<int64_t>(r) * KTMAX + j] = bf16{0};
+            if constexpr (!BF)
+              prob_lo[static_cast<int64_t>(r) * KTMAX + j] = bf16{0};
+          }
+        }
+      }
+      return;
+    }
+
     for (int r = 0; r < nrows; ++r) {
       float* p = logits + static_cast<int64_t>(r) * kt;
       bf16* pp = prob + static_cast<int64_t>(r) * KTMAX;

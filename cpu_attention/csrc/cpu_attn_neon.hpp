@@ -3,7 +3,8 @@
 // Layouts (this policy defines them; `pack`/`store_head` write them):
 //
 //   dense fp32   K [hd][pad]           V [pad][hd]
-//   dense bf16   K [hd/4][pad/2][8]    V [hd/2][pad/4][8]
+//   dense bf16   K [tile][hd/4][32][8] V [tile][hd/2][16][8] (64-key tiles;
+//                                       D=64 keeps V [hd/2][pad/4][8])
 //   paged fp32   K [hd][page]          V [page][hd]      (byte-compatible with
 //                                                        the VEC and Mojo paths)
 //   paged bf16   K [hd/2][page][2]     V [page/2][hd][2] (the Mojo ARM layout)
@@ -516,6 +517,12 @@ struct DenseBF {
   static constexpr int KTMAXV = 2048;
   static constexpr int DG = HD / 4;   // head-dim groups of 4
   static constexpr int RP = RQT / 2;  // row pairs
+  // Nearby dimension pairs avoid the long-sequence V stride on D=32/128.
+  // D=64 measured slightly slower with blocking, so it keeps the old layout.
+  static constexpr bool VBLOCK = HD != 64;
+  static constexpr int VKEYS = 64;
+  static constexpr int VGROUPS = VKEYS / 4;
+  static constexpr int VSTRIDE = VGROUPS * 16;
 
   static constexpr int kt_() { return KTC; }
   static int& rq_cached() {
@@ -569,7 +576,8 @@ struct DenseBF {
   }
 
   // K -> [tile][HD/4][32 pairs][8]: four head dims of two adjacent keys.
-  // V -> [HD/2][pad/4][8]: two head dims of four adjacent keys.
+  // V -> [tile][HD/2][16][8], or the unblocked D=64 layout: two head dims
+  // of four adjacent keys. The key order within a dot product is unchanged.
   static void pack(const DenseJob& job, int64_t b, int64_t kvh, char* slab) {
     if (neon_mode() & 1) return;
     const int64_t pad = pad_of(job.seq_k);
@@ -611,11 +619,16 @@ struct DenseBF {
         const uint32x4_t b = vreinterpretq_u32_u16(vzip2q_u16(r[0], r[1]));
         const uint32x4_t c = vreinterpretq_u32_u16(vzip1q_u16(r[2], r[3]));
         const uint32x4_t e = vreinterpretq_u32_u16(vzip2q_u16(r[2], r[3]));
-        char* dst = vd + ((d / 2) * kg_n + kg) * 16;
+        const int64_t stride = VBLOCK ? VSTRIDE : kg_n * 16;
+        const int64_t off = VBLOCK
+            ? ((t0 / VKEYS) * (HD / 2) + d / 2) * VGROUPS +
+                  (t0 % VKEYS) / 4
+            : (d / 2) * kg_n + kg;
+        char* dst = vd + off * 16;
         vst1q_u32(reinterpret_cast<uint32_t*>(dst), vzip1q_u32(a, c));
-        vst1q_u32(reinterpret_cast<uint32_t*>(dst + kg_n * 16), vzip2q_u32(a, c));
-        vst1q_u32(reinterpret_cast<uint32_t*>(dst + kg_n * 32), vzip1q_u32(b, e));
-        vst1q_u32(reinterpret_cast<uint32_t*>(dst + kg_n * 48), vzip2q_u32(b, e));
+        vst1q_u32(reinterpret_cast<uint32_t*>(dst + stride), vzip2q_u32(a, c));
+        vst1q_u32(reinterpret_cast<uint32_t*>(dst + 2 * stride), vzip1q_u32(b, e));
+        vst1q_u32(reinterpret_cast<uint32_t*>(dst + 3 * stride), vzip2q_u32(b, e));
       }
     }
   }
@@ -839,8 +852,8 @@ struct DenseBF {
     const int KG = kt_() / 4;
     const char* pt = pof(const_cast<float*>(logits));
     const int64_t pad = pad_of(job.seq_k);
-    const int64_t vs = (pad / 4) * 16;  // one key group of one dim pair
-    const char* vd = slab + pad * HD * 2 + (k0 / 4) * 16;
+    const int64_t vs = VBLOCK ? VSTRIDE : (pad / 4) * 16;
+    const char* vd = slab + pad * HD * 2;
     if (neon_mode() & 8) return;
     // Eight head dims per pass: the accumulator is 4 row pairs x 4 dim pairs =
     // 16 registers, which leaves room for the operands. Sixteen dims per pass
@@ -864,46 +877,50 @@ struct DenseBF {
       // (dim pair, key group) inside the loop cost 16 of the body's 42
       // instructions -- more than the matmul's own loads.
       const char* p = pt;
-      const char* v = vd + (int64_t(dc / 2) * (pad / 4)) * 16;
-      int j = 0;
-      // Sixteen keys per step (four 4-key groups): the eight loads of a group
-      // feed sixteen `bfmmla`, so a wider step is what lets the loads run ahead
-      // of the matmul instead of stalling behind it.
-      for (; j + 16 <= nkeys; j += 16) {
-        for (int h = 0; h < 4; ++h) {
+      for (int jb = 0; jb < (VBLOCK ? nkeys : 1); jb += VKEYS) {
+        const int block_keys = VBLOCK ? std::min(VKEYS, nkeys - jb) : nkeys;
+        const char* v = VBLOCK
+            ? vd + (((k0 + jb) / VKEYS) * (HD / 2) + dc / 2) * vs
+            : vd + int64_t(dc / 2) * vs + (k0 / 4) * 16;
+        int j = 0;
+        // Keep the output accumulator live across V tiles; only the operand
+        // pointers change. Sixteen keys per step let loads run ahead of dots.
+        for (; j + 16 <= block_keys; j += 16) {
+          for (int h = 0; h < 4; ++h) {
+            bfloat16x8_t pa[RP], vb[4];
+            for (int rp = 0; rp < RP; ++rp)
+              pa[rp] = ldb(p + rp * KG * 16 + h * 16);
+            for (int i = 0; i < 4; ++i) vb[i] = ldb(v + i * vs + h * 16);
+            for (int rp = 0; rp < RP; ++rp)
+              for (int i = 0; i < 4; ++i)
+                a[rp][i] = bfmmla(a[rp][i], pa[rp], vb[i]);
+          }
+          p += 64;
+          v += 64;
+        }
+        for (; j + 8 <= block_keys; j += 8) {
+          for (int h = 0; h < 2; ++h) {
+            bfloat16x8_t pa[RP], vb[4];
+            for (int rp = 0; rp < RP; ++rp)
+              pa[rp] = ldb(p + rp * KG * 16 + h * 16);
+            for (int i = 0; i < 4; ++i) vb[i] = ldb(v + i * vs + h * 16);
+            for (int rp = 0; rp < RP; ++rp)
+              for (int i = 0; i < 4; ++i)
+                a[rp][i] = bfmmla(a[rp][i], pa[rp], vb[i]);
+          }
+          p += 32;
+          v += 32;
+        }
+        for (; j < block_keys; j += 4) {
           bfloat16x8_t pa[RP], vb[4];
-          for (int rp = 0; rp < RP; ++rp)
-            pa[rp] = ldb(p + rp * KG * 16 + h * 16);
-          for (int i = 0; i < 4; ++i) vb[i] = ldb(v + i * vs + h * 16);
+          for (int rp = 0; rp < RP; ++rp) pa[rp] = ldb(p + rp * KG * 16);
+          for (int i = 0; i < 4; ++i) vb[i] = ldb(v + i * vs);
           for (int rp = 0; rp < RP; ++rp)
             for (int i = 0; i < 4; ++i)
               a[rp][i] = bfmmla(a[rp][i], pa[rp], vb[i]);
+          p += 16;
+          v += 16;
         }
-        p += 64;
-        v += 64;
-      }
-      for (; j + 8 <= nkeys; j += 8) {
-        for (int h = 0; h < 2; ++h) {
-          bfloat16x8_t pa[RP], vb[4];
-          for (int rp = 0; rp < RP; ++rp)
-            pa[rp] = ldb(p + rp * KG * 16 + h * 16);
-          for (int i = 0; i < 4; ++i) vb[i] = ldb(v + i * vs + h * 16);
-          for (int rp = 0; rp < RP; ++rp)
-            for (int i = 0; i < 4; ++i)
-              a[rp][i] = bfmmla(a[rp][i], pa[rp], vb[i]);
-        }
-        p += 32;
-        v += 32;
-      }
-      for (; j < nkeys; j += 4) {
-        bfloat16x8_t pa[RP], vb[4];
-        for (int rp = 0; rp < RP; ++rp) pa[rp] = ldb(p + rp * KG * 16);
-        for (int i = 0; i < 4; ++i) vb[i] = ldb(v + i * vs);
-        for (int rp = 0; rp < RP; ++rp)
-          for (int i = 0; i < 4; ++i)
-            a[rp][i] = bfmmla(a[rp][i], pa[rp], vb[i]);
-        p += 16;
-        v += 16;
       }
       for (int rp = 0; rp < RP; ++rp) {
         const int r0 = 2 * rp, r1 = 2 * rp + 1;
@@ -923,7 +940,7 @@ struct DenseBF {
 // ===========================================================================
 // paged fp32
 // ===========================================================================
-template <int HD>
+template <int HD, int PAGE = 0>
 struct PagedF32 {
   static constexpr int PT = 16;       // keys per page-resolution unit
   static constexpr int PG = 4;        // units per online-softmax step
@@ -940,11 +957,12 @@ struct PagedF32 {
   }
 
   static void store_head(const PagedJob& job, int64_t seq, int64_t head) {
+    const int64_t page = PAGE ? PAGE : job.page;
     const int64_t group = job.num_heads / job.num_kv_heads;
     const int64_t kvh = head / group;
     const int64_t slot = job.slots[seq];
-    const int64_t pg = slot / job.page, off = slot % job.page;
-    const int64_t stride = job.page * HD * 4;
+    const int64_t pg = slot / page, off = slot % page;
+    const int64_t stride = page * HD * 4;
     const int64_t base = (pg * job.num_kv_heads + kvh) * stride;
     float* kp =
         reinterpret_cast<float*>(static_cast<char*>(job.k_cache) + base);
@@ -957,12 +975,13 @@ struct PagedF32 {
         reinterpret_cast<const float*>(job.k) + seq * kvst + kvh * HD;
     const float* vs =
         reinterpret_cast<const float*>(job.v) + seq * kvst + kvh * HD;
-    for (int d = 0; d < HD; ++d) kp[d * job.page + off] = ks[d];
+    for (int d = 0; d < HD; ++d) kp[d * page + off] = ks[d];
     std::memcpy(vp + off * HD, vs, sizeof(float) * HD);
   }
 
   static void attend_head(const PagedJob& job, int64_t seq, int64_t head,
                           char* ws) {
+    const int32_t page = PAGE ? PAGE : static_cast<int32_t>(job.page);
     const int64_t group = job.num_heads / job.num_kv_heads;
     const int64_t kvh = head / group;
     const int64_t len = job.lens[seq];
@@ -979,9 +998,8 @@ struct PagedF32 {
       for (int i = 0; i < HD; ++i) op[i] = 0.0f;
       return;
     }
-    const int64_t stride = job.page * HD * 4;
+    const int64_t stride = int64_t(page) * HD * 4;
     const float c = job.scale * kLog2e;
-    const int32_t page = static_cast<int32_t>(job.page);
     float m = kNegInf, l = 0.0f;
     const float32x4_t vc = vdupq_n_f32(c);
     const int32x4_t lane = lane_idx();
@@ -1012,13 +1030,13 @@ struct PagedF32 {
         for (int d0 = 0; d0 < HD; d0 += 4) {
           const float32x4_t qv = ldf(q + d0);
           for (int h = 0; h < 4; ++h) {
-            float32x4_t k0 = ldf(kb + (d0 + 0) * job.page + 4 * h);
+            float32x4_t k0 = ldf(kb + (d0 + 0) * page + 4 * h);
             c[h][0] = vfmaq_laneq_f32(c[h][0], k0, qv, 0);
-            k0 = ldf(kb + (d0 + 1) * job.page + 4 * h);
+            k0 = ldf(kb + (d0 + 1) * page + 4 * h);
             c[h][1] = vfmaq_laneq_f32(c[h][1], k0, qv, 1);
-            k0 = ldf(kb + (d0 + 2) * job.page + 4 * h);
+            k0 = ldf(kb + (d0 + 2) * page + 4 * h);
             c[h][2] = vfmaq_laneq_f32(c[h][2], k0, qv, 2);
-            k0 = ldf(kb + (d0 + 3) * job.page + 4 * h);
+            k0 = ldf(kb + (d0 + 3) * page + 4 * h);
             c[h][3] = vfmaq_laneq_f32(c[h][3], k0, qv, 3);
           }
         }
@@ -1096,7 +1114,7 @@ struct PagedF32 {
 // ===========================================================================
 // paged bf16
 // ===========================================================================
-template <int HD>
+template <int HD, int PAGE = 0>
 struct PagedBF {
   static constexpr int PT = 16;
   static constexpr int PG = 4;
@@ -1117,11 +1135,12 @@ struct PagedBF {
   // operand shapes. The paired V needs `page % 16 == 0`, which is the documented
   // block-size contract.
   static void store_head(const PagedJob& job, int64_t seq, int64_t head) {
+    const int64_t page = PAGE ? PAGE : job.page;
     const int64_t group = job.num_heads / job.num_kv_heads;
     const int64_t kvh = head / group;
     const int64_t slot = job.slots[seq];
-    const int64_t pg = slot / job.page, off = slot % job.page;
-    const int64_t stride = job.page * HD * 2;
+    const int64_t pg = slot / page, off = slot % page;
+    const int64_t stride = page * HD * 2;
     const int64_t base = (pg * job.num_kv_heads + kvh) * stride;
     char* kp = static_cast<char*>(job.k_cache) + base;
     char* vp = static_cast<char*>(job.v_cache) + base;
@@ -1131,13 +1150,14 @@ struct PagedBF {
     const char* vs =
         static_cast<const char*>(job.v) + (seq * kvst + kvh * HD) * 2;
     for (int dp = 0; dp < HD / 2; ++dp)
-      std::memcpy(kp + (dp * job.page + off) * 4, ks + dp * 4, 4);
+      std::memcpy(kp + (dp * page + off) * 4, ks + dp * 4, 4);
     char* vdst = vp + ((off / 2) * HD + 0) * 4 + (off & 1) * 2;
     for (int d = 0; d < HD; ++d) std::memcpy(vdst + d * 4, vs + d * 2, 2);
   }
 
   static void attend_head(const PagedJob& job, int64_t seq, int64_t head,
                           char* ws) {
+    const int32_t page = PAGE ? PAGE : static_cast<int32_t>(job.page);
     const int64_t group = job.num_heads / job.num_kv_heads;
     const int64_t kvh = head / group;
     const int64_t len = job.lens[seq];
@@ -1156,9 +1176,8 @@ struct PagedBF {
       }
       return;
     }
-    const int64_t stride = job.page * HD * 2;
+    const int64_t stride = int64_t(page) * HD * 2;
     const float c = job.scale * kLog2e;
-    const int32_t page = static_cast<int32_t>(job.page);
     const int32x4_t lane = lane_idx();
     float m = kNegInf, l = 0.0f;
     const float32x4_t vc = vdupq_n_f32(c);
@@ -1185,7 +1204,7 @@ struct PagedBF {
         const bfloat16x8_t qa = dup_pair(q + dp * 4);
         for (int g = 0; g < tiles; ++g) {
           const char* kb =
-              kbase[g] + (static_cast<int64_t>(dp) * job.page + boff[g]) * 4;
+              kbase[g] + (static_cast<int64_t>(dp) * page + boff[g]) * 4;
           for (int h = 0; h < 4; ++h)
             lg[4 * g + h] = bfdot(lg[4 * g + h], qa, ldb(kb + h * 16));
         }
@@ -1289,17 +1308,27 @@ void dense(const DenseJob& job, int workers) {
 }
 
 void paged(const PagedJob& job, int workers) {
+  // Common pages get constant strides and shifts. Page-16 fp32 stays general
+  // at batch one: specializing it measured 5-11% slower there.
 #define ATTN_PG(DT, HD) paged_run<Paged##DT<HD>>(job, workers)
+#define ATTN_PGS(DT, HD)                                                 \
+  do {                                                                  \
+    if (job.page == 16 && (job.dtype != kF32 || job.num_seqs > 1))         \
+      paged_run<Paged##DT<HD, 16>>(job, workers);                         \
+    else if (job.page == 32) paged_run<Paged##DT<HD, 32>>(job, workers);    \
+    else ATTN_PG(DT, HD);                                                \
+  } while (0)
   if (job.dtype == kF32) {
-    if (job.head_dim == 32) ATTN_PG(F32, 32);
-    else if (job.head_dim == 64) ATTN_PG(F32, 64);
-    else ATTN_PG(F32, 128);
+    if (job.head_dim == 32) ATTN_PGS(F32, 32);
+    else if (job.head_dim == 64) ATTN_PGS(F32, 64);
+    else ATTN_PGS(F32, 128);
   } else {
-    if (job.head_dim == 32) ATTN_PG(BF, 32);
-    else if (job.head_dim == 64) ATTN_PG(BF, 64);
-    else ATTN_PG(BF, 128);
+    if (job.head_dim == 32) ATTN_PGS(BF, 32);
+    else if (job.head_dim == 64) ATTN_PGS(BF, 64);
+    else ATTN_PGS(BF, 128);
   }
 #undef ATTN_PG
+#undef ATTN_PGS
 }
 
 void store(const PagedJob& job, int workers) {

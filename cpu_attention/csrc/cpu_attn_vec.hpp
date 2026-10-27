@@ -376,9 +376,10 @@ struct Dense {
   }
 
   // logits[RQT][kt] = q[RQT] @ K^T for keys [k0, k0+nkeys), causal-masked.
-  static void qk(const DenseJob& job, const char* slab, int64_t, int64_t,
-                 const char* q_base, int nrows, int64_t k0, int nkeys,
-                 int64_t row_limit0, float* logits) {
+  template <int ROWS>
+  static void qk_rows(const DenseJob& job, const char* slab,
+                      const char* q_base, int nrows, int64_t k0, int nkeys,
+                      int64_t row_limit0, float* logits) {
     const int kt = kt_();
     if (mode() & 2) {
       for (int r = 0; r < nrows; ++r)
@@ -390,20 +391,20 @@ struct Dense {
     const int64_t lim = std::min(kend, row_limit0 + 1);
     const __m512i lane = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
                                            12, 13, 14, 15);
-    // The row loop is unrolled over the compile-time RQT: an array of vectors
+    // The row loop is unrolled over the compile-time row count: a vector array
     // indexed by a runtime bound lands in memory, which turns every FMA into a
     // load+store. Rows past `nrows` read a clamped query row and their logits
     // are never consumed.
     for (int j = 0; j < nkeys; j += LANES) {
       const int64_t jj = k0 + j;
-      __m512 c[RQT];
+      __m512 c[ROWS];
 #pragma GCC unroll 16
-      for (int r = 0; r < RQT; ++r) c[r] = _mm512_setzero_ps();
+      for (int r = 0; r < ROWS; ++r) c[r] = _mm512_setzero_ps();
       if constexpr (BF) {
         for (int d2 = 0; d2 < HD / 2; ++d2) {
           const __m512bh kb = load_pair_bf16(slab + kb_off(jj, d2) * ESZ);
 #pragma GCC unroll 16
-          for (int r = 0; r < RQT; ++r) {
+          for (int r = 0; r < ROWS; ++r) {
             const int rr = r < nrows ? r : nrows - 1;
             c[r] = _mm512_dpbf16_ps(c[r],
                                     bcast_pair(q_base + (rr * qt + 2 * d2) * 2),
@@ -414,7 +415,7 @@ struct Dense {
         for (int d = 0; d < HD; ++d) {
           const __m512 kb = ld16(slab + k_off(jj, d) * ESZ);
 #pragma GCC unroll 16
-          for (int r = 0; r < RQT; ++r) {
+          for (int r = 0; r < ROWS; ++r) {
             const int rr = r < nrows ? r : nrows - 1;
             c[r] =
                 _mm512_fmadd_ps(bcast_f32(q_base + (rr * qt + d) * 4), kb, c[r]);
@@ -423,13 +424,13 @@ struct Dense {
       }
       if (jj + LANES <= lim) {
 #pragma GCC unroll 16
-        for (int r = 0; r < RQT; ++r)
+        for (int r = 0; r < ROWS; ++r)
           if (r < nrows) st16(logits + r * kt + j, c[r]);
       } else {
         const __m512i idx = _mm512_add_epi32(_mm512_set1_epi32((int)jj), lane);
         const __m512 ninf = _mm512_set1_ps(-INFINITY);
 #pragma GCC unroll 16
-        for (int r = 0; r < RQT; ++r) {
+        for (int r = 0; r < ROWS; ++r) {
           if (r >= nrows) continue;
           const __mmask16 bad =
               _mm512_cmpge_epi32_mask(idx, _mm512_set1_epi32((int)kend)) |
@@ -439,6 +440,19 @@ struct Dense {
         }
       }
     }
+  }
+
+  static void qk(const DenseJob& job, const char* slab, int64_t, int64_t,
+                 const char* q, int nr, int64_t k0, int nk, int64_t limit,
+                 float* logits) {
+    // A partial register tile otherwise repeats the last live query up to RQT
+    // times. It happens on every work item when rq is not a multiple of RQT.
+    if (nr <= 2)
+      qk_rows<2>(job, slab, q, nr, k0, nk, limit, logits);
+    else if (nr <= 4)
+      qk_rows<4>(job, slab, q, nr, k0, nk, limit, logits);
+    else
+      qk_rows<RQT>(job, slab, q, nr, k0, nk, limit, logits);
   }
 
   // Online-softmax step over one kt-wide row tile: `logits` is replaced by the
@@ -515,18 +529,19 @@ struct Dense {
   // (tests/bench_vec_prims.cpp, 'pv_fma') and it is why P@V was 56% of the
   // 2048:16:128 bf16 call. The accumulator is a 32-dim chunk (two zmm per row)
   // so eight rows plus the operands stay inside 32 registers.
-  static void pv(const DenseJob& job, const char* slab, int64_t, int64_t,
-                 int64_t k0, int nkeys, const float* p, int nrows,
-                 float* acc) {
+  template <int ROWS>
+  static void pv_rows(const DenseJob& job, const char* slab,
+                      int64_t k0, int nkeys, const float* p, int nrows,
+                      float* acc) {
     const int kt = kt_();
     if (mode() & 8) return;
     const char* vs = slab + pad_of(job.seq_k) * HD * ESZ;
     const uint32_t* pp = BF ? pairs_of(p) : nullptr;
     const int half = kt / 2;
     for (int dc = 0; dc < HD; dc += 32) {
-      __m512 c[RQT][2];
+      __m512 c[ROWS][2];
 #pragma GCC unroll 16
-      for (int r = 0; r < RQT; ++r) {
+      for (int r = 0; r < ROWS; ++r) {
         c[r][0] = ld16(acc + r * HD + dc);
         c[r][1] = ld16(acc + r * HD + dc + 16);
       }
@@ -539,7 +554,7 @@ struct Dense {
           // while V is addressed by the global key.
           const int word = j >> 1;
 #pragma GCC unroll 16
-          for (int r = 0; r < RQT; ++r) {
+          for (int r = 0; r < ROWS; ++r) {
             const __m512bh pa = bcast_word(pp + r * half + word);
             c[r][0] = _mm512_dpbf16_ps(c[r][0], pa, v0);
             c[r][1] = _mm512_dpbf16_ps(c[r][1], pa, v1);
@@ -551,7 +566,7 @@ struct Dense {
           const __m512 v0 = ld16(v);
           const __m512 v1 = ld16(v + 64);
 #pragma GCC unroll 16
-          for (int r = 0; r < RQT; ++r) {
+          for (int r = 0; r < ROWS; ++r) {
             const __m512 pr = _mm512_set1_ps(p[r * kt + j]);
             c[r][0] = _mm512_fmadd_ps(pr, v0, c[r][0]);
             c[r][1] = _mm512_fmadd_ps(pr, v1, c[r][1]);
@@ -559,18 +574,28 @@ struct Dense {
         }
       }
 #pragma GCC unroll 16
-      for (int r = 0; r < RQT; ++r) {
+      for (int r = 0; r < ROWS; ++r) {
         st16(acc + r * HD + dc, c[r][0]);
         st16(acc + r * HD + dc + 16, c[r][1]);
       }
     }
+  }
+
+  static void pv(const DenseJob& job, const char* slab, int64_t, int64_t,
+                 int64_t k0, int nk, const float* p, int nr, float* acc) {
+    if (nr <= 2)
+      pv_rows<2>(job, slab, k0, nk, p, nr, acc);
+    else if (nr <= 4)
+      pv_rows<4>(job, slab, k0, nk, p, nr, acc);
+    else
+      pv_rows<RQT>(job, slab, k0, nk, p, nr, acc);
   }
 };
 
 // ---------------------------------------------------------------------------
 // paged policy
 // ---------------------------------------------------------------------------
-template <int DT, int HD>
+template <int DT, int HD, int PAGE = 0>
 struct Paged {
   static constexpr bool BF = DT == kBF16;
   static constexpr int ESZ = BF ? 2 : 4;
@@ -630,6 +655,7 @@ struct Paged {
   // Same store as the vec policy: fp32 K[hd][page] / V[page][hd], bf16
   // K[hd/2][page][2] / V[page][hd].
   static void store_head(const PagedJob& job, int64_t seq, int64_t head) {
+    const int64_t page = PAGE ? PAGE : job.page;
     // `head` is a *query* head: k/v arrive kv-headed (the engine's projection
     // emits one row per kv head), so the source index is the kv head. Every
     // query head of a group writes the same bytes to the same slot; the Python
@@ -638,8 +664,8 @@ struct Paged {
     const int64_t group = job.num_heads / job.num_kv_heads;
     const int64_t kvh = head / group;
     const int64_t slot = job.slots[seq];
-    const int64_t pg = slot / job.page, off = slot % job.page;
-    const int64_t stride = job.page * HD * ESZ;
+    const int64_t pg = slot / page, off = slot % page;
+    const int64_t stride = page * HD * ESZ;
     const int64_t base = (pg * job.num_kv_heads + kvh) * stride;
     char* kp = static_cast<char*>(job.k_cache) + base;
     char* vp = static_cast<char*>(job.v_cache) + base;
@@ -650,11 +676,11 @@ struct Paged {
         static_cast<const char*>(job.v) + (seq * kvst + kvh * HD) * ESZ;
     if constexpr (BF) {
       for (int d = 0; d < HD; ++d)
-        std::memcpy(kp + (((d / 2) * job.page + off) * 2 + (d & 1)) * ESZ,
+        std::memcpy(kp + (((d / 2) * page + off) * 2 + (d & 1)) * ESZ,
                     ks + d * ESZ, ESZ);
     } else {
       for (int d = 0; d < HD; ++d)
-        std::memcpy(kp + (d * job.page + off) * ESZ, ks + d * ESZ, ESZ);
+        std::memcpy(kp + (d * page + off) * ESZ, ks + d * ESZ, ESZ);
     }
     std::memcpy(vp + off * HD * ESZ, vs, HD * ESZ);
   }
@@ -748,7 +774,7 @@ struct Paged {
     char* op = static_cast<char*>(job.out) +
                (seq * job.out_stride + head * HD) * ESZ;
     float* logits = reinterpret_cast<float*>(ws);
-    const int64_t page = job.page;
+    const int64_t page = PAGE ? PAGE : job.page;
     const int64_t stride = page * HD * ESZ;   // bytes per (page, head)
     const int64_t krow = page * 4;            // bytes between K dim rows
     const int64_t vrow = HD * ESZ;            // bytes between V keys
@@ -929,7 +955,12 @@ void dense(const DenseJob& job, int workers) {
 }
 
 void paged(const PagedJob& job, int workers) {
-#define ATTN_PAGED(DT, HD) paged_run<Paged<DT, HD>>(job, workers)
+  // The standard x86 page gets constant K strides and page-index shifts.
+#define ATTN_PAGED(DT, HD)                                                \
+  do {                                                                  \
+    if (job.page == 32) paged_run<Paged<DT, HD, 32>>(job, workers);        \
+    else paged_run<Paged<DT, HD>>(job, workers);                          \
+  } while (0)
   if (job.dtype == kF32) {
     if (job.head_dim == 32) ATTN_PAGED(kF32, 32);
     else if (job.head_dim == 64) ATTN_PAGED(kF32, 64);

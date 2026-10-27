@@ -368,7 +368,9 @@ def _paged(
     read badly against a reference whose output is preallocated.
     """
     if out is None:
-        out = torch.empty_like(query, memory_format=torch.contiguous_format)
+        # Paged queries have contiguous heads/dims; a fused-projection token
+        # gap is compacted by empty_like without a memory-format keyword.
+        out = torch.empty_like(query)
     fn = _paged_plan(query, key, value, k_cache, page_table, do_store)
     if (_BACKEND == "mojo" and do_store and key is not None and
             query.shape[1] != k_cache.shape[1]):
