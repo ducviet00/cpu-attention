@@ -1,0 +1,10 @@
+0
+[OK] raw entry rejects bad arguments before reading a plan
+[OK] raw entry rejects bad arguments before reading a plan
+cpu_attention dense: 88/88 checks passed
+cpu_attention 0.1.0: all checks passed
+stray-read probe: 24/24 clean
+fuzz dense: 80/80 cases within tolerance, worst was 0.52x its tolerance
+  fp64-resolved reference precision cases: 1
+  worst fp32 8.05e-07 at (128, 16, 16, 16, 33, 3, False)
+  worst bf16 1.92 ulp at (128, 64, 16, 8, 2049, 2, False)

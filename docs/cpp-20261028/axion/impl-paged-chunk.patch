@@ -1,0 +1,36 @@
+diff --git a/cpu_attention/csrc/cpu_attn_impl.hpp b/cpu_attention/csrc/cpu_attn_impl.hpp
+index c97b051..134cf30 100644
+--- a/cpu_attention/csrc/cpu_attn_impl.hpp
++++ b/cpu_attention/csrc/cpu_attn_impl.hpp
+@@ -361,6 +361,10 @@ void paged_run(const PagedJob& job, int workers) {
+   // query heads of one group are different tasks and one of them may read a
+   // slice another is still writing.
+   const bool barrier = job.num_heads != job.num_kv_heads;
++  // Optional policy hook: a static chunk for the attend loop (0 keeps one
++  // contiguous slice per thread).
++  int chunk = 0;
++  if constexpr (requires { P::paged_chunk(job); }) chunk = P::paged_chunk(job);
+ #pragma omp parallel num_threads(workers)
+   {
+     if (do_store) {
+@@ -374,12 +378,18 @@ void paged_run(const PagedJob& job, int workers) {
+         }
+       }
+     }
+-#pragma omp for schedule(static) nowait
+-    for (int64_t t = 0; t < tasks; ++t) {
++    auto task = [&](int64_t t) {
+       if (do_store && !barrier && job.slots[t / job.num_heads] >= 0)
+         P::store_head(job, t / job.num_heads, t % job.num_heads);
+       P::attend_head(job, t / job.num_heads, t % job.num_heads,
+                       ws + static_cast<size_t>(omp_get_thread_num()) * aux);
++    };
++    if (chunk > 0) {
++#pragma omp for schedule(static, chunk) nowait
++      for (int64_t t = 0; t < tasks; ++t) task(t);
++    } else {
++#pragma omp for schedule(static) nowait
++      for (int64_t t = 0; t < tasks; ++t) task(t);
+     }
+   }
+ }
