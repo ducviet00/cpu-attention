@@ -188,24 +188,27 @@ inline __m512 exp2v(__m512 x) {
   // underflow to +0, while the positive side is bounded by the running-max
   // slack (<= 16 log2 units) by construction.
   x = _mm512_max_ps(x, _mm512_set1_ps(-127.0f));
-  const __m512 n =
-      _mm512_roundscale_ps(x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-  const __m512 r = _mm512_sub_ps(x, n);
+  // Round by adding 1.5*2^23 + 127: the sum's low mantissa bits are then
+  // n + 127, so one shift makes the 2^n bits, and `t - M` is n as a float.
+  // Two uops fewer than roundscale + cvtps2dq + add.
+  const __m512 magic = _mm512_set1_ps(12583039.0f);
+  const __m512 t = _mm512_add_ps(x, magic);
+  const __m512 r = _mm512_sub_ps(x, _mm512_sub_ps(t, magic));
   __m512 p;
   if constexpr (FAST) {
     p = _mm512_fmadd_ps(_mm512_set1_ps(2.3473140e-1f), r,
                         _mm512_set1_ps(6.9335938e-1f));
     p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f));
   } else {
-    p = _mm512_set1_ps(1.3392112e-3f);
-    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(9.6180963e-3f));
-    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(5.5503282e-2f));
-    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(2.4022652e-1f));
-    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(6.9314718e-1f));
+    // Minimax degree 4 on [-0.5, 0.5]: 2.8e-6 relative, below the degree-5
+    // Taylor-like set it replaces (3.4e-6) and the hi/lo split's 2^-16.
+    p = _mm512_set1_ps(9.582830106e-3f);
+    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(5.590639966e-2f));
+    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(2.402409885e-1f));
+    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(6.931241964e-1f));
     p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f));
   }
-  const __m512i e = _mm512_slli_epi32(
-      _mm512_add_epi32(_mm512_cvtps_epi32(n), _mm512_set1_epi32(127)), 23);
+  const __m512i e = _mm512_slli_epi32(_mm512_castps_si512(t), 23);
   return _mm512_mul_ps(p, _mm512_castsi512_ps(e));
 }
 
