@@ -52,9 +52,9 @@ struct Kern {
     const int64_t base = (pg * job.num_kv_heads + kvh) * stride;
     const int64_t kvst = job.kv_stride ? job.kv_stride : job.q_stride;
     const char* ks =
-        static_cast<const char*>(job.k) + (seq * kvst + head * HD) * esz;
+        static_cast<const char*>(job.k) + (seq * kvst + kvh * HD) * esz;
     const char* vs =
-        static_cast<const char*>(job.v) + (seq * kvst + head * HD) * esz;
+        static_cast<const char*>(job.v) + (seq * kvst + kvh * HD) * esz;
     char* kp = static_cast<char*>(job.k_cache) + base;
     char* vp = static_cast<char*>(job.v_cache) + base;
     for (int d = 0; d < HD; ++d) {

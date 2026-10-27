@@ -123,6 +123,8 @@ size_t workspace_bytes();
 //       a vectorised output epilogue; the default scalar loop is 1.6 us of a
 //       27 us call at 128:8:64 because `f32_to_bf16`'s NaN branch stops GCC
 //       from vectorising it.
+//   static void store_f32(char* dst, const float* src, int hd, float inv);
+//       the same for an fp32 output (the AMX policy uses non-temporal stores).
 template <class P>
 constexpr size_t logit_aux_floats(int kt) {
   if constexpr (requires { P::logit_aux_floats(kt); })
@@ -138,6 +140,16 @@ inline void store_bf16(char* dst, const float* src, int hd, float inv) {
   } else {
     bf16* o = reinterpret_cast<bf16*>(dst);
     for (int d = 0; d < hd; ++d) o[d] = f32_to_bf16(src[d] * inv);
+  }
+}
+
+template <class P>
+inline void store_f32(char* dst, const float* src, int hd, float inv) {
+  if constexpr (requires { P::store_f32(dst, src, hd, inv); }) {
+    P::store_f32(dst, src, hd, inv);
+  } else {
+    float* o = reinterpret_cast<float*>(dst);
+    for (int d = 0; d < hd; ++d) o[d] = src[d] * inv;
   }
 }
 
@@ -275,8 +287,7 @@ void dense_run(const DenseJob& job, int workers) {
         const float inv = 1.0f / l[r];
         const float* src = acc + r * hd;
         if (job.dtype == kF32) {
-          float* o = reinterpret_cast<float*>(op);
-          for (int d = 0; d < hd; ++d) o[d] = src[d] * inv;
+          store_f32<P>(op, src, hd, inv);
         } else {
           store_bf16<P>(op, src, hd, inv);
         }
@@ -287,7 +298,9 @@ void dense_run(const DenseJob& job, int workers) {
       // Work item == (batch, kv head): pack it, then attend every query block
       // of its query head. No barrier, and the packed head is what was just
       // written, so it is still in L1/L2.
-#pragma omp for schedule(static)
+      // Give neighboring heads to neighboring workers: their source chunks are
+      // adjacent in token-major K/V (12% at 1024:16:128 fp32 on the Ryzen).
+#pragma omp for schedule(static, 1) nowait
       for (int64_t i = 0; i < nbh; ++i) {
         // One slab per thread: with `nbh > workers` a thread takes several
         // heads in a row, and each pack overwrites the previous one only after
@@ -298,13 +311,13 @@ void dense_run(const DenseJob& job, int workers) {
         for (int64_t qb = 0; qb < nqb; ++qb) attend(b, kvh, qb, sl);
       }
     } else {
-#pragma omp for schedule(static)
+#pragma omp for schedule(static, 1)
       for (int64_t i = 0; i < nbh; ++i)
         P::pack(job, i / job.kv_heads, i % job.kv_heads,
                 ws + static_cast<size_t>(i) * slab);
       // The `omp for` above ends in an implicit barrier: every slab is complete
       // before any thread reads one.
-#pragma omp for schedule(dynamic, 1)
+#pragma omp for schedule(dynamic, 1) nowait
       for (int64_t t = 0; t < heads_total * nqb; ++t) {
         // Boustrophedon over the query blocks of one head: causal work grows
         // with the block index, so pair the cheapest with the most expensive
@@ -335,11 +348,13 @@ void dense_run(const DenseJob& job, int workers) {
 // else in the tree knows it.
 template <class P>
 void store_run(const PagedJob& job, int workers) {
-  const int64_t tasks = job.num_seqs * job.num_heads;
+  const int64_t tasks = job.num_seqs * job.num_kv_heads;
 #pragma omp parallel for num_threads(workers) schedule(static)
   for (int64_t t = 0; t < tasks; ++t) {
-    if (job.slots[t / job.num_heads] < 0) continue;
-    P::store_head(job, t / job.num_heads, t % job.num_heads);
+    const int64_t seq = t / job.num_kv_heads;
+    if (job.slots[seq] < 0) continue;
+    P::store_head(job, seq,
+                  (t % job.num_kv_heads) * (job.num_heads / job.num_kv_heads));
   }
 }
 
@@ -360,19 +375,23 @@ void paged_run(const PagedJob& job, int workers) {
 #pragma omp parallel num_threads(workers)
   {
     if (do_store) {
-#pragma omp for schedule(static)
-      for (int64_t t = 0; t < tasks; ++t) {
-        if (job.slots[t / job.num_heads] < 0) continue;
-        P::store_head(job, t / job.num_heads, t % job.num_heads);
-      }
       if (barrier) {
-#pragma omp barrier
+#pragma omp for schedule(static)
+        for (int64_t t = 0; t < job.num_seqs * job.num_kv_heads; ++t) {
+          const int64_t seq = t / job.num_kv_heads;
+          if (job.slots[seq] < 0) continue;
+          P::store_head(job, seq, (t % job.num_kv_heads) *
+                                     (job.num_heads / job.num_kv_heads));
+        }
       }
     }
-#pragma omp for schedule(static)
-    for (int64_t t = 0; t < tasks; ++t)
+#pragma omp for schedule(static) nowait
+    for (int64_t t = 0; t < tasks; ++t) {
+      if (do_store && !barrier && job.slots[t / job.num_heads] >= 0)
+        P::store_head(job, t / job.num_heads, t % job.num_heads);
       P::attend_head(job, t / job.num_heads, t % job.num_heads,
-                     ws + static_cast<size_t>(omp_get_thread_num()) * aux);
+                      ws + static_cast<size_t>(omp_get_thread_num()) * aux);
+    }
   }
 }
 

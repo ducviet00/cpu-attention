@@ -102,6 +102,21 @@ def main() -> int:
         2e-4,
     )
 
+    # Q can be contiguous while K and V have independent token/head strides.
+    # Reuse the contiguous plan first: keying strides only on Q hid this bug.
+    for dtype, tol in ((torch.float32, 2e-4), (torch.bfloat16, 3e-2)):
+        q = torch.randn(2, 9, 4, 32, dtype=dtype)
+        k = torch.randn(2, 34, 2, 32, dtype=dtype)[:, ::2]
+        v = torch.randn(2, 17, 4, 32, dtype=dtype)[:, :, ::2]
+        for causal in (False, True):
+            want = _reference(q, k, v, causal, 32**-0.5)
+            for name, kk, vv in (("contiguous", k.contiguous(), v.contiguous()),
+                                 ("K-strided", k, v.contiguous()),
+                                 ("V-strided", k.contiguous(), v),
+                                 ("KV-strided", k, v)):
+                check(f"{dtype} mixed-stride {name} causal={causal}",
+                      attn.flash_attn_func(q, kk, vv, causal=causal), want, tol)
+
     # A fully masked row must be zero, not NaN (flash-attn's contract).
     q = torch.randn(1, 4, 2, 32)
     k = torch.randn(1, 2, 2, 32)
@@ -122,6 +137,15 @@ def main() -> int:
     # different geometry. Both are silent numeric corruption, so they are tested
     # rather than argued about.
     import cpu_attention._kernel as K
+
+    K._AMX_PLANS.p = {"sentinel": object()}
+    K._drop_workspace()
+    checks += 1
+    if not getattr(K._AMX_PLANS, "p", None):
+        print("[OK] workspace eviction invalidates AMX plans")
+    else:
+        fails += 1
+        print("[FAIL] workspace eviction left stale AMX plans")
 
     for dtype, tol in ((torch.float32, 2e-4), (torch.bfloat16, 3e-2)):
         a = [torch.randn(1, 300, 4, 64, dtype=dtype) for _ in range(3)]
@@ -230,6 +254,28 @@ def main() -> int:
               f"on {abi_bad}/{abi_cases} cases")
     else:
         print(f"[OK] plan-buffer entry is bit-identical on {abi_cases} cases")
+
+    if K.backend() == "cpp":
+        mod = K.module()
+        stale = torch.zeros(24, dtype=torch.int64)
+        bad_calls = [
+            (mod.dense_forward, ()),
+            (mod.dense_forward, ("bad", 0, 0, 0, 0)),
+            (mod.dense_forward, (-1, 0, 0, 0, 0)),
+            (mod.dense_forward, (stale.data_ptr(), 0, 0, 0, 0)),
+            (mod.paged_call, ()),
+            (mod.paged_call, (*([0] * 9), None)),
+            (mod.paged_register, (0, 0, 0, False, 1)),
+        ]
+        for entry, args in bad_calls:
+            checks += 1
+            try:
+                entry(*args)
+            except (TypeError, OverflowError, RuntimeError):
+                print("[OK] raw entry rejects bad arguments before reading a plan")
+            else:
+                fails += 1
+                print("[FAIL] raw entry accepted invalid arguments")
 
     print(f"cpu_attention dense: {checks - fails}/{checks} checks passed")
     return fails

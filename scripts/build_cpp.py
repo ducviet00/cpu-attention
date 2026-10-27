@@ -13,6 +13,10 @@ Per-ISA flags, as required by the intrinsics each file uses:
   amx.cpp    the above plus -mamx-tile -mamx-bf16 -mamx-int8
   neon.cpp   -march=armv8.2-a+bf16+i8mm
 Everything else is compiled baseline, so the fallback paths stay portable.
+
+binding.cpp also sees torch's headers and the module links torch's libraries:
+the paged decode entry reads tensors directly (see its comment), so the build
+belongs to the torch it was made with. Rebuild after upgrading torch.
 """
 
 import os
@@ -46,6 +50,15 @@ def arch() -> str:
     raise SystemExit(f"build_cpp: unsupported machine {m}")
 
 
+def torch_paths():
+    """torch's include dirs, library dir and C++ ABI flag."""
+    import torch
+    from torch.utils import cpp_extension
+
+    return (cpp_extension.include_paths(), cpp_extension.library_paths()[0],
+            int(torch._C._GLIBCXX_USE_CXX11_ABI))
+
+
 def main() -> None:
     t0 = time.time()
     a = arch()
@@ -56,7 +69,10 @@ def main() -> None:
 
     # (source, extra flags)
     pyinc = sysconfig.get_paths()["include"]
-    units = [("cpu_attn.cpp", []), ("binding.cpp", ["-I", pyinc]),
+    torch_inc, torch_lib, torch_abi = torch_paths()
+    binding = ["-I", pyinc, *(f for p in torch_inc for f in ("-isystem", p)),
+               f"-D_GLIBCXX_USE_CXX11_ABI={torch_abi}"]
+    units = [("cpu_attn.cpp", []), ("binding.cpp", binding),
              ("cpu_isa.cpp", []), ("scalar.cpp", [])]
     if a == "x86_64":
         units += [("vec.cpp", X86_VEC), ("amx.cpp", X86_AMX)]
@@ -66,25 +82,34 @@ def main() -> None:
     for name, extra in units:
         src = os.path.join(SRC, name)
         if not os.path.exists(src):
-            if name == "amx.cpp":
-                # No AMX file yet: compile a stub so the dispatch links.
-                src = os.path.join(build, "amx_stub.cpp")
-                with open(src, "w") as f:
-                    f.write('#include "cpu_attn_amx.hpp"\n')
-            else:
-                raise SystemExit(f"build_cpp: missing {src}")
+            raise SystemExit(f"build_cpp: missing {src}")
         obj = os.path.join(build, name.replace(".cpp", ".o"))
         cmd = [cxx, *BASE, *extra, "-I", SRC, "-c", src, "-o", obj]
         print("+", " ".join(cmd))
         subprocess.run(cmd, check=True)
         objs.append(obj)
 
-    cmd = [cxx, "-shared", "-o", LIB, *objs, "-fopenmp"]
+    # Replacing the inode keeps an already-loaded A/B arm valid during a build.
+    # Linking straight into LIB can truncate executable pages in another process.
+    pending = os.path.join(build, f"_C_cpp.{os.getpid()}.so")
+    cmd = [cxx, "-shared", "-o", pending, *objs, "-fopenmp", f"-L{torch_lib}",
+           f"-Wl,-rpath,{torch_lib}", "-ltorch_python", "-ltorch_cpu", "-lc10"]
     print("+", " ".join(cmd))
-    subprocess.run(cmd, check=True)
+    try:
+        subprocess.run(cmd, check=True)
+        os.replace(pending, LIB)
+    finally:
+        if os.path.exists(pending):
+            os.unlink(pending)
     print(f"built {LIB} in {time.time() - t0:.1f}s")
 
     if "--test" in sys.argv:
+        isa_test = os.path.join(build, "test_cpu_isa")
+        subprocess.run([cxx, *BASE, "-I", SRC,
+                        os.path.join(ROOT, "tests", "test_cpu_isa.cpp"),
+                        os.path.join(build, "cpu_isa.o"), "-o", isa_test],
+                       check=True)
+        subprocess.run([isa_test], check=True)
         # Parity smoke: the dense suite covers the plan entry, GQA, masks and
         # both dtypes; the flash-shaped API covers the paged path.
         env = dict(os.environ, CPU_ATTENTION_BACKEND="cpp", PYTHONPATH=ROOT)

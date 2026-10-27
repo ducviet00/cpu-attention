@@ -188,25 +188,37 @@ inline __m512 exp2v(__m512 x) {
   // underflow to +0, while the positive side is bounded by the running-max
   // slack (<= 16 log2 units) by construction.
   x = _mm512_max_ps(x, _mm512_set1_ps(-127.0f));
-  const __m512 n =
-      _mm512_roundscale_ps(x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-  const __m512 r = _mm512_sub_ps(x, n);
+  // Round by adding 1.5*2^23 + 127: the sum's low mantissa bits are then
+  // n + 127, so one shift makes the 2^n bits, and `t - M` is n as a float.
+  // Two uops fewer than roundscale + cvtps2dq + add.
+  const __m512 magic = _mm512_set1_ps(12583039.0f);
+  const __m512 t = _mm512_add_ps(x, magic);
+  const __m512 r = _mm512_sub_ps(x, _mm512_sub_ps(t, magic));
   __m512 p;
   if constexpr (FAST) {
     p = _mm512_fmadd_ps(_mm512_set1_ps(2.3473140e-1f), r,
                         _mm512_set1_ps(6.9335938e-1f));
     p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f));
   } else {
-    p = _mm512_set1_ps(1.3392112e-3f);
-    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(9.6180963e-3f));
-    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(5.5503282e-2f));
-    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(2.4022652e-1f));
-    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(6.9314718e-1f));
+    // Minimax degree 4 on [-0.5, 0.5]: 2.8e-6 relative, below the degree-5
+    // Taylor-like set it replaces (3.4e-6) and the hi/lo split's 2^-16.
+    p = _mm512_set1_ps(9.582830106e-3f);
+    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(5.590639966e-2f));
+    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(2.402409885e-1f));
+    p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(6.931241964e-1f));
     p = _mm512_fmadd_ps(p, r, _mm512_set1_ps(1.0f));
   }
-  const __m512i e = _mm512_slli_epi32(
-      _mm512_add_epi32(_mm512_cvtps_epi32(n), _mm512_set1_epi32(127)), 23);
+  const __m512i e = _mm512_slli_epi32(_mm512_castps_si512(t), 23);
   return _mm512_mul_ps(p, _mm512_castsi512_ps(e));
+}
+
+// 32 fp32 -> 32 bf16 in key order (e0 = keys 0-15, e1 = keys 16-31): one
+// convert and one full-line store instead of two of each.
+inline __m512i cvt_bf16x32(__m512 e0, __m512 e1) {
+  const __m512bh h = _mm512_cvtne2ps_pbh(e1, e0);
+  __m512i r;
+  std::memcpy(&r, &h, sizeof(r));
+  return r;
 }
 
 // 16x16 transpose of 32-bit units, in place over 16 zmm: three shuffle stages,
@@ -217,7 +229,7 @@ inline __m512 exp2v(__m512 x) {
 //
 // The pack is memory-bound, not shuffle-bound: measured 21 GB/s on one thread
 // and 60-111 GB/s on four, against a measured 62-70 GB/s DRAM ceiling for this
-// box (`docs/AUDIT.md`). `always_inline` here is for the register file, not for
+// box (`docs/CPP.md`). `always_inline` here is for the register file, not for
 // bandwidth; it moved the pack by 0-3%.
 __attribute__((always_inline)) inline void transpose16x16(__m512* r) {
   for (int i = 0; i < 16; i += 2) {
@@ -251,6 +263,9 @@ __attribute__((always_inline)) inline void transpose16x16(__m512* r) {
 template <int DT, int HD>
 struct Dense {
   static constexpr bool BF = DT == kBF16;
+  // P@V starts with tile_zero. The driver handles rows with no visible key
+  // without reading the untouched accumulator.
+  static constexpr bool zeroes_acc = true;
   static constexpr int ESZ = BF ? 2 : 4;
   // One packed operand slot holds the bf16 tile and, for fp32, its lo half.
   static constexpr int NLO = BF ? 1 : 2;
@@ -301,7 +316,7 @@ struct Dense {
   // 1 = pack, 2 = Q@K^T, 4 = softmax, 8 = P@V, 16 = the Q hi/lo panel build
   // inside Q@K^T, 32 = the causal/padding mask. Results are garbage when set.
   //
-  // This is also the phase-ablation instrument for `docs/xeon/ablate2.py`: the
+  // This is also the phase-ablation instrument for phase ablations: the
   // Mojo backend reads the same variable in Python *at import*, the C++ kernel
   // reads it lazily on its first call, so setting it after the import ablates
   // only this kernel and leaves the Mojo arm as a drift reference in the same
@@ -327,6 +342,40 @@ struct Dense {
   }
 
   static int acc_rows(int rq) { return ((rq + RQT - 1) / RQT) * RQT; }
+
+  // Use the native bf16 conversion rather than the scalar converter's bit
+  // operations and NaN handling, even when the compiler vectorises that loop.
+  //
+  // The stores are non-temporal: the output is written once and was last
+  // owned by another call (often another core), so a normal store pays a
+  // read-for-ownership per line from L3 at the end of every work item.
+  static void store_bf16(char* dst, const float* src, int hd, float inv) {
+    const __m512 scale = _mm512_set1_ps(inv);
+    const bool nt = (reinterpret_cast<uintptr_t>(dst) & 31) == 0;
+    for (int d = 0; d < HD; d += 16) {
+      const __m256i out = cvt_bf16x16(
+          _mm512_mul_ps(_mm512_loadu_ps(src + d), scale));
+      __m256i* p = reinterpret_cast<__m256i*>(dst + d * 2);
+      if (nt)
+        _mm256_stream_si256(p, out);
+      else
+        _mm256_storeu_si256(p, out);
+    }
+  }
+
+  // The fp32 form of the same epilogue (the driver's hook, when it has one).
+  static void store_f32(char* dst, const float* src, int hd, float inv) {
+    const __m512 scale = _mm512_set1_ps(inv);
+    float* o = reinterpret_cast<float*>(dst);
+    const bool nt = (reinterpret_cast<uintptr_t>(dst) & 63) == 0;
+    for (int d = 0; d < HD; d += 16) {
+      const __m512 v = _mm512_mul_ps(_mm512_loadu_ps(src + d), scale);
+      if (nt)
+        _mm512_stream_ps(o + d, v);
+      else
+        _mm512_storeu_ps(o + d, v);
+    }
+  }
 
   static size_t aux_bytes(int rq, int hd) {
     (void)rq;
@@ -608,6 +657,25 @@ struct Dense {
     }
   }
 
+  // P for 32 keys of one row (hi, and lo for fp32), returning their fp32 sum.
+  // Whole 32-key steps: the QK mask leaves every lane in [nkeys, ntail) at
+  // -inf, so they come out as the exact zeros P@V needs past the key range.
+  __attribute__((always_inline)) static inline __m512 emit32(
+      const float* lp, bf16* pp, bf16* pl, __m512 vc, __m512 base) {
+    const __m512 e0 = exp2v<BF>(_mm512_fmsub_ps(_mm512_loadu_ps(lp), vc, base));
+    const __m512 e1 =
+        exp2v<BF>(_mm512_fmsub_ps(_mm512_loadu_ps(lp + 16), vc, base));
+    const __m512i h = cvt_bf16x32(e0, e1);
+    _mm512_storeu_si512(pp, h);
+    if constexpr (!BF) {
+      const __m512 f0 = widen_bf16x16(_mm512_castsi512_si256(h));
+      const __m512 f1 = widen_bf16x16(_mm512_extracti64x4_epi64(h, 1));
+      _mm512_storeu_si512(
+          pl, cvt_bf16x32(_mm512_sub_ps(e0, f0), _mm512_sub_ps(e1, f1)));
+    }
+    return _mm512_add_ps(e0, e1);
+  }
+
   // -------------------------------------------------------------------------
   // online softmax over one kt-key super-tile, in place; P in bf16
   // -------------------------------------------------------------------------
@@ -621,6 +689,61 @@ struct Dense {
     const __m512 vc = _mm512_set1_ps(c);
     const float slack = max_slack();
     const int ntail = ((nkeys + KSTEP - 1) & ~(KSTEP - 1));
+
+    if (nrows == RQT) {
+      // Four independent rows hide the exponential's dependency chain without
+      // changing either the online maxima or the probability rounding order.
+      for (int r0 = 0; r0 < RQT; r0 += 4) {
+        __m512 mx[4], base[4], sum[4];
+#pragma GCC unroll 4
+        for (int rr = 0; rr < 4; ++rr)
+          mx[rr] = _mm512_set1_ps(-INFINITY);
+        for (int j = 0; j < nkeys; j += 16) {
+#pragma GCC unroll 4
+          for (int rr = 0; rr < 4; ++rr)
+            mx[rr] = _mm512_max_ps(mx[rr], _mm512_loadu_ps(
+                logits + static_cast<int64_t>(r0 + rr) * kt + j));
+        }
+#pragma GCC unroll 4
+        for (int rr = 0; rr < 4; ++rr) {
+          const int r = r0 + rr;
+          const float mxv = _mm512_reduce_max_ps(mx[rr]) * c;
+          const float mo = m[r];
+          float mn, a;
+          if (mxv == -INFINITY) {
+            mn = mo;
+            a = 1.0f;
+          } else if (mo == -INFINITY) {
+            mn = mxv;
+            a = 1.0f;
+          } else if (mxv > mo + slack) {
+            mn = mxv;
+            a = std::exp2(mo - mn);
+          } else {
+            mn = mo;
+            a = 1.0f;
+          }
+          m[r] = mn;
+          alpha[r] = a;
+          l[r] *= a;
+          base[rr] = _mm512_set1_ps(mn == -INFINITY ? 0.0f : mn);
+          sum[rr] = _mm512_setzero_ps();
+        }
+        for (int j = 0; j < ntail; j += KSTEP) {
+#pragma GCC unroll 4
+          for (int rr = 0; rr < 4; ++rr) {
+            const int64_t r = r0 + rr;
+            sum[rr] = _mm512_add_ps(
+                sum[rr], emit32(logits + r * kt + j, prob + r * KTMAX + j,
+                                prob_lo + r * KTMAX + j, vc, base[rr]));
+          }
+        }
+#pragma GCC unroll 4
+        for (int rr = 0; rr < 4; ++rr)
+          l[r0 + rr] += _mm512_reduce_add_ps(sum[rr]);
+      }
+      return;
+    }
 
     for (int r = 0; r < nrows; ++r) {
       float* p = logits + static_cast<int64_t>(r) * kt;
@@ -675,25 +798,10 @@ struct Dense {
       }
       const __m512 vmn = _mm512_set1_ps(mn);
       __m512 sum = _mm512_setzero_ps();
-#pragma GCC unroll 2
-      for (int j = 0; j < nkeys; j += 16) {
-        // e = 2^(c*logit - m): one fma, no separate scaling pass.
-        const __m512 e =
-            exp2v<BF>(_mm512_fmsub_ps(_mm512_loadu_ps(p + j), vc, vmn));
-        sum = _mm512_add_ps(sum, e);
-        const __m256i h = cvt_bf16x16(e);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(pp + j), h);
-        if constexpr (!BF)
-          _mm256_storeu_si256(reinterpret_cast<__m256i*>(pl + j),
-                              cvt_bf16x16(_mm512_sub_ps(e, widen_bf16x16(h))));
-      }
+      // e = 2^(c*logit - m): one fma, no separate scaling pass.
+      for (int j = 0; j < ntail; j += KSTEP)
+        sum = _mm512_add_ps(sum, emit32(p + j, pp + j, pl + j, vc, vmn));
       l[r] += _mm512_reduce_add_ps(sum);
-      // P@V reads whole 32-key steps, so the tail lanes of the last step must be
-      // exactly zero: V is zero there too, and `NaN * 0` is not 0.
-      for (int j = nkeys; j < ntail; ++j) {
-        pp[j] = bf16{0};
-        if constexpr (!BF) pl[j] = bf16{0};
-      }
     }
   }
 
@@ -771,7 +879,7 @@ struct Dense {
 // Q@K^T with the broadcast hoisted, no `idiv` in the key loops, two P@V lanes for
 // bf16, a two-pass softmax -- none of which is per-ISA, so it now lives in
 // `cpu_attn_vec.hpp`'s `Paged` policy and every x86 machine runs it.
-// `docs/amx/AMX_PAGED.md` has the measurements and the A/B against the body it
+// `docs/CPP.md` has the measurements and the A/B against the body it
 // replaced. `vec` is authoritative; nothing paged is defined in this TU, and
 // `amx::paged`/`amx::store` below are one-line forwards so the dispatcher's
 // kIsaAmx route keeps working without a second copy to drift.

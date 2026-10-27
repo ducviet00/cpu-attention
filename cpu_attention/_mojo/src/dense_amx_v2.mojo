@@ -3,9 +3,9 @@
 Same contract, arithmetic and packed layouts as `dense_amx.mojo` (it reads the
 same K/V slabs, so `cpu_attention/_kernel.py` allocates the same workspace), and
 it is opt-in: `CPU_ATTENTION_AMX2=1`, v1 stays the default. Every number below
-is measured on the Emerald Rapids box by `tests/bench_amx_ceiling.py` (the
-roofs), `tests/bench_amx_phases2.py` (where a call's time goes) and
-`tests/bench_amx_v2.py` (the A/B, interleaved in one process, min-based).
+is measured on the Emerald Rapids box by in-process microbenchmarks (the
+roofs), phase ablations (where a call's time goes) and
+an interleaved one-process A/B, min-based (`docs/Mojo.md`).
 
 ## The roofs (EMR 8581C, 4 cores, 1 thread, per core)
 
@@ -748,7 +748,7 @@ def _v2_softmax[
     0.1761), but inside the kernel the logits come back from L2 rather than L1
     (the Q@K phase streamed 16 KB of operands per chunk through L1), so more
     loads in flight is what hides that latency: measured 0.343 -> see
-    tests/bench_amx_v2.py for the sweep.
+    docs/Mojo.md for the sweep.
 
     The max is accumulated here rather than in a pass of its own: all but the
     first super-tile of a work item exponentiate against a max that is one

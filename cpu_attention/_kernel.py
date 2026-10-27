@@ -23,13 +23,9 @@ import threading
 
 import torch
 
-# `auto` resolves per architecture, and the split is measured rather than
-# assumed: the C++ backend is ahead of the Mojo kernel on all 22 dense rows and
-# 19 of 20 paged rows on the x86 boxes, while on aarch64 its dense prefill is
-# 1.02-1.19 of Mojo's (its paged path is still 20/20 ahead there, so
-# `CPU_ATTENTION_BACKEND=cpp` remains the right choice for a paged-heavy
-# workload). docs/CPP_REPORT.md §10.2 has the cycle and instruction counts.
-_CHOSEN = os.environ.get("CPU_ATTENTION_BACKEND", "auto").lower()
+# Keep Mojo as the default until the full cross-ISA scorecard passes. Explicit
+# `auto` retains the earlier architecture-specific choice for existing callers.
+_CHOSEN = os.environ.get("CPU_ATTENTION_BACKEND", "mojo").lower()
 if _CHOSEN == "auto":
     _CHOSEN = "cpp" if platform.machine() in ("x86_64", "AMD64") else "mojo"
 if _CHOSEN not in ("mojo", "cpp"):
@@ -189,10 +185,11 @@ def _workers(num_tasks: int, pages: int = 1) -> int:
     it is 8x. The cap at the *physical* core count matters on SMT boxes (8
     workers on a 4-core Xeon: 1.5x slower at ctx 1024); torch already sizes its
     pool that way, so it only bites when a parent sets a larger
-    ``OMP_NUM_THREADS``. ``CPU_ATTENTION_WORKERS`` overrides everything.
+    ``OMP_NUM_THREADS``. ``CPU_ATTENTION_WORKERS`` selects within that cap.
     """
     if _OVERRIDE:
-        return max(1, min(int(_OVERRIDE), num_tasks))
+        return max(1, min(int(_OVERRIDE), num_tasks, _physical_cores(),
+                          torch.get_num_threads()))
     workers = min(torch.get_num_threads(), _physical_cores(), num_tasks)
     if workers > 1 and num_tasks * pages <= 32:
         return 1
@@ -269,11 +266,11 @@ def _call(
     return out
 
 
-_PAGED_BUFS = []
-"""Plan buffers held for the process: the C++ closures capture their address."""
-
 _PAGED_PLANS = threading.local()
-"""Per-thread geometry -> fast call, for the paged path.
+"""Per-thread geometry -> fast call, for the Mojo paged path.
+
+(The C++ backend keeps the same per-thread cache inside the extension:
+`paged_call` / `paged_register`.)
 
 The engine calls `self_attention`/`cross_attention` 24 times a decode step with
 the same geometry, and at batch 1 / ctx 256 the whole call is 7 us: reading a
@@ -292,71 +289,47 @@ def _paged_plan(query, key, value, k_cache, page_table, do_store):
     plans = getattr(_PAGED_PLANS, "p", None)
     if plans is None:
         plans = _PAGED_PLANS.p = {}
-    nseq, nheads, hd = query.shape
-    kvh = k_cache.shape[1]
-    page = k_cache.shape[2]
+    query_shape = query.shape
+    cache_shape = k_cache.shape
     npages = page_table.shape[1]
-    workers = _workers(nseq * nheads, npages)
-    # A flat tuple of small ints: the hash is as cheap as it gets, and no
-    # `.stride()` tuple is built. The two token strides are read per call
-    # instead (two C calls), which keeps a strided query correct.
+    # Token strides are patched per call, not cached. Worker policy is evaluated
+    # only on a miss; both thread settings stay in the key so a change is safe.
     # `_BACKEND` is in the key because the closures below capture the selected
     # extension entry at build time: without it, switching backends in one
     # process (the A/B harness does) keeps calling the first backend, and a
     # bf16 cache built for one layout is then read with the other one.
-    k = (nseq, nheads, hd, kvh, page, npages, _DTYPE_CODES[query.dtype],
-         workers, do_store, _BACKEND)
+    k = (query_shape, cache_shape, npages, query.dtype, torch.get_num_threads(),
+         _OVERRIDE, do_store, _BACKEND)
     fn = plans.get(k)
     if fn is None:
-        if _BACKEND == "cpp":
-            # The C++ extension keeps the geometry in a plan buffer, so a call
-            # marshals only pointers and two strides: `paged_forward` is 13
-            # arguments against the long form's 22, and the parse is a fifth of
-            # a batch-1 call.
-            make = _entry("paged_make_plan")
-            fwd = _entry("paged_forward")
-            pbuf = torch.empty(12, dtype=torch.int64)
-            addr = pbuf.data_ptr()
-            make(addr, nseq, nheads, kvh, hd, page, npages, nheads * hd,
-                 _DTYPE_CODES[query.dtype], 0.0, workers, int(bool(do_store)))
+        nseq, nheads, hd = query_shape
+        kvh, page = cache_shape[1:3]
+        workers = _workers(nseq * nheads, npages)
+        args = [
+            0, 0, 0, 0, 0, 0, 0, 0, 0,
+            nseq, nheads, kvh, hd, page, npages, 0, 0, nheads * hd,
+            _DTYPE_CODES[query.dtype], 0.0, workers, do_store, True,
+        ]
+        attention = _attention()
+        store = do_store
 
-            def fn(out, query, key, value, k_cache, v_cache, slots, block_table,
-                   lens, scale):
-                fwd(addr, query.data_ptr(),
-                    key.data_ptr() if key is not None else 0,
-                    value.data_ptr() if value is not None else 0,
-                    k_cache.data_ptr(), v_cache.data_ptr(), out.data_ptr(),
-                    slots.data_ptr() if slots is not None else 0,
-                    block_table.data_ptr(), lens.data_ptr(), query.stride(0),
-                    key.stride(0) if key is not None else 0, scale)
-
-            _PAGED_BUFS.append(pbuf)
-        else:
-            args = [
-                0, 0, 0, 0, 0, 0, 0, 0, 0,
-                nseq, nheads, kvh, hd, page, npages, 0, 0, nheads * hd,
-                _DTYPE_CODES[query.dtype], 0.0, workers, do_store, True,
-            ]
-            attention = _attention()
-            store = do_store
-
-            def fn(out, query, key, value, k_cache, v_cache, slots, block_table,
-                   lens, scale):
-                a = args
-                a[0] = query.data_ptr()
-                a[3] = k_cache.data_ptr()
-                a[4] = v_cache.data_ptr()
-                a[5] = out.data_ptr()
-                a[7] = block_table.data_ptr()
-                a[8] = lens.data_ptr()
-                a[15] = query.stride(0)
-                a[19] = scale
-                if store:
-                    a[1] = key.data_ptr()
-                    a[2] = value.data_ptr()
-                    a[6] = slots.data_ptr()
-                    a[16] = key.stride(0)
-                attention(*a)
+        def fn(out, query, key, value, k_cache, v_cache, slots, block_table,
+               lens, scale):
+            a = args
+            a[0] = query.data_ptr()
+            a[3] = k_cache.data_ptr()
+            a[4] = v_cache.data_ptr()
+            a[5] = out.data_ptr()
+            a[7] = block_table.data_ptr()
+            a[8] = lens.data_ptr()
+            a[15] = query.stride(0)
+            a[19] = scale
+            if store:
+                a[1] = key.data_ptr()
+                a[2] = value.data_ptr()
+                a[6] = slots.data_ptr()
+                a[16] = key.stride(0)
+            attention(*a)
 
         if len(plans) > 64:
             plans.clear()
@@ -374,20 +347,36 @@ def _paged(
     is a fifth of a batch-1 call and the reason the scorecard's batch-1 rows
     read badly against a reference whose output is preallocated.
     """
+    if _BACKEND == "cpp":
+        # The C++ entry reads the tensors and allocates `out` itself; it knows
+        # every geometry this thread registered (see `paged_call`).
+        call = _entry("paged_call")
+        res = call(query, key, value, k_cache, v_cache, slots, page_table, lens,
+                   scale, out)
+        if res is NotImplemented:
+            nseq, nheads = query.shape[:2]
+            npages = page_table.shape[1]
+            _entry("paged_register")(query, k_cache, page_table, do_store,
+                                     _workers(nseq * nheads, npages))
+            res = call(query, key, value, k_cache, v_cache, slots, page_table,
+                       lens, scale, out)
+        return res
     if out is None:
-        out = torch.empty(query.shape, dtype=query.dtype)
+        # Paged queries have contiguous heads/dims; a fused-projection token
+        # gap is compacted by empty_like without a memory-format keyword.
+        out = torch.empty_like(query)
     fn = _paged_plan(query, key, value, k_cache, page_table, do_store)
-    if do_store and key is not None and query.shape[1] != k_cache.shape[1]:
+    if (_BACKEND == "mojo" and do_store and key is not None and
+            query.shape[1] != k_cache.shape[1]):
         # GQA/MQA: the query heads of one group are different tasks, so a reader
         # could overtake another head's store. Two calls put every store before
         # every attend. MHA (the engine's models) keeps the single call, and its
         # 24-calls-per-step path never pays this.
-        store = _paged_plan(query, key, value, k_cache, page_table, True)
+        from .ops import reshape_and_cache
+
+        reshape_and_cache(key, value, k_cache, v_cache, slots)
         attend = _paged_plan(query, None, None, k_cache, page_table, False)
-        store(out, query, key, value, k_cache, v_cache, slots, page_table, lens,
-              scale)
-        attend(out, query, None, None, k_cache, v_cache, None, page_table, lens,
-               scale)
+        attend(out, query, None, None, k_cache, v_cache, None, page_table, lens, scale)
         return out
     fn(out, query, key, value, k_cache, v_cache, slots, page_table, lens, scale)
     return out
@@ -597,7 +586,7 @@ def _drop_workspace() -> None:
 
     One generation is all an engine needs, but a sweep over many *large* shapes
     would otherwise keep every geometry's K^T/V scratch alive at once -- a 22-row
-    ``tests/bench_vs_refs.py`` run reaches several hundred MB, and the rows it
+    ``benchmarks/bench.py`` run reaches several hundred MB, and the rows it
     measures late are 5-15% slower than the same rows run on their own (measured
     on the Graviton box, medians of 9; the fingerprint is positional, not
     shape-dependent). The plans hold references to the buffers, so the two have
@@ -610,6 +599,9 @@ def _drop_workspace() -> None:
     plans = getattr(_SCRATCH, "plans", None)
     if plans is not None:
         plans.clear()
+    # AMX plans contain raw addresses into the same scratch tensors. Clearing
+    # only the non-AMX plans made an on/off/on A/B reuse freed memory.
+    _AMX_PLANS.__dict__.pop("p", None)
 
 
 def _scratch(kind, shape, dtype):
@@ -648,9 +640,6 @@ def scratch_bytes() -> int:
 def clear_scratch() -> None:
     """Drop this thread's workspace buffers (tests, or after a shape sweep)."""
     _drop_workspace()
-    # The AMX call plans hold the workspace addresses; a stale plan would feed
-    # the kernel a freed buffer.
-    _AMX_PLANS.__dict__.pop("p", None)
 
 
 _QT_ENV = os.environ.get("CPU_ATTENTION_QT")
@@ -727,7 +716,7 @@ every one of its query blocks, so the two phases share bytes and the region
 needs no internal barrier. It only balances when ``batch*heads % workers == 0``
 (checked in :func:`_dense_plan`), and the header cache argument only holds while
 one head's K/V stays near-resident -- but it measured faster at *every* shape in
-the matrix (1.00-1.18x, in-process interleaved, `tests/bench_head.py`), so the
+the matrix (1.00-1.18x, in-process interleaved), so the
 default is on and the limit is only there for A/B and for a box where one head's
 K/V no longer fits. ``0`` = off.
 """
@@ -752,7 +741,7 @@ def _qt_for(
 
     ``qt`` is the *only* dimension across which K/V is reused, so traffic per
     row-key scales as ``1/qt``. That is what binds on the server boxes (see
-    ``PROFILE_ARM.md`` §10 and ``PROFILE_X86.md``): on x86 fp32 the load-bound
+    ``docs/Mojo.md``): on x86 fp32 the load-bound
     fraction is 48% vs vLLM's 15% and ``CPU_ATTENTION_QT=8`` is worth 1.20-1.34x.
 
     ARM (``lanes < 16``), fp32/bfdot, head_dim 64, measured on m9g
@@ -857,7 +846,7 @@ _AMX_ENV = os.environ.get("CPU_ATTENTION_AMX", "1") != "0"
 # CPU disagrees with the measured 5.5-7.6e-5 error.
 _AMX_FP32_ENV = os.environ.get("CPU_ATTENTION_AMX_FP32", "1") != "0"
 
-# Profiling only (see tests/bench_amx_phases.py): 1 skips the K/V pack, 2 skips
+# Profiling only (phase ablations): 1 skips the K/V pack, 2 skips
 # the attention. The results are garbage in either mode; timings only.
 # Profiling only: 1 skip pack, 2 skip attention, 4/8 skip V/K pack, 16/32/64
 # skip Q@K^T / softmax / P@V. Results are garbage in any of these; timings only.
@@ -868,7 +857,7 @@ _AMX_ENTRY = None
 # v2 of the AMX kernel (`dense_amx_v2.mojo`: one softmax pass per logit instead
 # of two). Opt-in so a regression cannot reach the engine:
 # `CPU_ATTENTION_AMX2=1` at import, or flip `_AMX_IMPL` between calls (which is
-# how tests/bench_amx_v2.py interleaves the two in one process).
+# how an in-process A/B interleaves the two in one process).
 _AMX_IMPL = os.environ.get("CPU_ATTENTION_AMX2", "0") == "1" and "v2" or "v1"
 _AMX_ENTRIES = {}
 
@@ -1115,7 +1104,7 @@ def _dense_plan(key, q, k, v, causal):
     # 32 MB-L3 laptop; on this box (48 MB) that left 2048:16:128 fp32 (V =
     # 16.8 MB) *without* the copy, and forcing it there measured 1.02-1.07x in
     # three interleaved runs while every smaller shape stayed within noise
-    # (`tests/bench_f32_vpack.py`). A third of the LLC fires at exactly the
+    # (in-process A/B). A third of the LLC fires at exactly the
     # shapes the half rule did on the laptop, plus that one.
     vpack = (dt == torch.float32
              and v.numel() * v.element_size() * 3 >= _llc_bytes())
@@ -1258,7 +1247,7 @@ def _dense_plan(key, q, k, v, causal):
         and _FUSE
         and seq_k <= _SMALL_MAXK
         and head_dim <= 128  # D=128 measured too: 256:16:128 bf16 1.068x in
-        # `tests/bench_small.py`; the tile geometry (ks=256) is the same kernel
+        # an in-process A/B; the tile geometry (ks=256) is the same kernel
     ):
         mode += 8
     plan = (
@@ -1302,34 +1291,28 @@ def _cpp_entries():
     return _entry("dense_make_plan"), _entry("dense_forward")
 
 
-def _cpp_plan(q, k, v, scale, causal):
+def _cpp_plan(q, k, v, scale, causal, geom=None):
     """The plan address for this geometry, building it on the first call."""
     plans = getattr(_CPP_PLANS, "p", None)
     if plans is None:
         plans = _CPP_PLANS.p = {}
-    batch, seq_q, heads, hd = q.shape
-    kv_heads = k.shape[2]
+    if geom is None:
+        geom = (q.shape, q.stride(), k.stride(), v.stride(), q.dtype)
+    qshape, qs, ks, vs, dtype = geom
+    batch, seq_q, heads, hd = qshape
+    kshape = k.shape
+    kv_heads = kshape[2]
     workers = _workers(batch * heads * -(-seq_q // 64), 8)
-    cont = q.is_contiguous()
-    # A contiguous tensor's strides follow from its shape, so the common case
-    # (a fresh q/k/v from flash_attn_func) builds no stride tuples.
-    key = (q.shape, k.shape, cont, causal, q.dtype, workers, scale,
-           cont or (q.stride(), k.stride(), v.stride()))
-    addr = plans.get(key)
-    if addr is None:
+    # The public wrapper already read every stride. A contiguous Q says nothing
+    # about K or V: mixed contiguous/strided inputs need their own plan too.
+    key = (qshape, kshape, qs, ks, vs, dtype, causal, workers, scale)
+    cached = plans.get(key)
+    if cached is None:
         make_plan, _ = _cpp_entries()
-        if cont:
-            # [batch, seq, heads, hd] row-major.
-            ks3 = kv_heads * hd
-            qs = (seq_q * heads * hd, heads * hd, hd, 1)
-            ks = (k.shape[1] * ks3, ks3, hd, 1)
-            vs = ks
-        else:
-            qs, ks, vs = q.stride(), k.stride(), v.stride()
         buf = torch.empty(24, dtype=torch.int64)
         make_plan(
-            buf.data_ptr(), batch, seq_q, k.shape[1], heads, kv_heads, hd,
-            _DTYPE_CODES[q.dtype], int(bool(causal)), float(scale),
+            buf.data_ptr(), batch, seq_q, kshape[1], heads, kv_heads, hd,
+            _DTYPE_CODES[dtype], int(bool(causal)), float(scale),
             qs[0], qs[1], qs[2], ks[0], ks[1], ks[2], vs[0], vs[1], vs[2],
             seq_q * heads * hd, heads * hd, hd, workers,
         )
@@ -1337,19 +1320,15 @@ def _cpp_plan(q, k, v, scale, causal):
             plans.clear()
         addr = buf.data_ptr()
         # The buffer has to outlive the address, so hold it next to the key.
-        plans[key] = addr
-        _CPP_BUFS.append(buf)
-    return addr
+        plans[key] = cached = (buf, addr)
+    return cached[1]
 
 
-_CPP_BUFS = []
-
-
-def _dense_cpp(q, k, v, scale: float, causal: bool):
+def _dense_cpp(q, k, v, scale: float, causal: bool, geom=None):
     """Dense attention through the C++ backend: one call, five arguments."""
-    _, forward = _cpp_entries()
-    out = torch.empty(q.shape, dtype=q.dtype)
-    forward(_cpp_plan(q, k, v, scale, causal), q.data_ptr(), k.data_ptr(),
+    forward = _entry("dense_forward")
+    out = torch.empty_like(q, memory_format=torch.contiguous_format)
+    forward(_cpp_plan(q, k, v, scale, causal, geom), q.data_ptr(), k.data_ptr(),
             v.data_ptr(), out.data_ptr())
     return out
 
@@ -1377,7 +1356,7 @@ def _dense(q, k, v, scale: float, causal: bool, geom=None):
     above it.
     """
     if _BACKEND == "cpp":
-        return _dense_cpp(q, k, v, scale, causal)
+        return _dense_cpp(q, k, v, scale, causal, geom)
     out = _amx_dense(q, k, v, scale, causal)
     if out is not None:
         return out
@@ -1403,7 +1382,7 @@ def _dense(q, k, v, scale: float, causal: bool, geom=None):
      vt_ptr, v_ptr_packed, ks_ptr, ks_bh, k0, k1, k2, v0, v1, v2,
      qb, qtok, qh, vb, vtok, vh, ob, otok, oh, pack_workers,
      _kt, _vt, _ks, _pbuf) = plan
-    out = torch.empty(geom[0], dtype=geom[4])
+    out = torch.empty_like(q, memory_format=torch.contiguous_format)
     q_ptr = q.data_ptr()
     k_ptr = k.data_ptr()
     v_ptr = v_ptr_packed if v_ptr_packed else v.data_ptr()
@@ -1412,7 +1391,7 @@ def _dense(q, k, v, scale: float, causal: bool, geom=None):
         # One OpenMP region for the pack and the attention, with a barrier
         # between them: two fork-joins cost two pool wakes, and at S=128 the
         # barrier was 14% of the process by perf. `CPU_ATTENTION_NO_FUSE=1`
-        # restores the two-call form, which is what `tests/bench_phases.py`
+        # restores the two-call form, which is what a phase ablation
         # instruments to split pack from kernel.
         if _PLAN_ABI:
             # Six arguments instead of 42: the geometry rides in `_pbuf`.

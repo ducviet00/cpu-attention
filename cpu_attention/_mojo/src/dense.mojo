@@ -3121,7 +3121,7 @@ def _dense_task_pair[
     #     consecutive items are *different heads* and every item re-reads its
     #     head's K/V from L3.
     #
-    # Measured interleaved, 8 threads, medians of 7 (`tests/ab_two_trees.py`),
+    # Measured interleaved, 8 threads, medians of 7 (two trees, alternating processes),
     # head-first over q-first: 128:8:64 bf16 1.19x, 256:16:128 bf16 1.20x,
     # 512:8:64 1.12x, 1024:8:64 1.07x, 2048:8:64 1.03x, 512:32:128 1.12x,
     # 1024:8:32 1.04x; and *slower* once a thread's working set leaves L2:

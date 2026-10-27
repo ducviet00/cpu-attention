@@ -52,7 +52,7 @@ Everything is the *same* tile geometry, the same bfmmla sequence and
 the same operand layouts as the shipped kernel. It was bit-identical while it
 shared the shipped kernel's degree-3 exponential; it now uses the bf16-precision
 degree-2 one (`_exp2_bf16`, the form `dense.mojo`'s tile kernel uses), so the
-two paths differ by ~1 bf16 ulp and `tests/bench_small.py` checks both against
+two paths differ by ~1 bf16 ulp and `tests/test_dense.py` checks both against
 SDPA inside the fixed bf16 tolerance rather than against each other. This file is
 separate from ``dense.mojo`` on purpose: the bf16 D=128 tile is being rewritten
 there, and this path only serves ``seq_k <= 256``.

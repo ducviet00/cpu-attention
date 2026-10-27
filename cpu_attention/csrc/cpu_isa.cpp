@@ -38,11 +38,15 @@ CpuFeatures detect() {
     f.avx512dq = (ebx >> 17) & 1;
     f.avx512bw = (ebx >> 30) & 1;
     f.avx512vl = (ebx >> 31) & 1;
-    f.avx512bf16 = (eax >> 5) & 1;   // CPUID.7.1:EAX[5]
+    const unsigned max_subleaf = eax;
     f.amx_bf16 = (edx >> 22) & 1;
     f.amx_tile = (edx >> 24) & 1;
     f.amx_int8 = (edx >> 25) & 1;
     f.avx512fp16 = (edx >> 23) & 1;
+    if (max_subleaf >= 1) {
+      __cpuid_count(7, 1, eax, ebx, ecx, edx);
+      f.avx512bf16 = (eax >> 5) & 1;
+    }
   }
   // Both AVX-512 and AMX are only usable when the OS enabled the state; without
   // an XSAVE-enabled build (some VMs) the first instruction is SIGILL.
@@ -62,7 +66,7 @@ CpuFeatures detect() {
     f.avx512dq &= zmm;
     f.avx512bf16 &= zmm;
     f.avx512fp16 &= zmm;
-    const bool tiles = (xcr0 & 0x60000) == 0x60000;  // opmask | zmm_hi256 | hi16_zmm
+    const bool tiles = (xcr0 & 0x60000) == 0x60000;  // XTILECFG | XTILEDATA
     f.amx_tile &= tiles;
     f.amx_bf16 &= tiles;
     f.amx_int8 &= tiles;
@@ -92,13 +96,11 @@ const CpuFeatures& cpu() {
 bool amx_init() {
 #if defined(__x86_64__)
   if (!cpu().amx_tile || !cpu().amx_bf16) return false;
-  static int state = -1;  // -1 unknown, 0 denied, 1 granted
-  if (state >= 0) return state == 1;
   // The tile registers are in a kernel-managed XSAVE state that is off by
   // default; without this the first tile instruction is SIGILL.
-  const long rc = syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA);
-  state = (rc == 0) ? 1 : 0;
-  return state == 1;
+  static const bool permitted =
+      syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA) == 0;
+  return permitted;
 #else
   return false;
 #endif

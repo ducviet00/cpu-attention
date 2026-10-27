@@ -3,7 +3,8 @@
 // Layouts (this policy defines them; `pack`/`store_head` write them):
 //
 //   dense fp32   K [hd][pad]           V [pad][hd]
-//   dense bf16   K [hd/4][pad/2][8]    V [hd/2][pad/4][8]
+//   dense bf16   K [tile][hd/4][32][8] V [tile][hd/2][16][8] (64-key tiles;
+//                                       D=64 keeps V [hd/2][pad/4][8])
 //   paged fp32   K [hd][page]          V [page][hd]      (byte-compatible with
 //                                                        the VEC and Mojo paths)
 //   paged bf16   K [hd/2][page][2]     V [page/2][hd][2] (the Mojo ARM layout)
@@ -111,24 +112,37 @@ inline float32x4_t bfmmla(float32x4_t acc, bfloat16x8_t a, bfloat16x8_t b) {
 template <int DEG>
 inline float32x4_t exp2v(float32x4_t x) {
   x = vmaxq_f32(x, vdupq_n_f32(-126.0f));
-  const float32x4_t n = vrndnq_f32(x);
-  const float32x4_t r = vsubq_f32(x, n);
+  // n = round(x) once as an integer (fcvtns) and once as a float; 2^n is then
+  // an integer add into p's exponent field instead of building 2^n and
+  // multiplying, one instruction fewer per vector.
+  const int32x4_t ni = vcvtnq_s32_f32(x);
+  const float32x4_t r = vsubq_f32(x, vcvtq_f32_s32(ni));
   // Horner with FMA: p = c_hi, then p = c_next + p*r.
   float32x4_t p;
-  if constexpr (DEG >= 5) {
+  if constexpr (DEG >= 6) {
+    p = vdupq_n_f32(1.5403530e-4f);
+    p = vfmaq_f32(vdupq_n_f32(1.3333558e-3f), p, r);
+    p = vfmaq_f32(vdupq_n_f32(9.6181291e-3f), p, r);
+    p = vfmaq_f32(vdupq_n_f32(5.5504109e-2f), p, r);
+    p = vfmaq_f32(vdupq_n_f32(2.4022651e-1f), p, r);
+  } else if constexpr (DEG >= 5) {
     p = vdupq_n_f32(1.3392112e-3f);
     p = vfmaq_f32(vdupq_n_f32(9.6180963e-3f), p, r);
     p = vfmaq_f32(vdupq_n_f32(5.5503282e-2f), p, r);
     p = vfmaq_f32(vdupq_n_f32(2.4022652e-1f), p, r);
+  } else if constexpr (DEG == 2) {
+    p = vdupq_n_f32(2.3473140e-1f);
   } else {
     p = vdupq_n_f32(5.587586976e-2f);
     p = vfmaq_f32(vdupq_n_f32(2.422964968e-1f), p, r);
   }
-  p = vfmaq_f32(vdupq_n_f32(6.9314718e-1f), p, r);
+  p = vfmaq_f32(vdupq_n_f32(DEG == 2 ? 6.9335938e-1f : 6.9314718e-1f), p, r);
   p = vfmaq_f32(vdupq_n_f32(1.0f), p, r);
-  const int32x4_t e =
-      vshlq_n_s32(vaddq_s32(vcvtq_s32_f32(n), vdupq_n_s32(127)), 23);
-  return vmulq_f32(p, vreinterpretq_f32_s32(e));
+  // p is in [0.70, 1.42], so its exponent field is 126 or 127 and adding
+  // n >= -126 cannot underflow past zero (at the clamp it lands in the
+  // subnormal range, ~1e-38, where only the "exactly tiny" property matters).
+  return vreinterpretq_f32_s32(
+      vaddq_s32(vreinterpretq_s32_f32(p), vshlq_n_s32(ni, 23)));
 }
 
 inline float hmax(float32x4_t v) { return vmaxvq_f32(v); }
@@ -170,6 +184,30 @@ inline float32x4_t zip_hi(float32x4_t a, float32x4_t b) {
 inline int64_t pad_of(int64_t seq_k) { return (seq_k + 63) & ~int64_t(63); }
 
 inline size_t round64(size_t n) { return (n + 63) & ~size_t(63); }
+
+template <int RQT, int KT>
+inline void mask_and_max(float* logits, int nrows, int nkeys, int64_t k0,
+                         int64_t row_limit0, float* tmax) {
+  const float32x4_t ninf = vdupq_n_f32(kNegInf);
+  const int32x4_t lane = lane_idx();
+  for (int r = 0; r < RQT; ++r) {
+    const int64_t limit = row_limit0 + std::min(r, nrows - 1) - k0 + 1;
+    const int valid = static_cast<int>(std::clamp<int64_t>(limit, 0, nkeys));
+    float* row = logits + r * KT;
+    float32x4_t mx = ninf;
+    int j = 0;
+    for (; j + 8 <= valid; j += 8)
+      mx = vmaxq_f32(mx, vmaxq_f32(ldf(row + j), ldf(row + j + 4)));
+    for (; j < nkeys; j += 4) {
+      const int32x4_t idx = vaddq_s32(vdupq_n_s32(j), lane);
+      const float32x4_t x = vbslq_f32(vcgeq_s32(idx, vdupq_n_s32(valid)),
+                                     ninf, ldf(row + j));
+      stf(row + j, x);
+      mx = vmaxq_f32(mx, x);
+    }
+    tmax[r] = hmax(mx);
+  }
+}
 
 // ===========================================================================
 // dense fp32
@@ -213,12 +251,14 @@ struct DenseF32 {
     return static_cast<size_t>(2) * pad_of(seq_k) * HD * 4;
   }
   // [logits RQT*kt f32][acc acc_rows(rq)*hd f32][m,l,alpha rq][tmax RQT][P_T]
+  // [Qpack RQT*hd f32]
   static size_t aux_bytes(int rq_, int) {
     return round64(static_cast<size_t>(RQT) * kt_() * 4 +
                    static_cast<size_t>(acc_rows(rq_)) * HD * 4 +
                    static_cast<size_t>(rq_) * 3 * 4 +
                    static_cast<size_t>(RQT) * 4 + 64 +
-                   static_cast<size_t>(kt_()) * RQT * 4);
+                   static_cast<size_t>(kt_()) * RQT * 4 +
+                   static_cast<size_t>(RQT) * HD * 4);
   }
   static float* tmax_of(float* logits) {
     const int rq_ = rq_cached();
@@ -227,6 +267,9 @@ struct DenseF32 {
            static_cast<size_t>(rq_) * 3;
   }
   static float* pof(float* logits) { return tmax_of(logits) + RQT + 16; }
+  static float* qpack_of(float* logits) {
+    return pof(logits) + static_cast<size_t>(kt_()) * RQT;
+  }
 
   // K^T is blocked every 64 keys: `[tile][hd][64]`. One dimension's 64
   // positions are contiguous (256 B at D=64) instead of `pad` floats apart, so
@@ -275,26 +318,26 @@ struct DenseF32 {
                  const char* q_base, int nrows, int64_t k0, int nkeys,
                  int64_t row_limit0, float* logits) {
     const int KT = kt_();
-    const int64_t pad = pad_of(job.seq_k);
     const int64_t qt = job.qt;
     const float* kd = reinterpret_cast<const float*>(slab);
-    const int64_t kend = k0 + nkeys;
     if (neon_mode() & 2) {
       for (int r = 0; r < nrows; ++r)
         std::memset(logits + r * KT, 0, sizeof(float) * nkeys);
       return;
     }
-    const int64_t lim = std::min<int64_t>(row_limit0, kend - 1);
-    const int32x4_t lane = lane_idx();
-    const float32x4_t ninf = vdupq_n_f32(kNegInf);
-    // RQT is a compile-time trip count on purpose: rows past `nrows` read the
-    // last real row again (no out-of-bounds load, no NaN) and are stored into
-    // the logits tile, which the softmax then ignores. That keeps every
-    // accumulator index constant, which is the difference between sixteen
-    // registers and sixteen stack slots.
-    const int rclamp = nrows - 1;
-    float32x4_t tmax[RQT];
-    for (int r = 0; r < RQT; ++r) tmax[r] = vdupq_n_f32(kNegInf);
+    // RQT is a compile-time trip count on purpose: rows past `nrows` are packed
+    // as copies of the last real row (no out-of-bounds load, no NaN) and are
+    // stored into the logits tile, which the softmax then ignores. That keeps
+    // every accumulator index constant, which is the difference between
+    // sixteen registers and sixteen stack slots. The pack itself puts the rows
+    // in one contiguous L1 panel: the caller's rows are a whole token stride
+    // apart, and the loop below reads each of them once per eight keys.
+    float* qpk = qpack_of(logits);
+    for (int r = 0; r < RQT; ++r) {
+      const char* src = q_base + static_cast<int64_t>(std::min(r, nrows - 1)) *
+                                     qt * 4;
+      std::memcpy(qpk + r * HD, src, sizeof(float) * HD);
+    }
     for (int j = 0; j < nkeys; j += 8) {
       const int64_t jj = k0 + j;
       float32x4_t c[RQT][2];
@@ -302,15 +345,16 @@ struct DenseF32 {
         c[r][0] = vdupq_n_f32(0.0f);
         c[r][1] = vdupq_n_f32(0.0f);
       }
+      // Keys jj..jj+7 of one dimension are 32 contiguous bytes of the tile.
+      const float* kp = kd + k_off(jj, 0);
       for (int d0 = 0; d0 < HD; d0 += 4) {
         float32x4_t kv[8];
         for (int dd = 0; dd < 4; ++dd) {
-          kv[2 * dd + 0] = ldf(kd + k_off(jj, d0 + dd));
-          kv[2 * dd + 1] = ldf(kd + k_off(jj + 4, d0 + dd));
+          kv[2 * dd + 0] = ldf(kp + (d0 + dd) * 64);
+          kv[2 * dd + 1] = ldf(kp + (d0 + dd) * 64 + 4);
         }
         for (int r = 0; r < RQT; ++r) {
-          const int rr = r < nrows ? r : rclamp;
-          const float32x4_t qv = ldf(q_base + (rr * qt + d0) * 4);
+          const float32x4_t qv = ldf(qpk + r * HD + d0);
           c[r][0] = vfmaq_laneq_f32(c[r][0], kv[0], qv, 0);
           c[r][1] = vfmaq_laneq_f32(c[r][1], kv[1], qv, 0);
           c[r][0] = vfmaq_laneq_f32(c[r][0], kv[2], qv, 1);
@@ -321,46 +365,13 @@ struct DenseF32 {
           c[r][1] = vfmaq_laneq_f32(c[r][1], kv[7], qv, 3);
         }
       }
-      // Row r sees keys <= row_limit0 + r, so from row `rsplit` on the panel is
-      // wholly visible and only the rows below it need the blend. When the panel
-      // runs past the chunk's last key (`kend-1`) the chunk bound is what masks,
-      // and that one does not grow with r: every row needs it.
-      const bool nomask = jj + 7 <= lim;
-      const int rsplit =
-          nomask ? 0
-                 : (jj + 7 <= kend - 1
-                        ? static_cast<int>(jj + 7 -
-                                           std::min<int64_t>(row_limit0,
-                                                             kend - 1))
-                        : RQT);
-      if (rsplit <= 0) {
-        for (int r = 0; r < RQT; ++r) {
-          stf(logits + r * KT + j, c[r][0]);
-          stf(logits + r * KT + j + 4, c[r][1]);
-          tmax[r] = vmaxq_f32(tmax[r], vmaxq_f32(c[r][0], c[r][1]));
-        }
-      } else {
-        const int32x4_t idx0 =
-            vaddq_s32(vdupq_n_s32(static_cast<int32_t>(jj)), lane);
-        const int32x4_t idx1 =
-            vaddq_s32(vdupq_n_s32(static_cast<int32_t>(jj + 4)), lane);
-        for (int r = 0; r < RQT; ++r) {
-          float32x4_t a0 = c[r][0], a1 = c[r][1];
-          if (r < rsplit) {
-            const int32_t lr = static_cast<int32_t>(std::min<int64_t>(
-                row_limit0 + (r < nrows ? r : rclamp), kend - 1));
-            const int32x4_t lv = vdupq_n_s32(lr);
-            a0 = vbslq_f32(vcgtq_s32(idx0, lv), ninf, a0);
-            a1 = vbslq_f32(vcgtq_s32(idx1, lv), ninf, a1);
-          }
-          stf(logits + r * KT + j, a0);
-          stf(logits + r * KT + j + 4, a1);
-          tmax[r] = vmaxq_f32(tmax[r], vmaxq_f32(a0, a1));
-        }
+      for (int r = 0; r < RQT; ++r) {
+        stf(logits + r * KT + j, c[r][0]);
+        stf(logits + r * KT + j + 4, c[r][1]);
       }
     }
-    float* tm = tmax_of(logits);
-    for (int r = 0; r < RQT; ++r) tm[r] = hmax(tmax[r]);
+    mask_and_max<RQT, KT>(logits, nrows, nkeys, k0, row_limit0,
+                          tmax_of(logits));
   }
 
   // Scales the tile by c and turns it into probabilities, transposed into the P
@@ -516,7 +527,7 @@ struct DenseF32 {
 // ===========================================================================
 template <int HD, int KTC>
 struct DenseBF {
-  static constexpr int RQT = 8;
+  static constexpr int RQT = 10;
   static constexpr bool zeroes_acc = true;  // see DenseF32
   static void store_bf16(char* dst, const float* src, int hd, float inv) {
     store_bf16_out(dst, src, hd, inv);
@@ -524,6 +535,12 @@ struct DenseBF {
   static constexpr int KTMAXV = 2048;
   static constexpr int DG = HD / 4;   // head-dim groups of 4
   static constexpr int RP = RQT / 2;  // row pairs
+  // Nearby dimension pairs avoid the long-sequence V stride on D=32/128.
+  // D=64 measured slightly slower with blocking, so it keeps the old layout.
+  static constexpr bool VBLOCK = HD != 64;
+  static constexpr int VKEYS = 64;
+  static constexpr int VGROUPS = VKEYS / 4;
+  static constexpr int VSTRIDE = VGROUPS * 16;
 
   static constexpr int kt_() { return KTC; }
   static int& rq_cached() {
@@ -577,7 +594,8 @@ struct DenseBF {
   }
 
   // K -> [tile][HD/4][32 pairs][8]: four head dims of two adjacent keys.
-  // V -> [HD/2][pad/4][8]: two head dims of four adjacent keys.
+  // V -> [tile][HD/2][16][8], or the unblocked D=64 layout: two head dims
+  // of four adjacent keys. The key order within a dot product is unchanged.
   static void pack(const DenseJob& job, int64_t b, int64_t kvh, char* slab) {
     if (neon_mode() & 1) return;
     const int64_t pad = pad_of(job.seq_k);
@@ -608,19 +626,27 @@ struct DenseBF {
     const int64_t kg_n = pad / 4;
     for (int64_t kg = 0; kg < kg_n; ++kg) {
       const int64_t t0 = 4 * kg;
-      for (int dp = 0; dp < HD / 2; ++dp) {
-        uint32_t w[4] = {0u, 0u, 0u, 0u};
+      for (int d = 0; d < HD; d += 8) {
+        uint16x8_t r[4];
         for (int t = 0; t < 4; ++t)
-          if (t0 + t < n)
-            std::memcpy(&w[t], vs + ((t0 + t) * job.vt + 2 * dp) * 2, 4);
-        // w[t] = (v[t][2dp], v[t][2dp+1]); the group wants the four keys of one
-        // head dim contiguous (column-major over the contraction).
-        const uint16x8_t vv = vreinterpretq_u16_u32(vld1q_u32(w));
-        char* dst = vd + (dp * kg_n + kg) * 16;
-        vst1_u16(reinterpret_cast<uint16_t*>(dst),
-                 vuzp1_u16(vget_low_u16(vv), vget_high_u16(vv)));
-        vst1_u16(reinterpret_cast<uint16_t*>(dst + 8),
-                 vuzp2_u16(vget_low_u16(vv), vget_high_u16(vv)));
+          r[t] = t0 + t < n
+                     ? vld1q_u16(reinterpret_cast<const uint16_t*>(
+                           vs + ((t0 + t) * job.vt + d) * 2))
+                     : vdupq_n_u16(0);
+        const uint32x4_t a = vreinterpretq_u32_u16(vzip1q_u16(r[0], r[1]));
+        const uint32x4_t b = vreinterpretq_u32_u16(vzip2q_u16(r[0], r[1]));
+        const uint32x4_t c = vreinterpretq_u32_u16(vzip1q_u16(r[2], r[3]));
+        const uint32x4_t e = vreinterpretq_u32_u16(vzip2q_u16(r[2], r[3]));
+        const int64_t stride = VBLOCK ? VSTRIDE : kg_n * 16;
+        const int64_t off = VBLOCK
+            ? ((t0 / VKEYS) * (HD / 2) + d / 2) * VGROUPS +
+                  (t0 % VKEYS) / 4
+            : (d / 2) * kg_n + kg;
+        char* dst = vd + off * 16;
+        vst1q_u32(reinterpret_cast<uint32_t*>(dst), vzip1q_u32(a, c));
+        vst1q_u32(reinterpret_cast<uint32_t*>(dst + stride), vzip2q_u32(a, c));
+        vst1q_u32(reinterpret_cast<uint32_t*>(dst + 2 * stride), vzip1q_u32(b, e));
+        vst1q_u32(reinterpret_cast<uint32_t*>(dst + 3 * stride), vzip2q_u32(b, e));
       }
     }
   }
@@ -651,8 +677,11 @@ struct DenseBF {
     const int64_t lim = std::min<int64_t>(row_limit0, kend - 1);
     const int32x4_t lane = lane_idx();
     const float32x4_t ninf = vdupq_n_f32(kNegInf);
-    float32x4_t tmax[RQT];
-    for (int r = 0; r < RQT; ++r) tmax[r] = vdupq_n_f32(kNegInf);
+    // Running maxima per row pair, lanes (r0, r0, r1, r1): five registers
+    // instead of ten, so they stay live beside the twenty accumulators rather
+    // than round-tripping through the stack every eight keys.
+    float32x4_t tmax[RP];
+    for (int rp = 0; rp < RP; ++rp) tmax[rp] = ninf;
     for (int j = 0; j < nkeys; j += 8) {
       const int64_t jj = k0 + j;
       float32x4_t acc[RP][4];
@@ -667,16 +696,34 @@ struct DenseBF {
           for (int kp = 0; kp < 4; ++kp)
             acc[rp][kp] = bfmmla(acc[rp][kp], a[rp], b[kp]);
       }
-      const bool nomask = jj + 7 <= lim;
+      auto emit = [&](int rp, float32x4_t ev0, float32x4_t ev1,
+                      float32x4_t od0, float32x4_t od1) {
+        const int r0 = 2 * rp, r1 = 2 * rp + 1;
+        stf(logits + r0 * KT + j, ev0);
+        stf(logits + r0 * KT + j + 4, ev1);
+        stf(logits + r1 * KT + j, od0);
+        stf(logits + r1 * KT + j + 4, od1);
+        tmax[rp] = vmaxq_f32(
+            tmax[rp], vpmaxq_f32(vmaxq_f32(ev0, ev1), vmaxq_f32(od0, od1)));
+      };
+      if (jj + 7 <= lim) {
+        // No key of this block is past any row's limit: the common case, kept
+        // free of the per-row-pair mask tests.
+        for (int rp = 0; rp < RP; ++rp)
+          emit(rp, zip_lo(acc[rp][0], acc[rp][1]),
+               zip_lo(acc[rp][2], acc[rp][3]), zip_hi(acc[rp][0], acc[rp][1]),
+               zip_hi(acc[rp][2], acc[rp][3]));
+        continue;
+      }
       const int rsplit =
-          nomask ? 0
-                 : (jj + 7 <= kend - 1
-                        ? static_cast<int>(jj + 7 -
-                                           std::min<int64_t>(row_limit0,
-                                                             kend - 1))
-                        : RQT);
-      float32x4_t tm[RQT];
-      for (int r = 0; r < RQT; ++r) tm[r] = vdupq_n_f32(kNegInf);
+          jj + 7 <= kend - 1
+              ? static_cast<int>(jj + 7 -
+                                 std::min<int64_t>(row_limit0, kend - 1))
+              : RQT;
+      const int32x4_t i0 =
+          vaddq_s32(vdupq_n_s32(static_cast<int32_t>(jj)), lane);
+      const int32x4_t i1 =
+          vaddq_s32(vdupq_n_s32(static_cast<int32_t>(jj + 4)), lane);
       for (int rp = 0; rp < RP; ++rp) {
         float32x4_t ev0 = zip_lo(acc[rp][0], acc[rp][1]);
         float32x4_t ev1 = zip_lo(acc[rp][2], acc[rp][3]);
@@ -686,10 +733,6 @@ struct DenseBF {
         if (rsplit > r0) {
           const int32_t l0 = static_cast<int32_t>(
               std::min<int64_t>(row_limit0 + r0, kend - 1));
-          const int32x4_t i0 =
-              vaddq_s32(vdupq_n_s32(static_cast<int32_t>(jj)), lane);
-          const int32x4_t i1 =
-              vaddq_s32(vdupq_n_s32(static_cast<int32_t>(jj + 4)), lane);
           ev0 = vbslq_f32(vcgtq_s32(i0, vdupq_n_s32(l0)), ninf, ev0);
           ev1 = vbslq_f32(vcgtq_s32(i1, vdupq_n_s32(l0)), ninf, ev1);
           if (rsplit > r1) {
@@ -699,17 +742,15 @@ struct DenseBF {
             od1 = vbslq_f32(vcgtq_s32(i1, vdupq_n_s32(l1)), ninf, od1);
           }
         }
-        stf(logits + r0 * KT + j, ev0);
-        stf(logits + r0 * KT + j + 4, ev1);
-        stf(logits + r1 * KT + j, od0);
-        stf(logits + r1 * KT + j + 4, od1);
-        tm[r0] = vmaxq_f32(tm[r0], vmaxq_f32(ev0, ev1));
-        tm[r1] = vmaxq_f32(tm[r1], vmaxq_f32(od0, od1));
+        emit(rp, ev0, ev1, od0, od1);
       }
-      for (int r = 0; r < RQT; ++r) tmax[r] = vmaxq_f32(tmax[r], tm[r]);
     }
     float* tmv = tmax_of(logits);
-    for (int r = 0; r < RQT; ++r) tmv[r] = hmax(tmax[r]);
+    for (int rp = 0; rp < RP; ++rp) {
+      const float32x4_t m = vpmaxq_f32(tmax[rp], tmax[rp]);
+      tmv[2 * rp] = vgetq_lane_f32(m, 0);
+      tmv[2 * rp + 1] = vgetq_lane_f32(m, 1);
+    }
   }
 
   // Probabilities straight into the P@V operand layout: [row pair][4 keys] holds
@@ -764,9 +805,9 @@ struct DenseBF {
         const bool z0 = mn[0] == kNegInf, z1 = mn[1] == kNegInf;
         for (int j = 0; j < nkeys; j += 4) {
           const float32x4_t e0 =
-              z0 ? zero : exp2v<3>(vfmaq_f32(vmn0, vc, ldf(p0 + j)));
+               z0 ? zero : exp2v<2>(vfmaq_f32(vmn0, vc, ldf(p0 + j)));
           const float32x4_t e1 =
-              z1 ? zero : exp2v<3>(vfmaq_f32(vmn1, vc, ldf(p1 + j)));
+               z1 ? zero : exp2v<2>(vfmaq_f32(vmn1, vc, ldf(p1 + j)));
           s0 = vaddq_f32(s0, e0);
           s1 = vaddq_f32(s1, e1);
           stb(dst + (j / 4) * 16,
@@ -780,14 +821,14 @@ struct DenseBF {
         // instructions' worth of work). Eight chains in flight is what closes
         // that gap.
         for (; j + 16 <= nkeys; j += 16) {
-          const float32x4_t c0 = exp2v<3>(vfmaq_f32(vmn0, vc, ldf(p0)));
-          const float32x4_t d0 = exp2v<3>(vfmaq_f32(vmn1, vc, ldf(p1)));
-          const float32x4_t c1 = exp2v<3>(vfmaq_f32(vmn0, vc, ldf(p0 + 4)));
-          const float32x4_t d1 = exp2v<3>(vfmaq_f32(vmn1, vc, ldf(p1 + 4)));
-          const float32x4_t c2 = exp2v<3>(vfmaq_f32(vmn0, vc, ldf(p0 + 8)));
-          const float32x4_t d2 = exp2v<3>(vfmaq_f32(vmn1, vc, ldf(p1 + 8)));
-          const float32x4_t c3 = exp2v<3>(vfmaq_f32(vmn0, vc, ldf(p0 + 12)));
-          const float32x4_t d3 = exp2v<3>(vfmaq_f32(vmn1, vc, ldf(p1 + 12)));
+          const float32x4_t c0 = exp2v<2>(vfmaq_f32(vmn0, vc, ldf(p0)));
+          const float32x4_t d0 = exp2v<2>(vfmaq_f32(vmn1, vc, ldf(p1)));
+          const float32x4_t c1 = exp2v<2>(vfmaq_f32(vmn0, vc, ldf(p0 + 4)));
+          const float32x4_t d1 = exp2v<2>(vfmaq_f32(vmn1, vc, ldf(p1 + 4)));
+          const float32x4_t c2 = exp2v<2>(vfmaq_f32(vmn0, vc, ldf(p0 + 8)));
+          const float32x4_t d2 = exp2v<2>(vfmaq_f32(vmn1, vc, ldf(p1 + 8)));
+          const float32x4_t c3 = exp2v<2>(vfmaq_f32(vmn0, vc, ldf(p0 + 12)));
+          const float32x4_t d3 = exp2v<2>(vfmaq_f32(vmn1, vc, ldf(p1 + 12)));
           p0 += 16;
           p1 += 16;
           s0 = vaddq_f32(s0, c0);
@@ -805,10 +846,10 @@ struct DenseBF {
           dst += 64;
         }
         for (; j + 8 <= nkeys; j += 8) {
-          const float32x4_t a0 = exp2v<3>(vfmaq_f32(vmn0, vc, ldf(p0)));
-          const float32x4_t a1 = exp2v<3>(vfmaq_f32(vmn1, vc, ldf(p1)));
-          const float32x4_t b0 = exp2v<3>(vfmaq_f32(vmn0, vc, ldf(p0 + 4)));
-          const float32x4_t b1 = exp2v<3>(vfmaq_f32(vmn1, vc, ldf(p1 + 4)));
+          const float32x4_t a0 = exp2v<2>(vfmaq_f32(vmn0, vc, ldf(p0)));
+          const float32x4_t a1 = exp2v<2>(vfmaq_f32(vmn1, vc, ldf(p1)));
+          const float32x4_t b0 = exp2v<2>(vfmaq_f32(vmn0, vc, ldf(p0 + 4)));
+          const float32x4_t b1 = exp2v<2>(vfmaq_f32(vmn1, vc, ldf(p1 + 4)));
           p0 += 8;
           p1 += 8;
           s0 = vaddq_f32(s0, a0);
@@ -823,8 +864,8 @@ struct DenseBF {
         // and the extra keys carry a ~1e-38 probability because their logits
         // were masked to -inf.
         for (; j < nkeys; j += 4) {
-          const float32x4_t a0 = exp2v<3>(vfmaq_f32(vmn0, vc, ldf(p0)));
-          const float32x4_t a1 = exp2v<3>(vfmaq_f32(vmn1, vc, ldf(p1)));
+          const float32x4_t a0 = exp2v<2>(vfmaq_f32(vmn0, vc, ldf(p0)));
+          const float32x4_t a1 = exp2v<2>(vfmaq_f32(vmn1, vc, ldf(p1)));
           p0 += 4;
           p1 += 4;
           s0 = vaddq_f32(s0, a0);
@@ -844,8 +885,8 @@ struct DenseBF {
     const int KG = kt_() / 4;
     const char* pt = pof(const_cast<float*>(logits));
     const int64_t pad = pad_of(job.seq_k);
-    const int64_t vs = (pad / 4) * 16;  // one key group of one dim pair
-    const char* vd = slab + pad * HD * 2 + (k0 / 4) * 16;
+    const int64_t vs = VBLOCK ? VSTRIDE : (pad / 4) * 16;
+    const char* vd = slab + pad * HD * 2;
     if (neon_mode() & 8) return;
     // Eight head dims per pass: the accumulator is 4 row pairs x 4 dim pairs =
     // 16 registers, which leaves room for the operands. Sixteen dims per pass
@@ -869,46 +910,50 @@ struct DenseBF {
       // (dim pair, key group) inside the loop cost 16 of the body's 42
       // instructions -- more than the matmul's own loads.
       const char* p = pt;
-      const char* v = vd + (int64_t(dc / 2) * (pad / 4)) * 16;
-      int j = 0;
-      // Sixteen keys per step (four 4-key groups): the eight loads of a group
-      // feed sixteen `bfmmla`, so a wider step is what lets the loads run ahead
-      // of the matmul instead of stalling behind it.
-      for (; j + 16 <= nkeys; j += 16) {
-        for (int h = 0; h < 4; ++h) {
+      for (int jb = 0; jb < (VBLOCK ? nkeys : 1); jb += VKEYS) {
+        const int block_keys = VBLOCK ? std::min(VKEYS, nkeys - jb) : nkeys;
+        const char* v = VBLOCK
+            ? vd + (((k0 + jb) / VKEYS) * (HD / 2) + dc / 2) * vs
+            : vd + int64_t(dc / 2) * vs + (k0 / 4) * 16;
+        int j = 0;
+        // Keep the output accumulator live across V tiles; only the operand
+        // pointers change. Sixteen keys per step let loads run ahead of dots.
+        for (; j + 16 <= block_keys; j += 16) {
+          for (int h = 0; h < 4; ++h) {
+            bfloat16x8_t pa[RP], vb[4];
+            for (int rp = 0; rp < RP; ++rp)
+              pa[rp] = ldb(p + rp * KG * 16 + h * 16);
+            for (int i = 0; i < 4; ++i) vb[i] = ldb(v + i * vs + h * 16);
+            for (int rp = 0; rp < RP; ++rp)
+              for (int i = 0; i < 4; ++i)
+                a[rp][i] = bfmmla(a[rp][i], pa[rp], vb[i]);
+          }
+          p += 64;
+          v += 64;
+        }
+        for (; j + 8 <= block_keys; j += 8) {
+          for (int h = 0; h < 2; ++h) {
+            bfloat16x8_t pa[RP], vb[4];
+            for (int rp = 0; rp < RP; ++rp)
+              pa[rp] = ldb(p + rp * KG * 16 + h * 16);
+            for (int i = 0; i < 4; ++i) vb[i] = ldb(v + i * vs + h * 16);
+            for (int rp = 0; rp < RP; ++rp)
+              for (int i = 0; i < 4; ++i)
+                a[rp][i] = bfmmla(a[rp][i], pa[rp], vb[i]);
+          }
+          p += 32;
+          v += 32;
+        }
+        for (; j < block_keys; j += 4) {
           bfloat16x8_t pa[RP], vb[4];
-          for (int rp = 0; rp < RP; ++rp)
-            pa[rp] = ldb(p + rp * KG * 16 + h * 16);
-          for (int i = 0; i < 4; ++i) vb[i] = ldb(v + i * vs + h * 16);
+          for (int rp = 0; rp < RP; ++rp) pa[rp] = ldb(p + rp * KG * 16);
+          for (int i = 0; i < 4; ++i) vb[i] = ldb(v + i * vs);
           for (int rp = 0; rp < RP; ++rp)
             for (int i = 0; i < 4; ++i)
               a[rp][i] = bfmmla(a[rp][i], pa[rp], vb[i]);
+          p += 16;
+          v += 16;
         }
-        p += 64;
-        v += 64;
-      }
-      for (; j + 8 <= nkeys; j += 8) {
-        for (int h = 0; h < 2; ++h) {
-          bfloat16x8_t pa[RP], vb[4];
-          for (int rp = 0; rp < RP; ++rp)
-            pa[rp] = ldb(p + rp * KG * 16 + h * 16);
-          for (int i = 0; i < 4; ++i) vb[i] = ldb(v + i * vs + h * 16);
-          for (int rp = 0; rp < RP; ++rp)
-            for (int i = 0; i < 4; ++i)
-              a[rp][i] = bfmmla(a[rp][i], pa[rp], vb[i]);
-        }
-        p += 32;
-        v += 32;
-      }
-      for (; j < nkeys; j += 4) {
-        bfloat16x8_t pa[RP], vb[4];
-        for (int rp = 0; rp < RP; ++rp) pa[rp] = ldb(p + rp * KG * 16);
-        for (int i = 0; i < 4; ++i) vb[i] = ldb(v + i * vs);
-        for (int rp = 0; rp < RP; ++rp)
-          for (int i = 0; i < 4; ++i)
-            a[rp][i] = bfmmla(a[rp][i], pa[rp], vb[i]);
-        p += 16;
-        v += 16;
       }
       for (int rp = 0; rp < RP; ++rp) {
         const int r0 = 2 * rp, r1 = 2 * rp + 1;
@@ -928,7 +973,7 @@ struct DenseBF {
 // ===========================================================================
 // paged fp32
 // ===========================================================================
-template <int HD>
+template <int HD, int PAGE = 0>
 struct PagedF32 {
   static constexpr int PT = 16;       // keys per page-resolution unit
   static constexpr int PG = 4;        // units per online-softmax step
@@ -945,11 +990,12 @@ struct PagedF32 {
   }
 
   static void store_head(const PagedJob& job, int64_t seq, int64_t head) {
+    const int64_t page = PAGE ? PAGE : job.page;
     const int64_t group = job.num_heads / job.num_kv_heads;
     const int64_t kvh = head / group;
     const int64_t slot = job.slots[seq];
-    const int64_t pg = slot / job.page, off = slot % job.page;
-    const int64_t stride = job.page * HD * 4;
+    const int64_t pg = slot / page, off = slot % page;
+    const int64_t stride = page * HD * 4;
     const int64_t base = (pg * job.num_kv_heads + kvh) * stride;
     float* kp =
         reinterpret_cast<float*>(static_cast<char*>(job.k_cache) + base);
@@ -962,12 +1008,13 @@ struct PagedF32 {
         reinterpret_cast<const float*>(job.k) + seq * kvst + kvh * HD;
     const float* vs =
         reinterpret_cast<const float*>(job.v) + seq * kvst + kvh * HD;
-    for (int d = 0; d < HD; ++d) kp[d * job.page + off] = ks[d];
+    for (int d = 0; d < HD; ++d) kp[d * page + off] = ks[d];
     std::memcpy(vp + off * HD, vs, sizeof(float) * HD);
   }
 
   static void attend_head(const PagedJob& job, int64_t seq, int64_t head,
                           char* ws) {
+    const int32_t page = PAGE ? PAGE : static_cast<int32_t>(job.page);
     const int64_t group = job.num_heads / job.num_kv_heads;
     const int64_t kvh = head / group;
     const int64_t len = job.lens[seq];
@@ -984,9 +1031,8 @@ struct PagedF32 {
       for (int i = 0; i < HD; ++i) op[i] = 0.0f;
       return;
     }
-    const int64_t stride = job.page * HD * 4;
+    const int64_t stride = int64_t(page) * HD * 4;
     const float c = job.scale * kLog2e;
-    const int32_t page = static_cast<int32_t>(job.page);
     float m = kNegInf, l = 0.0f;
     const float32x4_t vc = vdupq_n_f32(c);
     const int32x4_t lane = lane_idx();
@@ -1009,21 +1055,27 @@ struct PagedF32 {
       // Q@K^T for the whole step: 4 key groups of 4 keys per 16-key unit.
       float32x4_t lg[NK / 4];
       for (int i = 0; i < NK / 4; ++i) lg[i] = vdupq_n_f32(0.0f);
-      for (int d0 = 0; d0 < HD; d0 += 4) {
-        const float32x4_t qv = ldf(q + d0);
-        for (int g = 0; g < tiles; ++g) {
-          const float* kb = reinterpret_cast<const float*>(kbase[g]) + boff[g];
+      for (int g = 0; g < tiles; ++g) {
+        float32x4_t c[4][4];
+        for (int h = 0; h < 4; ++h)
+          for (int d = 0; d < 4; ++d) c[h][d] = vdupq_n_f32(0.0f);
+        const float* kb = reinterpret_cast<const float*>(kbase[g]) + boff[g];
+        for (int d0 = 0; d0 < HD; d0 += 4) {
+          const float32x4_t qv = ldf(q + d0);
           for (int h = 0; h < 4; ++h) {
-            float32x4_t k0 = ldf(kb + (d0 + 0) * job.page + 4 * h);
-            lg[0 + 4 * g + h] = vfmaq_laneq_f32(lg[0 + 4 * g + h], k0, qv, 0);
-            k0 = ldf(kb + (d0 + 1) * job.page + 4 * h);
-            lg[0 + 4 * g + h] = vfmaq_laneq_f32(lg[0 + 4 * g + h], k0, qv, 1);
-            k0 = ldf(kb + (d0 + 2) * job.page + 4 * h);
-            lg[0 + 4 * g + h] = vfmaq_laneq_f32(lg[0 + 4 * g + h], k0, qv, 2);
-            k0 = ldf(kb + (d0 + 3) * job.page + 4 * h);
-            lg[0 + 4 * g + h] = vfmaq_laneq_f32(lg[0 + 4 * g + h], k0, qv, 3);
+            float32x4_t k0 = ldf(kb + (d0 + 0) * page + 4 * h);
+            c[h][0] = vfmaq_laneq_f32(c[h][0], k0, qv, 0);
+            k0 = ldf(kb + (d0 + 1) * page + 4 * h);
+            c[h][1] = vfmaq_laneq_f32(c[h][1], k0, qv, 1);
+            k0 = ldf(kb + (d0 + 2) * page + 4 * h);
+            c[h][2] = vfmaq_laneq_f32(c[h][2], k0, qv, 2);
+            k0 = ldf(kb + (d0 + 3) * page + 4 * h);
+            c[h][3] = vfmaq_laneq_f32(c[h][3], k0, qv, 3);
           }
         }
+        for (int h = 0; h < 4; ++h)
+          lg[4 * g + h] = vaddq_f32(vaddq_f32(c[h][0], c[h][1]),
+                                    vaddq_f32(c[h][2], c[h][3]));
       }
       const int64_t gvalid = std::min<int64_t>(NK, len - pos);
       for (int i = 0; i < NK / 4; ++i) {
@@ -1055,7 +1107,7 @@ struct PagedF32 {
       const float32x4_t vmn = vdupq_n_f32(-mn);
       float32x4_t sum = vdupq_n_f32(0.0f);
       for (int i = 0; i < NK / 4; ++i) {
-        const float32x4_t e = exp2v<5>(vfmaq_f32(vmn, vc, lg[i]));
+        const float32x4_t e = exp2v<6>(vfmaq_f32(vmn, vc, lg[i]));
         stf(pbuf + 4 * i, e);
         sum = vaddq_f32(sum, e);
       }
@@ -1095,7 +1147,7 @@ struct PagedF32 {
 // ===========================================================================
 // paged bf16
 // ===========================================================================
-template <int HD>
+template <int HD, int PAGE = 0>
 struct PagedBF {
   static constexpr int PT = 16;
   static constexpr int PG = 4;
@@ -1116,11 +1168,12 @@ struct PagedBF {
   // operand shapes. The paired V needs `page % 16 == 0`, which is the documented
   // block-size contract.
   static void store_head(const PagedJob& job, int64_t seq, int64_t head) {
+    const int64_t page = PAGE ? PAGE : job.page;
     const int64_t group = job.num_heads / job.num_kv_heads;
     const int64_t kvh = head / group;
     const int64_t slot = job.slots[seq];
-    const int64_t pg = slot / job.page, off = slot % job.page;
-    const int64_t stride = job.page * HD * 2;
+    const int64_t pg = slot / page, off = slot % page;
+    const int64_t stride = page * HD * 2;
     const int64_t base = (pg * job.num_kv_heads + kvh) * stride;
     char* kp = static_cast<char*>(job.k_cache) + base;
     char* vp = static_cast<char*>(job.v_cache) + base;
@@ -1130,13 +1183,14 @@ struct PagedBF {
     const char* vs =
         static_cast<const char*>(job.v) + (seq * kvst + kvh * HD) * 2;
     for (int dp = 0; dp < HD / 2; ++dp)
-      std::memcpy(kp + (dp * job.page + off) * 4, ks + dp * 4, 4);
+      std::memcpy(kp + (dp * page + off) * 4, ks + dp * 4, 4);
     char* vdst = vp + ((off / 2) * HD + 0) * 4 + (off & 1) * 2;
     for (int d = 0; d < HD; ++d) std::memcpy(vdst + d * 4, vs + d * 2, 2);
   }
 
   static void attend_head(const PagedJob& job, int64_t seq, int64_t head,
                           char* ws) {
+    const int32_t page = PAGE ? PAGE : static_cast<int32_t>(job.page);
     const int64_t group = job.num_heads / job.num_kv_heads;
     const int64_t kvh = head / group;
     const int64_t len = job.lens[seq];
@@ -1155,9 +1209,8 @@ struct PagedBF {
       }
       return;
     }
-    const int64_t stride = job.page * HD * 2;
+    const int64_t stride = int64_t(page) * HD * 2;
     const float c = job.scale * kLog2e;
-    const int32_t page = static_cast<int32_t>(job.page);
     const int32x4_t lane = lane_idx();
     float m = kNegInf, l = 0.0f;
     const float32x4_t vc = vdupq_n_f32(c);
@@ -1184,7 +1237,7 @@ struct PagedBF {
         const bfloat16x8_t qa = dup_pair(q + dp * 4);
         for (int g = 0; g < tiles; ++g) {
           const char* kb =
-              kbase[g] + (static_cast<int64_t>(dp) * job.page + boff[g]) * 4;
+              kbase[g] + (static_cast<int64_t>(dp) * page + boff[g]) * 4;
           for (int h = 0; h < 4; ++h)
             lg[4 * g + h] = bfdot(lg[4 * g + h], qa, ldb(kb + h * 16));
         }
@@ -1288,17 +1341,27 @@ void dense(const DenseJob& job, int workers) {
 }
 
 void paged(const PagedJob& job, int workers) {
+  // Common pages get constant strides and shifts. Page-16 fp32 stays general
+  // at batch one: specializing it measured 5-11% slower there.
 #define ATTN_PG(DT, HD) paged_run<Paged##DT<HD>>(job, workers)
+#define ATTN_PGS(DT, HD)                                                 \
+  do {                                                                  \
+    if (job.page == 16 && (job.dtype != kF32 || job.num_seqs > 1))         \
+      paged_run<Paged##DT<HD, 16>>(job, workers);                         \
+    else if (job.page == 32) paged_run<Paged##DT<HD, 32>>(job, workers);    \
+    else ATTN_PG(DT, HD);                                                \
+  } while (0)
   if (job.dtype == kF32) {
-    if (job.head_dim == 32) ATTN_PG(F32, 32);
-    else if (job.head_dim == 64) ATTN_PG(F32, 64);
-    else ATTN_PG(F32, 128);
+    if (job.head_dim == 32) ATTN_PGS(F32, 32);
+    else if (job.head_dim == 64) ATTN_PGS(F32, 64);
+    else ATTN_PGS(F32, 128);
   } else {
-    if (job.head_dim == 32) ATTN_PG(BF, 32);
-    else if (job.head_dim == 64) ATTN_PG(BF, 64);
-    else ATTN_PG(BF, 128);
+    if (job.head_dim == 32) ATTN_PGS(BF, 32);
+    else if (job.head_dim == 64) ATTN_PGS(BF, 64);
+    else ATTN_PGS(BF, 128);
   }
 #undef ATTN_PG
+#undef ATTN_PGS
 }
 
 void store(const PagedJob& job, int workers) {
