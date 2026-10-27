@@ -212,6 +212,15 @@ inline __m512 exp2v(__m512 x) {
   return _mm512_mul_ps(p, _mm512_castsi512_ps(e));
 }
 
+// 32 fp32 -> 32 bf16 in key order (e0 = keys 0-15, e1 = keys 16-31): one
+// convert and one full-line store instead of two of each.
+inline __m512i cvt_bf16x32(__m512 e0, __m512 e1) {
+  const __m512bh h = _mm512_cvtne2ps_pbh(e1, e0);
+  __m512i r;
+  std::memcpy(&r, &h, sizeof(r));
+  return r;
+}
+
 // 16x16 transpose of 32-bit units, in place over 16 zmm: three shuffle stages,
 // each writing back the pair it read so the live set is 16 + 4 registers rather
 // than 32 (`t[16]` + `u[16]` live at once does spill, and the two-array form
@@ -625,6 +634,25 @@ struct Dense {
     }
   }
 
+  // P for 32 keys of one row (hi, and lo for fp32), returning their fp32 sum.
+  // Whole 32-key steps: the QK mask leaves every lane in [nkeys, ntail) at
+  // -inf, so they come out as the exact zeros P@V needs past the key range.
+  __attribute__((always_inline)) static inline __m512 emit32(
+      const float* lp, bf16* pp, bf16* pl, __m512 vc, __m512 base) {
+    const __m512 e0 = exp2v<BF>(_mm512_fmsub_ps(_mm512_loadu_ps(lp), vc, base));
+    const __m512 e1 =
+        exp2v<BF>(_mm512_fmsub_ps(_mm512_loadu_ps(lp + 16), vc, base));
+    const __m512i h = cvt_bf16x32(e0, e1);
+    _mm512_storeu_si512(pp, h);
+    if constexpr (!BF) {
+      const __m512 f0 = widen_bf16x16(_mm512_castsi512_si256(h));
+      const __m512 f1 = widen_bf16x16(_mm512_extracti64x4_epi64(h, 1));
+      _mm512_storeu_si512(
+          pl, cvt_bf16x32(_mm512_sub_ps(e0, f0), _mm512_sub_ps(e1, f1)));
+    }
+    return _mm512_add_ps(e0, e1);
+  }
+
   // -------------------------------------------------------------------------
   // online softmax over one kt-key super-tile, in place; P in bf16
   // -------------------------------------------------------------------------
@@ -678,33 +706,18 @@ struct Dense {
           base[rr] = _mm512_set1_ps(mn == -INFINITY ? 0.0f : mn);
           sum[rr] = _mm512_setzero_ps();
         }
-        for (int j = 0; j < nkeys; j += 16) {
+        for (int j = 0; j < ntail; j += KSTEP) {
 #pragma GCC unroll 4
           for (int rr = 0; rr < 4; ++rr) {
-            const int r = r0 + rr;
-            const __m512 e = exp2v<BF>(_mm512_fmsub_ps(
-                _mm512_loadu_ps(logits + static_cast<int64_t>(r) * kt + j),
-                vc, base[rr]));
-            sum[rr] = _mm512_add_ps(sum[rr], e);
-            const __m256i h = cvt_bf16x16(e);
-            _mm256_storeu_si256(reinterpret_cast<__m256i*>(
-                prob + static_cast<int64_t>(r) * KTMAX + j), h);
-            if constexpr (!BF)
-              _mm256_storeu_si256(reinterpret_cast<__m256i*>(
-                  prob_lo + static_cast<int64_t>(r) * KTMAX + j),
-                  cvt_bf16x16(_mm512_sub_ps(e, widen_bf16x16(h))));
+            const int64_t r = r0 + rr;
+            sum[rr] = _mm512_add_ps(
+                sum[rr], emit32(logits + r * kt + j, prob + r * KTMAX + j,
+                                prob_lo + r * KTMAX + j, vc, base[rr]));
           }
         }
 #pragma GCC unroll 4
-        for (int rr = 0; rr < 4; ++rr) {
-          const int r = r0 + rr;
-          l[r] += _mm512_reduce_add_ps(sum[rr]);
-          for (int j = nkeys; j < ntail; ++j) {
-            prob[static_cast<int64_t>(r) * KTMAX + j] = bf16{0};
-            if constexpr (!BF)
-              prob_lo[static_cast<int64_t>(r) * KTMAX + j] = bf16{0};
-          }
-        }
+        for (int rr = 0; rr < 4; ++rr)
+          l[r0 + rr] += _mm512_reduce_add_ps(sum[rr]);
       }
       return;
     }
@@ -762,25 +775,10 @@ struct Dense {
       }
       const __m512 vmn = _mm512_set1_ps(mn);
       __m512 sum = _mm512_setzero_ps();
-#pragma GCC unroll 2
-      for (int j = 0; j < nkeys; j += 16) {
-        // e = 2^(c*logit - m): one fma, no separate scaling pass.
-        const __m512 e =
-            exp2v<BF>(_mm512_fmsub_ps(_mm512_loadu_ps(p + j), vc, vmn));
-        sum = _mm512_add_ps(sum, e);
-        const __m256i h = cvt_bf16x16(e);
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(pp + j), h);
-        if constexpr (!BF)
-          _mm256_storeu_si256(reinterpret_cast<__m256i*>(pl + j),
-                              cvt_bf16x16(_mm512_sub_ps(e, widen_bf16x16(h))));
-      }
+      // e = 2^(c*logit - m): one fma, no separate scaling pass.
+      for (int j = 0; j < ntail; j += KSTEP)
+        sum = _mm512_add_ps(sum, emit32(p + j, pp + j, pl + j, vc, vmn));
       l[r] += _mm512_reduce_add_ps(sum);
-      // P@V reads whole 32-key steps, so the tail lanes of the last step must be
-      // exactly zero: V is zero there too, and `NaN * 0` is not 0.
-      for (int j = nkeys; j < ntail; ++j) {
-        pp[j] = bf16{0};
-        if constexpr (!BF) pl[j] = bf16{0};
-      }
     }
   }
 
