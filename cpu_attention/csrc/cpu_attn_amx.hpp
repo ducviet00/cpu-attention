@@ -345,12 +345,21 @@ struct Dense {
 
   // Use the native bf16 conversion rather than the scalar converter's bit
   // operations and NaN handling, even when the compiler vectorises that loop.
+  //
+  // The stores are non-temporal: the output is written once and was last
+  // owned by another call (often another core), so a normal store pays a
+  // read-for-ownership per line from L3 at the end of every work item.
   static void store_bf16(char* dst, const float* src, int hd, float inv) {
     const __m512 scale = _mm512_set1_ps(inv);
+    const bool nt = (reinterpret_cast<uintptr_t>(dst) & 31) == 0;
     for (int d = 0; d < HD; d += 16) {
       const __m256i out = cvt_bf16x16(
           _mm512_mul_ps(_mm512_loadu_ps(src + d), scale));
-      _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + d * 2), out);
+      __m256i* p = reinterpret_cast<__m256i*>(dst + d * 2);
+      if (nt)
+        _mm256_stream_si256(p, out);
+      else
+        _mm256_storeu_si256(p, out);
     }
   }
 
