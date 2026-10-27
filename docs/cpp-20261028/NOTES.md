@@ -200,3 +200,53 @@ re-committed as `ef51486`) and the docs.
   - re-run every <5% A/B on the fixed harness;
   - run the full 61/121-round three-box matrix on the integrated tree and
     render it with `scripts/cpp_scorecard.py --check`.
+
+## 8. Final verification, all three boxes (integrated tree `4f07d2b`)
+
+Same tree on every box, built there. Parity first, then the full 42-row
+matrix against Mojo and the vLLM build for the ISA that box actually uses.
+The rendered scorecard is [`SCORECARD.md`](SCORECARD.md); per-box raw JSON and
+logs are in `ryzen-final/`, `axion-final/` and `xeon-final/`. The remote driver
+is `remote_verify.sh`.
+
+| box | baseline ISA | parity | clear wins | noise band | losses | acceptance |
+|---|---|---|---:|---:|---:|---|
+| Xeon 8581C (GCP C4, 4C/8T) | AMX bf16, VEC fp32 | dense 89/89, fuzz 80/80, paged 504/504 (7.75e-7, 1.96 ulp) | **39/42** | 3 | 0 | **PASS** |
+| Axion Neoverse-V2 (GCP c4a) | NEON | dense 89/89, fuzz 80/80, paged 504/504 (8.05e-7, 1.92 ulp) | 35/42 | 7 | 0 | not met (83% < 90%) |
+| Ryzen 7840H | VEC | dense 89/89, fuzz 80/80, paged 504/504, engine 45/45 | 37/42 (38/42*) | 3 | 2 (1*) | not met |
+
+Rounds: servers 61 dense / 121 paged; Ryzen 41 dense (one process per row)
+and 41 x 40-call paged blocks. Mojo's own suites pass on all three boxes.
+
+\* **The Ryzen dense 128:8:64 fp32 matrix row (1.326) is a transient.** It ran
+first, straight after the parity suites. Mojo and C++ both slowed about 1.7x
+in that process while vLLM moved 14%. Three isolated re-runs read
+**0.870 / 0.870 / 0.873** (control 0.997-1.007, `ryzen-final/rerun-*.json`),
+matching this morning's 0.866. The rendered scorecard keeps the matrix value
+unedited; with the re-run the Ryzen is 38/42 clear (90.5%) and one loss.
+
+**What is still open:**
+
+- **Ryzen paged self b=32 ctx=1024 bf16: 1.155 against Mojo** (ctrl 1.028;
+  cross on the same row 1.002). This is the third session `bench_cpp.py` has
+  read 1.155-1.163 here. Ad-hoc probes in other processes read 0.95-1.18, so
+  the size is process-dependent, but the direction is consistent in this
+  harness. It is the only real loss on any box, and §4.4 / §6.3 have the lead
+  (store traffic perturbing the following DRAM stream).
+- **Axion's 7 noise-band rows are all dense rows where Mojo is the faster
+  baseline**, at 0.970-1.007:
+  - fp32 512:8:64, 1024:8:64, 2048:8:64, 1024:16:128, 1024:8:32
+  - bf16 1024:8:64, 1024:16:128
+
+  vLLM NEON is beaten on all 42 rows. The 90% bar needs 3 of these 7 below
+  0.97. The fp32 D=64 tile experiment in §7 is the lead.
+- **Ryzen noise band:** dense fp32 2048:16:128 0.981 and 512:32:128 0.994 (vs
+  vLLM VEC), and paged cross b=32 ctx=1024 bf16 1.002 (vs Mojo).
+- **The exact Graviton 5 / Xeon 6975P-C acceptance boxes were not run** (one
+  endpoint unreachable, one with a changed host key). These results are from
+  the GCP stand-ins and are labelled as such.
+
+**Default backend:** this does not meet the flip criterion on two of the three
+boxes, so `CPU_ATTENTION_BACKEND` still defaults to `mojo`. Explicit `auto`
+already selects C++ on x86-64, where the Xeon passes outright and the Ryzen's
+only loss is the one paged row.

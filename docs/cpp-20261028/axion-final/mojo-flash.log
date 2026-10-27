@@ -1,0 +1,36 @@
+/home/ducviet00/cpu-attention-final-20261028/.venv/lib/python3.14/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+[OK] flash_api write+attend t=0: max|diff|=0.00e+00
+[OK] flash_api write+attend t=1: max|diff|=2.38e-07
+[OK] flash_api write+attend t=2: max|diff|=2.38e-07
+[OK] flash_api write+attend t=3: max|diff|=2.38e-07
+[OK] flash_api write+attend t=4: max|diff|=2.38e-07
+[OK] flash_api write+attend t=5: max|diff|=4.77e-07
+[OK] flash_api write+attend t=6: max|diff|=2.38e-07
+[OK] flash_api write+attend t=7: max|diff|=2.38e-07
+[OK] flash_api write+attend t=8: max|diff|=3.58e-07
+[OK] flash_api write+attend t=9: max|diff|=3.58e-07
+[OK] flash_api write+attend t=10: max|diff|=2.98e-07
+[OK] flash_api write+attend t=11: max|diff|=2.38e-07
+[OK] flash_api slot_mapping output: max|diff|=0.00e+00
+[OK] flash_api slot_mapping cache: max|diff|=0.00e+00
+[OK] flash_api cross, tensor lengths: max|diff|=2.38e-07
+[OK] flash_api cache_batch_idx: max|diff|=2.38e-07
+[OK] flash_api gqa: max|diff|=2.38e-07
+[OK] flash_api flash_attn_func L=1: max|diff|=5.96e-07
+[OK] flash_api self_attention alias: max|diff|=0.00e+00
+[OK] flash_api cross_attention alias: max|diff|=2.38e-07
+[OK] flash_api rejects seqlen=2
+[OK] flash_api rejects two new tokens
+[OK] flash_api rejects window_size
+[OK] flash_api rejects softcap
+[OK] flash_api rejects rotary_cos
+[OK] flash_api rejects qv
+[OK] flash_api rejects cache_leftpad
+[OK] flash_api rejects return_softmax_lse
+[OK] flash_api rejects page_table+block_table
+[OK] flash_api rejects slot_mapping without k/v
+[OK] flash_api rejects dense head_dim=96
+[OK] flash_api rejects dense nheads not divisible by nheads_k
+[OK] flash_api rejects flash_attn_varlen_func
+cpu_attention 0.1.0: all checks passed

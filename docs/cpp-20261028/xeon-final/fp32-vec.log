@@ -1,0 +1,24 @@
+/home/ducviet00/cpu-attention-final-20261028/.venv/lib/python3.14/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+threads=4 isa=vec cpp-isa=amx vllm=yes
+dense   128: 8: 64 fp32: cpp      46.4 (med      49.2) mojo      53.3  cpp/mojo 0.870  ctrl/mojo 0.853  vllm      62.5 cpp/vllm 0.742 mojo/vllm 0.853  d 1.3e-05
+dense   512: 8: 64 fp32: cpp     329.7 (med     362.0) mojo     426.1  cpp/mojo 0.774  ctrl/mojo 0.786  vllm     625.6 cpp/vllm 0.527 mojo/vllm 0.681  d 2.1e-05
+dense  1024: 8: 64 fp32: cpp    1195.4 (med    1373.3) mojo    1407.2  cpp/mojo 0.849  ctrl/mojo 0.819  vllm    2246.4 cpp/vllm 0.532 mojo/vllm 0.626  d 2.6e-05
+dense  2048: 8: 64 fp32: cpp    4437.9 (med    5978.3) mojo    5191.3  cpp/mojo 0.855  ctrl/mojo 0.813  vllm    8661.2 cpp/vllm 0.512 mojo/vllm 0.599  d 2.2e-05
+dense  4096: 8: 64 fp32: cpp   17537.1 (med   20726.8) mojo   20404.0  cpp/mojo 0.859  ctrl/mojo 0.845  vllm   33529.8 cpp/vllm 0.523 mojo/vllm 0.609  d 1.5e-05
+dense   256:16:128 fp32: cpp     375.4 (med     399.2) mojo     509.5  cpp/mojo 0.737  ctrl/mojo 0.730  vllm     685.0 cpp/vllm 0.548 mojo/vllm 0.744  d 1.9e-05
+dense  1024:16:128 fp32: cpp    3517.9 (med    3791.6) mojo    4569.7  cpp/mojo 0.770  ctrl/mojo 0.766  vllm    8366.4 cpp/vllm 0.420 mojo/vllm 0.546  d 2.2e-05
+dense  2048:16:128 fp32: cpp   14961.3 (med   17596.1) mojo   17501.9  cpp/mojo 0.855  ctrl/mojo 0.834  vllm   32305.5 cpp/vllm 0.463 mojo/vllm 0.542  d 2.3e-05
+dense  4096:16:128 fp32: cpp   77076.4 (med   78659.3) mojo   87542.7  cpp/mojo 0.880  ctrl/mojo 0.881  vllm  123414.9 cpp/vllm 0.625 mojo/vllm 0.709  d 1.8e-05
+dense   512:32:128 fp32: cpp    2135.0 (med    2350.6) mojo    2860.5  cpp/mojo 0.746  ctrl/mojo 0.747  vllm    4610.1 cpp/vllm 0.463 mojo/vllm 0.620  d 2.3e-05
+dense  1024: 8: 32 fp32: cpp     843.2 (med     998.0) mojo    1016.6  cpp/mojo 0.829  ctrl/mojo 0.834  vllm    1350.5 cpp/vllm 0.624 mojo/vllm 0.753  d 1.6e-05
+paged self  b=1   ctx=256   fp32: cpp      8.7 (med     10.5) mojo     12.0  cpp/mojo 0.728 ctrl/mojo 0.737  vllm     16.1 cpp/vllm 0.543 mojo/vllm 0.746  d 2.1e-07
+paged cross b=1   ctx=256   fp32: cpp      8.4 (med      9.6) mojo     10.8  cpp/mojo 0.779 ctrl/mojo 0.775  vllm     12.9 cpp/vllm 0.650 mojo/vllm 0.834  d 2.1e-07
+paged self  b=8   ctx=256   fp32: cpp    144.5 (med    149.7) mojo    153.0  cpp/mojo 0.944 ctrl/mojo 0.946  vllm    158.7 cpp/vllm 0.910 mojo/vllm 0.964  d 3.0e-07
+paged cross b=8   ctx=256   fp32: cpp    142.1 (med    146.4) mojo    145.9  cpp/mojo 0.974 ctrl/mojo 0.979  vllm    145.2 cpp/vllm 0.978 mojo/vllm 1.005  d 3.0e-07
+paged self  b=8   ctx=1024  fp32: cpp    594.2 (med    633.5) mojo    837.1  cpp/mojo 0.710 ctrl/mojo 0.725  vllm    915.0 cpp/vllm 0.649 mojo/vllm 0.915  d 2.4e-07
+paged cross b=8   ctx=1024  fp32: cpp    592.1 (med    629.9) mojo    821.6  cpp/mojo 0.721 ctrl/mojo 0.732  vllm    917.7 cpp/vllm 0.645 mojo/vllm 0.895  d 2.4e-07
+paged self  b=32  ctx=1024  fp32: cpp   4339.9 (med   4634.7) mojo   4897.9  cpp/mojo 0.886 ctrl/mojo 0.892  vllm   4760.1 cpp/vllm 0.912 mojo/vllm 1.029  d 4.9e-07
+paged cross b=32  ctx=1024  fp32: cpp   4418.5 (med   4745.5) mojo   4899.6  cpp/mojo 0.902 ctrl/mojo 0.904  vllm   4684.7 cpp/vllm 0.943 mojo/vllm 1.046  d 4.9e-07
+paged self  b=1   ctx=4096  fp32: cpp    310.9 (med    321.4) mojo    334.2  cpp/mojo 0.930 ctrl/mojo 0.932  vllm    317.8 cpp/vllm 0.978 mojo/vllm 1.052  d 2.2e-07
+paged cross b=1   ctx=4096  fp32: cpp    309.5 (med    322.0) mojo    332.6  cpp/mojo 0.931 ctrl/mojo 0.931  vllm    314.2 cpp/vllm 0.985 mojo/vllm 1.058  d 2.2e-07
