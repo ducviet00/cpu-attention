@@ -363,6 +363,20 @@ struct Dense {
     }
   }
 
+  // The fp32 form of the same epilogue (the driver's hook, when it has one).
+  static void store_f32(char* dst, const float* src, int hd, float inv) {
+    const __m512 scale = _mm512_set1_ps(inv);
+    float* o = reinterpret_cast<float*>(dst);
+    const bool nt = (reinterpret_cast<uintptr_t>(dst) & 63) == 0;
+    for (int d = 0; d < HD; d += 16) {
+      const __m512 v = _mm512_mul_ps(_mm512_loadu_ps(src + d), scale);
+      if (nt)
+        _mm512_stream_ps(o + d, v);
+      else
+        _mm512_storeu_ps(o + d, v);
+    }
+  }
+
   static size_t aux_bytes(int rq, int hd) {
     (void)rq;
     (void)hd;
