@@ -33,6 +33,7 @@ on another. No `-march=native`.
 | TU | flags |
 |---|---|
 | everything else | `-O3 -fPIC -std=c++20 -fopenmp` |
+| `binding.cpp` | + torch's include dirs; the module links `torch_python`, `torch_cpu`, `c10` |
 | `vec.cpp` | + `-mavx512f -mavx512bw -mavx512vl -mavx512dq -mavx512bf16 -mavx512vnni -mfma -mavx2` |
 | `amx.cpp` | the vec flags + `-mamx-tile -mamx-bf16 -mamx-int8` |
 | `neon.cpp` | `-march=armv8.2-a+bf16+i8mm` |
@@ -63,9 +64,10 @@ packed K/V layout, `qk`, `softmax`, `pv`, and the paged `store_head` /
   chunk clamps to its own limit, so a causal call never computes a masked block
   (4.8x the useful work at rq=32 without it).
 * **Call path:** the dense path uses a 5-argument plan-buffer entry
-  (`dense_make_plan` + `dense_forward`); the paged path a 12-argument plan entry
-  (`paged_make_plan` + `paged_forward`) that patches only pointers, two token
-  strides and the scale. `self_attention` / `cross_attention` also take an
+  (`dense_make_plan` + `dense_forward`); the paged path one torch-aware entry
+  (`paged_call`) that reads pointers, sizes and strides from the tensors,
+  keeps the geometry -> workers cache per thread in C++ and allocates `out`
+  with `at::empty` (§14). `self_attention` / `cross_attention` also take an
   `out=` buffer; at batch 1 `torch.empty` is 1.3 us of a 6.8 us call.
 * **Workspace** is per thread, per geometry, never returned to the allocator.
 
@@ -631,3 +633,21 @@ SSH endpoint `13.236.70.191` timed out; the historical Xeon endpoint
 `13.210.181.255` presented a **changed SSH host key**. Host-key verification
 was not bypassed. Thus the exact Graviton 5 / 6975P-C acceptance matrix remains
 unverified, independently of progress on the available boxes.
+
+## 14. Continuation, 2026-10-28
+
+**Acceptance remains open; Mojo stays the default.** Details, raw JSON and the
+ledger are in [`cpp-20261028/NOTES.md`](cpp-20261028/NOTES.md); the GCP-box
+agents' results are under `cpp-20261028/axion/` and `cpp-20261028/xeon/`.
+
+* `paged_call` (torch-aware paged entry) removes 1.2-1.5 us of Python per
+  call: cross b=1 ctx=256 is now 0.767 (bf16) / 0.812 (fp32) of vLLM VEC on the
+  Ryzen, from 1.09 / 1.17. The binding builds against torch.
+* fp32 dense reads V in place while V fits in LLC/2 and streams oversized
+  slabs. The Ryzen D=128 fp32 rows went 1.031-1.155 -> 0.973-1.018 of the best
+  baseline. The Ryzen dense scorecard is 18 clear wins, 4 noise-band rows, 0
+  losses; paged beats vLLM on all 20 rows.
+* The 2026-10-27 dense A/B harness had a control blind to module-level effects
+  (identical builds read 0.93); the fixed harness is
+  `cpp-20261028/ab_dense_variants.py`, and A/Bs under 5% made with the old one
+  are unconfirmed.
