@@ -139,3 +139,64 @@ Mojo the b=32 ctx=1024 rows are at parity (cross 1.006 for both dtypes, self fp3
 6. **Run the matrix on the exact boxes.** Graviton 5 / Xeon 6975P-C acceptance
    needs those boxes (one endpoint timed out; the other changed its host key).
    The GCP boxes are stand-ins and must stay labelled as such.
+
+## 7. Box agents (merged into `cpp`)
+
+Full write-ups: [`xeon/NOTES.md`](xeon/NOTES.md), [`axion/NOTES.md`](axion/NOTES.md).
+Neither box ran the final 61/121-round matrix: both stopped early for the usage
+limit. The rows below are therefore **not acceptance evidence**.
+
+**Xeon 8581C (C4, AMX).** Merged `09f2631`, `5cab199`, `f1c4d8d` and
+`d3af1f1` (all `cpu_attn_amx.hpp`), plus the shared `P::store_f32` hook
+(`038bd69`).
+
+- **Exp2.** Magic-constant rounding with a minimax degree-4 fp32 polynomial
+  (rel. err 2.8e-6): fp32 0.899-0.978, bf16 0.947-0.986.
+- **Non-temporal output epilogues.** The fp32 output store was 15-17% of a
+  short call, because every line paid a read-for-ownership. With the hook,
+  fp32 is 0.85-0.95 and bf16 0.88-0.98.
+- **Dense target rows**, C++ / best, 31 rounds:
+
+  | row | before | after |
+  |---|---:|---:|
+  | fp32 128:8:64 | 1.071 | 0.896 |
+  | fp32 1024:8:64 | 1.012 | 0.840 |
+  | fp32 1024:8:32 | 1.003 | 0.848 |
+  | fp32 2048:8:64 | 0.972 | 0.871 |
+  | fp32 256:16:128 | 0.978 | 0.759 |
+  | bf16 128:8:64 | 0.967 | 0.838 |
+
+  All 22 dense rows read 0.73-0.90 in that run.
+- **Paged fp32.** b8/256 is already at the box's 4-thread read floor (139.6 us),
+  so it cannot beat vLLM by 3% there. b1/4096 is 0.95-1.00, about 8% above its
+  floor.
+- `5cab199` (<5%) was measured with a biased harness and is **unconfirmed**.
+
+**Axion Neoverse-V2 (c4a, NEON).** Merged `394ce24` (the dense NEON changes,
+re-committed as `ef51486`) and the docs.
+
+- **The dense change:** a leaner bf16 Q@K^T epilogue (196 -> 65 instructions
+  per 8 keys), an integer-add exp2, and a contiguous fp32 Q panel.
+- **Dense, 41-round `bench_cpp.py`.** 6 of 7 bf16 target rows are below 0.97
+  of the best baseline (1024:8:64 at 0.977). fp32 512:32:128 moved 0.998 ->
+  0.953. The fp32 D=64 rows are still level with Mojo (0.977-0.995).
+- **Not merged: the `paged_chunk` hook and its driver patch**
+  (`axion/impl-paged-chunk.patch`). Its own control does not separate it from
+  the baseline: new/old 0.82-0.90 against ctrl/old 0.80-0.97, so the *old* arm
+  is the outlier. The agent also found the paged b1/4096 timing depends on
+  which cache tensor was allocated first (3-12% for the same binary). Re-test
+  it on the fixed three-module harness with rotated allocation order before
+  adopting it.
+
+**Still worth trying, from the agents:**
+- **AMX fp32.** Cache the Q hi/lo panel per work item instead of rebuilding it
+  per key tile: 114 us of 1352 at 1024:8:64.
+- **AMX.** Skip the softmax max pass after a row's first tile, on long rows.
+- **NEON fp32 D=64.** Both FMA loops sit at exactly 16 accumulators; try an
+  8-row x 12-key Q@K^T tile (24 accumulators).
+- **NEON bf16 softmax.** It is ~27% of the call, and GCC adds `mov`s for the
+  polynomial's constant accumulators.
+- **Before any acceptance claim:**
+  - re-run every <5% A/B on the fixed harness;
+  - run the full 61/121-round three-box matrix on the integrated tree and
+    render it with `scripts/cpp_scorecard.py --check`.
