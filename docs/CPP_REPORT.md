@@ -569,3 +569,65 @@ The archived complete scorecard has **82/126 clear wins**, 33 noise-band rows an
 The exact Graviton 5 / Xeon 6975P-C matrix was not rerun in this continuation.
 Remaining work is the unresolved short AMX / b1 cross rows and the final few
 percent on ARM dense. No default flip or completed-goal claim is made.
+
+## 13. Continuation, 2026-10-27
+
+**Acceptance remains open; Mojo is still the default.** This continuation
+started at `a1d9fdf`, with an existing, uncommitted VEC change from 8 to 10
+fp32 register rows. It was measured (below), lost 3.4-3.5% on the 2048/4096:16:128
+rows it was meant to help even with the partial-tile specialisation, and is
+reverted: the shipped fp32 register tile stays at 8 rows.
+
+### Primary-side measurements
+
+Raw samples, both minima and medians, errors and the duplicate control are in
+[`cpp-20261027/`](cpp-20261027/). Saved shared objects were loaded together;
+the old/new comparisons below are never ratios between separate processes.
+`new / old` is the ratio direction. Governor-pinned runs restore the original
+governor in a `finally` block.
+
+| change | measured result | interpretation |
+|---|---|---|
+| existing 10-row fp32 tile vs committed 8-row tile | 1.089–1.211 on seven rows, 41 rounds | loses; full work items end in a partial register tile |
+| align work-item rows down to a multiple of 10 | 0.934 at 1024:16:128; 0.991–1.061 elsewhere (512:32:128 control 0.917) | not a matrix-wide win; scratch-tree experiment only |
+| specialize the partial QK/PV tile to 2 or 4 register rows | 0.950 at 1024:16:128 vs committed 8-row build; other resolved rows 1.008–1.045 | recovers most of the existing 10-row variant's loss, not an acceptance result |
+| checked CPython `METH_FASTCALL` for the two forward entries | batch-1 cross fp32 **5.402 → 5.313 µs**, bf16 **4.778 → 4.657 µs**; 101 rounds × 40 calls, ctrl/new **0.998 / 1.002** | small measured call-path win; no numerical change |
+
+The 512:32:128 row's duplicate arm is 8% faster in both tail experiments;
+its apparent 2–4% gain is therefore unresolved, not evidence of a win. The
+tail specializations preserve the probability buffer layout and apply the
+same arithmetic to live rows; no accuracy tolerance has changed.
+
+`perf stat` and `perf record` work on the Ryzen. The exploratory profile
+contains the reference/burn-in and an overlapping build, so its absolute times
+are **not** performance evidence. Its hot kernel symbols are QK and PV;
+`llvm-mca` is not installed on this host. The final matrix is run without a
+concurrent local build or test.
+
+### Validation
+
+* Mojo rebuilt with `scripts/build.py --tests`: **11/11** standalone cases.
+* C++ after the partial-tile change: **82/82** dense checks, flash API green,
+  fuzz **80/80**, stray-read probes **24/24**.
+* C++ strict paged sweep: **504/504**, worst fp32 **8.34e-7** and bf16
+  **1.96 ulp** against the other backend.
+* The engine suite passed **45/45** before the dense-only tail specialization;
+  the paged kernel is unchanged by the primary's edits.
+* Mojo dense **82/82** and flash API remain green. Six raw-entry rejection
+  checks passed separately and are now included in `tests/test_dense.py` for
+  C++ (wrong arity, wrong pointer type, negative address and stale plans).
+
+The laptop row harness now retains raw samples, control medians, output policy,
+thread count and load average, uses 41 rounds by default, and fails on a parity
+error. The matrix driver stops on a failed child and saves each completed row
+instead of losing the entire run at exit.
+
+### Hardware identity and blocked exact-box reruns
+
+The existing GCP Axion spot instance was reused; one new GCP C4 spot instance
+was provisioned for the AMX subagent. Axion/Neoverse-V2 and C4/8581C results
+must not be labeled Graviton 5 or Xeon 6975P-C. The named historical Graviton
+SSH endpoint `13.236.70.191` timed out; the historical Xeon endpoint
+`13.210.181.255` presented a **changed SSH host key**. Host-key verification
+was not bypassed. Thus the exact Graviton 5 / 6975P-C acceptance matrix remains
+unverified, independently of progress on the available boxes.

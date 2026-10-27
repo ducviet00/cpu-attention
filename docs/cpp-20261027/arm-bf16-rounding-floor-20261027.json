@@ -1,0 +1,30 @@
+[
+  {
+    "machine": "aarch64",
+    "backend": "cpp",
+    "inputs": [
+      1.0,
+      1.0078125
+    ],
+    "exact_output": 1.00390625,
+    "bf16_output": 1.0,
+    "max_abs_error": 0.00390625,
+    "minimum_bf16_rounding_error": 0.00390625,
+    "requested_absolute_gate": 0.001,
+    "gate_possible": false
+  },
+  {
+    "machine": "aarch64",
+    "backend": "mojo",
+    "inputs": [
+      1.0,
+      1.0078125
+    ],
+    "exact_output": 1.00390625,
+    "bf16_output": 1.0,
+    "max_abs_error": 0.00390625,
+    "minimum_bf16_rounding_error": 0.00390625,
+    "requested_absolute_gate": 0.001,
+    "gate_possible": false
+  }
+]

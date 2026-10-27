@@ -1,0 +1,551 @@
+ Percent |	Source code & Disassembly of _C_cpp.so for cpu-clock:u (2281 samples, percent: local period)
+------------------------------------------------------------------------------------------------------------
+         :
+         :
+         :
+         : 3     Disassembly of section .text:
+         :
+         : 5     00000000000164e0 <attn::neon::(anonymous namespace)::DenseBF<64, 256>::qk(attn::DenseJob const&, char const*, long, long, char const*, int, long, int, long, float*) [clone .isra.0]>:
+    0.00 :   164e0:  stp     x29, x30, [sp, #-288]!
+    0.00 :   164e4:  adrp    x8, 50000 <memcpy@GLIBC_2.17>
+    0.00 :   164e8:  mov     w11, #0x6667                    // #26215
+    0.00 :   164ec:  mov     x29, sp
+    0.00 :   164f0:  ldr     w8, [x8, #952]
+    0.00 :   164f4:  movk    w11, #0x6666, lsl #16
+    0.04 :   164f8:  mov     x10, x7
+    0.00 :   164fc:  add     w9, w8, #0x9
+    0.00 :   16500:  mov     x7, x2
+    0.00 :   16504:  mov     w12, #0xc                       // #12
+    0.00 :   16508:  movi    v31.2s, #0x0
+    0.00 :   1650c:  stp     x19, x20, [sp, #16]
+    0.00 :   16510:  smull   x2, w9, w11
+    0.00 :   16514:  smull   x12, w8, w12
+    0.00 :   16518:  add     x8, x7, x0, lsl #1
+    0.00 :   1651c:  mov     w11, #0x1                       // #1
+    0.00 :   16520:  stp     x21, x22, [sp, #32]
+    0.00 :   16524:  asr     x2, x2, #34
+    0.00 :   16528:  sub     w9, w2, w9, asr #31
+    0.00 :   1652c:  str     x23, [sp, #48]
+    0.00 :   16530:  stp     d8, d9, [sp, #64]
+    0.00 :   16534:  add     w9, w9, w9, lsl #2
+    0.00 :   16538:  stp     d10, d11, [sp, #80]
+    0.00 :   1653c:  lsl     w9, w9, #1
+    0.00 :   16540:  stp     d12, d13, [sp, #96]
+    0.00 :   16544:  sxtw    x9, w9
+    0.00 :   16548:  add     x9, x9, #0x28
+    0.00 :   1654c:  stp     d14, d15, [sp, #112]
+    0.00 :   16550:  add     x9, x12, x9, lsl #8
+    0.00 :   16554:  add     x14, x9, #0x68
+    0.00 :   16558:  add     x14, x10, x14
+    0.00 :   1655c:  mov     x2, x14
+    0.00 :   16560:  sub     w12, w11, #0x1
+    0.00 :   16564:  cmp     w3, w12
+    0.00 :   16568:  b.le    16bb8 <attn::neon::(anonymous namespace)::DenseBF<64, 256>::qk(attn::DenseJob const&, char const*, long, long, char const*, int, long, int, long, float*) [clone .isra.0]+0x6d8>
+    0.00 :   1656c:  ldr     d30, [x7]
+    0.35 :   16570:  cmp     w3, w11
+    0.00 :   16574:  b.le    16c58 <attn::neon::(anonymous namespace)::DenseBF<64, 256>::qk(attn::DenseJob const&, char const*, long, long, char const*, int, long, int, long, float*) [clone .isra.0]+0x778>
+    0.00 :   16578:  ldr     d29, [x8]
+    0.09 :   1657c:  stp     d30, d29, [x2]
+    0.04 :   16580:  ldr     d30, [x7, #8]
+    0.09 :   16584:  ldr     d29, [x8, #8]
+    0.13 :   16588:  stp     d30, d29, [x2, #16]
+    0.00 :   1658c:  ldr     d30, [x7, #16]
+    0.09 :   16590:  ldr     d29, [x8, #16]
+    0.00 :   16594:  stp     d30, d29, [x2, #32]
+    0.04 :   16598:  ldr     d30, [x7, #24]
+    0.04 :   1659c:  ldr     d29, [x8, #24]
+    0.18 :   165a0:  stp     d30, d29, [x2, #48]
+    0.04 :   165a4:  ldr     d30, [x7, #32]
+    0.00 :   165a8:  ldr     d29, [x8, #32]
+    0.04 :   165ac:  stp     d30, d29, [x2, #64]
+    0.00 :   165b0:  ldr     d30, [x7, #40]
+    0.00 :   165b4:  ldr     d29, [x8, #40]
+    0.09 :   165b8:  stp     d30, d29, [x2, #80]
+    0.04 :   165bc:  ldr     d30, [x7, #48]
+    0.00 :   165c0:  ldr     d29, [x8, #48]
+    0.00 :   165c4:  stp     d30, d29, [x2, #96]
+    0.04 :   165c8:  ldr     d30, [x7, #56]
+    0.09 :   165cc:  ldr     d29, [x8, #56]
+    0.09 :   165d0:  stp     d30, d29, [x2, #112]
+    0.00 :   165d4:  ldr     d30, [x7, #64]
+    0.39 :   165d8:  ldr     d29, [x8, #64]
+    0.22 :   165dc:  stp     d30, d29, [x2, #128]
+    0.00 :   165e0:  ldr     d30, [x7, #72]
+    0.09 :   165e4:  ldr     d29, [x8, #72]
+    0.09 :   165e8:  stp     d30, d29, [x2, #144]
+    0.00 :   165ec:  ldr     d29, [x8, #80]
+    0.13 :   165f0:  ldr     d30, [x7, #80]
+    0.09 :   165f4:  stp     d30, d29, [x2, #160]
+    0.00 :   165f8:  ldr     d30, [x7, #88]
+    0.00 :   165fc:  ldr     d29, [x8, #88]
+    0.09 :   16600:  stp     d30, d29, [x2, #176]
+    0.04 :   16604:  ldr     d30, [x7, #96]
+    0.13 :   16608:  ldr     d29, [x8, #96]
+    0.09 :   1660c:  stp     d30, d29, [x2, #192]
+    0.04 :   16610:  ldr     d30, [x7, #104]
+    0.00 :   16614:  ldr     d29, [x8, #104]
+    0.13 :   16618:  stp     d30, d29, [x2, #208]
+    0.00 :   1661c:  ldr     d30, [x7, #112]
+    0.09 :   16620:  ldr     d29, [x8, #112]
+    0.09 :   16624:  stp     d30, d29, [x2, #224]
+    0.00 :   16628:  ldr     d30, [x7, #120]
+    0.00 :   1662c:  ldr     d29, [x8, #120]
+    0.22 :   16630:  stp     d30, d29, [x2, #240]
+    0.00 :   16634:  add     w11, w11, #0x2
+    0.00 :   16638:  add     x2, x2, #0x100
+    0.04 :   1663c:  add     x8, x8, x0, lsl #2
+    0.04 :   16640:  add     x7, x7, x0, lsl #2
+    0.13 :   16644:  cmp     w11, #0xb
+    0.00 :   16648:  b.ne    16560 <attn::neon::(anonymous namespace)::DenseBF<64, 256>::qk(attn::DenseJob const&, char const*, long, long, char const*, int, long, int, long, float*) [clone .isra.0]+0x80>  // b.any
+    0.00 :   1664c:  add     x7, x4, w5, sxtw
+    0.00 :   16650:  adrp    x2, 3c000 <_fini+0x28c>
+    0.00 :   16654:  sub     x7, x7, #0x1
+    0.00 :   16658:  sub     w13, w5, #0x1
+    0.00 :   1665c:  cmp     x7, x6
+    0.04 :   16660:  add     w0, w4, #0xc
+    0.00 :   16664:  csel    x15, x7, x6, le
+    0.00 :   16668:  and     w13, w13, #0xfffffff8
+    0.00 :   1666c:  mvni    v30.4s, #0x7f, msl #16
+    0.00 :   16670:  mov     x8, x4
+    0.00 :   16674:  dup     v31.4s, w15
+    0.00 :   16678:  add     w5, w4, #0x4
+    0.00 :   1667c:  ldr     q10, [x2, #560]
+    0.04 :   16680:  add     x11, x4, #0x6
+    0.00 :   16684:  mov     v29.16b, v30.16b
+    0.00 :   16688:  add     x23, x6, #0x1
+    0.00 :   1668c:  mov     v26.16b, v30.16b
+    0.00 :   16690:  str     q31, [sp, #272]
+    0.00 :   16694:  add     x22, x6, #0x2
+    0.00 :   16698:  mov     v28.16b, v30.16b
+    0.00 :   1669c:  add     x21, x6, #0x3
+    0.00 :   166a0:  mov     v27.16b, v30.16b
+    0.00 :   166a4:  add     x20, x6, #0x4
+    0.00 :   166a8:  mov     v31.16b, v30.16b
+    0.00 :   166ac:  add     x19, x6, #0x5
+    0.00 :   166b0:  add     x30, x6, #0x6
+    0.00 :   166b4:  add     x18, x6, #0x7
+    0.04 :   166b8:  add     x17, x6, #0x8
+    0.00 :   166bc:  mov     w16, #0x7                       // #7
+    0.00 :   166c0:  add     w13, w13, w0
+    0.00 :   166c4:  sub     w16, w16, w15
+    0.00 :   166c8:  mov     x3, x10
+    0.00 :   166cc:  add     x4, x14, #0x100
+    0.00 :   166d0:  add     x6, x6, #0x9
+    0.00 :   166d4:  stp     q30, q30, [sp, #128]
+    0.09 :   166d8:  stp     q30, q30, [sp, #160]
+    0.00 :   166dc:  str     q30, [sp, #192]
+    0.13 :   166e0:  asr     x2, x8, #6
+    0.00 :   166e4:  movi    v20.4s, #0x0
+    0.09 :   166e8:  ubfx    x12, x8, #1, #5
+    0.00 :   166ec:  add     x2, x12, x2, lsl #9
+    0.04 :   166f0:  mov     x0, x14
+    0.04 :   166f4:  stp     q27, q26, [sp, #208]
+    0.18 :   166f8:  add     x2, x1, x2, lsl #4
+    0.00 :   166fc:  mov     v17.16b, v20.16b
+    0.04 :   16700:  stp     q28, q29, [sp, #240]
+    0.09 :   16704:  mov     v6.16b, v20.16b
+    0.00 :   16708:  mov     v16.16b, v20.16b
+    0.13 :   1670c:  mov     v5.16b, v20.16b
+    0.09 :   16710:  mov     v15.16b, v20.16b
+    0.09 :   16714:  mov     v4.16b, v20.16b
+    0.09 :   16718:  mov     v14.16b, v20.16b
+    0.09 :   1671c:  mov     v3.16b, v20.16b
+    0.09 :   16720:  mov     v13.16b, v20.16b
+    0.00 :   16724:  mov     v2.16b, v20.16b
+    0.04 :   16728:  mov     v12.16b, v20.16b
+    0.04 :   1672c:  mov     v1.16b, v20.16b
+    0.00 :   16730:  mov     v11.16b, v20.16b
+    0.00 :   16734:  mov     v0.16b, v20.16b
+    0.04 :   16738:  mov     v9.16b, v20.16b
+    0.00 :   1673c:  mov     v8.16b, v20.16b
+    0.13 :   16740:  mov     v19.16b, v20.16b
+    0.04 :   16744:  mov     v7.16b, v20.16b
+    0.18 :   16748:  mov     v18.16b, v20.16b
+    1.62 :   1674c:  ldr     q21, [x0]
+    0.04 :   16750:  add     x0, x0, #0x10
+    5.26 :   16754:  ldr     q22, [x0, #240]
+    8.86 :   16758:  ldr     q23, [x0, #496]
+    4.69 :   1675c:  ldr     q24, [x0, #752]
+    6.75 :   16760:  ldr     q25, [x0, #1008]
+    6.18 :   16764:  ldp     q26, q27, [x2]
+   17.84 :   16768:  ldp     q28, q29, [x2, #32]
+    0.04 :   1676c:  add     x2, x2, #0x200
+    7.89 :   16770:  bfmmla  v18.4s, v21.8h, v26.8h
+    0.35 :   16774:  bfmmla  v7.4s, v21.8h, v27.8h
+    0.57 :   16778:  bfmmla  v19.4s, v21.8h, v28.8h
+    0.75 :   1677c:  bfmmla  v8.4s, v21.8h, v29.8h
+    1.49 :   16780:  bfmmla  v9.4s, v22.8h, v26.8h
+    0.00 :   16784:  bfmmla  v0.4s, v22.8h, v27.8h
+    1.80 :   16788:  bfmmla  v11.4s, v22.8h, v28.8h
+    0.53 :   1678c:  bfmmla  v1.4s, v22.8h, v29.8h
+    1.01 :   16790:  bfmmla  v12.4s, v23.8h, v26.8h
+    0.53 :   16794:  bfmmla  v2.4s, v23.8h, v27.8h
+    0.53 :   16798:  bfmmla  v13.4s, v23.8h, v28.8h
+    1.14 :   1679c:  bfmmla  v3.4s, v23.8h, v29.8h
+    1.45 :   167a0:  bfmmla  v14.4s, v24.8h, v26.8h
+    0.48 :   167a4:  bfmmla  v4.4s, v24.8h, v27.8h
+    1.18 :   167a8:  bfmmla  v15.4s, v24.8h, v28.8h
+    0.13 :   167ac:  bfmmla  v5.4s, v24.8h, v29.8h
+    1.40 :   167b0:  bfmmla  v16.4s, v25.8h, v26.8h
+    0.61 :   167b4:  bfmmla  v6.4s, v25.8h, v27.8h
+    0.96 :   167b8:  bfmmla  v17.4s, v25.8h, v28.8h
+    0.83 :   167bc:  bfmmla  v20.4s, v25.8h, v29.8h
+    1.97 :   167c0:  cmp     x4, x0
+    0.00 :   167c4:  b.ne    1674c <attn::neon::(anonymous namespace)::DenseBF<64, 256>::qk(attn::DenseJob const&, char const*, long, long, char const*, int, long, int, long, float*) [clone .isra.0]+0x26c>  // b.any
+    0.04 :   167c8:  ldp     q27, q26, [sp, #208]
+    0.22 :   167cc:  ldp     q28, q29, [sp, #240]
+    0.18 :   167d0:  cmp     x15, x11
+    0.00 :   167d4:  b.le    16b58 <attn::neon::(anonymous namespace)::DenseBF<64, 256>::qk(attn::DenseJob const&, char const*, long, long, char const*, int, long, int, long, float*) [clone .isra.0]+0x678>
+    0.09 :   167d8:  zip1    v25.2d, v18.2d, v7.2d
+    0.04 :   167dc:  mov     w0, #0x0                        // #0
+    0.00 :   167e0:  zip1    v24.2d, v19.2d, v8.2d
+    0.00 :   167e4:  zip2    v18.2d, v18.2d, v7.2d
+    0.13 :   167e8:  zip2    v19.2d, v19.2d, v8.2d
+    0.04 :   167ec:  fmax    v23.4s, v25.4s, v24.4s
+    0.00 :   167f0:  stp     q25, q24, [x3]
+    0.09 :   167f4:  zip1    v21.2d, v9.2d, v0.2d
+    0.13 :   167f8:  str     q19, [x3, #1040]
+    0.04 :   167fc:  fmax    v25.4s, v18.4s, v19.4s
+    0.00 :   16800:  str     q18, [x3, #1024]
+    0.04 :   16804:  zip1    v19.2d, v11.2d, v1.2d
+    0.00 :   16808:  zip2    v9.2d, v9.2d, v0.2d
+    0.00 :   1680c:  zip2    v11.2d, v11.2d, v1.2d
+    0.04 :   16810:  fmax    v7.4s, v31.4s, v23.4s
+    0.09 :   16814:  fmax    v1.4s, v31.4s, v25.4s
+    0.00 :   16818:  mov     v22.16b, v21.16b
+    0.04 :   1681c:  mov     v23.16b, v9.16b
+    0.09 :   16820:  mov     v24.16b, v19.16b
+    0.09 :   16824:  mov     v25.16b, v11.16b
+    0.04 :   16828:  cmp     w0, #0x2
+    0.00 :   1682c:  b.le    16880 <attn::neon::(anonymous namespace)::DenseBF<64, 256>::qk(attn::DenseJob const&, char const*, long, long, char const*, int, long, int, long, float*) [clone .isra.0]+0x3a0>
+    0.00 :   16830:  dup     v8.4s, w8
+    0.04 :   16834:  dup     v18.4s, w5
+    0.00 :   16838:  cmp     x22, x7
+    0.00 :   1683c:  csel    x2, x22, x7, le
+    0.04 :   16840:  add     v8.4s, v8.4s, v10.4s
+    0.00 :   16844:  dup     v24.4s, w2
+    0.00 :   16848:  add     v18.4s, v18.4s, v10.4s
+    0.00 :   1684c:  cmgt    v22.4s, v8.4s, v24.4s
+    0.04 :   16850:  cmgt    v24.4s, v18.4s, v24.4s
+    0.00 :   16854:  bsl     v22.16b, v31.16b, v21.16b
+    0.00 :   16858:  bsl     v24.16b, v31.16b, v19.16b
+    0.00 :   1685c:  cmp     w0, #0x3
+    0.04 :   16860:  b.eq    16880 <attn::neon::(anonymous namespace)::DenseBF<64, 256>::qk(attn::DenseJob const&, char const*, long, long, char const*, int, long, int, long, float*) [clone .isra.0]+0x3a0>  // b.none
+    0.00 :   16864:  cmp     x21, x7
+    0.00 :   16868:  csel    x2, x21, x7, le
+    0.00 :   1686c:  dup     v25.4s, w2
+    0.00 :   16870:  cmgt    v23.4s, v8.4s, v25.4s
+    0.00 :   16874:  cmgt    v25.4s, v18.4s, v25.4s
+    0.00 :   16878:  bsl     v23.16b, v31.16b, v9.16b
+    0.00 :   1687c:  bsl     v25.16b, v31.16b, v11.16b
+    0.09 :   16880:  fmax    v19.4s, v22.4s, v24.4s
+    0.09 :   16884:  str     q22, [x3, #2048]
+    0.13 :   16888:  zip1    v21.2d, v12.2d, v2.2d
+    0.09 :   1688c:  str     q24, [x3, #2064]
+    0.04 :   16890:  fmax    v22.4s, v23.4s, v25.4s
+    0.04 :   16894:  str     q23, [x3, #3072]
+    0.31 :   16898:  zip1    v18.2d, v13.2d, v3.2d
+    0.13 :   1689c:  str     q25, [x3, #3088]
+    0.04 :   168a0:  zip2    v12.2d, v12.2d, v2.2d
+    0.00 :   168a4:  zip2    v13.2d, v13.2d, v3.2d
+    0.09 :   168a8:  fmax    v8.4s, v31.4s, v22.4s
+    0.04 :   168ac:  fmax    v19.4s, v31.4s, v19.4s
+    0.09 :   168b0:  mov     v22.16b, v21.16b
+    0.04 :   168b4:  mov     v23.16b, v12.16b
+    0.13 :   168b8:  mov     v24.16b, v18.16b
+    0.09 :   168bc:  mov     v25.16b, v13.16b
+    0.04 :   168c0:  cmp     w0, #0x4
+    0.00 :   168c4:  b.le    16918 <attn::neon::(anonymous namespace)::DenseBF<64, 256>::qk(attn::DenseJob const&, char const*, long, long, char const*, int, long, int, long, float*) [clone .isra.0]+0x438>
+    0.00 :   168c8:  dup     v9.4s, w8
+    0.00 :   168cc:  dup     v11.4s, w5
+    0.00 :   168d0:  cmp     x20, x7
+    0.00 :   168d4:  csel    x2, x20, x7, le
+    0.00 :   168d8:  add     v9.4s, v9.4s, v10.4s
+    0.00 :   168dc:  dup     v24.4s, w2
+    0.00 :   168e0:  add     v11.4s, v11.4s, v10.4s
+    0.00 :   168e4:  cmgt    v22.4s, v9.4s, v24.4s
+    0.00 :   168e8:  cmgt    v24.4s, v11.4s, v24.4s
+    0.00 :   168ec:  bsl     v22.16b, v31.16b, v21.16b
+    0.00 :   168f0:  bsl     v24.16b, v31.16b, v18.16b
+    0.00 :   168f4:  cmp     w0, #0x5
+    0.00 :   168f8:  b.eq    16918 <attn::neon::(anonymous namespace)::DenseBF<64, 256>::qk(attn::DenseJob const&, char const*, long, long, char const*, int, long, int, long, float*) [clone .isra.0]+0x438>  // b.none
+    0.04 :   168fc:  cmp     x19, x7
+    0.00 :   16900:  csel    x2, x19, x7, le
+    0.00 :   16904:  dup     v25.4s, w2
+    0.00 :   16908:  cmgt    v23.4s, v9.4s, v25.4s
+    0.00 :   1690c:  cmgt    v25.4s, v11.4s, v25.4s
+    0.00 :   16910:  bsl     v23.16b, v31.16b, v12.16b
+    0.00 :   16914:  bsl     v25.16b, v31.16b, v13.16b
+    0.13 :   16918:  fmax    v21.4s, v22.4s, v24.4s
+    0.13 :   1691c:  str     q22, [x3, #4096]
+    0.31 :   16920:  zip1    v18.2d, v14.2d, v4.2d
+    0.09 :   16924:  str     q24, [x3, #4112]
+    0.13 :   16928:  fmax    v22.4s, v23.4s, v25.4s
+    0.04 :   1692c:  str     q23, [x3, #5120]
+    0.13 :   16930:  zip1    v11.2d, v15.2d, v5.2d
+    0.09 :   16934:  str     q25, [x3, #5136]
+    0.18 :   16938:  zip2    v14.2d, v14.2d, v4.2d
+    0.00 :   1693c:  zip2    v15.2d, v15.2d, v5.2d
+    0.00 :   16940:  fmax    v21.4s, v31.4s, v21.4s
+    0.00 :   16944:  fmax    v22.4s, v31.4s, v22.4s
+    0.09 :   16948:  mov     v13.16b, v14.16b
+    0.04 :   1694c:  mov     v24.16b, v18.16b
+    0.09 :   16950:  mov     v25.16b, v11.16b
+    0.09 :   16954:  mov     v23.16b, v15.16b
+    0.18 :   16958:  cmp     w0, #0x6
+    0.00 :   1695c:  b.le    169b8 <attn::neon::(anonymous namespace)::DenseBF<64, 256>::qk(attn::DenseJob const&, char const*, long, long, char const*, int, long, int, long, float*) [clone .isra.0]+0x4d8>
+    0.00 :   16960:  dup     v9.4s, w8
+    0.04 :   16964:  dup     v12.4s, w5
+    0.00 :   16968:  cmp     x30, x7
+    0.00 :   1696c:  csel    x2, x30, x7, le
+    0.00 :   16970:  add     v9.4s, v9.4s, v10.4s
+    0.00 :   16974:  dup     v25.4s, w2
+    0.00 :   16978:  add     v12.4s, v12.4s, v10.4s
+    0.00 :   1697c:  cmgt    v24.4s, v9.4s, v25.4s
+    0.00 :   16980:  cmgt    v25.4s, v12.4s, v25.4s
+    0.00 :   16984:  bsl     v24.16b, v31.16b, v18.16b
+    0.00 :   16988:  bsl     v25.16b, v31.16b, v11.16b
+    0.00 :   1698c:  cmp     w0, #0x7
+    0.00 :   16990:  b.eq    169b8 <attn::neon::(anonymous namespace)::DenseBF<64, 256>::qk(attn::DenseJob const&, char const*, long, long, char const*, int, long, int, long, float*) [clone .isra.0]+0x4d8>  // b.none
+    0.04 :   16994:  cmp     x18, x7
+    0.00 :   16998:  csel    x2, x18, x7, le
+    0.00 :   1699c:  dup     v23.4s, w2
+    0.00 :   169a0:  cmgt    v9.4s, v9.4s, v23.4s
+    0.00 :   169a4:  cmgt    v12.4s, v12.4s, v23.4s
+    0.00 :   169a8:  bsl     v9.16b, v31.16b, v14.16b
+    0.00 :   169ac:  bsl     v12.16b, v31.16b, v15.16b
+    0.00 :   169b0:  mov     v13.16b, v9.16b
+    0.00 :   169b4:  mov     v23.16b, v12.16b
+    0.22 :   169b8:  fmax    v15.4s, v24.4s, v25.4s
+    0.09 :   169bc:  str     q24, [x3, #6144]
+    0.57 :   169c0:  zip1    v12.2d, v17.2d, v20.2d
+    0.04 :   169c4:  str     q25, [x3, #6160]
+    0.53 :   169c8:  zip1    v18.2d, v16.2d, v6.2d
+    0.13 :   169cc:  str     q13, [x3, #7168]
+    0.31 :   169d0:  zip2    v17.2d, v17.2d, v20.2d
+    0.09 :   169d4:  str     q23, [x3, #7184]
+    0.35 :   169d8:  fmax    v24.4s, v13.4s, v23.4s
+    0.04 :   169dc:  zip2    v16.2d, v16.2d, v6.2d
+    0.04 :   169e0:  fmax    v20.4s, v31.4s, v15.4s
+    0.00 :   169e4:  mov     v25.16b, v12.16b
+    0.04 :   169e8:  fmax    v23.4s, v31.4s, v24.4s
+    0.00 :   169ec:  mov     v14.16b, v16.16b
+    0.04 :   169f0:  mov     v15.16b, v17.16b
+    0.09 :   169f4:  mov     v24.16b, v18.16b
+    0.09 :   169f8:  cmp     w0, #0x8
+    0.00 :   169fc:  b.le    16a58 <attn::neon::(anonymous namespace)::DenseBF<64, 256>::qk(attn::DenseJob const&, char const*, long, long, char const*, int, long, int, long, float*) [clone .isra.0]+0x578>
+    0.00 :   16a00:  dup     v11.4s, w8
+    0.00 :   16a04:  dup     v13.4s, w5
+    0.00 :   16a08:  cmp     x17, x7
+    0.00 :   16a0c:  csel    x2, x17, x7, le
+    0.00 :   16a10:  add     v11.4s, v11.4s, v10.4s
+    0.00 :   16a14:  dup     v25.4s, w2
+    0.00 :   16a18:  add     v13.4s, v13.4s, v10.4s
+    0.00 :   16a1c:  cmgt    v24.4s, v11.4s, v25.4s
+    0.00 :   16a20:  cmgt    v25.4s, v13.4s, v25.4s
+    0.04 :   16a24:  bsl     v24.16b, v31.16b, v18.16b
+    0.00 :   16a28:  bsl     v25.16b, v31.16b, v12.16b
+    0.00 :   16a2c:  cmp     w0, #0x9
+    0.00 :   16a30:  b.eq    16a58 <attn::neon::(anonymous namespace)::DenseBF<64, 256>::qk(attn::DenseJob const&, char const*, long, long, char const*, int, long, int, long, float*) [clone .isra.0]+0x578>  // b.none
+    0.00 :   16a34:  cmp     x6, x7
+    0.00 :   16a38:  csel    x0, x6, x7, le
+    0.00 :   16a3c:  dup     v18.4s, w0
+    0.00 :   16a40:  cmgt    v11.4s, v11.4s, v18.4s
+    0.00 :   16a44:  cmgt    v13.4s, v13.4s, v18.4s
+    0.00 :   16a48:  bsl     v11.16b, v31.16b, v16.16b
+    0.00 :   16a4c:  bsl     v13.16b, v31.16b, v17.16b
+    0.00 :   16a50:  mov     v14.16b, v11.16b
+    0.00 :   16a54:  mov     v15.16b, v13.16b
+    0.26 :   16a58:  fmax    v18.4s, v14.4s, v15.4s
+    0.09 :   16a5c:  str     q25, [x3, #8208]
+    0.88 :   16a60:  add     w5, w5, #0x8
+    0.00 :   16a64:  fmax    v17.4s, v24.4s, v25.4s
+    0.09 :   16a68:  str     q24, [x3, #8192]
+    0.22 :   16a6c:  add     x8, x8, #0x8
+    0.09 :   16a70:  fmax    v25.4s, v31.4s, v18.4s
+    0.09 :   16a74:  str     q14, [x3, #9216]
+    0.22 :   16a78:  add     x11, x11, #0x8
+    0.00 :   16a7c:  ldr     q18, [sp, #192]
+    1.49 :   16a80:  str     q15, [x3, #9232]
+    0.09 :   16a84:  add     x3, x3, #0x20
+    0.00 :   16a88:  fmax    v30.4s, v30.4s, v25.4s
+    0.13 :   16a8c:  ldr     q25, [sp, #128]
+    0.83 :   16a90:  fmax    v24.4s, v31.4s, v17.4s
+    0.00 :   16a94:  fmax    v27.4s, v27.4s, v7.4s
+    0.09 :   16a98:  fmax    v25.4s, v25.4s, v21.4s
+    0.04 :   16a9c:  fmax    v26.4s, v26.4s, v1.4s
+    0.09 :   16aa0:  fmax    v24.4s, v18.4s, v24.4s
+    0.00 :   16aa4:  fmax    v28.4s, v28.4s, v19.4s
+    0.09 :   16aa8:  fmax    v29.4s, v29.4s, v8.4s
+    0.13 :   16aac:  str     q25, [sp, #128]
+    0.31 :   16ab0:  ldr     q25, [sp, #144]
+    0.57 :   16ab4:  fmax    v25.4s, v25.4s, v22.4s
+    0.09 :   16ab8:  str     q25, [sp, #144]
+    0.26 :   16abc:  ldr     q25, [sp, #160]
+    0.79 :   16ac0:  fmax    v25.4s, v25.4s, v20.4s
+    0.22 :   16ac4:  str     q25, [sp, #160]
+    0.31 :   16ac8:  ldr     q25, [sp, #176]
+    1.18 :   16acc:  fmax    v25.4s, v25.4s, v23.4s
+    0.04 :   16ad0:  stp     q25, q24, [sp, #176]
+    0.18 :   16ad4:  cmp     w5, w13
+    0.00 :   16ad8:  b.ne    166e0 <attn::neon::(anonymous namespace)::DenseBF<64, 256>::qk(attn::DenseJob const&, char const*, long, long, char const*, int, long, int, long, float*) [clone .isra.0]+0x200>  // b.any
+    0.00 :   16adc:  ldr     q31, [sp, #128]
+    0.53 :   16ae0:  add     x0, x10, x9
+    0.04 :   16ae4:  fmaxv   s25, v28.4s
+    0.00 :   16ae8:  fmaxv   s28, v27.4s
+    0.00 :   16aec:  fmaxv   s24, v31.4s
+    0.00 :   16af0:  ldr     q31, [sp, #144]
+    0.09 :   16af4:  fmaxv   s26, v26.4s
+    0.00 :   16af8:  str     s28, [x10, x9]
+    0.00 :   16afc:  fmaxv   s29, v29.4s
+    0.00 :   16b00:  fmaxv   s28, v31.4s
+    0.00 :   16b04:  fmaxv   s30, v30.4s
+    0.04 :   16b08:  stp     s26, s25, [x0, #4]
+    0.00 :   16b0c:  ldr     q31, [sp, #160]
+    0.00 :   16b10:  fmaxv   s27, v31.4s
+    0.04 :   16b14:  ldr     q31, [sp, #176]
+    0.00 :   16b18:  stp     s29, s24, [x0, #12]
+    0.00 :   16b1c:  ldr     q29, [sp, #192]
+    0.00 :   16b20:  stp     s28, s27, [x0, #20]
+    0.00 :   16b24:  fmaxv   s31, v31.4s
+    0.00 :   16b28:  fmaxv   s29, v29.4s
+    0.00 :   16b2c:  stp     s31, s29, [x0, #28]
+    0.00 :   16b30:  ldr     x23, [sp, #48]
+    0.00 :   16b34:  str     s30, [x0, #36]
+    0.00 :   16b38:  ldp     x19, x20, [sp, #16]
+    0.00 :   16b3c:  ldp     x21, x22, [sp, #32]
+    0.00 :   16b40:  ldp     d8, d9, [sp, #64]
+    0.00 :   16b44:  ldp     d10, d11, [sp, #80]
+    0.00 :   16b48:  ldp     d12, d13, [sp, #96]
+    0.00 :   16b4c:  ldp     d14, d15, [sp, #112]
+    0.00 :   16b50:  ldp     x29, x30, [sp], #288
+    0.00 :   16b54:  ret
+    0.00 :   16b58:  cmp     x7, x11
+    0.00 :   16b5c:  b.gt    16c04 <attn::neon::(anonymous namespace)::DenseBF<64, 256>::qk(attn::DenseJob const&, char const*, long, long, char const*, int, long, int, long, float*) [clone .isra.0]+0x724>
+    0.00 :   16b60:  dup     v25.4s, w5
+    0.00 :   16b64:  dup     v23.4s, w8
+    0.00 :   16b68:  ldr     q24, [sp, #272]
+    0.00 :   16b6c:  mov     w0, #0xa                        // #10
+    0.00 :   16b70:  zip1    v22.2d, v18.2d, v7.2d
+    0.00 :   16b74:  add     v23.4s, v23.4s, v10.4s
+    0.00 :   16b78:  zip2    v18.2d, v18.2d, v7.2d
+    0.00 :   16b7c:  add     v7.4s, v25.4s, v10.4s
+    0.00 :   16b80:  zip1    v21.2d, v19.2d, v8.2d
+    0.00 :   16b84:  cmgt    v25.4s, v23.4s, v24.4s
+    0.00 :   16b88:  zip2    v19.2d, v19.2d, v8.2d
+    0.00 :   16b8c:  cmgt    v24.4s, v7.4s, v24.4s
+    0.04 :   16b90:  bsl     v25.16b, v31.16b, v22.16b
+    0.00 :   16b94:  bsl     v24.16b, v31.16b, v21.16b
+    0.00 :   16b98:  cmp     x23, x7
+    0.00 :   16b9c:  csel    x2, x23, x7, le
+    0.04 :   16ba0:  dup     v22.4s, w2
+    0.00 :   16ba4:  cmgt    v23.4s, v23.4s, v22.4s
+    0.04 :   16ba8:  cmgt    v22.4s, v7.4s, v22.4s
+    0.00 :   16bac:  bit     v18.16b, v31.16b, v23.16b
+    0.00 :   16bb0:  bit     v19.16b, v31.16b, v22.16b
+    0.00 :   16bb4:  b       167ec <attn::neon::(anonymous namespace)::DenseBF<64, 256>::qk(attn::DenseJob const&, char const*, long, long, char const*, int, long, int, long, float*) [clone .isra.0]+0x30c>
+    0.00 :   16bb8:  cmp     w3, w11
+    0.00 :   16bbc:  b.gt    16cd8 <attn::neon::(anonymous namespace)::DenseBF<64, 256>::qk(attn::DenseJob const&, char const*, long, long, char const*, int, long, int, long, float*) [clone .isra.0]+0x7f8>
+    0.00 :   16bc0:  stp     d31, d31, [x2]
+    0.00 :   16bc4:  stp     d31, d31, [x2, #16]
+    0.00 :   16bc8:  stp     d31, d31, [x2, #32]
+    0.00 :   16bcc:  stp     d31, d31, [x2, #48]
+    0.00 :   16bd0:  stp     d31, d31, [x2, #64]
+    0.00 :   16bd4:  stp     d31, d31, [x2, #80]
+    0.00 :   16bd8:  stp     d31, d31, [x2, #96]
+    0.00 :   16bdc:  stp     d31, d31, [x2, #112]
+    0.00 :   16be0:  stp     d31, d31, [x2, #128]
+    0.00 :   16be4:  stp     d31, d31, [x2, #144]
+    0.00 :   16be8:  stp     d31, d31, [x2, #160]
+    0.00 :   16bec:  stp     d31, d31, [x2, #176]
+    0.00 :   16bf0:  stp     d31, d31, [x2, #192]
+    0.00 :   16bf4:  stp     d31, d31, [x2, #208]
+    0.04 :   16bf8:  stp     d31, d31, [x2, #224]
+    0.00 :   16bfc:  stp     d31, d31, [x2, #240]
+    0.00 :   16c00:  b       16634 <attn::neon::(anonymous namespace)::DenseBF<64, 256>::qk(attn::DenseJob const&, char const*, long, long, char const*, int, long, int, long, float*) [clone .isra.0]+0x154>
+    0.00 :   16c04:  zip1    v21.2d, v18.2d, v7.2d
+    0.00 :   16c08:  add     w0, w16, w8
+    0.00 :   16c0c:  zip1    v22.2d, v19.2d, v8.2d
+    0.00 :   16c10:  zip2    v18.2d, v18.2d, v7.2d
+    0.00 :   16c14:  zip2    v19.2d, v19.2d, v8.2d
+    0.00 :   16c18:  mov     v25.16b, v21.16b
+    0.00 :   16c1c:  mov     v24.16b, v22.16b
+    0.00 :   16c20:  cmp     w0, #0x0
+    0.00 :   16c24:  b.le    167ec <attn::neon::(anonymous namespace)::DenseBF<64, 256>::qk(attn::DenseJob const&, char const*, long, long, char const*, int, long, int, long, float*) [clone .isra.0]+0x30c>
+    0.04 :   16c28:  dup     v23.4s, w8
+    0.00 :   16c2c:  dup     v7.4s, w5
+    0.00 :   16c30:  ldr     q24, [sp, #272]
+    0.00 :   16c34:  add     v23.4s, v23.4s, v10.4s
+    0.00 :   16c38:  add     v7.4s, v7.4s, v10.4s
+    0.00 :   16c3c:  cmgt    v25.4s, v23.4s, v24.4s
+    0.04 :   16c40:  cmgt    v24.4s, v7.4s, v24.4s
+    0.00 :   16c44:  bsl     v25.16b, v31.16b, v21.16b
+    0.00 :   16c48:  bsl     v24.16b, v31.16b, v22.16b
+    0.00 :   16c4c:  cmp     w0, #0x1
+    0.00 :   16c50:  b.eq    167ec <attn::neon::(anonymous namespace)::DenseBF<64, 256>::qk(attn::DenseJob const&, char const*, long, long, char const*, int, long, int, long, float*) [clone .isra.0]+0x30c>  // b.none
+    0.00 :   16c54:  b       16b98 <attn::neon::(anonymous namespace)::DenseBF<64, 256>::qk(attn::DenseJob const&, char const*, long, long, char const*, int, long, int, long, float*) [clone .isra.0]+0x6b8>
+    0.00 :   16c58:  stp     d30, d31, [x2]
+    0.00 :   16c5c:  movi    v29.2s, #0x0
+    0.00 :   16c60:  ldr     d30, [x7, #8]
+    0.00 :   16c64:  stp     d30, d31, [x2, #16]
+    0.00 :   16c68:  ldr     d30, [x7, #16]
+    0.00 :   16c6c:  stp     d30, d31, [x2, #32]
+    0.00 :   16c70:  ldr     d30, [x7, #24]
+    0.00 :   16c74:  stp     d30, d31, [x2, #48]
+    0.00 :   16c78:  ldr     d30, [x7, #32]
+    0.00 :   16c7c:  stp     d30, d31, [x2, #64]
+    0.00 :   16c80:  ldr     d30, [x7, #40]
+    0.00 :   16c84:  stp     d30, d31, [x2, #80]
+    0.00 :   16c88:  ldr     d30, [x7, #48]
+    0.00 :   16c8c:  stp     d30, d31, [x2, #96]
+    0.00 :   16c90:  ldr     d30, [x7, #56]
+    0.00 :   16c94:  stp     d30, d31, [x2, #112]
+    0.00 :   16c98:  ldr     d30, [x7, #64]
+    0.00 :   16c9c:  stp     d30, d31, [x2, #128]
+    0.00 :   16ca0:  ldr     d30, [x7, #72]
+    0.00 :   16ca4:  stp     d30, d31, [x2, #144]
+    0.00 :   16ca8:  ldr     d30, [x7, #80]
+    0.00 :   16cac:  stp     d30, d31, [x2, #160]
+    0.00 :   16cb0:  ldr     d30, [x7, #88]
+    0.00 :   16cb4:  stp     d30, d31, [x2, #176]
+    0.00 :   16cb8:  ldr     d30, [x7, #96]
+    0.00 :   16cbc:  stp     d30, d31, [x2, #192]
+    0.00 :   16cc0:  ldr     d30, [x7, #104]
+    0.00 :   16cc4:  stp     d30, d31, [x2, #208]
+    0.00 :   16cc8:  ldr     d30, [x7, #112]
+    0.00 :   16ccc:  stp     d30, d31, [x2, #224]
+    0.00 :   16cd0:  ldr     d30, [x7, #120]
+    0.00 :   16cd4:  b       16630 <attn::neon::(anonymous namespace)::DenseBF<64, 256>::qk(attn::DenseJob const&, char const*, long, long, char const*, int, long, int, long, float*) [clone .isra.0]+0x150>
+    0.00 :   16cd8:  ldr     d30, [x8]
+    0.00 :   16cdc:  stp     d31, d30, [x2]
+    0.00 :   16ce0:  ldr     d30, [x8, #8]
+    0.00 :   16ce4:  stp     d31, d30, [x2, #16]
+    0.00 :   16ce8:  ldr     d30, [x8, #16]
+    0.00 :   16cec:  stp     d31, d30, [x2, #32]
+    0.00 :   16cf0:  ldr     d30, [x8, #24]
+    0.00 :   16cf4:  stp     d31, d30, [x2, #48]
+    0.00 :   16cf8:  ldr     d30, [x8, #32]
+    0.00 :   16cfc:  stp     d31, d30, [x2, #64]
+    0.00 :   16d00:  ldr     d30, [x8, #40]
+    0.00 :   16d04:  stp     d31, d30, [x2, #80]
+    0.00 :   16d08:  ldr     d30, [x8, #48]
+    0.00 :   16d0c:  stp     d31, d30, [x2, #96]
+    0.00 :   16d10:  ldr     d30, [x8, #56]
+    0.00 :   16d14:  stp     d31, d30, [x2, #112]
+    0.00 :   16d18:  ldr     d30, [x8, #64]
+    0.00 :   16d1c:  stp     d31, d30, [x2, #128]
+    0.00 :   16d20:  ldr     d30, [x8, #72]
+    0.00 :   16d24:  stp     d31, d30, [x2, #144]
+    0.00 :   16d28:  ldr     d30, [x8, #80]
+    0.00 :   16d2c:  stp     d31, d30, [x2, #160]
+    0.00 :   16d30:  ldr     d30, [x8, #88]
+    0.00 :   16d34:  stp     d31, d30, [x2, #176]
+    0.00 :   16d38:  ldr     d30, [x8, #96]
+    0.00 :   16d3c:  stp     d31, d30, [x2, #192]
+    0.00 :   16d40:  ldr     d30, [x8, #104]
+    0.00 :   16d44:  stp     d31, d30, [x2, #208]
+    0.00 :   16d48:  ldr     d30, [x8, #112]
+    0.00 :   16d4c:  stp     d31, d30, [x2, #224]
+    0.00 :   16d50:  ldr     d30, [x8, #120]
+    0.00 :   16d54:  stp     d31, d30, [x2, #240]
+    0.00 :   16d58:  b       16634 <attn::neon::(anonymous namespace)::DenseBF<64, 256>::qk(attn::DenseJob const&, char const*, long, long, char const*, int, long, int, long, float*) [clone .isra.0]+0x154>

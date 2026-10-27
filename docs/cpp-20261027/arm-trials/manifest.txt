@@ -1,0 +1,18 @@
+Linux fe-arm-20261026-173549 7.0.0-1014-gcp #14-Ubuntu SMP PREEMPT Tue Sep 15 20:16:30 UTC 2026 aarch64 GNU/Linux
+g++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0
+Copyright (C) 2025 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
+25987fce987a72a8245654bbafc2c7f6615c612bf38955d2be1503c3dc9af312  cpu_attention/_C.so
+6a3258f1136bdb03340c71ee01059fcf27a949c4398ceb6fa929ed7fa8ec4cea  cpu_attention/_C_cpp.so
+c31f5173697d74329b4b6300ad991a9f742366f688b8b7f082e178b96c83e9c1  cpu_attention/_C_cpp_old.so
+7ad6e44e13506dc8037568d4919216940e3e4eb170e9fbe282ca7438b40c1a01  cpu_attention/csrc/cpu_attn_neon.hpp
+final-build-parity.log:cpu_attention dense: 82/82 checks passed
+final-build-parity.log:cpu_attention 0.1.0: all checks passed
+final-fuzz.log:stray-read probe: 24/24 clean
+final-fuzz.log:fuzz dense: 80/80 cases within tolerance, worst was 0.52x its tolerance
+final-paged.log:paged sweep: 504/504 within tolerance
+final-paged.log:  worst fp32 8.05e-07 at (128, 16, 16, 16, 33, 3, False)
+final-paged.log:  worst bf16 1.92 ulp at (128, 64, 16, 8, 2049, 2, False)
+8d6da4cc469faacf603e128281a9ceae1a57b637642caff537738892f9fe8e13  /home/ducviet00/vllm_cpu_build/vllm_cpu_attn_bench.so

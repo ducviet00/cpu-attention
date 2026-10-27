@@ -1,0 +1,13 @@
+/home/ducviet00/cpu-attention-primary-20261027/.venv/lib/python3.14/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+threads=4 isa=vec cpp-isa=amx vllm=yes
+paged self  b=1   ctx=256   fp32: cpp     11.5 (med     13.5) mojo     13.6  cpp/mojo 0.846 ctrl/mojo 0.855  vllm     18.4 cpp/vllm 0.623 mojo/vllm 0.737  d 1.8e-07
+paged cross b=1   ctx=256   fp32: cpp     10.6 (med     12.3) mojo     12.3  cpp/mojo 0.863 ctrl/mojo 0.870  vllm     13.1 cpp/vllm 0.807 mojo/vllm 0.935  d 1.8e-07
+paged self  b=8   ctx=256   fp32: cpp    149.0 (med    152.7) mojo    151.5  cpp/mojo 0.983 ctrl/mojo 0.987  vllm    162.5 cpp/vllm 0.917 mojo/vllm 0.932  d 2.7e-07
+paged cross b=8   ctx=256   fp32: cpp    147.3 (med    150.9) mojo    147.3  cpp/mojo 1.000 ctrl/mojo 1.002  vllm    146.8 cpp/vllm 1.003 mojo/vllm 1.003  d 2.7e-07
+paged self  b=8   ctx=1024  fp32: cpp    612.3 (med    655.5) mojo    891.0  cpp/mojo 0.687 ctrl/mojo 0.699  vllm    978.8 cpp/vllm 0.626 mojo/vllm 0.910  d 2.4e-07
+paged cross b=8   ctx=1024  fp32: cpp    615.7 (med    655.2) mojo    917.1  cpp/mojo 0.671 ctrl/mojo 0.680  vllm    958.0 cpp/vllm 0.643 mojo/vllm 0.957  d 2.4e-07
+paged self  b=32  ctx=1024  fp32: cpp   4323.5 (med   4640.5) mojo   4907.1  cpp/mojo 0.881 ctrl/mojo 0.886  vllm   4812.6 cpp/vllm 0.898 mojo/vllm 1.020  d 3.9e-07
+paged cross b=32  ctx=1024  fp32: cpp   4225.3 (med   4480.0) mojo   4787.1  cpp/mojo 0.883 ctrl/mojo 0.888  vllm   4637.7 cpp/vllm 0.911 mojo/vllm 1.032  d 3.9e-07
+paged self  b=1   ctx=4096  fp32: cpp    308.6 (med    319.6) mojo    318.5  cpp/mojo 0.969 ctrl/mojo 0.971  vllm    314.1 cpp/vllm 0.982 mojo/vllm 1.014  d 1.9e-07
+paged cross b=1   ctx=4096  fp32: cpp    306.4 (med    318.6) mojo    313.2  cpp/mojo 0.978 ctrl/mojo 0.981  vllm    310.7 cpp/vllm 0.986 mojo/vllm 1.008  d 1.9e-07

@@ -1,0 +1,4 @@
+/home/ducviet00/cpu-attention/.venv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+torch.float32 0.9834470184271659 0.9981130921291003 {'old': {'min': 5.40235, 'median': 5.78285, 'p90': 5.95415, 'n': 101}, 'new': {'min': 5.312925, 'median': 5.6686, 'p90': 5.906575, 'n': 101}, 'ctrl': {'min': 5.3029, 'median': 5.6701250000000005, 'p90': 5.728725, 'n': 101}}
+torch.bfloat16 0.9746829482672025 1.001717687348696 {'old': {'min': 4.7783999999999995, 'median': 4.916175, 'p90': 4.988075, 'n': 101}, 'new': {'min': 4.657425, 'median': 4.806475, 'p90': 4.90615, 'n': 101}, 'ctrl': {'min': 4.665425, 'median': 4.809225, 'p90': 4.881600000000001, 'n': 101}}

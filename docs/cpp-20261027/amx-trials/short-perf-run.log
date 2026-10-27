@@ -1,0 +1,5 @@
+/home/ducviet00/cpu-attention/.venv/lib/python3.14/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+{"cpp": {"min": 26.371, "median": 31.1, "p90": 35.988, "n": 50001}, "ctrl": {"min": 26.26, "median": 30.351, "p90": 35.249, "n": 50001}, "mojo": {"min": 28.748, "median": 32.123, "p90": 36.107, "n": 50001}}
+[ perf record: Woken up 1 times to write data ]
+[ perf record: Captured and wrote 0.970 MB /home/ducviet00/amx-results/short-perf.data (25137 samples) ]
