@@ -1,0 +1,52 @@
+diff --git a/cpu_attention/csrc/cpu_attn_impl.hpp b/cpu_attention/csrc/cpu_attn_impl.hpp
+index c97b051..e6219ce 100644
+--- a/cpu_attention/csrc/cpu_attn_impl.hpp
++++ b/cpu_attention/csrc/cpu_attn_impl.hpp
+@@ -26,6 +26,9 @@
+ #include <limits>
+ 
+ #include "utils.hpp"
++#ifdef __AVX512F__
++#include <immintrin.h>
++#endif
+ 
+ namespace attn {
+ 
+@@ -141,6 +144,11 @@ inline void store_bf16(char* dst, const float* src, int hd, float inv) {
+   }
+ }
+ 
++template <class P>
++constexpr bool has_prefetch_out() {
++  return requires(char* p, size_t n) { P::prefetch_out(p, n); };
++}
++
+ template <class P>
+ constexpr bool zeroes_acc() {
+   if constexpr (requires { P::zeroes_acc; })
+@@ -210,6 +218,13 @@ void dense_run(const DenseJob& job, int workers) {
+       // an int32: the mask is applied with 32-bit lane compares.
+       const int64_t row_limit0 = job.causal ? (q0 + diag) : (int64_t(1) << 30);
+       const bool empty = job.causal && (row_limit0 + nrows - 1) < 0;
++      if constexpr (has_prefetch_out<P>()) {
++        for (int r = 0; r < nrows; ++r)
++          P::prefetch_out(static_cast<char*>(job.out) +
++                              (b * job.ob + (q0 + r) * job.ot + h * job.oh) *
++                                  esz,
++                          static_cast<size_t>(esz) * hd);
++      }
+       // A policy whose `pv` zeroes the accumulator on its first key tile (the
+       // AMX kernel's tile_zero) does not need this, and at head_dim 128 it is
+       // 16 KB of stores per work item. Detected rather than declared so the
+@@ -276,7 +291,11 @@ void dense_run(const DenseJob& job, int workers) {
+         const float* src = acc + r * hd;
+         if (job.dtype == kF32) {
+           float* o = reinterpret_cast<float*>(op);
++#ifdef __AVX512F__
++          for (int d = 0; d < hd; d += 16) _mm512_stream_ps(o + d, _mm512_mul_ps(_mm512_loadu_ps(src + d), _mm512_set1_ps(inv)));
++#else
+           for (int d = 0; d < hd; ++d) o[d] = src[d] * inv;
++#endif
+         } else {
+           store_bf16<P>(op, src, hd, inv);
+         }
