@@ -123,6 +123,8 @@ size_t workspace_bytes();
 //       a vectorised output epilogue; the default scalar loop is 1.6 us of a
 //       27 us call at 128:8:64 because `f32_to_bf16`'s NaN branch stops GCC
 //       from vectorising it.
+//   static void store_f32(char* dst, const float* src, int hd, float inv);
+//       the same for an fp32 output (the AMX policy uses non-temporal stores).
 template <class P>
 constexpr size_t logit_aux_floats(int kt) {
   if constexpr (requires { P::logit_aux_floats(kt); })
@@ -138,6 +140,16 @@ inline void store_bf16(char* dst, const float* src, int hd, float inv) {
   } else {
     bf16* o = reinterpret_cast<bf16*>(dst);
     for (int d = 0; d < hd; ++d) o[d] = f32_to_bf16(src[d] * inv);
+  }
+}
+
+template <class P>
+inline void store_f32(char* dst, const float* src, int hd, float inv) {
+  if constexpr (requires { P::store_f32(dst, src, hd, inv); }) {
+    P::store_f32(dst, src, hd, inv);
+  } else {
+    float* o = reinterpret_cast<float*>(dst);
+    for (int d = 0; d < hd; ++d) o[d] = src[d] * inv;
   }
 }
 
@@ -275,8 +287,7 @@ void dense_run(const DenseJob& job, int workers) {
         const float inv = 1.0f / l[r];
         const float* src = acc + r * hd;
         if (job.dtype == kF32) {
-          float* o = reinterpret_cast<float*>(op);
-          for (int d = 0; d < hd; ++d) o[d] = src[d] * inv;
+          store_f32<P>(op, src, hd, inv);
         } else {
           store_bf16<P>(op, src, hd, inv);
         }
