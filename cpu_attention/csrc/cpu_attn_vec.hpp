@@ -237,6 +237,15 @@ struct Dense {
   static size_t slab_bytes(int64_t seq_k, int hd) {
     return static_cast<size_t>(2 * pad_of(seq_k) * hd) * ESZ;
   }
+  // fp32 V is already [token][dim] within a head, the order P@V walks, so the
+  // copy only buys a unit token stride. While all of V fits in half the LLC
+  // the copy is the slower side (0.92-0.95 at 256:16:128, 1024:16:128,
+  // 512:32:128 and 2048:8:64 without it); past that a strided V is a DRAM
+  // stream the prefetchers lose, 1.32x slower at 4096:16:128.
+  static bool v_direct(const DenseJob& job) {
+    return !BF && job.batch * job.kv_heads * job.seq_k * HD * ESZ <=
+                      last_level_cache_bytes() / 2;
+  }
   // bf16 output: one 32-byte store per 16 dims (`_mm512_cvtneps_pbh` is
   // round-to-nearest-even, the same as `f32_to_bf16`).
   static void store_bf16(char* dst, const float* src, int hd, float inv) {
@@ -282,6 +291,11 @@ struct Dense {
         static_cast<const char*>(job.v) + (b * job.vb + kvh * job.vh) * ESZ;
     char* kdst = slab;
     char* vdst = slab + pad * HD * ESZ;
+    // When every head's slab together exceeds the LLC the slab is written to
+    // DRAM regardless, and an ordinary store first reads the line it replaces.
+    const bool stream = !BF && static_cast<int64_t>(slab_bytes(job.seq_k, HD)) *
+                                       job.batch * job.kv_heads >
+                                   last_level_cache_bytes();
     for (int64_t t0 = 0; t0 < job.seq_k; t0 += 16) {
       const int64_t tn = std::min<int64_t>(16, job.seq_k - t0);
       if (tn == 16) {
@@ -297,8 +311,11 @@ struct Dense {
               store_pair_bf16(kdst + kb_off(t0, (d0 + d) / 2) * ESZ, r[d],
                               r[d + 1]);
           } else {
-            for (int d = 0; d < 16; ++d)
-              st16(kdst + k_off(t0, d0 + d) * 4, r[d]);
+            for (int d = 0; d < 16; ++d) {
+              float* dst = reinterpret_cast<float*>(kdst + k_off(t0, d0 + d) * 4);
+              if (stream) _mm512_stream_ps(dst, r[d]);
+              else st16(dst, r[d]);
+            }
           }
         }
       } else {
@@ -335,7 +352,13 @@ struct Dense {
             }
           }
         }
-      } else {
+      } else if (stream) {
+        for (int64_t t = 0; t < tn; ++t)
+          for (int d = 0; d < HD; d += 16)
+            _mm512_stream_ps(
+                reinterpret_cast<float*>(vdst + ((t0 + t) * HD + d) * ESZ),
+                ld16(vsrc + (t0 + t) * vstride + d * ESZ));
+      } else if (!v_direct(job)) {
         for (int64_t t = 0; t < tn; ++t)
           std::memcpy(vdst + (t0 + t) * HD * ESZ,
                       vsrc + (t0 + t) * vstride, HD * ESZ);
@@ -353,7 +376,7 @@ struct Dense {
         if (pairs > 0)
           std::memset(vdst + from * (HD * 2) * ESZ, 0,
                       pairs * (HD * 2) * ESZ);
-      } else {
+      } else if (!v_direct(job)) {
         std::memset(vdst + job.seq_k * HD * ESZ, 0, tail * HD * ESZ);
       }
       // Only the 16-lane group holding the last key can be read partially; the
@@ -373,6 +396,8 @@ struct Dense {
         }
       }
     }
+    // Streaming stores are weakly ordered; the driver's barrier follows.
+    if (stream) _mm_sfence();
   }
 
   // logits[RQT][kt] = q[RQT] @ K^T for keys [k0, k0+nkeys), causal-masked.
@@ -530,12 +555,17 @@ struct Dense {
   // 2048:16:128 bf16 call. The accumulator is a 32-dim chunk (two zmm per row)
   // so eight rows plus the operands stay inside 32 registers.
   template <int ROWS>
-  static void pv_rows(const DenseJob& job, const char* slab,
-                      int64_t k0, int nkeys, const float* p, int nrows,
-                      float* acc) {
+  static void pv_rows(const DenseJob& job, const char* slab, int64_t b,
+                      int64_t kvh, int64_t k0, int nkeys, const float* p,
+                      int nrows, float* acc) {
     const int kt = kt_();
     if (mode() & 8) return;
     const char* vs = slab + pad_of(job.seq_k) * HD * ESZ;
+    const bool direct = v_direct(job);
+    const char* vsrc = direct ? static_cast<const char*>(job.v) +
+                                    (b * job.vb + kvh * job.vh) * ESZ
+                              : vs;
+    const int64_t vstride = direct ? job.vt * ESZ : HD * ESZ;
     const uint32_t* pp = BF ? pairs_of(p) : nullptr;
     const int half = kt / 2;
     for (int dc = 0; dc < HD; dc += 32) {
@@ -562,7 +592,7 @@ struct Dense {
         }
       } else {
         for (int j = 0; j < nkeys; ++j) {
-          const char* v = vs + ((k0 + j) * HD + dc) * ESZ;
+          const char* v = vsrc + (k0 + j) * vstride + dc * ESZ;
           const __m512 v0 = ld16(v);
           const __m512 v1 = ld16(v + 64);
 #pragma GCC unroll 16
@@ -581,14 +611,14 @@ struct Dense {
     }
   }
 
-  static void pv(const DenseJob& job, const char* slab, int64_t, int64_t,
+  static void pv(const DenseJob& job, const char* slab, int64_t b, int64_t kvh,
                  int64_t k0, int nk, const float* p, int nr, float* acc) {
     if (nr <= 2)
-      pv_rows<2>(job, slab, k0, nk, p, nr, acc);
+      pv_rows<2>(job, slab, b, kvh, k0, nk, p, nr, acc);
     else if (nr <= 4)
-      pv_rows<4>(job, slab, k0, nk, p, nr, acc);
+      pv_rows<4>(job, slab, b, kvh, k0, nk, p, nr, acc);
     else
-      pv_rows<RQT>(job, slab, k0, nk, p, nr, acc);
+      pv_rows<RQT>(job, slab, b, kvh, k0, nk, p, nr, acc);
   }
 };
 
