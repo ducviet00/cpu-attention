@@ -586,7 +586,7 @@ def _drop_workspace() -> None:
 
     One generation is all an engine needs, but a sweep over many *large* shapes
     would otherwise keep every geometry's K^T/V scratch alive at once -- a 22-row
-    ``tests/bench_vs_refs.py`` run reaches several hundred MB, and the rows it
+    ``benchmarks/bench.py`` run reaches several hundred MB, and the rows it
     measures late are 5-15% slower than the same rows run on their own (measured
     on the Graviton box, medians of 9; the fingerprint is positional, not
     shape-dependent). The plans hold references to the buffers, so the two have
@@ -716,7 +716,7 @@ every one of its query blocks, so the two phases share bytes and the region
 needs no internal barrier. It only balances when ``batch*heads % workers == 0``
 (checked in :func:`_dense_plan`), and the header cache argument only holds while
 one head's K/V stays near-resident -- but it measured faster at *every* shape in
-the matrix (1.00-1.18x, in-process interleaved, `tests/bench_head.py`), so the
+the matrix (1.00-1.18x, in-process interleaved), so the
 default is on and the limit is only there for A/B and for a box where one head's
 K/V no longer fits. ``0`` = off.
 """
@@ -741,7 +741,7 @@ def _qt_for(
 
     ``qt`` is the *only* dimension across which K/V is reused, so traffic per
     row-key scales as ``1/qt``. That is what binds on the server boxes (see
-    ``PROFILE_ARM.md`` §10 and ``PROFILE_X86.md``): on x86 fp32 the load-bound
+    ``docs/Mojo.md``): on x86 fp32 the load-bound
     fraction is 48% vs vLLM's 15% and ``CPU_ATTENTION_QT=8`` is worth 1.20-1.34x.
 
     ARM (``lanes < 16``), fp32/bfdot, head_dim 64, measured on m9g
@@ -846,7 +846,7 @@ _AMX_ENV = os.environ.get("CPU_ATTENTION_AMX", "1") != "0"
 # CPU disagrees with the measured 5.5-7.6e-5 error.
 _AMX_FP32_ENV = os.environ.get("CPU_ATTENTION_AMX_FP32", "1") != "0"
 
-# Profiling only (see tests/bench_amx_phases.py): 1 skips the K/V pack, 2 skips
+# Profiling only (phase ablations): 1 skips the K/V pack, 2 skips
 # the attention. The results are garbage in either mode; timings only.
 # Profiling only: 1 skip pack, 2 skip attention, 4/8 skip V/K pack, 16/32/64
 # skip Q@K^T / softmax / P@V. Results are garbage in any of these; timings only.
@@ -857,7 +857,7 @@ _AMX_ENTRY = None
 # v2 of the AMX kernel (`dense_amx_v2.mojo`: one softmax pass per logit instead
 # of two). Opt-in so a regression cannot reach the engine:
 # `CPU_ATTENTION_AMX2=1` at import, or flip `_AMX_IMPL` between calls (which is
-# how tests/bench_amx_v2.py interleaves the two in one process).
+# how an in-process A/B interleaves the two in one process).
 _AMX_IMPL = os.environ.get("CPU_ATTENTION_AMX2", "0") == "1" and "v2" or "v1"
 _AMX_ENTRIES = {}
 
@@ -1104,7 +1104,7 @@ def _dense_plan(key, q, k, v, causal):
     # 32 MB-L3 laptop; on this box (48 MB) that left 2048:16:128 fp32 (V =
     # 16.8 MB) *without* the copy, and forcing it there measured 1.02-1.07x in
     # three interleaved runs while every smaller shape stayed within noise
-    # (`tests/bench_f32_vpack.py`). A third of the LLC fires at exactly the
+    # (in-process A/B). A third of the LLC fires at exactly the
     # shapes the half rule did on the laptop, plus that one.
     vpack = (dt == torch.float32
              and v.numel() * v.element_size() * 3 >= _llc_bytes())
@@ -1247,7 +1247,7 @@ def _dense_plan(key, q, k, v, causal):
         and _FUSE
         and seq_k <= _SMALL_MAXK
         and head_dim <= 128  # D=128 measured too: 256:16:128 bf16 1.068x in
-        # `tests/bench_small.py`; the tile geometry (ks=256) is the same kernel
+        # an in-process A/B; the tile geometry (ks=256) is the same kernel
     ):
         mode += 8
     plan = (
@@ -1391,7 +1391,7 @@ def _dense(q, k, v, scale: float, causal: bool, geom=None):
         # One OpenMP region for the pack and the attention, with a barrier
         # between them: two fork-joins cost two pool wakes, and at S=128 the
         # barrier was 14% of the process by perf. `CPU_ATTENTION_NO_FUSE=1`
-        # restores the two-call form, which is what `tests/bench_phases.py`
+        # restores the two-call form, which is what a phase ablation
         # instruments to split pack from kernel.
         if _PLAN_ABI:
             # Six arguments instead of 42: the geometry rides in `_pbuf`.

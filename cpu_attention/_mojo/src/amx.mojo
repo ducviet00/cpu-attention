@@ -180,7 +180,7 @@ def tile_dpbf16ps[dst: Int, a: Int, b: Int]() -> None:
     # so the surrounding loads/stores cannot be scheduled around it). Ordering is
     # still safe because `has_side_effect=True` keeps side-effecting asm in
     # program order, and the tile loads/stores around it keep their own clobber.
-    # Measured by `tests/ab_two_trees.py` against the gcc-built C kernel.
+    # Measured, alternating processes, against the gcc-built C kernel.
     inlined_assembly[
         asm,
         NoneType,

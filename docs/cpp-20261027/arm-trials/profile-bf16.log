@@ -1,4 +1,0 @@
-/home/ducviet00/cpu-attention-arm-isa1-20261027/.venv/lib/python3.14/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
-  cpu = _conversion_method_template(device=torch.device("cpu"))
-[ perf record: Woken up 2 times to write data ]
-[ perf record: Captured and wrote 0.273 MB profile-bf16.data (6818 samples) ]

@@ -1,8 +1,0 @@
-/home/ducviet00/cpu-attention-final-20261028/.venv/lib/python3.14/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
-  cpu = _conversion_method_template(device=torch.device("cpu"))
-backend cpp
-[reference precision] hd=128 page=32 ctx=33: kernel/fp32=1.788e-06, fp32/fp64=1.831e-06, kernel/fp64=2.496e-07
-paged sweep: 504/504 within tolerance
-  fp64-resolved reference precision cases: 1
-  worst fp32 8.05e-07 at (128, 16, 16, 16, 33, 3, False)
-  worst bf16 1.92 ulp at (128, 64, 16, 8, 2049, 2, False)

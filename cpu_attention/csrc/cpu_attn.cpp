@@ -28,7 +28,7 @@ void dense(const DenseJob&, int);
 // The paged kernel lives in this TU because it is the fastest AVX-512 paged
 // path on the box `available()` is true for, but it is not a tile kernel: an
 // AMX tile is 16 rows and a decode item is one live query row (31 useful
-// MAC/cycle against `dpbf16ps`'s 32), so `docs/amx/AMX_PAGED.md` measures it and
+// MAC/cycle against `dpbf16ps`'s 32), so `docs/CPP.md` records the measurement and
 // keeps the vector form. Routing paged here is a per-dtype loop-shape choice --
 // dim-outer Q@K^T with 64 keys per step for bf16 -- not an ISA change.
 void paged(const PagedJob&, int);

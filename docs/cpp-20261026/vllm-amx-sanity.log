@@ -1,6 +1,0 @@
-/home/ducviet00/cpu-attention/.venv/lib/python3.14/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
-  cpu = _conversion_method_template(device=torch.device("cpu"))
-tile permission via cpp ISA: amx
-{'seq': 128, 'heads': 8, 'dim': 64, 'stats': {'vec': {'min': 56.943, 'median': 58.178, 'p90': 60.837, 'n': 41}, 'amx': {'min': 27.333, 'median': 30.244, 'p90': 31.842, 'n': 41}, 'ctrl': {'min': 27.534, 'median': 29.864, 'p90': 31.256, 'n': 41}}}
-{'seq': 512, 'heads': 8, 'dim': 64, 'stats': {'vec': {'min': 637.173, 'median': 660.726, 'p90': 666.867, 'n': 41}, 'amx': {'min': 214.549, 'median': 235.78, 'p90': 250.527, 'n': 41}, 'ctrl': {'min': 213.501, 'median': 232.515, 'p90': 254.503, 'n': 41}}}
-{'seq': 1024, 'heads': 16, 'dim': 128, 'stats': {'vec': {'min': 9027.002, 'median': 9170.81, 'p90': 9273.598, 'n': 41}, 'amx': {'min': 2107.335, 'median': 2255.901, 'p90': 2359.75, 'n': 41}, 'ctrl': {'min': 2103.098, 'median': 2170.247, 'p90': 2315.058, 'n': 41}}}

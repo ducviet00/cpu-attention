@@ -17,9 +17,9 @@ import torch
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
-sys.path.insert(0, os.path.join(_ROOT, "audit"))
+sys.path.insert(0, os.path.join(_ROOT, "tests"))
 
-import audit_common as C  # noqa: E402
+import reference as C  # noqa: E402
 import cpu_attention as attn  # noqa: E402
 from cpu_attention import _kernel  # noqa: E402
 

@@ -229,7 +229,7 @@ inline __m512i cvt_bf16x32(__m512 e0, __m512 e1) {
 //
 // The pack is memory-bound, not shuffle-bound: measured 21 GB/s on one thread
 // and 60-111 GB/s on four, against a measured 62-70 GB/s DRAM ceiling for this
-// box (`docs/AUDIT.md`). `always_inline` here is for the register file, not for
+// box (`docs/CPP.md`). `always_inline` here is for the register file, not for
 // bandwidth; it moved the pack by 0-3%.
 __attribute__((always_inline)) inline void transpose16x16(__m512* r) {
   for (int i = 0; i < 16; i += 2) {
@@ -316,7 +316,7 @@ struct Dense {
   // 1 = pack, 2 = Q@K^T, 4 = softmax, 8 = P@V, 16 = the Q hi/lo panel build
   // inside Q@K^T, 32 = the causal/padding mask. Results are garbage when set.
   //
-  // This is also the phase-ablation instrument for `docs/xeon/ablate2.py`: the
+  // This is also the phase-ablation instrument for phase ablations: the
   // Mojo backend reads the same variable in Python *at import*, the C++ kernel
   // reads it lazily on its first call, so setting it after the import ablates
   // only this kernel and leaves the Mojo arm as a drift reference in the same
@@ -879,7 +879,7 @@ struct Dense {
 // Q@K^T with the broadcast hoisted, no `idiv` in the key loops, two P@V lanes for
 // bf16, a two-pass softmax -- none of which is per-ISA, so it now lives in
 // `cpu_attn_vec.hpp`'s `Paged` policy and every x86 machine runs it.
-// `docs/amx/AMX_PAGED.md` has the measurements and the A/B against the body it
+// `docs/CPP.md` has the measurements and the A/B against the body it
 // replaced. `vec` is authoritative; nothing paged is defined in this TU, and
 // `amx::paged`/`amx::store` below are one-line forwards so the dispatcher's
 // kIsaAmx route keeps working without a second copy to drift.

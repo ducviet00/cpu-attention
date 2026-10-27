@@ -334,7 +334,7 @@ struct Dense {
       if constexpr (BF) {
         // V goes to [key/2][hd][2]: one 64-byte store holds 16 dims of two
         // adjacent keys, which is the pair `dpbf16ps` contracts in P@V. That is
-        // worth 2.05x on the phase (tests/bench_vec_prims.cpp, pv_fma).
+        // worth 2.05x on the phase (isolated phase microbenchmark).
         for (int64_t t = 0; t < tn; t += 2) {
           const char* a = vsrc + (t0 + t) * vstride;
           const bool have_b = (t + 1) < tn;
@@ -483,7 +483,7 @@ struct Dense {
   // Online-softmax step over one kt-wide row tile: `logits` is replaced by the
   // probabilities. The scale is folded into the exponential instead of being
   // written back in the max pass: one fewer full pass over the tile per step
-  // (9.0 -> 5.8 us of the 4096-key fp32 softmax in tests/bench_vec_prims.cpp).
+  // (9.0 -> 5.8 us of the 4096-key fp32 softmax, isolated).
   static void softmax(float* logits, int nrows, int nkeys, float c, float* m,
                       float* l, float* alpha) {
     const int kt = kt_();
@@ -551,7 +551,7 @@ struct Dense {
   // bf16 runs `dpbf16ps` with the contraction on keys: one instruction
   // multiplies a broadcast key-pair probability by 16 dims of two adjacent keys
   // and accumulates 32 MACs against 16 for an fp32 FMA. That is 2.05x the phase
-  // (tests/bench_vec_prims.cpp, 'pv_fma') and it is why P@V was 56% of the
+  // (isolated phase microbenchmark) and it is why P@V was 56% of the
   // 2048:16:128 bf16 call. The accumulator is a 32-dim chunk (two zmm per row)
   // so eight rows plus the operands stay inside 32 registers.
   template <int ROWS>
@@ -646,14 +646,14 @@ struct Paged {
   // Q@K^T and in keys for P@V (0 = off). The kernel is latency-bound -- each
   // phase reaches 70-88% of what a plain sequential read of the same bytes
   // measures -- so the question is whether a few lines fetched ahead buy
-  // anything. `docs/amx/AMX_PAGED.md` has the sweep.
+  // anything. `docs/CPP.md` has the result.
   static int pf_dist() {
     static const int d = env_int("CPU_ATTENTION_PAGED_PF", 0, 0, 64);
     return d;
   }
 
   // Loop shapes, chosen per dtype from an in-process A/B against the vec policy
-  // (`docs/amx/AMX_PAGED.md` §5). bf16 takes the dim-outer Q@K^T (1.09-1.25x
+  // (`docs/CPP.md`). bf16 takes the dim-outer Q@K^T (1.09-1.25x
   // over the vec shape at every shape) and two P@V lanes; fp32 takes the
   // dim-inner Q@K^T and one lane, which is *parity* with the vec shape at
   // 256/1024/4096 keys and 2.5-4% better at b=32 -- the dim-outer form costs
