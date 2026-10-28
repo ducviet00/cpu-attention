@@ -267,6 +267,7 @@ def _call(
 
 
 _PAGED_PLANS = threading.local()
+_get_num_threads = torch.get_num_threads
 """Per-thread geometry -> fast call, for the Mojo paged path.
 
 (The C++ backend keeps the same per-thread cache inside the extension:
@@ -284,74 +285,86 @@ contiguous q and cache) builds no stride tuples at all.
 """
 
 
-def _kv_plan(query, k_cache, page_table, do_store, do_attend=True):
-    """The Mojo fast call for this geometry, built on the first call.
+def _kv_build(query, key, value, k_cache, page_table, do_store, do_attend):
+    """Build the Mojo fast call for one geometry + layout.
 
-    The geometry rides in a 12-slot int64 buffer the kernel reads, so a call
-    marshals the per-call pointers, two token strides and the scale. Workers
-    follow `_workers`; `chunks` splits a GQA/MQA group across workers only when
-    there are fewer (sequence, kv head) pairs than workers (each chunk is a
-    register tile of that group's query heads over one scan of the cache).
+    The geometry rides in a 12-slot int64 buffer the kernel reads, and the token
+    strides are constants of the plan (they are part of its key), so a call
+    marshals only the per-call pointers and the scale. Workers follow
+    `_workers`; `chunks` splits a GQA/MQA group across workers only when there
+    are fewer (sequence, kv head) pairs than workers (each chunk is a register
+    tile of the group's query heads over one scan of the cache).
     """
-    plans = getattr(_PAGED_PLANS, "p", None)
-    if plans is None:
-        plans = _PAGED_PLANS.p = {}
-    query_shape = query.shape
-    cache_shape = k_cache.shape
+    nseq, nheads, hd = query.shape
+    kvh, page = k_cache.shape[1:3]
     npages = page_table.shape[1] if page_table is not None else 0
-    k = (query_shape, cache_shape, npages, query.dtype, torch.get_num_threads(),
-         _OVERRIDE, do_store, do_attend, _BACKEND)
-    fn = plans.get(k)
-    if fn is None:
-        nseq, nheads, hd = query_shape
-        kvh, page = cache_shape[1:3]
-        pairs = nseq * kvh
-        group = nheads // kvh
-        workers = _workers(nseq * nheads, max(npages, 1))
-        chunks = 1
-        if do_attend and pairs < workers:
-            chunks = min(group, -(-workers // pairs))
-        workers = max(1, min(workers, pairs * chunks))
-        buf = torch.tensor([nseq, nheads, kvh, hd, page, npages, nheads * hd,
-                            _DTYPE_CODES[query.dtype], workers, int(do_store),
-                            int(do_attend), chunks], dtype=torch.int64)
-        plan = buf.data_ptr()
-        entry = _entry("kv_attention")
+    # Heads and dims must be contiguous; a token stride is fine (the engine's
+    # q/k/v are chunks of one fused projection). Anything else is copied.
+    q_ok = query.stride(-1) == 1 and query.stride(-2) == hd
+    kv_ok = (not do_store or (key.stride(-1) == 1 and key.stride(-2) == hd and
+                              value.stride() == key.stride()))
+    q_stride = query.stride(0) if q_ok else nheads * hd
+    kv_stride = (key.stride(0) if kv_ok else key.shape[1] * hd) if do_store else 0
+    pairs = nseq * kvh
+    group = nheads // kvh
+    workers = _workers(nseq * nheads, max(npages, 1))
+    chunks = 1
+    if do_attend and pairs < workers:
+        chunks = min(group, -(-workers // pairs))
+    workers = max(1, min(workers, pairs * chunks))
+    buf = torch.tensor([nseq, nheads, kvh, hd, page, npages, nheads * hd,
+                        _DTYPE_CODES[query.dtype], workers, int(do_store),
+                        int(do_attend), chunks], dtype=torch.int64)
+    plan = buf.data_ptr()
+    entry = _entry("kv_attention")
 
-        if do_store and do_attend:
-            def fn(out, query, key, value, k_cache, v_cache, slots, block_table,
-                   lens, scale, _buf=buf):
-                entry(plan, query.data_ptr(), key.data_ptr(), value.data_ptr(),
-                      k_cache.data_ptr(), v_cache.data_ptr(), out.data_ptr(),
-                      slots.data_ptr(), block_table.data_ptr(), lens.data_ptr(),
-                      query.stride(0), key.stride(0), scale)
-        elif do_attend:
-            def fn(out, query, key, value, k_cache, v_cache, slots, block_table,
-                   lens, scale, _buf=buf):
-                entry(plan, query.data_ptr(), 0, 0, k_cache.data_ptr(),
-                      v_cache.data_ptr(), out.data_ptr(), 0,
-                      block_table.data_ptr(), lens.data_ptr(), query.stride(0),
-                      0, scale)
-        else:
-            def fn(out, query, key, value, k_cache, v_cache, slots, block_table,
-                   lens, scale, _buf=buf):
-                entry(plan, 0, key.data_ptr(), value.data_ptr(),
-                      k_cache.data_ptr(), v_cache.data_ptr(), 0,
-                      slots.data_ptr(), 0, 0, 0, key.stride(0), 1.0)
-
-        if len(plans) > 64:
-            plans.clear()
-        plans[k] = fn
+    if do_store and do_attend:
+        def fn(out, query, key, value, k_cache, v_cache, slots, block_table,
+               lens, scale, _buf=buf):
+            if not q_ok:
+                query = query.contiguous()
+            if not kv_ok:
+                key, value = key.contiguous(), value.contiguous()
+            entry(plan, query.data_ptr(), key.data_ptr(), value.data_ptr(),
+                  k_cache.data_ptr(), v_cache.data_ptr(), out.data_ptr(),
+                  slots.data_ptr(), block_table.data_ptr(), lens.data_ptr(),
+                  q_stride, kv_stride, scale)
+    elif do_attend:
+        def fn(out, query, key, value, k_cache, v_cache, slots, block_table,
+               lens, scale, _buf=buf):
+            if not q_ok:
+                query = query.contiguous()
+            entry(plan, query.data_ptr(), 0, 0, k_cache.data_ptr(),
+                  v_cache.data_ptr(), out.data_ptr(), 0,
+                  block_table.data_ptr(), lens.data_ptr(), q_stride, 0, scale)
+    else:
+        def fn(out, query, key, value, k_cache, v_cache, slots, block_table,
+               lens, scale, _buf=buf):
+            if not kv_ok:
+                key, value = key.contiguous(), value.contiguous()
+            entry(plan, 0, key.data_ptr(), value.data_ptr(), k_cache.data_ptr(),
+                  v_cache.data_ptr(), 0, slots.data_ptr(), 0, 0, 0, kv_stride,
+                  1.0)
     return fn
 
 
+def _kv_plans():
+    plans = getattr(_PAGED_PLANS, "p", None)
+    if plans is None:
+        plans = _PAGED_PLANS.p = {}
+    return plans
+
+
 def _kv_store(key, value, k_cache, v_cache, slots):
-    """reshape_and_cache on the Mojo backend: one token per `query` row."""
-    hd = key.shape[-1]
-    if (key.stride(-1) != 1 or key.stride(-2) != hd or
-            value.stride() != key.stride()):
-        key, value = key.contiguous(), value.contiguous()
-    fn = _kv_plan(key, k_cache, None, True, False)
+    """reshape_and_cache on the Mojo backend: one token per `key` row."""
+    plans = _kv_plans()
+    k = (key.shape, key.stride(), value.stride(), k_cache.shape,
+         _get_num_threads(), _OVERRIDE, key.dtype, "store")
+    fn = plans.get(k)
+    if fn is None:
+        if len(plans) > 64:
+            plans.clear()
+        fn = plans[k] = _kv_build(key, key, value, k_cache, None, True, False)
     fn(None, key, key, value, k_cache, v_cache, slots, None, None, 1.0)
 
 
@@ -379,17 +392,26 @@ def _paged(
             res = call(query, key, value, k_cache, v_cache, slots, page_table,
                        lens, scale, out)
         return res
+    # One tuple, one lookup: the key carries the strides, so the layout checks
+    # run only when a plan is built (0.75 us of Python per call before).
+    plans = _kv_plans()
+    if do_store:
+        k = (query.shape, query.stride(), key.stride(), value.stride(),
+             k_cache.shape, page_table.shape, _get_num_threads(), _OVERRIDE,
+             query.dtype)
+    else:
+        k = (query.shape, query.stride(), k_cache.shape, page_table.shape,
+             _get_num_threads(), _OVERRIDE, query.dtype)
+    fn = plans.get(k)
+    if fn is None:
+        if len(plans) > 64:
+            plans.clear()
+        fn = plans[k] = _kv_build(query, key, value, k_cache, page_table,
+                                  do_store, True)
     if out is None:
         # Paged queries have contiguous heads/dims; a fused-projection token
         # gap is compacted by empty_like without a memory-format keyword.
         out = torch.empty_like(query)
-    hd = query.shape[-1]
-    if query.stride(-1) != 1 or query.stride(-2) != hd:
-        query = query.contiguous()
-    if do_store and (key.stride(-1) != 1 or key.stride(-2) != hd or
-                     value.stride() != key.stride()):
-        key, value = key.contiguous(), value.contiguous()
-    fn = _kv_plan(query, k_cache, page_table, do_store)
     fn(out, query, key, value, k_cache, v_cache, slots, page_table, lens, scale)
     return out
 
