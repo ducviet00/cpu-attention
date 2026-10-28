@@ -1,0 +1,322 @@
+pin_governor: pinned 32 settings to performance
+/home/ducviet00/cpu-attention/.venv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+{
+ "git": "6f9040d933bdd1baa5be22d8fd4287e4dc8ec8a5",
+ "mojo": "Mojo 1.2.0 (2016d0cd)",
+ "torch": "2.14.1+cpu",
+ "threads": 8,
+ "governor": "performance",
+ "arms": {
+  "mojo_new": {
+   "backend": "mojo",
+   "env": {},
+   "origin": "6f9040d",
+   "lib": "/tmp/ca_arms_ij4bb__7/mojo_new/ca_mojo_new/_C_x86-avx512bf16.so",
+   "tier": "x86-avx512bf16"
+  },
+  "mojo_ctrl": {
+   "backend": "mojo",
+   "env": {},
+   "origin": "6f9040d",
+   "lib": "/tmp/ca_arms_ij4bb__7/mojo_ctrl/ca_mojo_ctrl/_C_x86-avx512bf16.so",
+   "tier": "x86-avx512bf16"
+  },
+  "mojo_old": {
+   "backend": "mojo",
+   "env": {},
+   "origin": "mojo-oracle-v1.1",
+   "lib": "/tmp/ca_arms_ij4bb__7/mojo_old/ca_mojo_old/_C.so"
+  },
+  "cpp_vec": {
+   "backend": "cpp",
+   "env": {
+    "CPU_ATTENTION_ISA": "vec"
+   },
+   "origin": "mojo-oracle-v1.1",
+   "lib": "/tmp/ca_arms_ij4bb__7/cpp_vec/ca_cpp_vec/_C_cpp.so",
+   "isa": "vec"
+  },
+  "cpp_scalar": {
+   "backend": "cpp",
+   "env": {
+    "CPU_ATTENTION_ISA": "scalar"
+   },
+   "origin": "mojo-oracle-v1.1",
+   "lib": "/tmp/ca_arms_ij4bb__7/cpp_scalar/ca_cpp_scalar/_C_cpp.so",
+   "isa": "scalar"
+  }
+ }
+}
+flash 128:8:64 bf16                              new       15.5 cpp_vec       19.1 ratio 0.815 ctrl 0.008 win /mojo_old 0.549 /vllm 0.454 /sdpa 0.215
+flash 128:8:64 fp32                              new       25.6 cpp_vec       27.0 ratio 0.946 ctrl 0.026 win /mojo_old 0.772 /vllm 0.801 /sdpa 0.408
+flash 512:8:64 bf16                              new      176.3 cpp_vec      189.3 ratio 0.931 ctrl 0.003 win /mojo_old 0.636 /vllm 0.453 /sdpa 0.219
+flash 512:8:64 fp32                              new      329.8 cpp_vec      326.8 ratio 1.009 ctrl 0.008 unresolved /mojo_old 0.887 /vllm 0.895 /sdpa 0.423
+flash 1024:8:64 bf16                             new      696.5 cpp_vec      762.5 ratio 0.913 ctrl 0.012 win /mojo_old 0.638 /vllm 0.450 /sdpa 0.255
+flash 1024:8:64 fp32                             new     1290.7 cpp_vec     1291.8 ratio 0.999 ctrl 0.007 unresolved /mojo_old 0.928 /vllm 0.874 /sdpa 0.522
+flash 2048:8:64 bf16                             new     2813.1 cpp_vec     2986.4 ratio 0.942 ctrl 0.003 win /mojo_old 0.670 /vllm 0.469 /sdpa 0.335
+flash 2048:8:64 fp32                             new     4947.6 cpp_vec     5066.1 ratio 0.977 ctrl 0.033 unresolved /mojo_old 0.906 /vllm 0.923 /sdpa 0.632
+flash 4096:8:64 bf16                             new    10806.7 cpp_vec    12120.6 ratio 0.892 ctrl 0.015 win /mojo_old 0.629 /vllm 0.465 /sdpa 0.356
+flash 4096:8:64 fp32                             new    19879.3 cpp_vec    20032.9 ratio 0.992 ctrl 0.028 unresolved /mojo_old 0.886 /vllm 0.938 /sdpa 0.665
+flash 256:16:128 bf16                            new      216.9 cpp_vec      231.4 ratio 0.938 ctrl 0.004 win /mojo_old 0.492 /vllm 0.509 /sdpa 0.230
+flash 256:16:128 fp32                            new      672.1 cpp_vec      675.7 ratio 0.995 ctrl 0.029 unresolved /mojo_old 0.900 /vllm 1.123 /sdpa 0.459
+flash 1024:16:128 bf16                           new     2928.9 cpp_vec     3110.0 ratio 0.942 ctrl 0.027 win /mojo_old 0.497 /vllm 0.498 /sdpa 0.262
+flash 1024:16:128 fp32                           new     5662.6 cpp_vec     5597.9 ratio 1.012 ctrl 0.023 unresolved /mojo_old 0.810 /vllm 1.105 /sdpa 0.510
+flash 2048:16:128 bf16                           new    10465.9 cpp_vec    10974.4 ratio 0.954 ctrl 0.009 win /mojo_old 0.526 /vllm 0.461 /sdpa 0.327
+flash 2048:16:128 fp32                           new    21074.5 cpp_vec    20477.5 ratio 1.029 ctrl 0.005 unresolved /mojo_old 0.907 /vllm 1.037 /sdpa 0.670
+flash 4096:16:128 bf16                           new    42035.9 cpp_vec    44173.5 ratio 0.952 ctrl 0.002 win /mojo_old 0.465 /vllm 0.459 /sdpa 0.368
+flash 4096:16:128 fp32                           new    80684.2 cpp_vec    79526.1 ratio 1.015 ctrl 0.005 unresolved /mojo_old 0.673 /vllm 0.963 /sdpa 0.706
+flash 512:32:128 bf16                            new     1624.7 cpp_vec     1606.4 ratio 1.011 ctrl 0.065 unresolved /mojo_old 0.561 /vllm 0.511 /sdpa 0.239
+flash 512:32:128 fp32                            new     2941.2 cpp_vec     2998.4 ratio 0.981 ctrl 0.007 unresolved /mojo_old 0.755 /vllm 0.995 /sdpa 0.430
+flash 1024:8:32 bf16                             new      411.6 cpp_vec      457.9 ratio 0.899 ctrl 0.027 win /mojo_old 0.597 /vllm 0.487 /sdpa 0.270
+flash 1024:8:32 fp32                             new      718.2 cpp_vec      742.1 ratio 0.968 ctrl 0.010 win /mojo_old 0.889 /vllm 0.886 /sdpa 0.525
+paged engine self b=1 ctx=256 bf16               new        3.7 cpp_vec        3.7 ratio 0.995 ctrl 0.004 unresolved /mojo_old 0.611 /vllm 0.561
+paged engine self b=1 ctx=256 fp32               new        6.0 cpp_vec        5.6 ratio 1.068 ctrl 0.129 unresolved /mojo_old 0.729 /vllm 0.877
+paged engine cross b=1 ctx=256 bf16              new        3.7 cpp_vec        3.5 ratio 1.034 ctrl 0.018 loss /mojo_old 0.662 /vllm 0.800
+paged engine cross b=1 ctx=256 fp32              new        5.9 cpp_vec        5.5 ratio 1.073 ctrl 0.140 unresolved /mojo_old 0.770 /vllm 1.239
+paged engine self b=8 ctx=256 bf16               new       20.3 cpp_vec       21.0 ratio 0.966 ctrl 0.022 win /mojo_old 0.781 /vllm 0.581
+paged engine self b=8 ctx=256 fp32               new       39.5 cpp_vec       43.3 ratio 0.912 ctrl 0.004 win /mojo_old 0.756 /vllm 0.756
+paged engine cross b=8 ctx=256 bf16              new       18.6 cpp_vec       20.4 ratio 0.912 ctrl 0.048 win /mojo_old 0.747 /vllm 0.641
+paged engine cross b=8 ctx=256 fp32              new       37.9 cpp_vec       43.1 ratio 0.879 ctrl 0.031 win /mojo_old 0.745 /vllm 0.821
+paged engine self b=8 ctx=1024 bf16              new      346.7 cpp_vec      364.0 ratio 0.952 ctrl 0.087 unresolved /mojo_old 0.863 /vllm 0.723
+paged engine self b=8 ctx=1024 fp32              new     1103.5 cpp_vec     1076.4 ratio 1.025 ctrl 0.009 unresolved /mojo_old 1.009 /vllm 0.888
+paged engine cross b=8 ctx=1024 bf16             new      369.8 cpp_vec      354.5 ratio 1.043 ctrl 0.009 loss /mojo_old 0.946 /vllm 0.907
+paged engine cross b=8 ctx=1024 fp32             new     1064.5 cpp_vec     1039.7 ratio 1.024 ctrl 0.014 unresolved /mojo_old 1.004 /vllm 0.886
+paged engine self b=32 ctx=1024 bf16             new     2457.1 cpp_vec     2842.8 ratio 0.864 ctrl 0.013 win /mojo_old 0.953 /vllm 0.848
+paged engine self b=32 ctx=1024 fp32             new     4705.2 cpp_vec     4758.0 ratio 0.989 ctrl 0.007 unresolved /mojo_old 0.970 /vllm 0.980
+paged engine cross b=32 ctx=1024 bf16            new     2382.5 cpp_vec     2469.4 ratio 0.965 ctrl 0.015 win /mojo_old 0.981 /vllm 0.830
+paged engine cross b=32 ctx=1024 fp32            new     4618.8 cpp_vec     4536.7 ratio 1.018 ctrl 0.002 unresolved /mojo_old 0.965 /vllm 1.007
+paged engine self b=1 ctx=4096 bf16              new       48.7 cpp_vec       53.1 ratio 0.919 ctrl 0.222 unresolved /mojo_old 0.761 /vllm 0.629
+paged engine self b=1 ctx=4096 fp32              new      300.9 cpp_vec      300.8 ratio 1.000 ctrl 0.002 unresolved /mojo_old 0.938 /vllm 0.889
+paged engine cross b=1 ctx=4096 bf16             new       44.4 cpp_vec       53.5 ratio 0.830 ctrl 0.060 win /mojo_old 0.730 /vllm 0.582
+paged engine cross b=1 ctx=4096 fp32             new      310.4 cpp_vec      299.1 ratio 1.038 ctrl 0.029 loss /mojo_old 0.983 /vllm 0.918
+flash 17:8:64 bf16                               new        3.9 cpp_vec        6.6 ratio 0.603 ctrl 0.043 win /mojo_old 0.520 /vllm 0.651 /sdpa 0.314
+flash 17:8:64 fp32                               new        4.3 cpp_vec        6.7 ratio 0.639 ctrl 0.042 win /mojo_old 0.543 /vllm 0.739 /sdpa 0.437
+flash 65:8:64 bf16                               new        7.6 cpp_vec       10.4 ratio 0.731 ctrl 0.053 win /mojo_old 0.547 /vllm 0.554 /sdpa 0.208
+flash 65:8:64 fp32                               new       10.6 cpp_vec       12.8 ratio 0.833 ctrl 0.010 win /mojo_old 0.646 /vllm 0.788 /sdpa 0.366
+flash 129:8:64 bf16                              new       27.1 cpp_vec       29.9 ratio 0.906 ctrl 0.002 win /mojo_old 0.581 /vllm 0.699 /sdpa 0.205
+flash 129:8:64 fp32                              new       43.8 cpp_vec       45.4 ratio 0.964 ctrl 0.000 win /mojo_old 0.775 /vllm 1.269 /sdpa 0.432
+flash 257:8:64 bf16                              new       48.2 cpp_vec       53.6 ratio 0.899 ctrl 0.009 win /mojo_old 0.595 /vllm 0.437 /sdpa 0.194
+flash 257:8:64 fp32                              new       84.1 cpp_vec       83.8 ratio 1.004 ctrl 0.000 unresolved /mojo_old 0.830 /vllm 0.848 /sdpa 0.396
+flash 513:8:64 bf16                              new      189.0 cpp_vec      200.6 ratio 0.942 ctrl 0.007 win /mojo_old 0.628 /vllm 0.459 /sdpa 0.212
+flash 513:8:64 fp32                              new      341.9 cpp_vec      337.8 ratio 1.012 ctrl 0.012 unresolved /mojo_old 0.871 /vllm 0.892 /sdpa 0.408
+flash 1025:8:64 bf16                             new      734.3 cpp_vec      814.3 ratio 0.902 ctrl 0.006 win /mojo_old 0.627 /vllm 0.454 /sdpa 0.248
+flash 1025:8:64 fp32                             new     1354.5 cpp_vec     1359.0 ratio 0.997 ctrl 0.004 unresolved /mojo_old 0.894 /vllm 0.882 /sdpa 0.527
+flash 2049:8:64 bf16                             new     2879.6 cpp_vec     3081.1 ratio 0.935 ctrl 0.004 win /mojo_old 0.644 /vllm 0.457 /sdpa 0.326
+flash 2049:8:64 fp32                             new     5178.8 cpp_vec     5343.7 ratio 0.969 ctrl 0.010 win /mojo_old 0.899 /vllm 0.907 /sdpa 0.649
+flash 4097:8:64 bf16                             new    11021.3 cpp_vec    12380.8 ratio 0.890 ctrl 0.015 win /mojo_old 0.623 /vllm 0.458 /sdpa 0.346
+flash 4097:8:64 fp32                             new    20389.9 cpp_vec    21175.7 ratio 0.963 ctrl 0.037 win /mojo_old 0.942 /vllm 0.944 /sdpa 0.698
+flash 129:16:128 bf16                            new       59.5 cpp_vec       62.2 ratio 0.957 ctrl 0.020 win /mojo_old 0.506 /vllm 0.485 /sdpa 0.169
+flash 129:16:128 fp32                            new      111.0 cpp_vec      107.8 ratio 1.030 ctrl 0.037 unresolved /mojo_old 0.802 /vllm 0.889 /sdpa 0.425
+flash 257:16:128 bf16                            new      206.9 cpp_vec      224.2 ratio 0.923 ctrl 0.029 win /mojo_old 0.496 /vllm 0.469 /sdpa 0.170
+flash 257:16:128 fp32                            new      388.7 cpp_vec      392.2 ratio 0.991 ctrl 0.007 unresolved /mojo_old 0.729 /vllm 0.788 /sdpa 0.419
+flash 1025:16:128 bf16                           new     2777.9 cpp_vec     2998.8 ratio 0.926 ctrl 0.011 win /mojo_old 0.500 /vllm 0.452 /sdpa 0.232
+flash 1025:16:128 fp32                           new     5493.6 cpp_vec     5770.4 ratio 0.952 ctrl 0.028 win /mojo_old 0.826 /vllm 1.017 /sdpa 0.557
+flash 2049:16:128 bf16                           new    10355.8 cpp_vec    11068.9 ratio 0.936 ctrl 0.026 win /mojo_old 0.481 /vllm 0.454 /sdpa 0.291
+flash 2049:16:128 fp32                           new    20924.3 cpp_vec    20848.6 ratio 1.004 ctrl 0.022 unresolved /mojo_old 0.892 /vllm 1.043 /sdpa 0.640
+flash 1025:8:32 bf16                             new      436.2 cpp_vec      466.8 ratio 0.934 ctrl 0.015 win /mojo_old 0.606 /vllm 0.496 /sdpa 0.270
+flash 1025:8:32 fp32                             new      715.4 cpp_vec      736.9 ratio 0.971 ctrl 0.008 unresolved /mojo_old 0.856 /vllm 0.892 /sdpa 0.519
+flash 1x129:8:64 bf16                            new        4.6 cpp_vec        6.8 ratio 0.668 ctrl 0.035 win /mojo_old 0.615 /sdpa 0.191
+flash 1x129:8:64 fp32                            new        4.3 cpp_vec        6.3 ratio 0.678 ctrl 0.030 win /mojo_old 0.539 /sdpa 0.398
+flash 17x301:8:64 bf16                           new       11.9 cpp_vec       14.4 ratio 0.820 ctrl 0.004 win /mojo_old 0.710 /sdpa 0.319
+flash 17x301:8:64 fp32                           new       16.3 cpp_vec       18.5 ratio 0.880 ctrl 0.002 win /mojo_old 0.743 /sdpa 0.473
+flash 127x129:8:64 bf16                          new       16.0 cpp_vec       19.4 ratio 0.825 ctrl 0.013 win /mojo_old 0.556 /sdpa 0.175
+flash 127x129:8:64 fp32                          new       26.2 cpp_vec       28.0 ratio 0.936 ctrl 0.011 win /mojo_old 0.765 /sdpa 0.327
+flash 129x127:8:64 bf16                          new       16.2 cpp_vec       20.3 ratio 0.798 ctrl 0.011 win /mojo_old 0.563 /sdpa 0.141
+flash 129x127:8:64 fp32                          new       25.9 cpp_vec       27.1 ratio 0.956 ctrl 0.012 win /mojo_old 0.755 /sdpa 0.296
+flash 257x513:8:64 bf16                          new      130.1 cpp_vec      140.4 ratio 0.926 ctrl 0.002 win /mojo_old 0.627 /sdpa 0.252
+flash 257x513:8:64 fp32                          new      237.3 cpp_vec      233.6 ratio 1.016 ctrl 0.001 unresolved /mojo_old 0.890 /sdpa 0.522
+flash 513x257:8:64 bf16                          new       49.8 cpp_vec       58.5 ratio 0.852 ctrl 0.019 win /mojo_old 0.551 /sdpa 0.109
+flash 513x257:8:64 fp32                          new       91.1 cpp_vec       90.7 ratio 1.004 ctrl 0.005 unresolved /mojo_old 0.816 /sdpa 0.210
+flash 1025x2049:8:64 bf16                        new     2186.3 cpp_vec     2357.0 ratio 0.928 ctrl 0.002 win /mojo_old 0.659 /sdpa 0.269
+flash 1025x2049:8:64 fp32                        new     3900.9 cpp_vec     3954.6 ratio 0.986 ctrl 0.011 unresolved /mojo_old 0.914 /sdpa 0.521
+flash 2049x1025:8:64 bf16                        new      789.2 cpp_vec      817.0 ratio 0.966 ctrl 0.022 win /mojo_old 0.663 /sdpa 0.106
+flash 2049x1025:8:64 fp32                        new     1403.4 cpp_vec     1434.8 ratio 0.978 ctrl 0.002 unresolved /mojo_old 0.830 /sdpa 0.195
+flash 1024:8:64 noncausal bf16                   new     1371.6 cpp_vec     1513.5 ratio 0.906 ctrl 0.008 win /mojo_old 0.668 /vllm 0.447 /sdpa 0.378
+flash 1024:8:64 noncausal fp32                   new     2539.2 cpp_vec     2545.6 ratio 0.997 ctrl 0.037 unresolved /mojo_old 0.926 /vllm 0.837 /sdpa 0.772
+flash 1025:8:64 noncausal bf16                   new     1410.1 cpp_vec     1530.1 ratio 0.922 ctrl 0.003 win /mojo_old 0.644 /vllm 0.447 /sdpa 0.365
+flash 1025:8:64 noncausal fp32                   new     2585.9 cpp_vec     2529.3 ratio 1.022 ctrl 0.015 unresolved /mojo_old 0.920 /vllm 0.885 /sdpa 0.777
+flash 1024:16:128 noncausal bf16                 new     5044.2 cpp_vec     5418.5 ratio 0.931 ctrl 0.000 win /mojo_old 0.501 /vllm 0.413 /sdpa 0.385
+flash 1024:16:128 noncausal fp32                 new    10018.6 cpp_vec     9996.2 ratio 1.002 ctrl 0.009 unresolved /mojo_old 0.858 /vllm 0.904 /sdpa 0.796
+flash 1024:32/8:128 bf16                         new     5164.0 cpp_vec     5471.6 ratio 0.944 ctrl 0.002 win /mojo_old 0.504 /vllm 0.444 /sdpa 0.269
+flash 1024:32/8:128 fp32                         new    10110.3 cpp_vec     9939.9 ratio 1.017 ctrl 0.012 unresolved /mojo_old 0.887 /vllm 0.950 /sdpa 0.557
+flash 1024:16/1:64 bf16                          new     1422.3 cpp_vec     1508.9 ratio 0.943 ctrl 0.015 win /mojo_old 0.636 /vllm 0.452 /sdpa 0.282
+flash 1024:16/1:64 fp32                          new     2596.0 cpp_vec     2559.6 ratio 1.014 ctrl 0.001 unresolved /mojo_old 0.932 /vllm 0.937 /sdpa 0.554
+flash 1024:8:64 fused bf16                       new      733.1 cpp_vec      799.8 ratio 0.917 ctrl 0.012 win /mojo_old 0.650 /vllm 0.457 /sdpa 0.254
+flash 1024:8:64 fused fp32                       new     1354.4 cpp_vec     1341.3 ratio 1.010 ctrl 0.029 unresolved /mojo_old 0.955 /vllm 0.892 /sdpa 0.542
+flash 257:16:128 fused bf16                      new      212.1 cpp_vec      223.1 ratio 0.951 ctrl 0.012 win /mojo_old 0.501 /vllm 0.459 /sdpa 0.177
+flash 257:16:128 fused fp32                      new      405.0 cpp_vec      400.5 ratio 1.011 ctrl 0.048 unresolved /mojo_old 0.787 /vllm 0.702 /sdpa 0.443
+paged engine self b=8 ctx=255 bf16               new       19.4 cpp_vec       22.3 ratio 0.874 ctrl 0.023 win /mojo_old 0.741 /vllm 0.562
+paged engine self b=8 ctx=255 fp32               new       38.9 cpp_vec       43.0 ratio 0.904 ctrl 0.034 win /mojo_old 0.762 /vllm 0.754
+paged engine cross b=8 ctx=255 bf16              new       19.1 cpp_vec       20.7 ratio 0.925 ctrl 0.042 win /mojo_old 0.754 /vllm 0.653
+paged engine cross b=8 ctx=255 fp32              new       39.0 cpp_vec       39.5 ratio 0.989 ctrl 0.035 unresolved /mojo_old 0.838 /vllm 0.870
+paged engine self b=8 ctx=257 bf16               new       20.9 cpp_vec       21.9 ratio 0.952 ctrl 0.025 win /mojo_old 0.719 /vllm 0.526
+paged engine self b=8 ctx=257 fp32               new       41.5 cpp_vec       43.0 ratio 0.966 ctrl 0.100 unresolved /mojo_old 0.756 /vllm 0.634
+paged engine cross b=8 ctx=257 bf16              new       20.2 cpp_vec       22.6 ratio 0.894 ctrl 0.049 win /mojo_old 0.721 /vllm 0.588
+paged engine cross b=8 ctx=257 fp32              new       38.9 cpp_vec       42.8 ratio 0.910 ctrl 0.016 win /mojo_old 0.866 /vllm 0.613
+paged engine self b=8 ctx=1023 bf16              new      386.7 cpp_vec      361.0 ratio 1.071 ctrl 0.024 loss /mojo_old 0.968 /vllm 0.913
+paged engine self b=8 ctx=1023 fp32              new     1072.1 cpp_vec     1072.1 ratio 1.000 ctrl 0.013 unresolved /mojo_old 0.947 /vllm 0.865
+paged engine cross b=8 ctx=1023 bf16             new      353.7 cpp_vec      360.9 ratio 0.980 ctrl 0.062 unresolved /mojo_old 0.911 /vllm 0.853
+paged engine cross b=8 ctx=1023 fp32             new     1057.9 cpp_vec     1039.7 ratio 1.018 ctrl 0.013 unresolved /mojo_old 1.002 /vllm 0.880
+paged engine self b=8 ctx=1025 bf16              new      378.3 cpp_vec      384.0 ratio 0.985 ctrl 0.007 unresolved /mojo_old 0.884 /vllm 0.821
+paged engine self b=8 ctx=1025 fp32              new     1112.0 cpp_vec     1079.4 ratio 1.030 ctrl 0.008 loss /mojo_old 0.970 /vllm 0.871
+paged engine cross b=8 ctx=1025 bf16             new      408.0 cpp_vec      365.9 ratio 1.115 ctrl 0.041 loss /mojo_old 0.946 /vllm 0.875
+paged engine cross b=8 ctx=1025 fp32             new     1056.7 cpp_vec     1040.0 ratio 1.016 ctrl 0.017 unresolved /mojo_old 0.963 /vllm 0.846
+paged engine self b=1 ctx=4097 bf16              new       62.2 cpp_vec       68.8 ratio 0.904 ctrl 0.016 win /mojo_old 0.653 /vllm 0.756
+paged engine self b=1 ctx=4097 fp32              new      321.1 cpp_vec      300.3 ratio 1.069 ctrl 0.026 loss /mojo_old 1.016 /vllm 0.930
+paged engine cross b=1 ctx=4097 bf16             new       59.6 cpp_vec       63.2 ratio 0.943 ctrl 0.036 win /mojo_old 0.682 /vllm 0.745
+paged engine cross b=1 ctx=4097 fp32             new      301.4 cpp_vec      298.0 ratio 1.011 ctrl 0.002 unresolved /mojo_old 0.954 /vllm 0.846
+[F1028 20:41:34.154414566 cpu_attn.cpp:277] Check failed: input.block_size % attn_impl::BlockSizeAlignment == 0 (16 vs. 0). 
+  vllm unavailable for this row: [F1028 20:41:34.154414566 cpu_attn.cpp:277] Check failed: input.block_size % attn_impl::BlockSizeAlignment == 0 (16 vs. 0). 
+
+paged engine self b=8 ctx=1024 page=16 bf16      new      401.6 cpp_vec      386.7 ratio 1.039 ctrl 0.059 unresolved /mojo_old 0.861
+[F1028 20:41:37.112780346 cpu_attn.cpp:277] Check failed: input.block_size % attn_impl::BlockSizeAlignment == 0 (16 vs. 0). 
+  vllm unavailable for this row: [F1028 20:41:37.112780346 cpu_attn.cpp:277] Check failed: input.block_size % attn_impl::BlockSizeAlignment == 0 (16 vs. 0). 
+
+paged engine self b=8 ctx=1024 page=16 fp32      new     1146.9 cpp_vec     1119.5 ratio 1.024 ctrl 0.003 unresolved /mojo_old 1.030
+[F1028 20:41:47.805377510 cpu_attn.cpp:277] Check failed: input.block_size % attn_impl::BlockSizeAlignment == 0 (16 vs. 0). 
+  vllm unavailable for this row: [F1028 20:41:47.805377510 cpu_attn.cpp:277] Check failed: input.block_size % attn_impl::BlockSizeAlignment == 0 (16 vs. 0). 
+
+paged engine self b=8 ctx=1024 page=48 bf16      new      319.7 cpp_vec      327.4 ratio 0.976 ctrl 0.028 unresolved /mojo_old 0.872
+[F1028 20:41:50.267828526 cpu_attn.cpp:277] Check failed: input.block_size % attn_impl::BlockSizeAlignment == 0 (16 vs. 0). 
+  vllm unavailable for this row: [F1028 20:41:50.267828526 cpu_attn.cpp:277] Check failed: input.block_size % attn_impl::BlockSizeAlignment == 0 (16 vs. 0). 
+
+paged engine self b=8 ctx=1024 page=48 fp32      new     1188.2 cpp_vec     1202.1 ratio 0.988 ctrl 0.002 unresolved /mojo_old 0.989
+paged engine self b=8 ctx=1024 page=64 bf16      new      351.1 cpp_vec      325.4 ratio 1.079 ctrl 0.036 loss /mojo_old 0.927 /vllm 0.932
+paged engine self b=8 ctx=1024 page=64 fp32      new     1179.9 cpp_vec     1108.5 ratio 1.064 ctrl 0.050 loss /mojo_old 1.032 /vllm 1.067
+paged engine self b=8 ctx=1024 h=16/4 bf16       new       36.9 cpp_vec       58.0 ratio 0.636 ctrl 0.011 win /mojo_old 0.478 /vllm 0.601
+paged engine self b=8 ctx=1024 h=16/4 fp32       new       67.0 cpp_vec      101.2 ratio 0.663 ctrl 0.020 win /mojo_old 0.349 /vllm 1.013
+paged engine cross b=8 ctx=1024 h=16/4 bf16      new       38.2 cpp_vec       61.6 ratio 0.620 ctrl 0.041 win /mojo_old 0.521 /vllm 0.648
+paged engine cross b=8 ctx=1024 h=16/4 fp32      new       66.8 cpp_vec      145.2 ratio 0.460 ctrl 0.028 win /mojo_old 0.388 /vllm 1.067
+paged engine cross b=8 ctx=1024 h=16/1 bf16      new       34.6 cpp_vec       52.5 ratio 0.659 ctrl 0.004 win /mojo_old 0.507 /vllm 0.347
+paged engine cross b=8 ctx=1024 h=16/1 fp32      new       39.0 cpp_vec       70.0 ratio 0.556 ctrl 0.001 win /mojo_old 0.496 /vllm 0.417
+paged engine self b=8 ctx=het bf16               new      189.9 cpp_vec      196.6 ratio 0.966 ctrl 0.025 win /mojo_old 0.644 /vllm 1.065
+paged engine self b=8 ctx=het fp32               new      770.9 cpp_vec      782.1 ratio 0.986 ctrl 0.016 unresolved /mojo_old 1.062 /vllm 1.514
+paged engine cross b=8 ctx=het bf16              new      186.5 cpp_vec      190.3 ratio 0.980 ctrl 0.008 unresolved /mojo_old 0.638 /vllm 1.026
+paged engine cross b=8 ctx=het fp32              new      751.6 cpp_vec      769.1 ratio 0.977 ctrl 0.038 unresolved /mojo_old 1.088 /vllm 1.497
+paged engine cross b=8 ctx=1024 d=32 bf16        new       47.9 cpp_vec       51.3 ratio 0.935 ctrl 0.342 unresolved /mojo_old 0.543 /vllm 0.608
+paged engine cross b=8 ctx=1024 d=32 fp32        new      329.8 cpp_vec      318.5 ratio 1.036 ctrl 0.017 loss /mojo_old 0.932 /vllm 0.981
+paged engine cross b=8 ctx=1024 d=128 bf16       new      350.0 cpp_vec      345.6 ratio 1.013 ctrl 0.068 unresolved /mojo_old 0.971 /vllm 0.890
+paged engine cross b=8 ctx=1024 d=128 fp32       new     1065.8 cpp_vec     1150.4 ratio 0.926 ctrl 0.017 win /mojo_old 0.913 /vllm 0.880
+paged store store b=32 ctx=1 bf16                new        3.7 cpp_vec        5.1 ratio 0.725 ctrl 0.023 win /mojo_old 0.868
+paged store store b=32 ctx=1 fp32                new        5.3 cpp_scalar        5.4 ratio 0.978 ctrl 0.009 unresolved /mojo_old 0.888
+paged store store b=1 ctx=1024 bf16              new       43.2 cpp_scalar       94.4 ratio 0.458 ctrl 0.015 win /mojo_old 0.770
+paged store store b=1 ctx=1024 fp32              new      105.5 cpp_vec      100.6 ratio 1.048 ctrl 0.054 unresolved /mojo_old 0.980
+paged engine_out self b=1 ctx=256 bf16           new        2.9 cpp_vec        3.4 ratio 0.851 ctrl 0.061 win /mojo_old 0.521 /vllm 0.429
+paged engine_out self b=1 ctx=256 fp32           new        4.1 cpp_vec        5.0 ratio 0.830 ctrl 0.021 win /mojo_old 0.585 /vllm 0.585
+paged engine_out cross b=1 ctx=256 bf16          new        3.0 cpp_vec        3.0 ratio 0.986 ctrl 0.007 unresolved /mojo_old 0.585 /vllm 0.662
+paged engine_out cross b=1 ctx=256 fp32          new        4.1 cpp_vec        4.9 ratio 0.831 ctrl 0.210 unresolved /mojo_old 0.635 /vllm 0.786
+paged engine_out self b=8 ctx=256 bf16           new       18.6 cpp_vec       20.2 ratio 0.918 ctrl 0.039 win /mojo_old 0.753 /vllm 0.539
+paged engine_out self b=8 ctx=256 fp32           new       39.3 cpp_vec       42.7 ratio 0.922 ctrl 0.042 win /mojo_old 0.782 /vllm 0.749
+paged engine_out cross b=8 ctx=256 bf16          new       17.0 cpp_vec       19.8 ratio 0.859 ctrl 0.003 win /mojo_old 0.707 /vllm 0.602
+paged engine_out cross b=8 ctx=256 fp32          new       35.6 cpp_vec       39.2 ratio 0.907 ctrl 0.155 unresolved /mojo_old 0.748 /vllm 0.809
+paged engine_out self b=8 ctx=1024 bf16          new      374.4 cpp_vec      375.2 ratio 0.998 ctrl 0.077 unresolved /mojo_old 0.904 /vllm 0.885
+paged engine_out self b=8 ctx=1024 fp32          new     1084.3 cpp_vec     1069.5 ratio 1.014 ctrl 0.007 unresolved /mojo_old 0.997 /vllm 0.876
+paged engine_out cross b=8 ctx=1024 bf16         new      378.3 cpp_vec      360.5 ratio 1.049 ctrl 0.093 unresolved /mojo_old 0.986 /vllm 0.896
+paged engine_out cross b=8 ctx=1024 fp32         new     1025.1 cpp_vec     1029.2 ratio 0.996 ctrl 0.001 unresolved /mojo_old 0.951 /vllm 0.848
+paged engine_out self b=32 ctx=1024 bf16         new     2349.0 cpp_vec     2801.9 ratio 0.838 ctrl 0.025 win /mojo_old 0.935 /vllm 0.816
+paged engine_out self b=32 ctx=1024 fp32         new     4760.7 cpp_vec     4753.3 ratio 1.002 ctrl 0.001 unresolved /mojo_old 0.908 /vllm 0.997
+paged engine_out cross b=32 ctx=1024 bf16        new     2306.3 cpp_vec     2360.2 ratio 0.977 ctrl 0.008 unresolved /mojo_old 0.968 /vllm 0.835
+paged engine_out cross b=32 ctx=1024 fp32        new     4603.9 cpp_vec     4632.0 ratio 0.994 ctrl 0.000 unresolved /mojo_old 0.969 /vllm 1.003
+paged engine_out self b=1 ctx=4096 bf16          new       59.9 cpp_vec       58.6 ratio 1.022 ctrl 0.001 unresolved /mojo_old 0.699 /vllm 0.766
+paged engine_out self b=1 ctx=4096 fp32          new      352.0 cpp_vec      354.3 ratio 0.994 ctrl 0.155 unresolved /mojo_old 0.925 /vllm 0.989
+paged engine_out cross b=1 ctx=4096 bf16         new       51.3 cpp_vec       70.6 ratio 0.727 ctrl 0.064 win /mojo_old 0.558 /vllm 0.688
+paged engine_out cross b=1 ctx=4096 fp32         new      350.4 cpp_vec      353.3 ratio 0.992 ctrl 0.039 unresolved /mojo_old 0.909 /vllm 1.025
+paged api self b=1 ctx=256 bf16                  new       23.3 cpp_vec       24.2 ratio 0.965 ctrl 0.014 win /mojo_old 0.902
+paged api self b=1 ctx=256 fp32                  new       25.0 cpp_vec       25.0 ratio 1.001 ctrl 0.029 unresolved /mojo_old 0.930
+paged api cross b=1 ctx=256 bf16                 new        7.4 cpp_vec        7.4 ratio 0.995 ctrl 0.039 unresolved /mojo_old 0.777
+paged api cross b=1 ctx=256 fp32                 new        8.9 cpp_vec        9.6 ratio 0.936 ctrl 0.099 unresolved /mojo_old 0.768
+paged api self b=8 ctx=1024 bf16                 new      444.3 cpp_vec      426.7 ratio 1.041 ctrl 0.031 loss /mojo_old 0.963
+paged api self b=8 ctx=1024 fp32                 new     1149.0 cpp_vec     1135.6 ratio 1.012 ctrl 0.012 unresolved /mojo_old 0.960
+paged api cross b=8 ctx=1024 bf16                new      401.6 cpp_vec      388.7 ratio 1.033 ctrl 0.006 loss /mojo_old 0.949
+paged api cross b=8 ctx=1024 fp32                new     1069.8 cpp_vec     1058.0 ratio 1.011 ctrl 0.001 unresolved /mojo_old 0.995
+
+170 rows: 83 win, 75 unresolved, 12 loss, 0 invalid
+  unresolved flash 512:8:64 fp32  ratio 1.009 vs cpp_vec
+  unresolved flash 1024:8:64 fp32  ratio 0.999 vs cpp_vec
+  unresolved flash 2048:8:64 fp32  ratio 0.977 vs cpp_vec
+  unresolved flash 4096:8:64 fp32  ratio 0.992 vs cpp_vec
+  unresolved flash 256:16:128 fp32  ratio 0.995 vs cpp_vec
+  unresolved flash 1024:16:128 fp32  ratio 1.012 vs cpp_vec
+  unresolved flash 2048:16:128 fp32  ratio 1.029 vs cpp_vec
+  unresolved flash 4096:16:128 fp32  ratio 1.015 vs cpp_vec
+  unresolved flash 512:32:128 bf16  ratio 1.011 vs cpp_vec
+  unresolved flash 512:32:128 fp32  ratio 0.981 vs cpp_vec
+  unresolved paged engine self b=1 ctx=256 bf16  ratio 0.995 vs cpp_vec
+  unresolved paged engine self b=1 ctx=256 fp32  ratio 1.068 vs cpp_vec
+  loss       paged engine cross b=1 ctx=256 bf16  ratio 1.034 vs cpp_vec
+  unresolved paged engine cross b=1 ctx=256 fp32  ratio 1.073 vs cpp_vec
+  unresolved paged engine self b=8 ctx=1024 bf16  ratio 0.952 vs cpp_vec
+  unresolved paged engine self b=8 ctx=1024 fp32  ratio 1.025 vs cpp_vec
+  loss       paged engine cross b=8 ctx=1024 bf16  ratio 1.043 vs cpp_vec
+  unresolved paged engine cross b=8 ctx=1024 fp32  ratio 1.024 vs cpp_vec
+  unresolved paged engine self b=32 ctx=1024 fp32  ratio 0.989 vs cpp_vec
+  unresolved paged engine cross b=32 ctx=1024 fp32  ratio 1.018 vs cpp_vec
+  unresolved paged engine self b=1 ctx=4096 bf16  ratio 0.919 vs cpp_vec
+  unresolved paged engine self b=1 ctx=4096 fp32  ratio 1.000 vs cpp_vec
+  loss       paged engine cross b=1 ctx=4096 fp32  ratio 1.038 vs cpp_vec
+  unresolved flash 257:8:64 fp32  ratio 1.004 vs cpp_vec
+  unresolved flash 513:8:64 fp32  ratio 1.012 vs cpp_vec
+  unresolved flash 1025:8:64 fp32  ratio 0.997 vs cpp_vec
+  unresolved flash 129:16:128 fp32  ratio 1.030 vs cpp_vec
+  unresolved flash 257:16:128 fp32  ratio 0.991 vs cpp_vec
+  unresolved flash 2049:16:128 fp32  ratio 1.004 vs cpp_vec
+  unresolved flash 1025:8:32 fp32  ratio 0.971 vs cpp_vec
+  unresolved flash 257x513:8:64 fp32  ratio 1.016 vs cpp_vec
+  unresolved flash 513x257:8:64 fp32  ratio 1.004 vs cpp_vec
+  unresolved flash 1025x2049:8:64 fp32  ratio 0.986 vs cpp_vec
+  unresolved flash 2049x1025:8:64 fp32  ratio 0.978 vs cpp_vec
+  unresolved flash 1024:8:64 noncausal fp32  ratio 0.997 vs cpp_vec
+  unresolved flash 1025:8:64 noncausal fp32  ratio 1.022 vs cpp_vec
+  unresolved flash 1024:16:128 noncausal fp32  ratio 1.002 vs cpp_vec
+  unresolved flash 1024:32/8:128 fp32  ratio 1.017 vs cpp_vec
+  unresolved flash 1024:16/1:64 fp32  ratio 1.014 vs cpp_vec
+  unresolved flash 1024:8:64 fused fp32  ratio 1.010 vs cpp_vec
+  unresolved flash 257:16:128 fused fp32  ratio 1.011 vs cpp_vec
+  unresolved paged engine cross b=8 ctx=255 fp32  ratio 0.989 vs cpp_vec
+  unresolved paged engine self b=8 ctx=257 fp32  ratio 0.966 vs cpp_vec
+  loss       paged engine self b=8 ctx=1023 bf16  ratio 1.071 vs cpp_vec
+  unresolved paged engine self b=8 ctx=1023 fp32  ratio 1.000 vs cpp_vec
+  unresolved paged engine cross b=8 ctx=1023 bf16  ratio 0.980 vs cpp_vec
+  unresolved paged engine cross b=8 ctx=1023 fp32  ratio 1.018 vs cpp_vec
+  unresolved paged engine self b=8 ctx=1025 bf16  ratio 0.985 vs cpp_vec
+  loss       paged engine self b=8 ctx=1025 fp32  ratio 1.030 vs cpp_vec
+  loss       paged engine cross b=8 ctx=1025 bf16  ratio 1.115 vs cpp_vec
+  unresolved paged engine cross b=8 ctx=1025 fp32  ratio 1.016 vs cpp_vec
+  loss       paged engine self b=1 ctx=4097 fp32  ratio 1.069 vs cpp_vec
+  unresolved paged engine cross b=1 ctx=4097 fp32  ratio 1.011 vs cpp_vec
+  unresolved paged engine self b=8 ctx=1024 page=16 bf16  ratio 1.039 vs cpp_vec
+  unresolved paged engine self b=8 ctx=1024 page=16 fp32  ratio 1.024 vs cpp_vec
+  unresolved paged engine self b=8 ctx=1024 page=48 bf16  ratio 0.976 vs cpp_vec
+  unresolved paged engine self b=8 ctx=1024 page=48 fp32  ratio 0.988 vs cpp_vec
+  loss       paged engine self b=8 ctx=1024 page=64 bf16  ratio 1.079 vs cpp_vec
+  loss       paged engine self b=8 ctx=1024 page=64 fp32  ratio 1.064 vs cpp_vec
+  unresolved paged engine self b=8 ctx=het fp32  ratio 0.986 vs cpp_vec
+  unresolved paged engine cross b=8 ctx=het bf16  ratio 0.980 vs cpp_vec
+  unresolved paged engine cross b=8 ctx=het fp32  ratio 0.977 vs cpp_vec
+  unresolved paged engine cross b=8 ctx=1024 d=32 bf16  ratio 0.935 vs cpp_vec
+  loss       paged engine cross b=8 ctx=1024 d=32 fp32  ratio 1.036 vs cpp_vec
+  unresolved paged engine cross b=8 ctx=1024 d=128 bf16  ratio 1.013 vs cpp_vec
+  unresolved paged store store b=32 ctx=1 fp32  ratio 0.978 vs cpp_scalar
+  unresolved paged store store b=1 ctx=1024 fp32  ratio 1.048 vs cpp_vec
+  unresolved paged engine_out cross b=1 ctx=256 bf16  ratio 0.986 vs cpp_vec
+  unresolved paged engine_out cross b=1 ctx=256 fp32  ratio 0.831 vs cpp_vec
+  unresolved paged engine_out cross b=8 ctx=256 fp32  ratio 0.907 vs cpp_vec
+  unresolved paged engine_out self b=8 ctx=1024 bf16  ratio 0.998 vs cpp_vec
+  unresolved paged engine_out self b=8 ctx=1024 fp32  ratio 1.014 vs cpp_vec
+  unresolved paged engine_out cross b=8 ctx=1024 bf16  ratio 1.049 vs cpp_vec
+  unresolved paged engine_out cross b=8 ctx=1024 fp32  ratio 0.996 vs cpp_vec
+  unresolved paged engine_out self b=32 ctx=1024 fp32  ratio 1.002 vs cpp_vec
+  unresolved paged engine_out cross b=32 ctx=1024 bf16  ratio 0.977 vs cpp_vec
+  unresolved paged engine_out cross b=32 ctx=1024 fp32  ratio 0.994 vs cpp_vec
+  unresolved paged engine_out self b=1 ctx=4096 bf16  ratio 1.022 vs cpp_vec
+  unresolved paged engine_out self b=1 ctx=4096 fp32  ratio 0.994 vs cpp_vec
+  unresolved paged engine_out cross b=1 ctx=4096 fp32  ratio 0.992 vs cpp_vec
+  unresolved paged api self b=1 ctx=256 fp32  ratio 1.001 vs cpp_vec
+  unresolved paged api cross b=1 ctx=256 bf16  ratio 0.995 vs cpp_vec
+  unresolved paged api cross b=1 ctx=256 fp32  ratio 0.936 vs cpp_vec
+  loss       paged api self b=8 ctx=1024 bf16  ratio 1.041 vs cpp_vec
+  unresolved paged api self b=8 ctx=1024 fp32  ratio 1.012 vs cpp_vec
+  loss       paged api cross b=8 ctx=1024 bf16  ratio 1.033 vs cpp_vec
+  unresolved paged api cross b=8 ctx=1024 fp32  ratio 1.011 vs cpp_vec
+pin_governor: restored 32 settings
