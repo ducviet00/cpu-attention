@@ -795,12 +795,13 @@ def _flash_plan(geom, k, causal):
     dt = _DTYPE_CODES[dtype]
     # The policy id: 1 = AMX (bf16, or fp32 as hi/lo unless switched off), else
     # the vector policy. Part of the key because the toggles flip between calls.
-    isa = 1 if amx_available() and (dt == 1 or _AMX_FP32_ENV) else 0
+    isa = (2 if module().tier() == "aarch64-bf16" else
+           1 if amx_available() and (dt == 1 or _AMX_FP32_ENV) else 0)
     key = (geom, k.shape, causal, _OVERRIDE, torch.get_num_threads(),
            _llc_bytes(), isa)
     plan = plans.get(key)
     if plan is None:
-        if isa:
+        if isa == 1:
             # Two 32-row AMX register tiles per work item: K/V tiles are loaded
             # once per 64 rows.
             rq = 64

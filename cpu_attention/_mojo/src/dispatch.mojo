@@ -6,11 +6,13 @@ Every policy compiled into this tier is listed here; `isa` comes from the plan
 
 from flash_attn import FlashJob, FlashPolicy, aux_bytes, flash_drive
 from flash_amx import AmxPolicy
+from flash_neon import NeonF32Policy, NeonMmlaPolicy
 from flash_vec import VecPolicy
-from isa import AMX_TIER
+from isa import AMX_TIER, NEON_BF16
 
 comptime ISA_VEC = 0
 comptime ISA_AMX = 1
+comptime ISA_NEON_MMLA = 2
 
 
 def _policy[dtype: DType, hd: Int](job: FlashJob, isa: Int) raises:
@@ -19,6 +21,14 @@ def _policy[dtype: DType, hd: Int](job: FlashJob, isa: Int) raises:
     elif isa == ISA_AMX:
         comptime if AMX_TIER:
             flash_drive[AmxPolicy[dtype, hd]](job)
+        else:
+            raise Error("cpu_attention: ISA policy not in this build")
+    elif isa == ISA_NEON_MMLA:
+        comptime if NEON_BF16:
+            comptime if dtype == DType.bfloat16:
+                flash_drive[NeonMmlaPolicy[hd]](job)
+            else:
+                flash_drive[NeonF32Policy[hd]](job)
         else:
             raise Error("cpu_attention: ISA policy not in this build")
     else:
@@ -55,6 +65,12 @@ def _sizes_isa[dtype: DType, hd: Int](seq_k: Int, rq: Int, isa: Int) raises -> T
     if isa == ISA_AMX:
         comptime if AMX_TIER:
             return _sizes[AmxPolicy[dtype, hd]](seq_k, rq)
+    if isa == ISA_NEON_MMLA:
+        comptime if NEON_BF16:
+            comptime if dtype == DType.bfloat16:
+                return _sizes[NeonMmlaPolicy[hd]](seq_k, rq)
+            else:
+                return _sizes[NeonF32Policy[hd]](seq_k, rq)
     raise Error("cpu_attention: ISA policy not in this build")
 
 
