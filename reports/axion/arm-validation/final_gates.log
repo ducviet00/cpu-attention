@@ -1,0 +1,7 @@
+standalone exit=0
+lower test_dense exit=0
+lower test_flash_api exit=0
+lower fuzz_dense exit=0
+lower test_paged_sweep exit=0
+lower test_regressions exit=0
+cpp scalar regressions exit=0

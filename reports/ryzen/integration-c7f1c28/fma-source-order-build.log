@@ -1,0 +1,5 @@
+/home/ducviet00/cpu-attention/.venv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
++ /home/ducviet00/cpu-attention/.venv/bin/mojo build /home/ducviet00/cpu-attention/cpu_attention/_mojo/src/_C.mojo --emit shared-lib --target-cpu x86-64-v4 --target-features +avx512bf16,+avx512vnni -o /home/ducviet00/cpu-attention/cpu_attention/_C_x86-avx512bf16.so -Xlinker -l:libgomp.so.1 -Xlinker -L/home/ducviet00/cpu-attention/.venv/lib/python3.12/site-packages/torch/lib
+built /home/ducviet00/cpu-attention/cpu_attention/_C_x86-avx512bf16.so
+/home/ducviet00/cpu-attention/cpu_attention/_C.so = _C_x86-avx512bf16.so

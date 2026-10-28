@@ -1,0 +1,7 @@
+/home/ducviet00/agent-arm/.venv/lib/python3.14/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
++ /home/ducviet00/agent-arm/.venv/bin/mojo build /home/ducviet00/arm-validation-afbea06/cpu_attention/_mojo/src/_C.mojo --emit shared-lib --target-cpu neoverse-n1 --target-features +bf16,+i8mm -o /home/ducviet00/arm-validation-afbea06/cpu_attention/_C_aarch64-bf16.so -Xlinker -l:libgomp.so.1 -Xlinker -L/home/ducviet00/agent-arm/.venv/lib/python3.14/site-packages/torch/lib
++ /home/ducviet00/agent-arm/.venv/bin/mojo build /home/ducviet00/arm-validation-afbea06/cpu_attention/_mojo/src/_C.mojo --emit shared-lib --target-cpu generic -o /home/ducviet00/arm-validation-afbea06/cpu_attention/_C_aarch64-neon.so -Xlinker -l:libgomp.so.1 -Xlinker -L/home/ducviet00/agent-arm/.venv/lib/python3.14/site-packages/torch/lib
+built /home/ducviet00/arm-validation-afbea06/cpu_attention/_C_aarch64-bf16.so
+built /home/ducviet00/arm-validation-afbea06/cpu_attention/_C_aarch64-neon.so
+/home/ducviet00/arm-validation-afbea06/cpu_attention/_C.so = _C_aarch64-bf16.so

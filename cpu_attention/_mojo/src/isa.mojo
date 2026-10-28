@@ -55,11 +55,23 @@ comptime LOG2E = 1.4426950408889634
 
 
 @always_inline
+def vmax[w: Int](a: SIMD[DType.float32, w], b: SIMD[DType.float32, w]) -> SIMD[DType.float32, w]:
+    """Fast lane-wise maximum (one `vmaxps` on x86, one `fmaxnm` on aarch64);
+    `max()` on SIMD floats is NaN-propagating and emits compare + select on x86."""
+    comptime if CompilationTarget.has_neon() and w == 4:
+        return llvm_intrinsic[
+            "llvm.maxnum.v4f32", SIMD[DType.float32, w], has_side_effect=False
+        ](a, b)
+    else:
+        return a.gt(b).select(a, b)
+
+
+@always_inline
 def exp2[
     degree: Int, width: Int
 ](x: SIMD[DType.float32, width]) -> SIMD[DType.float32, width]:
     """`2^x` for `x <= 0`: round to nearest, a polynomial on the fraction, the
-    integer part inserted into the exponent. About 10 instructions against
+    integer part inserted into the exponent. About 9-10 instructions against
     `std.math.exp`'s ~22 (docs/Mojo.md §7). Inputs below -127 clamp, so a masked
     lane (-inf) yields exactly 0 rather than NaN.
 
@@ -67,9 +79,20 @@ def exp2[
     (relative 2e-3), 5 is a minimax at 3e-6, 6 (Taylor) at 1.2e-7 -- the paged
     fp32 gate (1e-6 absolute) needs 6.
     """
-    comptime MAGIC = 12582912.0  # 1.5 * 2^23: adding it rounds to nearest
-    var xc = max(x, SIMD[DType.float32, width](-127.0))
-    var n = (xc + MAGIC) - MAGIC
+    var xc = vmax(x, SIMD[DType.float32, width](-127.0))
+    var n: SIMD[DType.float32, width]
+    comptime if X86_BF16 and width == 16:
+        var x16 = rebind[SIMD[DType.float32, 16]](xc)
+        n = rebind[SIMD[DType.float32, width]](
+            llvm_intrinsic[
+                "llvm.x86.avx512.mask.rndscale.ps.512",
+                SIMD[DType.float32, 16],
+                has_side_effect=False,
+            ](x16, Int32(8), x16, Int16(-1), Int32(4))
+        )
+    else:
+        comptime MAGIC = 12582912.0  # 1.5 * 2^23: adding it rounds to nearest
+        n = (xc + MAGIC) - MAGIC
     var r = xc - n
     var p: SIMD[DType.float32, width]
     comptime if degree <= 2:

@@ -102,6 +102,44 @@ def flash_attn_with_kvcache(
       cost a few microseconds per call, which at 24 calls per decode step is
       measurable end to end.
     """
+    if (
+        _kernel._BACKEND == "mojo"
+        and qv is None
+        and rotary_cos is None
+        and rotary_sin is None
+        and cache_leftpad is None
+        and cu_seqlens_q is None
+        and cu_seqlens_k_new is None
+        and max_seqlen_q is None
+        and rotary_seqlens is None
+        and q_descale is None
+        and k_descale is None
+        and v_descale is None
+        and cache_batch_idx is None
+        and window_size == (-1, -1)
+        and not softcap
+        and not attention_chunk
+        and not return_softmax_lse
+        and (page_table is None) != (block_table is None)
+    ):
+        table = getattr(_kernel._KV_TABLE, "t", None)
+        if table is not None and _kernel._KV_TABLE.gen == _kernel._KV_GEN[0]:
+            pt = page_table if page_table is not None else block_table
+            out = torch.empty_like(q)
+            if _kernel._entry("kv_fast")(
+                _kernel._KV_TABLE.addr,
+                q,
+                k,
+                v,
+                k_cache,
+                v_cache,
+                slot_mapping,
+                pt,
+                cache_seqlens,
+                softmax_scale,
+                out,
+            ):
+                return out
     if check_inputs:
         if (
             qv is not None
@@ -207,8 +245,12 @@ def flash_attn_with_kvcache(
     if k is not None:
         if slot_mapping is None:
             before = _lens_tensor(cache_seqlens, batch, q.device)
-            slots = _append_slots(page_table, before, block_size)
-            lens = before + 1
+            if _kernel._BACKEND == "mojo":
+                slots = None
+                lens = before
+            else:
+                slots = _append_slots(page_table, before, block_size)
+                lens = before + 1
         else:
             slots = slot_mapping
             lens = _lens_tensor(cache_seqlens, batch, q.device)

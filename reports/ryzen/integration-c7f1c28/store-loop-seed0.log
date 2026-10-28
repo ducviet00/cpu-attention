@@ -1,0 +1,106 @@
+pin_governor: pinned 32 settings to performance
+/home/ducviet00/cpu-attention/.venv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+{
+ "git": "c7f1c28cb787ffd5aaf96be6ded9a35f7e003c6d",
+ "mojo": "Could not find platform dependent libraries <exec_prefix>\nTraceback (most recent call last):\n  File \"/home/ducviet00/cpu-attention/.venv/bin/mojo\", line 4, in <module>\n    from mojo._entrypoints import exec_mojo\nModuleNotFoundError: No module named 'mojo'",
+ "torch": "2.14.1+cpu",
+ "threads": 8,
+ "governor": "performance",
+ "arms": {
+  "mojo_previous": {
+   "backend": "mojo",
+   "env": {},
+   "origin": "/tmp/opencode/unified-start/previous",
+   "lib": "/tmp/ca_arms_1arlpg1u/mojo_previous/ca_mojo_previous/_C_x86-avx512bf16.so",
+   "sha256": {
+    "_C.so": "dfea400ebadab35414d040f23417be0e39f38d1197d10727357bdf0017784804",
+    "_C_cpp.so": "5a3d980415fba82201ca92b09e806d8a07cf31e78494d80a9f933ff1ee28d063",
+    "_C_x86-64.so": "fca634ff7af3d0f185b1a1f7f23529d03da034cb9476bebf817c9af434acb73e",
+    "_C_x86-avx2.so": "8c2e9e63169a298d5c5dbed05354f87abdf9a5fff12a0bc0af48e3e4153404be",
+    "_C_x86-avx512bf16.so": "dfea400ebadab35414d040f23417be0e39f38d1197d10727357bdf0017784804",
+    "__init__.py": "2fb4c23f2fa3eda87080ec0e52e78280d205259ce3403c6a0c81292078902a59",
+    "_kernel.py": "294613311bed49224b69d97dcb3546d6b1ebe7b02910cf07ba23506301789f50",
+    "flash_attn_interface.py": "3505701c2159faea531a5c6d5f5814f28c8baf032c66ac08a20240d0864dcdc7",
+    "ops.py": "852e832d01de801055d345dd679d04d06f2d86638b6852ebc6b81a88b8513799"
+   },
+   "tier": "x86-avx512bf16"
+  },
+  "mojo_ctrl": {
+   "backend": "mojo",
+   "env": {},
+   "origin": "/tmp/opencode/unified-start/previous",
+   "lib": "/tmp/ca_arms_1arlpg1u/mojo_ctrl/ca_mojo_ctrl/_C_x86-avx512bf16.so",
+   "sha256": {
+    "_C.so": "dfea400ebadab35414d040f23417be0e39f38d1197d10727357bdf0017784804",
+    "_C_cpp.so": "5a3d980415fba82201ca92b09e806d8a07cf31e78494d80a9f933ff1ee28d063",
+    "_C_x86-64.so": "fca634ff7af3d0f185b1a1f7f23529d03da034cb9476bebf817c9af434acb73e",
+    "_C_x86-avx2.so": "8c2e9e63169a298d5c5dbed05354f87abdf9a5fff12a0bc0af48e3e4153404be",
+    "_C_x86-avx512bf16.so": "dfea400ebadab35414d040f23417be0e39f38d1197d10727357bdf0017784804",
+    "__init__.py": "2fb4c23f2fa3eda87080ec0e52e78280d205259ce3403c6a0c81292078902a59",
+    "_kernel.py": "294613311bed49224b69d97dcb3546d6b1ebe7b02910cf07ba23506301789f50",
+    "flash_attn_interface.py": "3505701c2159faea531a5c6d5f5814f28c8baf032c66ac08a20240d0864dcdc7",
+    "ops.py": "852e832d01de801055d345dd679d04d06f2d86638b6852ebc6b81a88b8513799"
+   },
+   "tier": "x86-avx512bf16"
+  },
+  "mojo_new": {
+   "backend": "mojo",
+   "env": {},
+   "origin": "c7f1c28+dirty",
+   "lib": "/tmp/ca_arms_1arlpg1u/mojo_new/ca_mojo_new/_C_x86-avx512bf16.so",
+   "sha256": {
+    "_C.so": "0236ee4ed8037b9207e304b97984c1ebbb675b2451e6aa5b67b822f0d728a774",
+    "_C_cpp.so": "5a3d980415fba82201ca92b09e806d8a07cf31e78494d80a9f933ff1ee28d063",
+    "_C_x86-64.so": "cf25b42ed5255e5353f31e7837deab5ccfa80cd288797d655441ede37bb5f213",
+    "_C_x86-avx2.so": "a0ab18a67c4b9337fc8c4fb55cd96324dbb82cc3148887739a40fcab9d864edf",
+    "_C_x86-avx512bf16.so": "0236ee4ed8037b9207e304b97984c1ebbb675b2451e6aa5b67b822f0d728a774",
+    "__init__.py": "2fb4c23f2fa3eda87080ec0e52e78280d205259ce3403c6a0c81292078902a59",
+    "_kernel.py": "294613311bed49224b69d97dcb3546d6b1ebe7b02910cf07ba23506301789f50",
+    "flash_attn_interface.py": "3505701c2159faea531a5c6d5f5814f28c8baf032c66ac08a20240d0864dcdc7",
+    "ops.py": "852e832d01de801055d345dd679d04d06f2d86638b6852ebc6b81a88b8513799"
+   },
+   "tier": "x86-avx512bf16"
+  },
+  "cpp_scalar": {
+   "backend": "cpp",
+   "env": {
+    "CPU_ATTENTION_ISA": "scalar"
+   },
+   "origin": "mojo-oracle-v1.1",
+   "lib": "/tmp/ca_arms_1arlpg1u/cpp_scalar/ca_cpp_scalar/_C_cpp.so",
+   "sha256": {
+    "_C_cpp.so": "5a3d980415fba82201ca92b09e806d8a07cf31e78494d80a9f933ff1ee28d063",
+    "__init__.py": "2fb4c23f2fa3eda87080ec0e52e78280d205259ce3403c6a0c81292078902a59",
+    "_kernel.py": "733c10255b1c88e223287eac06d5288f405b13251a1ff8b86889c2f9706b2a1b",
+    "flash_attn_interface.py": "b7116437cfc5cd6321b04cda19afa12a8bc0d4b6433073d73b7870488076b02b",
+    "ops.py": "7f73f3bbf948e119f21da5753fc4f547c2710228304e8e6a655555b726ec90c0"
+   },
+   "isa": "scalar"
+  },
+  "cpp_vec": {
+   "backend": "cpp",
+   "env": {
+    "CPU_ATTENTION_ISA": "vec"
+   },
+   "origin": "mojo-oracle-v1.1",
+   "lib": "/tmp/ca_arms_1arlpg1u/cpp_vec/ca_cpp_vec/_C_cpp.so",
+   "sha256": {
+    "_C_cpp.so": "5a3d980415fba82201ca92b09e806d8a07cf31e78494d80a9f933ff1ee28d063",
+    "__init__.py": "2fb4c23f2fa3eda87080ec0e52e78280d205259ce3403c6a0c81292078902a59",
+    "_kernel.py": "733c10255b1c88e223287eac06d5288f405b13251a1ff8b86889c2f9706b2a1b",
+    "flash_attn_interface.py": "b7116437cfc5cd6321b04cda19afa12a8bc0d4b6433073d73b7870488076b02b",
+    "ops.py": "7f73f3bbf948e119f21da5753fc4f547c2710228304e8e6a655555b726ec90c0"
+   },
+   "isa": "vec"
+  }
+ }
+}
+paged store store b=32 ctx=1 bf16                new        3.5 cpp_vec        5.2 ratio 0.685 ctrl 0.022 win
+paged store store b=32 ctx=1 fp32                new        5.1 cpp_vec        5.4 ratio 0.955 ctrl 0.041 win
+paged store store b=1 ctx=1024 bf16              new       45.7 cpp_scalar       93.3 ratio 0.490 ctrl 0.067 win
+paged store store b=1 ctx=1024 fp32              new      115.7 cpp_vec      114.5 ratio 1.010 ctrl 0.128 unresolved
+
+4 rows: 3 win, 1 unresolved, 0 loss, 0 invalid
+  unresolved paged store store b=1 ctx=1024 fp32  ratio 1.010 vs cpp_vec
+pin_governor: restored 32 settings

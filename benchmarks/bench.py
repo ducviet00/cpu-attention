@@ -29,9 +29,12 @@ Rules (docs/CPP.md §7):
 """
 
 import argparse
+import glob
+import hashlib
 import json
 import os
 import platform
+import random
 import subprocess
 import sys
 import time
@@ -56,31 +59,45 @@ ARM64 = platform.machine() in ("aarch64", "arm64")
 # ---------------------------------------------------------------------------
 def _sh(*cmd):
     try:
-        return subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=20).stdout.strip()
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        return (result.stdout or result.stderr).strip()
     except Exception as e:  # noqa: BLE001
         return f"error: {e}"
 
 
-def environment(arms_):
+def environment(arms_, compiler):
     gov = "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
-    mojo = os.path.join(os.path.dirname(sys.executable), "mojo")
     return {
         "date": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "git": _sh("git", "-C", _ROOT, "rev-parse", "HEAD"),
         "git_status": _sh("git", "-C", _ROOT, "status", "--porcelain",
-                          "cpu_attention"),
-        "mojo": _sh(mojo, "--version") if os.path.exists(mojo) else "?",
+                           "cpu_attention"),
+        "source_sha256": source_hashes(),
+        "mojo": compiler,
         "torch": torch.__version__, "python": sys.version.split()[0],
+        "torch_parallel": torch.__config__.parallel_info(),
         "gcc": _sh("gcc", "--version").split("\n")[0],
         "lscpu": _sh("lscpu"), "uname": _sh("uname", "-a"),
         "governor": open(gov).read().strip() if os.path.exists(gov) else None,
         "affinity": sorted(os.sched_getaffinity(0)),
         "threads": torch.get_num_threads(),
         "env": {k: v for k, v in os.environ.items()
-                if k.startswith(("CPU_ATTENTION", "OMP", "KMP", "VLLM"))},
+                 if k.startswith(("CPU_ATTENTION", "OMP", "GOMP", "KMP", "MKL", "VLLM"))},
         "arms": {a.name: a.describe() for a in arms_},
     }
+
+
+def source_hashes():
+    paths = ["pyproject.toml", "uv.lock", "scripts/build.py", "scripts/build_cpp.py",
+             "benchmarks/bench.py", "benchmarks/arms.py", "benchmarks/manifest.py"]
+    paths += [os.path.relpath(p, _ROOT) for pattern in
+              ("cpu_attention/_mojo/src/*.mojo", "cpu_attention/csrc/*")
+              for p in glob.glob(os.path.join(_ROOT, pattern)) if os.path.isfile(p)]
+    result = {}
+    for path in sorted(paths):
+        with open(os.path.join(_ROOT, path), "rb") as f:
+            result[path] = hashlib.sha256(f.read()).hexdigest()
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +127,12 @@ def time_arms(fns, envs, rounds, calls, warmup=2):
 def stats(xs):
     s = sorted(xs)
     return {"min": s[0], "median": s[len(s) // 2], "n": len(s)}
+
+
+def screen_cpp(screen, valid, factor):
+    best = min((min(xs) for n, xs in screen.items() if valid[n][1]),
+               default=float("inf"))
+    return {n: xs for n, xs in screen.items() if min(xs) > factor * best}
 
 
 # ---------------------------------------------------------------------------
@@ -231,11 +254,20 @@ def paged_row(r, arms_, vllm, args, page):
     kflat, vflat = torch.cat(x["kall"]), torch.cat(x["vall"])
     out, fns, caches = {}, {}, {}
     entry, op = r["entry"], r["op"]
+    stage_k, stage_v = kflat, vflat
+    if op == "self":
+        stage_k, stage_v = kflat.clone(), vflat.clone()
+        last = lens.long().cumsum(0) - 1
+        stage_k[last] = float("nan")
+        stage_v[last] = float("nan")
     for a in arms_:
         kc = torch.zeros(x["shape"], dtype=dtype)
         vc = torch.zeros_like(kc)
         a.enter()
-        a.pkg.reshape_and_cache(kflat, vflat, kc, vc, x["allslots"])
+        a.pkg.reshape_and_cache(stage_k, stage_v, kc, vc, x["allslots"])
+        if entry == "store":
+            kc.fill_(float("nan"))
+            vc.fill_(float("nan"))
         caches[a.name] = (kc, vc)
         o = torch.empty_like(q)
         p = a.pkg
@@ -281,14 +313,27 @@ def paged_row(r, arms_, vllm, args, page):
                        scale=scale, lens=lens)
     peer = {}
 
-    def result(name):
-        if entry != "store":
-            return out[name].float()
-        # A store is validated by attending over what it wrote.
+    def store_check(name):
         arm = next(a for a in arms_ if a.name == name)
-        arm.enter()
         kc, vc = caches[name]
-        return arm.pkg.cross_attention(q, kc, vc, bt, lens, scale).float()
+        slot = x["allslots"].view(-1, 1, 1)
+        head = torch.arange(r["hkv"]).view(1, -1, 1)
+        dim = torch.arange(r["d"]).view(1, 1, -1)
+        base = ((slot // page) * r["hkv"] + head) * page * r["d"]
+        off = slot % page
+        ko = ((dim // 2 * page + off) * 2 + dim % 2
+              if r["dtype"] == "bf16" else dim * page + off)
+        paired_v = (ARM64 and r["dtype"] == "bf16" and not
+                    (arm.backend == "cpp" and arm.env.get("CPU_ATTENTION_ISA") == "scalar"))
+        vo = ((off // 2 * r["d"] + dim) * 2 + off % 2
+              if paired_v else off * r["d"] + dim)
+        ek = (kc.flatten()[base + ko].float() - kflat.float()).abs().max().item()
+        ev = (vc.flatten()[base + vo].float() - vflat.float()).abs().max().item()
+        error = max(ek, ev)
+        return error, ek == 0 and ev == 0
+
+    def result(name):
+        return out[name].float()
 
     def check(name):
         got = result(name)
@@ -313,8 +358,20 @@ def paged_row(r, arms_, vllm, args, page):
         return err, ok
 
     def check_all(names):
+        if entry == "store":
+            return {n: store_check(n) for n in names}
         if r["dtype"] == "bf16":
-            peer["ref"] = result(args.ref_arm)
+            candidates = [args.ref_arm] + [a.name for a in arms_
+                                          if a.name.startswith("cpp_") and a.name != args.ref_arm]
+            peer["ref"] = ref.bfloat16().float()
+            check_all.peer = "rounded_reference_no_valid_cpp_peer"
+            for n in candidates:
+                value = result(n)
+                error = (value - ref).abs().max().item()
+                if error <= 3e-2 and (not ARM64 or R.bf16_excess(value, ref) <= 1e-3):
+                    peer["ref"] = value
+                    check_all.peer = n
+                    break
         return {n: check(n) for n in names}
     rounds = args.paged_rounds
     return fns, check_all, rounds, args.block_calls
@@ -346,24 +403,30 @@ def vllm_paged(vl, r, x, q, kn, vn, scale, op, out):
 
 # ---------------------------------------------------------------------------
 def build_arms(args):
-    arms_ = []
+    factories = []
     want = args.arms.split(",")
     if "mojo_new" in want:
-        arms_.append(A.current("mojo_new", "mojo"))
+        factories.append(lambda: A.current("mojo_new", "mojo"))
     if "mojo_ctrl" in want:
-        arms_.append(A.current("mojo_ctrl", "mojo"))
+        if args.previous:
+            factories.append(lambda: A.snapshot("mojo_ctrl", args.previous))
+        else:
+            factories.append(lambda: A.current("mojo_ctrl", "mojo"))
+    if args.previous:
+        factories.append(lambda: A.snapshot("mojo_previous", args.previous))
     if "mojo_old" in want and os.path.exists(args.oracle):
-        arms_.append(A.tagged("mojo_old", args.oracle_tag, "mojo",
-                              {"_C.so": args.oracle}))
+        factories.append(lambda: A.tagged("mojo_old", args.oracle_tag, "mojo",
+                                          {"_C.so": args.oracle}))
     cpp = os.path.join(A.PKG, "_C_cpp.so")
     if "cpp" in want:
         isas = sorted(set(A.cpp_isas("bf16")) | set(A.cpp_isas("fp32")),
                       key=["amx", "vec", "neon", "scalar"].index)
         for isa in isas:
-            arms_.append(A.tagged(f"cpp_{isa}", args.oracle_tag, "cpp",
-                                  {"_C_cpp.so": cpp},
-                                  {"CPU_ATTENTION_ISA": isa}))
-    return arms_
+            factories.append(lambda isa=isa: A.tagged(
+                f"cpp_{isa}", args.oracle_tag, "cpp", {"_C_cpp.so": cpp},
+                {"CPU_ATTENTION_ISA": isa}))
+    random.Random(args.load_seed).shuffle(factories)
+    return [factory() for factory in factories]
 
 
 def main():
@@ -376,6 +439,9 @@ def main():
     ap.add_argument("--oracle", default=os.path.join(
         _ROOT, "cpu_attention", "_mojo", "oracle", "_C_oracle.so"))
     ap.add_argument("--oracle-tag", default="mojo-oracle-v1.1")
+    ap.add_argument("--previous", default="", metavar="PACKAGE_DIR",
+                    help="saved previous package (glue and libraries); load it twice "
+                         "as mojo_previous and mojo_ctrl for build comparisons")
     ap.add_argument("--vllm-bf16", default=os.environ.get("VLLM_REF_BF16", ""),
                     help="vLLM build for bf16 rows (AMX build on AMX boxes)")
     ap.add_argument("--vllm-fp32", default=os.environ.get("VLLM_REF_FP32", ""))
@@ -387,14 +453,19 @@ def main():
     ap.add_argument("--screen-x", type=float, default=2.0)
     ap.add_argument("--page", type=int, default=16 if ARM64 else 32)
     ap.add_argument("--threads", type=int, default=0)
+    ap.add_argument("--load-seed", type=int, default=0,
+                    help="shuffle module load and cache allocation order reproducibly")
     ap.add_argument("--json", default="")
     args = ap.parse_args()
     if args.threads:
         torch.set_num_threads(args.threads)
 
+    mojo = os.path.join(os.path.dirname(sys.executable), "mojo")
+    compiler = _sh(mojo, "--version") if os.path.exists(mojo) else "?"
     arms_ = build_arms(args)
     names = [a.name for a in arms_]
-    cpp_names = [n for n in names if n.startswith("cpp_")]
+    cpp_names = sorted((n for n in names if n.startswith("cpp_")),
+                       key=["cpp_amx", "cpp_vec", "cpp_neon", "cpp_scalar"].index)
     args.ref_arm = cpp_names[0] if cpp_names else names[0]
     vllm = {}
     if "vllm" in args.arms:
@@ -403,7 +474,7 @@ def main():
             mod = R.load_so(path) if path else None
             if mod is not None:
                 vllm[tag] = (mod, getattr(args, f"vllm_isa_{tag}"))
-    env = environment(arms_)
+    env = environment(arms_, compiler)
     env.update(argv=sys.argv, vllm={k: [getattr(args, f"vllm_{k}"), v[1]]
                                     for k, v in vllm.items()})
     print(json.dumps({k: env[k] for k in ("git", "mojo", "torch", "threads",
@@ -433,11 +504,11 @@ def main():
             if len(cpp_names) > 1 else {}
         dropped = {}
         if screen:
-            best = min(min(s) for s in screen.values())
-            for n, s in screen.items():
-                if min(s) > args.screen_x * best:
-                    dropped[n] = s
-                    fns.pop(n)
+            screen_valid = (checks(cpp_names) if checks else
+                            {n: check(n) for n in cpp_names})
+            dropped = screen_cpp(screen, screen_valid, args.screen_x)
+            for n in dropped:
+                fns.pop(n)
         samples = time_arms(fns, envs, rounds, calls)
         st = {n: stats(s) for n, s in samples.items()}
         valid = (checks(list(fns)) if checks else
@@ -448,12 +519,16 @@ def main():
                    median_us={n: s["median"] for n, s in st.items()},
                    samples_us=samples, err={n: v[0] for n, v in valid.items()},
                    valid={n: v[1] for n, v in valid.items()},
-                   screened_out=dropped, loadavg=os.getloadavg())
+                   screened_out=dropped,
+                   screen_valid={n: v[1] for n, v in screen_valid.items()} if screen else {},
+                   bf16_peer=getattr(checks, "peer", None),
+                   loadavg=os.getloadavg())
         line = f"{label:48s}"
         if cpp_valid and "mojo_new" in st:
             base = min(cpp_valid, key=lambda n: st[n]["min"])
             ratio = st["mojo_new"]["min"] / st[base]["min"]
-            spread = (abs(st["mojo_ctrl"]["min"] / st["mojo_new"]["min"] - 1)
+            control_peer = "mojo_previous" if args.previous else "mojo_new"
+            spread = (abs(st["mojo_ctrl"]["min"] / st[control_peer]["min"] - 1)
                       if "mojo_ctrl" in st else 0.0)
             band = max(0.03, spread)
             verdict = ("win" if ratio < 1 - band else
@@ -462,6 +537,8 @@ def main():
                 verdict = "INVALID"
             row.update(baseline=base, ratio=ratio, ctrl_spread=spread,
                        band=band, verdict=verdict)
+            if args.previous:
+                row["new/previous"] = st["mojo_new"]["min"] / st["mojo_previous"]["min"]
             line += (f" new {st['mojo_new']['min']:10.1f} {base} "
                      f"{st[base]['min']:10.1f} ratio {ratio:5.3f} "
                      f"ctrl {spread:5.3f} {verdict}")
@@ -476,8 +553,10 @@ def main():
         results.append(row)
         if args.json:  # rewritten every row: a spot preemption keeps the rest
             os.makedirs(os.path.dirname(os.path.abspath(args.json)), exist_ok=True)
-            with open(args.json, "w") as f:
+            pending = args.json + ".tmp"
+            with open(pending, "w") as f:
                 json.dump({"environment": env, "rows": results}, f)
+            os.replace(pending, args.json)
     summarize(results)
     return 0
 

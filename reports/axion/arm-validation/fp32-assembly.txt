@@ -1,0 +1,9 @@
+f32,hd=128,PAGE=0 6460 6460 same mnemonic sequence True count diff False
+f32,hd=128,PAGE=16 6444 6444 same mnemonic sequence True count diff False
+f32,hd=128,PAGE=32 6440 6440 same mnemonic sequence True count diff False
+f32,hd=32,PAGE=0 3000 3000 same mnemonic sequence True count diff False
+f32,hd=32,PAGE=16 2960 2960 same mnemonic sequence True count diff False
+f32,hd=32,PAGE=32 2960 2960 same mnemonic sequence True count diff False
+f32,hd=64,PAGE=0 4244 4244 same mnemonic sequence True count diff False
+f32,hd=64,PAGE=16 4288 4288 same mnemonic sequence True count diff False
+f32,hd=64,PAGE=32 4288 4288 same mnemonic sequence True count diff False

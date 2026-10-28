@@ -1,0 +1,211 @@
+/home/ducviet00/agent-arm/.venv/lib/python3.14/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+{
+ "git": "afbea06509ab3440c1a329c77c70561fa4c49f2d",
+ "mojo": "Mojo 1.2.0 (2016d0cd)",
+ "torch": "2.14.1+cpu",
+ "threads": 8,
+ "governor": null,
+ "arms": {
+  "mojo_new": {
+   "backend": "mojo",
+   "env": {},
+   "origin": "afbea06+dirty",
+   "lib": "/tmp/ca_arms_b1kkt_a6/mojo_new/ca_mojo_new/_C_aarch64-bf16.so",
+   "sha256": {
+    "_C.so": "8131e6831df337c110c6242a21826125a6dc2d04f24c27da19e5c41633b45c4b",
+    "_C_aarch64-bf16.so": "8131e6831df337c110c6242a21826125a6dc2d04f24c27da19e5c41633b45c4b",
+    "_C_aarch64-neon.so": "aa7eaf4268e89ec9a38433d91cd59a5c8a9ea11693eab4f08d256a77a389db40",
+    "_C_cpp.so": "1af7d0e6ea640fd800d2be1f8a8a40da1db481b3a1ab7ce9f3cdd2b739fac478",
+    "__init__.py": "2fb4c23f2fa3eda87080ec0e52e78280d205259ce3403c6a0c81292078902a59",
+    "_kernel.py": "7fcdc7dd58b372fcf7dd6121e18d366f68ce2ae3821129b10750debd6d46b738",
+    "flash_attn_interface.py": "b7116437cfc5cd6321b04cda19afa12a8bc0d4b6433073d73b7870488076b02b",
+    "ops.py": "852e832d01de801055d345dd679d04d06f2d86638b6852ebc6b81a88b8513799"
+   },
+   "tier": "aarch64-bf16"
+  },
+  "mojo_ctrl": {
+   "backend": "mojo",
+   "env": {},
+   "origin": "/home/ducviet00/arm-validation-afbea06/reports/axion/arm-validation/before",
+   "lib": "/tmp/ca_arms_b1kkt_a6/mojo_ctrl/ca_mojo_ctrl/_C_aarch64-bf16.so",
+   "sha256": {
+    "_C.so": "22e9896940eabf3d97e8dfa6d4a4c65e8371a008ad82213a2f2d4678a2574572",
+    "_C_aarch64-bf16.so": "22e9896940eabf3d97e8dfa6d4a4c65e8371a008ad82213a2f2d4678a2574572",
+    "_C_aarch64-neon.so": "aa7eaf4268e89ec9a38433d91cd59a5c8a9ea11693eab4f08d256a77a389db40",
+    "_C_cpp.so": "1af7d0e6ea640fd800d2be1f8a8a40da1db481b3a1ab7ce9f3cdd2b739fac478",
+    "__init__.py": "2fb4c23f2fa3eda87080ec0e52e78280d205259ce3403c6a0c81292078902a59",
+    "_kernel.py": "aab041372bb54569159906832870cf94fc566e45562cb09feb9e9970a5e0e73c",
+    "flash_attn_interface.py": "b7116437cfc5cd6321b04cda19afa12a8bc0d4b6433073d73b7870488076b02b",
+    "ops.py": "852e832d01de801055d345dd679d04d06f2d86638b6852ebc6b81a88b8513799"
+   },
+   "tier": "aarch64-bf16"
+  },
+  "mojo_previous": {
+   "backend": "mojo",
+   "env": {},
+   "origin": "/home/ducviet00/arm-validation-afbea06/reports/axion/arm-validation/before",
+   "lib": "/tmp/ca_arms_b1kkt_a6/mojo_previous/ca_mojo_previous/_C_aarch64-bf16.so",
+   "sha256": {
+    "_C.so": "22e9896940eabf3d97e8dfa6d4a4c65e8371a008ad82213a2f2d4678a2574572",
+    "_C_aarch64-bf16.so": "22e9896940eabf3d97e8dfa6d4a4c65e8371a008ad82213a2f2d4678a2574572",
+    "_C_aarch64-neon.so": "aa7eaf4268e89ec9a38433d91cd59a5c8a9ea11693eab4f08d256a77a389db40",
+    "_C_cpp.so": "1af7d0e6ea640fd800d2be1f8a8a40da1db481b3a1ab7ce9f3cdd2b739fac478",
+    "__init__.py": "2fb4c23f2fa3eda87080ec0e52e78280d205259ce3403c6a0c81292078902a59",
+    "_kernel.py": "aab041372bb54569159906832870cf94fc566e45562cb09feb9e9970a5e0e73c",
+    "flash_attn_interface.py": "b7116437cfc5cd6321b04cda19afa12a8bc0d4b6433073d73b7870488076b02b",
+    "ops.py": "852e832d01de801055d345dd679d04d06f2d86638b6852ebc6b81a88b8513799"
+   },
+   "tier": "aarch64-bf16"
+  },
+  "mojo_old": {
+   "backend": "mojo",
+   "env": {},
+   "origin": "mojo-oracle-v1.1",
+   "lib": "/tmp/ca_arms_b1kkt_a6/mojo_old/ca_mojo_old/_C.so",
+   "sha256": {
+    "_C.so": "1aaff14b09818d8be5864649d66de1851377cc840035238bcfd864c676d90c31",
+    "__init__.py": "2fb4c23f2fa3eda87080ec0e52e78280d205259ce3403c6a0c81292078902a59",
+    "_kernel.py": "733c10255b1c88e223287eac06d5288f405b13251a1ff8b86889c2f9706b2a1b",
+    "flash_attn_interface.py": "b7116437cfc5cd6321b04cda19afa12a8bc0d4b6433073d73b7870488076b02b",
+    "ops.py": "7f73f3bbf948e119f21da5753fc4f547c2710228304e8e6a655555b726ec90c0"
+   }
+  },
+  "cpp_neon": {
+   "backend": "cpp",
+   "env": {
+    "CPU_ATTENTION_ISA": "neon"
+   },
+   "origin": "mojo-oracle-v1.1",
+   "lib": "/tmp/ca_arms_b1kkt_a6/cpp_neon/ca_cpp_neon/_C_cpp.so",
+   "sha256": {
+    "_C_cpp.so": "1af7d0e6ea640fd800d2be1f8a8a40da1db481b3a1ab7ce9f3cdd2b739fac478",
+    "__init__.py": "2fb4c23f2fa3eda87080ec0e52e78280d205259ce3403c6a0c81292078902a59",
+    "_kernel.py": "733c10255b1c88e223287eac06d5288f405b13251a1ff8b86889c2f9706b2a1b",
+    "flash_attn_interface.py": "b7116437cfc5cd6321b04cda19afa12a8bc0d4b6433073d73b7870488076b02b",
+    "ops.py": "7f73f3bbf948e119f21da5753fc4f547c2710228304e8e6a655555b726ec90c0"
+   },
+   "isa": "neon"
+  },
+  "cpp_scalar": {
+   "backend": "cpp",
+   "env": {
+    "CPU_ATTENTION_ISA": "scalar"
+   },
+   "origin": "mojo-oracle-v1.1",
+   "lib": "/tmp/ca_arms_b1kkt_a6/cpp_scalar/ca_cpp_scalar/_C_cpp.so",
+   "sha256": {
+    "_C_cpp.so": "1af7d0e6ea640fd800d2be1f8a8a40da1db481b3a1ab7ce9f3cdd2b739fac478",
+    "__init__.py": "2fb4c23f2fa3eda87080ec0e52e78280d205259ce3403c6a0c81292078902a59",
+    "_kernel.py": "733c10255b1c88e223287eac06d5288f405b13251a1ff8b86889c2f9706b2a1b",
+    "flash_attn_interface.py": "b7116437cfc5cd6321b04cda19afa12a8bc0d4b6433073d73b7870488076b02b",
+    "ops.py": "7f73f3bbf948e119f21da5753fc4f547c2710228304e8e6a655555b726ec90c0"
+   },
+   "isa": "scalar"
+  }
+ }
+}
+flash 128:8:64 bf16                              new       28.6 cpp_neon       26.5 ratio 1.079 ctrl 0.044 loss /mojo_old 1.075 /vllm 0.960 /sdpa 0.423
+flash 128:8:64 fp32                              new       48.9 cpp_neon       48.3 ratio 1.014 ctrl 0.001 unresolved /mojo_old 0.918 /vllm 0.807 /sdpa 0.285
+flash 512:8:64 bf16                              new      223.8 cpp_neon      227.9 ratio 0.982 ctrl 0.004 unresolved /mojo_old 0.941 /vllm 0.812 /sdpa 0.361
+flash 512:8:64 fp32                              new      547.6 cpp_neon      566.5 ratio 0.967 ctrl 0.006 win /mojo_old 0.938 /vllm 0.836 /sdpa 0.309
+flash 1024:8:64 bf16                             new      812.4 cpp_neon      885.8 ratio 0.917 ctrl 0.002 win /mojo_old 0.908 /vllm 0.810 /sdpa 0.493
+flash 1024:8:64 fp32                             new     2092.9 cpp_neon     2177.3 ratio 0.961 ctrl 0.003 win /mojo_old 0.946 /vllm 0.831 /sdpa 0.456
+flash 2048:8:64 bf16                             new     3108.9 cpp_neon     3374.7 ratio 0.921 ctrl 0.001 win /mojo_old 0.891 /vllm 0.829 /sdpa 0.584
+flash 2048:8:64 fp32                             new     8176.7 cpp_neon     8575.9 ratio 0.953 ctrl 0.000 win /mojo_old 0.939 /vllm 0.847 /sdpa 0.573
+flash 4096:8:64 bf16                             new    12247.0 cpp_neon    13069.6 ratio 0.937 ctrl 0.002 win /mojo_old 0.886 /vllm 0.816 /sdpa 0.633
+flash 4096:8:64 fp32                             new    32831.8 cpp_neon    34314.6 ratio 0.957 ctrl 0.002 win /mojo_old 0.880 /vllm 0.861 /sdpa 0.680
+flash 256:16:128 bf16                            new      210.4 cpp_neon      211.5 ratio 0.995 ctrl 0.001 unresolved /mojo_old 0.951 /vllm 0.837 /sdpa 0.376
+flash 256:16:128 fp32                            new      548.9 cpp_neon      551.2 ratio 0.996 ctrl 0.000 unresolved /mojo_old 0.919 /vllm 0.736 /sdpa 0.411
+flash 1024:16:128 bf16                           new     2682.2 cpp_neon     2893.1 ratio 0.927 ctrl 0.001 win /mojo_old 0.905 /vllm 0.841 /sdpa 0.504
+flash 1024:16:128 fp32                           new     7749.4 cpp_neon     8486.1 ratio 0.913 ctrl 0.002 win /mojo_old 0.897 /vllm 0.741 /sdpa 0.570
+flash 2048:16:128 bf16                           new    10345.7 cpp_neon    11123.8 ratio 0.930 ctrl 0.000 win /mojo_old 0.890 /vllm 0.847 /sdpa 0.588
+flash 2048:16:128 fp32                           new    30948.6 cpp_neon    32194.5 ratio 0.961 ctrl 0.002 win /mojo_old 0.748 /vllm 0.760 /sdpa 0.715
+flash 4096:16:128 bf16                           new    40978.7 cpp_neon    43964.1 ratio 0.932 ctrl 0.002 win /mojo_old 0.877 /vllm 0.848 /sdpa 0.654
+flash 4096:16:128 fp32                           new   123066.6 cpp_neon   126057.9 ratio 0.976 ctrl 0.001 unresolved /mojo_old 0.779 /vllm 0.758 /sdpa 0.821
+flash 512:32:128 bf16                            new     1408.6 cpp_neon     1438.8 ratio 0.979 ctrl 0.005 unresolved /mojo_old 0.905 /vllm 0.836 /sdpa 0.347
+flash 512:32:128 fp32                            new     4026.7 cpp_neon     4106.4 ratio 0.981 ctrl 0.002 unresolved /mojo_old 0.943 /vllm 0.750 /sdpa 0.392
+flash 1024:8:32 bf16                             new      547.2 cpp_neon      579.9 ratio 0.944 ctrl 0.004 win /mojo_old 0.885 /vllm 0.779 /sdpa 0.466
+flash 1024:8:32 fp32                             new     1215.0 cpp_neon     1273.6 ratio 0.954 ctrl 0.003 win /mojo_old 0.940 /vllm 0.835 /sdpa 0.443
+flash 17:8:64 bf16                               new       10.2 cpp_neon       11.1 ratio 0.922 ctrl 0.038 win /mojo_old 1.141 /vllm 1.149 /sdpa 0.501
+flash 17:8:64 fp32                               new       10.5 cpp_neon       12.7 ratio 0.825 ctrl 0.033 win /mojo_old 0.935 /vllm 1.030 /sdpa 0.449
+flash 65:8:64 bf16                               new       16.8 cpp_neon       17.1 ratio 0.982 ctrl 0.012 unresolved /mojo_old 1.059 /vllm 1.112 /sdpa 0.488
+flash 65:8:64 fp32                               new       22.8 cpp_neon       25.0 ratio 0.914 ctrl 0.002 win /mojo_old 0.904 /vllm 0.933 /sdpa 0.441
+flash 129:8:64 bf16                              new       29.2 cpp_neon       28.4 ratio 1.027 ctrl 0.027 unresolved /mojo_old 1.014 /vllm 0.933 /sdpa 0.411
+flash 129:8:64 fp32                              new       51.4 cpp_neon       53.7 ratio 0.957 ctrl 0.004 win /mojo_old 0.895 /vllm 0.835 /sdpa 0.383
+flash 257:8:64 bf16                              new       70.4 cpp_neon       69.1 ratio 1.019 ctrl 0.015 unresolved /mojo_old 0.947 /vllm 0.808 /sdpa 0.379
+flash 257:8:64 fp32                              new      155.4 cpp_neon      162.9 ratio 0.954 ctrl 0.004 win /mojo_old 0.908 /vllm 0.824 /sdpa 0.365
+flash 513:8:64 bf16                              new      226.0 cpp_neon      235.1 ratio 0.961 ctrl 0.002 win /mojo_old 0.910 /vllm 0.805 /sdpa 0.366
+flash 513:8:64 fp32                              new      574.6 cpp_neon      585.1 ratio 0.982 ctrl 0.003 unresolved /mojo_old 0.956 /vllm 0.854 /sdpa 0.362
+flash 1025:8:64 bf16                             new      818.3 cpp_neon      875.5 ratio 0.935 ctrl 0.001 win /mojo_old 0.895 /vllm 0.805 /sdpa 0.492
+flash 1025:8:64 fp32                             new     2111.7 cpp_neon     2214.9 ratio 0.953 ctrl 0.001 win /mojo_old 0.943 /vllm 0.853 /sdpa 0.514
+flash 2049:8:64 bf16                             new     3124.2 cpp_neon     3387.4 ratio 0.922 ctrl 0.001 win /mojo_old 0.889 /vllm 0.824 /sdpa 0.583
+flash 2049:8:64 fp32                             new     8376.4 cpp_neon     8648.4 ratio 0.969 ctrl 0.002 win /mojo_old 0.964 /vllm 0.848 /sdpa 0.662
+flash 4097:8:64 bf16                             new    12206.7 cpp_neon    13291.1 ratio 0.918 ctrl 0.000 win /mojo_old 0.882 /vllm 0.816 /sdpa 0.633
+flash 4097:8:64 fp32                             new    33006.8 cpp_neon    34624.6 ratio 0.953 ctrl 0.000 win /mojo_old 0.916 /vllm 0.866 /sdpa 0.771
+flash 129:16:128 bf16                            new       76.3 cpp_neon       75.8 ratio 1.006 ctrl 0.022 unresolved /mojo_old 0.977 /vllm 0.885 /sdpa 0.380
+flash 129:16:128 fp32                            new      173.6 cpp_neon      180.9 ratio 0.960 ctrl 0.008 win /mojo_old 0.897 /vllm 0.785 /sdpa 0.423
+flash 257:16:128 bf16                            new      217.0 cpp_neon      214.2 ratio 1.013 ctrl 0.009 unresolved /mojo_old 0.938 /vllm 0.853 /sdpa 0.378
+flash 257:16:128 fp32                            new      578.3 cpp_neon      591.0 ratio 0.979 ctrl 0.003 unresolved /mojo_old 0.923 /vllm 0.765 /sdpa 0.423
+flash 1025:16:128 bf16                           new     2731.8 cpp_neon     2950.4 ratio 0.926 ctrl 0.001 win /mojo_old 0.890 /vllm 0.839 /sdpa 0.508
+flash 1025:16:128 fp32                           new     8031.2 cpp_neon     8223.3 ratio 0.977 ctrl 0.006 unresolved /mojo_old 0.955 /vllm 0.757 /sdpa 0.576
+flash 2049:16:128 bf16                           new    10379.5 cpp_neon    11276.8 ratio 0.920 ctrl 0.002 win /mojo_old 0.878 /vllm 0.837 /sdpa 0.584
+flash 2049:16:128 fp32                           new    30939.7 cpp_neon    31892.1 ratio 0.970 ctrl 0.002 unresolved /mojo_old 0.912 /vllm 0.749 /sdpa 0.713
+flash 1025:8:32 bf16                             new      550.0 cpp_neon      578.3 ratio 0.951 ctrl 0.002 win /mojo_old 0.868 /vllm 0.779 /sdpa 0.467
+flash 1025:8:32 fp32                             new     1223.1 cpp_neon     1292.6 ratio 0.946 ctrl 0.002 win /mojo_old 0.943 /vllm 0.834 /sdpa 0.442
+flash 1x129:8:64 bf16                            new       11.9 cpp_neon       13.3 ratio 0.897 ctrl 0.096 win /mojo_old 1.097 /sdpa 0.472
+flash 1x129:8:64 fp32                            new       11.8 cpp_neon       16.2 ratio 0.725 ctrl 0.015 win /mojo_old 0.764 /sdpa 0.442
+flash 17x301:8:64 bf16                           new       22.1 cpp_neon       22.6 ratio 0.979 ctrl 0.025 unresolved /mojo_old 0.975 /sdpa 0.433
+flash 17x301:8:64 fp32                           new       36.6 cpp_neon       42.5 ratio 0.860 ctrl 0.001 win /mojo_old 0.775 /sdpa 0.530
+flash 127x129:8:64 bf16                          new       28.4 cpp_neon       28.3 ratio 1.003 ctrl 0.010 unresolved /mojo_old 1.000 /sdpa 0.304
+flash 127x129:8:64 fp32                          new       49.5 cpp_neon       52.5 ratio 0.943 ctrl 0.015 win /mojo_old 0.894 /sdpa 0.313
+flash 129x127:8:64 bf16                          new       28.2 cpp_neon       26.8 ratio 1.054 ctrl 0.042 loss /mojo_old 1.005 /sdpa 0.298
+flash 129x127:8:64 fp32                          new       48.7 cpp_neon       51.1 ratio 0.953 ctrl 0.014 win /mojo_old 0.869 /sdpa 0.300
+flash 257x513:8:64 bf16                          new      164.4 cpp_neon      171.7 ratio 0.958 ctrl 0.005 win /mojo_old 0.886 /sdpa 0.412
+flash 257x513:8:64 fp32                          new      416.0 cpp_neon      437.9 ratio 0.950 ctrl 0.001 win /mojo_old 0.929 /sdpa 0.517
+flash 513x257:8:64 bf16                          new       70.3 cpp_neon       72.5 ratio 0.969 ctrl 0.013 win /mojo_old 0.924 /sdpa 0.185
+flash 513x257:8:64 fp32                          new      157.0 cpp_neon      163.3 ratio 0.962 ctrl 0.003 win /mojo_old 0.862 /sdpa 0.201
+flash 1025x2049:8:64 bf16                        new     2339.6 cpp_neon     2555.4 ratio 0.916 ctrl 0.002 win /mojo_old 0.893 /sdpa 0.464
+flash 1025x2049:8:64 fp32                        new     6174.6 cpp_neon     6537.6 ratio 0.944 ctrl 0.001 win /mojo_old 0.943 /sdpa 0.545
+flash 2049x1025:8:64 bf16                        new      824.3 cpp_neon      875.9 ratio 0.941 ctrl 0.002 win /mojo_old 0.877 /sdpa 0.179
+flash 2049x1025:8:64 fp32                        new     2136.5 cpp_neon     2219.1 ratio 0.963 ctrl 0.006 win /mojo_old 0.929 /sdpa 0.200
+flash 1024:8:64 noncausal bf16                   new     1545.6 cpp_neon     1654.4 ratio 0.934 ctrl 0.002 win /mojo_old 0.900 /vllm 0.836 /sdpa 0.720
+flash 1024:8:64 noncausal fp32                   new     4060.2 cpp_neon     4222.6 ratio 0.962 ctrl 0.003 win /mojo_old 0.942 /vllm 0.833 /sdpa 0.912
+flash 1025:8:64 noncausal bf16                   new     1581.6 cpp_neon     1696.6 ratio 0.932 ctrl 0.002 win /mojo_old 0.897 /vllm 0.824 /sdpa 0.714
+flash 1025:8:64 noncausal fp32                   new     4113.8 cpp_neon     4299.7 ratio 0.957 ctrl 0.001 win /mojo_old 0.946 /vllm 0.847 /sdpa 0.908
+flash 1024:16:128 noncausal bf16                 new     5109.3 cpp_neon     5475.3 ratio 0.933 ctrl 0.002 win /mojo_old 0.898 /vllm 0.827 /sdpa 0.723
+flash 1024:16:128 noncausal fp32                 new    15222.8 cpp_neon    17339.1 ratio 0.878 ctrl 0.001 win /mojo_old 0.916 /vllm 0.761 /sdpa 0.943
+flash 1024:32/8:128 bf16                         new     5317.0 cpp_neon     5638.3 ratio 0.943 ctrl 0.001 win /mojo_old 0.886 /vllm 0.847 /sdpa 0.510
+flash 1024:32/8:128 fp32                         new    15798.8 cpp_neon    16048.6 ratio 0.984 ctrl 0.000 unresolved /mojo_old 0.917 /vllm 0.754 /sdpa 0.583
+flash 1024:16/1:64 bf16                          new     1613.1 cpp_neon     1725.4 ratio 0.935 ctrl 0.003 win /mojo_old 0.881 /vllm 0.843 /sdpa 0.503
+flash 1024:16/1:64 fp32                          new     4165.6 cpp_neon     4366.6 ratio 0.954 ctrl 0.001 win /mojo_old 0.960 /vllm 0.879 /sdpa 0.518
+flash 1024:8:64 fused bf16                       new      812.2 cpp_neon      886.1 ratio 0.917 ctrl 0.000 win /mojo_old 0.907 /vllm 0.813 /sdpa 0.490
+flash 1024:8:64 fused fp32                       new     2115.7 cpp_neon     2176.0 ratio 0.972 ctrl 0.002 unresolved /mojo_old 0.940 /vllm 0.843 /sdpa 0.518
+flash 257:16:128 fused bf16                      new      215.0 cpp_neon      212.3 ratio 1.013 ctrl 0.006 unresolved /mojo_old 0.936 /vllm 0.852 /sdpa 0.367
+flash 257:16:128 fused fp32                      new      576.8 cpp_neon      585.5 ratio 0.985 ctrl 0.001 unresolved /mojo_old 0.915 /vllm 0.750 /sdpa 0.422
+
+78 rows: 54 win, 22 unresolved, 2 loss, 0 invalid
+  loss       flash 128:8:64 bf16  ratio 1.079 vs cpp_neon
+  unresolved flash 128:8:64 fp32  ratio 1.014 vs cpp_neon
+  unresolved flash 512:8:64 bf16  ratio 0.982 vs cpp_neon
+  unresolved flash 256:16:128 bf16  ratio 0.995 vs cpp_neon
+  unresolved flash 256:16:128 fp32  ratio 0.996 vs cpp_neon
+  unresolved flash 4096:16:128 fp32  ratio 0.976 vs cpp_neon
+  unresolved flash 512:32:128 bf16  ratio 0.979 vs cpp_neon
+  unresolved flash 512:32:128 fp32  ratio 0.981 vs cpp_neon
+  unresolved flash 65:8:64 bf16  ratio 0.982 vs cpp_neon
+  unresolved flash 129:8:64 bf16  ratio 1.027 vs cpp_neon
+  unresolved flash 257:8:64 bf16  ratio 1.019 vs cpp_neon
+  unresolved flash 513:8:64 fp32  ratio 0.982 vs cpp_neon
+  unresolved flash 129:16:128 bf16  ratio 1.006 vs cpp_neon
+  unresolved flash 257:16:128 bf16  ratio 1.013 vs cpp_neon
+  unresolved flash 257:16:128 fp32  ratio 0.979 vs cpp_neon
+  unresolved flash 1025:16:128 fp32  ratio 0.977 vs cpp_neon
+  unresolved flash 2049:16:128 fp32  ratio 0.970 vs cpp_neon
+  unresolved flash 17x301:8:64 bf16  ratio 0.979 vs cpp_neon
+  unresolved flash 127x129:8:64 bf16  ratio 1.003 vs cpp_neon
+  loss       flash 129x127:8:64 bf16  ratio 1.054 vs cpp_neon
+  unresolved flash 1024:32/8:128 fp32  ratio 0.984 vs cpp_neon
+  unresolved flash 1024:8:64 fused fp32  ratio 0.972 vs cpp_neon
+  unresolved flash 257:16:128 fused bf16  ratio 1.013 vs cpp_neon
+  unresolved flash 257:16:128 fused fp32  ratio 0.985 vs cpp_neon

@@ -1,0 +1,11 @@
+mojo test_dense exit=0
+mojo test_flash_api exit=0
+mojo fuzz_dense exit=0
+mojo test_paged_sweep exit=0
+mojo test_regressions exit=0
+cpp test_dense exit=0
+cpp test_flash_api exit=0
+cpp fuzz_dense exit=0
+cpp test_paged_sweep exit=0
+cpp test_regressions exit=1
+PAGED_DONE exit=0

@@ -14,6 +14,34 @@ uv run --extra build python scripts/build.py --tests    # every tier + the stand
 
 ## 1. Status
 
+**Integration checkpoint (2026-10-28).** The primary tree at `c7f1c28` already
+contains the AMX policy merge (`6d2cf34`) and the fast-plan AMX-toggle fix. The
+in-progress Axion merge (`afbea06`) has been resolved retaining both policy IDs
+(AMX 1, ARM 2); only AMX uses the AMX-specific 64-row work-item rule. All three
+x86 tiers build with Mojo 1.2.0. On Ryzen, both backends pass `test_dense`,
+`test_flash_api`, 80-case fuzz, the 504-case paged sweep, 412 regressions, and
+fast-encdec's engine test. AMX tests skip on this non-AMX CPU. Logs are in
+`reports/ryzen/integration-c7f1c28/`; the engine test uses fast-encdec's own
+environment (torch 2.14.1+cpu, transformers 5.19.0). This is a correctness
+checkpoint, not a claim that the performance objective is met.
+
+The integration baseline (`reports/ryzen/integration-c7f1c28/baseline.json`),
+41 rounds / 41 x 40-call paged blocks, measured all 170 rows with valid outputs:
+
+| rows | win | unresolved | loss |
+|---|---:|---:|---:|
+| flash_attn_func bf16 (39) | 36 | 3 | 0 |
+| flash_attn_func fp32 (39) | 13 | 25 | 1 |
+| decode / store / public API (92) | 39 | 37 | 16 |
+| **all (170)** | **88** | **65** | **17** |
+
+These are observations from that run, not an across-process speedup claim over
+the older checkpoint below. Every non-win and its band is also listed in
+`reports/ryzen/integration-c7f1c28/nonwins.json`. A fresh C++ build reproduced
+the baseline library's SHA256 exactly. The baseline's in-process Mojo-version
+subprocess failed after loading the extensions; `compiler.txt` records the
+compiler separately. The harness now probes it before loading any extension.
+
 Ryzen 7 7840H, full 170-row manifest (`benchmarks/manifest.py`), against the
 fastest numerically valid C++ path per row (`cpp_vec` or `cpp_scalar`), one
 process, independently loaded arms, 41 rounds (paged: 41 x 40-call blocks),
@@ -40,9 +68,18 @@ anything else is unresolved, not a win. The starting point (the oracle build,
   per cycle, single-thread parity at every shape measured); 27 of 39 rows are
   unresolved.
 
-**Axion and Xeon** results are pending the ARM (bfmmla) and AMX policy work;
-until those land the objective is not met on those boxes and no result is
-claimed for them.
+**Axion.** The ARM hi/lo-probability `bfdot` P@V policy (`8b6521a`) improved all
+44 bf16 decode/API rows by 8-41% beyond their saved-build controls, but the full
+92-row paged/store run still had 12 wins / 27 unresolved / 53 losses against
+valid C++. See `reports/axion/arm-validation/SUMMARY.md` and its per-row raw
+JSON. A globally larger work item regressed short calls; a guarded long-square
+causal fp32 D=128 rule is under integration validation. Default C++ NEON still
+fails poisoned-tail regressions; the scalar path passes. Invalid C++ arms are
+excluded per row, not silently accepted as references.
+
+**Xeon.** The AMX policy is integrated, but full primary-tree validation and
+the missing paged/store measurements remain pending. No cross-machine
+dominance claim is made.
 
 ## 2. Layout
 
@@ -182,6 +219,22 @@ original setting. Paged rows on the Ryzen use 40-call blocks, which keep a
 16 MB working set warm; that is the documented protocol, not a cold-cache
 number.
 
+For an optimization A/B, save the previous package's Python files and shared
+libraries, then pass `--previous /path/to/saved/package`. This loads the previous
+build twice independently (`mojo_previous`, `mojo_ctrl`); their spread defines
+the control uncertainty, not the candidate's improvement. Reports fingerprint
+the Python files, shared libraries, kernel sources, manifest, lockfile and build
+scripts. Screening uses only numerically valid C++ arms to establish its cutoff.
+Store-only rows start with poisoned caches, and self-attention rows stage a
+poisoned append slot, so missing writes cannot pass merely because setup already
+wrote the expected data.
+Store validation reads the logical K/V elements directly and requires exact
+copies; it does not reject a valid store because that arm's decoder reads
+unused poisoned padding incorrectly.
+Use `--load-seed` to repeat with different reproducible module-load and cache
+allocation orders. A bf16 C++ peer must itself pass the reference check before
+it can arbitrate the cross-backend gate; its name is recorded per row.
+
 ## 8. Defects found and fixed (each has a regression test)
 
 1. **Old Mojo: negative slot** stored at a negative offset (segfault). C++ skips
@@ -217,6 +270,9 @@ the control by more than 3-5%.
 | degree-2 exp2 for bf16 dense probabilities | 5.08 -> 4.92 ms | kept |
 | tile maximum tracked in Q@K^T (no max pass) | 4.92 -> 4.61 ms | kept |
 | native tensor reads (decode / flash) | 4.4 -> 2.75 us; 5.26 -> 3.05 us | kept |
+| MHA decode fast path (`R=1` separated from GQA `_rows_tile`, incremental page walk, `PAGE=16/32/48/64` compile-time constants, store-only + pre-append `slots=None` in `kv_fast`) | Ryzen paged bf16 0.60-0.96 of C++ (`b=1 ctx=256` 3.61 -> 3.50 us, `b=1 ctx=4096` 0.53-0.67 of `mojo_old`); ARM `bfdot` P@V single-bf16 for `len >= 128` + hi/lo residual for `len < 128` | kept |
+| single-lane (`LN=1`) fp32 decode P@V on x86 | `b=8 ctx=256 fp32` 39.7 -> 43.6 us (+9.5% slower; one FMA chain per dim vector is latency-bound at `R=1`) | reverted |
+| interleaved (`i = tid; i += threads`) MHA decode scheduling on x86 | `b=8 ctx=256 bf16` 19.2 -> 21.5 us (+12% slower due to cross-core page-table/cache contention vs static contiguous ranges) | reverted |
 | x86 decode P@V via `dpbf16ps` key pairs | rounding P to bf16 alone adds up to 1.81 peak ulp; with the existing 1.89 it breaks the 2-ulp gate | rejected on arithmetic |
 | two dot chains per key group in decode Q@K^T | 0.86 -> 0.86 us/head (L3-bound) | reverted |
 | one dim vector per P@V pass (fold the probability broadcast) | fp32 hd=128 1.28x slower (V re-read), others neutral | reverted |

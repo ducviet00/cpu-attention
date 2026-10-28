@@ -1,0 +1,40 @@
+/home/ducviet00/agent-arm/.venv/lib/python3.14/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+backend mojo
+[FAIL] neg_slot (subprocess) rc=0 ['RESULT True cache unchanged True err 5.364418029785156e-07', 'RESULT False cache unchanged True err 0.0023452043533325195'] Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+[FAIL] test_memory_safety
+[OK] test_odd_lengths
+[OK] test_unequal
+[OK] test_strides
+[OK] test_scale_and_plans
+[OK] test_workers
+[OK] test_amx_toggle
+[FAIL] paged poisoned page=16 d=32 h=4/2 bf16 err 1.855e-03
+[FAIL] paged poisoned page=16 d=64 h=4/4 bf16 err 1.953e-03
+[FAIL] paged poisoned page=16 d=128 h=4/1 bf16 err 1.953e-03
+[FAIL] paged poisoned page=32 d=32 h=4/2 bf16 err 1.322e-03
+[FAIL] paged poisoned page=32 d=64 h=4/4 bf16 err 1.402e-03
+[FAIL] paged poisoned page=32 d=128 h=4/1 bf16 err 1.254e-03
+[FAIL] paged poisoned page=48 d=64 h=4/4 bf16 err 1.911e-03
+[FAIL] paged poisoned page=48 d=128 h=4/1 bf16 err 1.861e-03
+[FAIL] paged poisoned page=64 d=32 h=4/2 bf16 err 1.078e-03
+[FAIL] paged poisoned page=64 d=128 h=4/1 bf16 err 1.053e-03
+[FAIL] test_paged_boundaries
+[FAIL] store order h=8/8 bf16 err 1.876e-03
+[FAIL] api append h=8/8 bf16 err 1.876e-03
+[FAIL] store order h=8/2 bf16 err 1.611e-03
+[FAIL] api append h=8/2 bf16 err 1.611e-03
+[FAIL] store order h=8/1 bf16 err 1.074e-03
+[FAIL] api append h=8/1 bf16 err 1.074e-03
+[FAIL] test_paged_store_order
+[FAIL] out= result bf16 err 1.095e-03
+[FAIL] paged scale 0.05 bf16 err 1.745e-03
+[FAIL] paged scale 0.125 bf16 err 1.095e-03
+[FAIL] paged scale 0.05 bf16 err 1.745e-03
+[FAIL] paged scale 0.1 bf16 err 1.663e-03
+[FAIL] test_paged_out_guard_and_scale
+[OK] test_paged_workers
+[OK] test_concurrent
+[OK] test_two_builds
+regressions: 390/412 passed

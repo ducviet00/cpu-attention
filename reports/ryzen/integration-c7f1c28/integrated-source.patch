@@ -1,0 +1,785 @@
+diff --git a/cpu_attention/_kernel.py b/cpu_attention/_kernel.py
+index f2cc931..2582d6e 100644
+--- a/cpu_attention/_kernel.py
++++ b/cpu_attention/_kernel.py
+@@ -795,12 +795,13 @@ def _flash_plan(geom, k, causal):
+     dt = _DTYPE_CODES[dtype]
+     # The policy id: 1 = AMX (bf16, or fp32 as hi/lo unless switched off), else
+     # the vector policy. Part of the key because the toggles flip between calls.
+-    isa = 1 if amx_available() and (dt == 1 or _AMX_FP32_ENV) else 0
++    isa = (2 if module().tier() == "aarch64-bf16" else
++           1 if amx_available() and (dt == 1 or _AMX_FP32_ENV) else 0)
+     key = (geom, k.shape, causal, _OVERRIDE, torch.get_num_threads(),
+            _llc_bytes(), isa)
+     plan = plans.get(key)
+     if plan is None:
+-        if isa:
++        if isa == 1:
+             # Two 32-row AMX register tiles per work item: K/V tiles are loaded
+             # once per 64 rows.
+             rq = 64
+diff --git a/cpu_attention/_mojo/src/dispatch.mojo b/cpu_attention/_mojo/src/dispatch.mojo
+index eab7472..0a95192 100644
+--- a/cpu_attention/_mojo/src/dispatch.mojo
++++ b/cpu_attention/_mojo/src/dispatch.mojo
+@@ -6,11 +6,13 @@ Every policy compiled into this tier is listed here; `isa` comes from the plan
+ 
+ from flash_attn import FlashJob, FlashPolicy, aux_bytes, flash_drive
+ from flash_amx import AmxPolicy
++from flash_neon import NeonF32Policy, NeonMmlaPolicy
+ from flash_vec import VecPolicy
+-from isa import AMX_TIER
++from isa import AMX_TIER, NEON_BF16
+ 
+ comptime ISA_VEC = 0
+ comptime ISA_AMX = 1
++comptime ISA_NEON_MMLA = 2
+ 
+ 
+ def _policy[dtype: DType, hd: Int](job: FlashJob, isa: Int) raises:
+@@ -21,6 +23,14 @@ def _policy[dtype: DType, hd: Int](job: FlashJob, isa: Int) raises:
+             flash_drive[AmxPolicy[dtype, hd]](job)
+         else:
+             raise Error("cpu_attention: ISA policy not in this build")
++    elif isa == ISA_NEON_MMLA:
++        comptime if NEON_BF16:
++            comptime if dtype == DType.bfloat16:
++                flash_drive[NeonMmlaPolicy[hd]](job)
++            else:
++                flash_drive[NeonF32Policy[hd]](job)
++        else:
++            raise Error("cpu_attention: ISA policy not in this build")
+     else:
+         raise Error("cpu_attention: ISA policy not in this build")
+ 
+@@ -55,6 +65,12 @@ def _sizes_isa[dtype: DType, hd: Int](seq_k: Int, rq: Int, isa: Int) raises -> T
+     if isa == ISA_AMX:
+         comptime if AMX_TIER:
+             return _sizes[AmxPolicy[dtype, hd]](seq_k, rq)
++    if isa == ISA_NEON_MMLA:
++        comptime if NEON_BF16:
++            comptime if dtype == DType.bfloat16:
++                return _sizes[NeonMmlaPolicy[hd]](seq_k, rq)
++            else:
++                return _sizes[NeonF32Policy[hd]](seq_k, rq)
+     raise Error("cpu_attention: ISA policy not in this build")
+ 
+ 
+diff --git a/cpu_attention/_mojo/src/flash_neon.mojo b/cpu_attention/_mojo/src/flash_neon.mojo
+new file mode 100644
+index 0000000..660f0f9
+--- /dev/null
++++ b/cpu_attention/_mojo/src/flash_neon.mojo
+@@ -0,0 +1,712 @@
++"""The aarch64 `bfmmla` policy of flash_attn_func (bf16 dense, Armv8.6 BF16).
++
++`bfmmla` is a 2x2 fp32 tile `acc[i][j] += dot(a[4i..4i+3], b[4j..4j+3])`: `a`
++holds two *rows* of four contraction lanes, `b` two *columns*. 16 MACs per
++instruction against 8 for `bfdot` (2.2-3.2x over it in the previous kernel).
++
++* Q@K^T: 2 query rows x 4 head dims against 2 keys x 4 head dims. The logits
++  *are* the accumulators, in tile order (r0k0, r0k1, r1k0, r1k1).
++* P@V: 2 query rows x 4 keys against 2 head dims x 4 keys; the output tile is
++  (r0d0, r0d1, r1d0, r1d1).
++* The softmax runs on the tile as it is: a row pair's max / offset / alpha are
++  vectors in (r0, r0, r1, r1) lane order, and the bf16 probabilities leave as
++  the P@V `a` operand ([r0 k0..k3][r1 k0..k3]) with one zip.
++
++Packed slab (per batch, kv head; keys padded to 16):
++  K  `[key block of 8][hd/4][4 key pairs][8]`: four dims of two keys per 16 B,
++     so Q@K^T walks one linear stream (hd * 16 B per 8 keys);
++  V  `[hd/8 chunk][key group of 4][4 dim pairs][8]`: a P@V pass over 8 dims
++     reads one linear stream, 64 B per 4 keys.
++"""
++
++from std.memory import bitcast
++from std.sys import llvm_intrinsic
++
++from flash_attn import FlashJob, FlashPolicy, NEG
++from flash_vec import _pack as _pack_vec, _pad as _pad_vec
++from isa import ptr
++
++comptime F4 = SIMD[DType.float32, 4]
++comptime F2 = SIMD[DType.float32, 2]
++comptime B8 = SIMD[DType.bfloat16, 8]
++comptime B4 = SIMD[DType.bfloat16, 4]
++comptime U4 = SIMD[DType.uint32, 4]
++comptime U2 = SIMD[DType.uint32, 2]
++
++comptime KT = 512  # keys per softmax tile
++comptime RQT = 8  # query rows per register tile (4 row pairs)
++comptime PAD = 16  # slab keys are padded to a multiple of this
++
++
++@always_inline
++def _pad(n: Int) -> Int:
++    return (n + PAD - 1) // PAD * PAD
++
++
++@always_inline
++def _bfmmla(acc: F4, a: B8, b: B8) -> F4:
++    return llvm_intrinsic[
++        "llvm.aarch64.neon.bfmmla", F4, has_side_effect=False
++    ](acc, a, b)
++
++
++@always_inline
++def _vmax(a: F4, b: F4) -> F4:
++    """One `fmaxnm`: the compare-and-select spelling is two instructions."""
++    return llvm_intrinsic["llvm.maxnum.v4f32", F4, has_side_effect=False](a, b)
++
++
++@always_inline
++def _ninf() -> F4:
++    return F4(bitcast[DType.float32, 1](SIMD[DType.uint32, 1](0xFF800000))[0])
++
++
++@always_inline
++def _swap(v: F4) -> F4:
++    """(v1, v0, v3, v2): exchange the two key lanes of each row."""
++    return v.shuffle[1, 0, 3, 2]()
++
++
++@always_inline
++def _exp2[degree: Int](x: F4) -> F4:
++    """`2^x` for `x <= 0`; Remez minimax on [-0.5, 0.5], relative error 1.7e-3
++    (degree 2, inside the bf16 rounding that follows) or 2.6e-6 (degree 4, the
++    fp32 path and the rescale factor). The magic-constant add rounds x without
++    the fcvtns/scvtf pair, which issue on one pipe at 1/cycle (measured) against
++    ~3/cycle for add/sub. The exponent is an integer add, so a masked lane
++    (clamped at -126) is ~1e-38, not exactly 0."""
++    var xc = _vmax(x, F4(-126.0))
++    var y = xc + F4(12582912.0)
++    var r = xc - (y - F4(12582912.0))
++    var p: F4
++    comptime if degree <= 2:
++        p = (r * F4(2.384289358e-1) + F4(7.034480059e-1)) * r + F4(1.000443142)
++    else:
++        p = F4(9.570101908e-3)
++        p = p.fma(r, 5.591786032e-2)
++        p = p.fma(r, 2.402474483e-1)
++        p = p.fma(r, 6.931218147e-1)
++        p = p.fma(r, 9.999992614e-1)
++    return bitcast[DType.float32, 4](
++        bitcast[DType.int32, 4](p) + (bitcast[DType.int32, 4](y) << SIMD[DType.int32, 4](23))
++    )
++
++
++@always_inline
++def _bf16(e: F4) -> SIMD[DType.uint16, 4]:
++    """fp32 -> bf16 bits by round-half-up and a narrowing shift (add + shrn):
++    `bfcvtn` issues once per cycle on one pipe (measured), these spread."""
++    var b = bitcast[DType.uint32, 4](e) + SIMD[DType.uint32, 4](0x8000)
++    return (b >> SIMD[DType.uint32, 4](16)).cast[DType.uint16]()
++
++
++# ---------------------------------------------------------------------------
++# pack
++# ---------------------------------------------------------------------------
++def _pack[hd: Int](job: FlashJob, b: Int, kvh: Int, slab: Int):
++    comptime DG = hd // 4
++    var n = job.seq_k
++    var pad = _pad(n)
++    var ks = ptr[BFloat16](job.k + (b * job.kb + kvh * job.kh) * 2)
++    var vs = ptr[BFloat16](job.v + (b * job.vb + kvh * job.vh) * 2)
++    var kd = ptr[BFloat16](slab)
++    var vd = ptr[BFloat16](slab + pad * hd * 2)
++    var zero = B8(0)
++    # K: four keys at a time; their four dims of one group are 32 contiguous
++    # bytes in the packed block (two adjacent key pairs).
++    var t0 = 0
++    while t0 < pad:
++        var blk = kd + ((t0 >> 3) * DG * 4 + ((t0 >> 1) & 3)) * 8
++        comptime for dg2 in range(0, DG, 2):
++            var r0 = zero
++            var r1 = zero
++            var r2 = zero
++            var r3 = zero
++            if t0 < n:
++                r0 = (ks + t0 * job.kt).unsafe_load[width=8](dg2 * 4)
++            if t0 + 1 < n:
++                r1 = (ks + (t0 + 1) * job.kt).unsafe_load[width=8](dg2 * 4)
++            if t0 + 2 < n:
++                r2 = (ks + (t0 + 2) * job.kt).unsafe_load[width=8](dg2 * 4)
++            if t0 + 3 < n:
++                r3 = (ks + (t0 + 3) * job.kt).unsafe_load[width=8](dg2 * 4)
++            blk.unsafe_store[width=8](
++                dg2 * 32,
++                r0.slice[4, offset=0]().join(r1.slice[4, offset=0]()),
++            )
++            blk.unsafe_store[width=8](
++                dg2 * 32 + 8,
++                r2.slice[4, offset=0]().join(r3.slice[4, offset=0]()),
++            )
++            blk.unsafe_store[width=8](
++                (dg2 + 1) * 32,
++                r0.slice[4, offset=4]().join(r1.slice[4, offset=4]()),
++            )
++            blk.unsafe_store[width=8](
++                (dg2 + 1) * 32 + 8,
++                r2.slice[4, offset=4]().join(r3.slice[4, offset=4]()),
++            )
++        t0 += 4
++    # V: [chunk of 8 dims][key group][4 dim pairs][8]; a dim pair holds, for
++    # each of its two dims, the four keys of the group.
++    var kgn = pad // 4
++    for kg in range(kgn):
++        var t = kg * 4
++        comptime for dc in range(hd // 8):
++            var r0 = zero
++            var r1 = zero
++            var r2 = zero
++            var r3 = zero
++            if t < n:
++                r0 = (vs + t * job.vt).unsafe_load[width=8](dc * 8)
++            if t + 1 < n:
++                r1 = (vs + (t + 1) * job.vt).unsafe_load[width=8](dc * 8)
++            if t + 2 < n:
++                r2 = (vs + (t + 2) * job.vt).unsafe_load[width=8](dc * 8)
++            if t + 3 < n:
++                r3 = (vs + (t + 3) * job.vt).unsafe_load[width=8](dc * 8)
++            var z01 = r0.interleave(r1)  # (k0 k1) per dim, dims 0..7
++            var z23 = r2.interleave(r3)
++            var a = bitcast[DType.uint32, 4](z01.slice[8, offset=0]())  # dims 0-3
++            var bb = bitcast[DType.uint32, 4](z01.slice[8, offset=8]())  # dims 4-7
++            var c = bitcast[DType.uint32, 4](z23.slice[8, offset=0]())
++            var e = bitcast[DType.uint32, 4](z23.slice[8, offset=8]())
++            var dst = vd + (dc * kgn + kg) * 32
++            var p0 = a.interleave(c)  # (a0 c0 a1 c1 | a2 c2 a3 c3)
++            var p1 = bb.interleave(e)
++            dst.unsafe_store[width=8](0, bitcast[DType.bfloat16, 16](p0).slice[8, offset=0]())
++            dst.unsafe_store[width=8](8, bitcast[DType.bfloat16, 16](p0).slice[8, offset=8]())
++            dst.unsafe_store[width=8](16, bitcast[DType.bfloat16, 16](p1).slice[8, offset=0]())
++            dst.unsafe_store[width=8](24, bitcast[DType.bfloat16, 16](p1).slice[8, offset=8]())
++
++
++# ---------------------------------------------------------------------------
++# Q@K^T: logits in tile order, row maxima per row pair
++# ---------------------------------------------------------------------------
++@always_inline
++def _qk[
++    hd: Int, RP: Int
++](kd: Int, qp: Int, lg: Int, mxo: Int, k0: Int, nk: Int, limit0: Int):
++    comptime DG = hd // 4
++    var kend = k0 + nk
++    var lim = min(kend - 1, limit0)
++    var kbase = ptr[BFloat16](kd)
++    var qpp = ptr[BFloat16](qp)
++    var lgp = ptr[Float32](lg)
++    var ninf = _ninf()
++    var mx = Array[F4, RP](fill=ninf)
++    var j = 0
++    while j < nk:
++        var jj = k0 + j
++        var kp_ = kbase + (jj >> 3) * (DG * 32)
++        var accs = Array[F4, RP * 4](fill=F4(0))
++        var dg = 0
++        # Runtime loop over dim groups with a small unroll: fully unrolled, LLVM
++        # hoists the Q panels out of the key loop and spills them.
++        while dg < DG:
++            comptime for u in range(4):
++                var bv = Array[B8, 4](uninitialized=True)
++                comptime for kp in range(4):
++                    bv[kp] = kp_.unsafe_load[width=8]((dg + u) * 32 + kp * 8)
++                comptime for rp in range(RP):
++                    var a = qpp.unsafe_load[width=8](((dg + u) * RP + rp) * 8)
++                    comptime for kp in range(4):
++                        accs[rp * 4 + kp] = _bfmmla(accs[rp * 4 + kp], a, bv[kp])
++            dg += 4
++        if jj + 7 <= lim:
++            comptime for rp in range(RP):
++                var o = lgp + (rp * (KT // 2) + (j >> 1)) * 4
++                comptime for kp in range(4):
++                    o.unsafe_store[width=4](kp * 4, accs[rp * 4 + kp])
++                mx[rp] = _vmax(
++                    mx[rp],
++                    _vmax(
++                        _vmax(accs[rp * 4], accs[rp * 4 + 1]),
++                        _vmax(accs[rp * 4 + 2], accs[rp * 4 + 3]),
++                    ),
++                )
++        else:
++            var ib = SIMD[DType.int32, 4](
++                Int32(jj), Int32(jj + 1), Int32(jj), Int32(jj + 1)
++            )
++            comptime for rp in range(RP):
++                var l0 = Int32(min(limit0 + 2 * rp, kend - 1))
++                var l1 = Int32(min(limit0 + 2 * rp + 1, kend - 1))
++                var lv = SIMD[DType.int32, 4](l0, l0, l1, l1)
++                var o = lgp + (rp * (KT // 2) + (j >> 1)) * 4
++                var m4 = ninf
++                comptime for kp in range(4):
++                    var x = (ib + Int32(2 * kp)).gt(lv).select(ninf, accs[rp * 4 + kp])
++                    o.unsafe_store[width=4](kp * 4, x)
++                    m4 = _vmax(m4, x)
++                mx[rp] = _vmax(mx[rp], m4)
++        j += 8
++    comptime for rp in range(RP):
++        ptr[Float32](mxo).unsafe_store[width=4](rp * 4, mx[rp])
++
++
++# ---------------------------------------------------------------------------
++# online softmax: P (bf16, the P@V `a` operand layout) and m / l / alpha
++# ---------------------------------------------------------------------------
++@always_inline
++def _softmax[
++    RP: Int, FIX: Bool
++](
++    lg: Int,
++    pb: Int,
++    mxv: F4,
++    rp: Int,
++    nblk: Int,
++    c: Float32,
++    sub: Int,
++    m: Int,
++    l: Int,
++    alpha: Int,
++):
++    var r0 = 2 * rp
++    var r1 = min(2 * rp + 1, sub - 1)
++    var mp = ptr[Float32](m)
++    var lp = ptr[Float32](l)
++    var ap = ptr[Float32](alpha)
++    var mt = _vmax(mxv, _swap(mxv))  # (r0, r0, r1, r1) tile max, logit units
++    var mo0 = mp.unsafe_load(r0)
++    var mo1 = mp.unsafe_load(r1)
++    var mo = F4(mo0, mo0, mo1, mo1)
++    var mn = _vmax(mo, mt * F4(c))
++    var a4 = _exp2[4](mo - mn)
++    var live = 2 * rp + 1 < sub
++    mp.unsafe_store(r0, mn[0])
++    ap.unsafe_store(r0, a4[0])
++    if live:
++        mp.unsafe_store(r1, mn[2])
++        ap.unsafe_store(r1, a4[2])
++    var off = F4(0) - mn
++    var c4 = F4(c)
++    var lgp = ptr[Float32](lg) + rp * (KT // 2) * 4
++    var pp = ptr[BFloat16](pb)
++    var s = F4(0)
++    var dead = SIMD[DType.bool, 4](fill=False)
++    comptime if FIX:
++        dead = mt.eq(_ninf())
++    for blk in range(nblk):
++        var e0 = _exp2[2](lgp.unsafe_load[width=4](blk * 16).fma(c4, off))
++        var e1 = _exp2[2](lgp.unsafe_load[width=4](blk * 16 + 4).fma(c4, off))
++        var e2 = _exp2[2](lgp.unsafe_load[width=4](blk * 16 + 8).fma(c4, off))
++        var e3 = _exp2[2](lgp.unsafe_load[width=4](blk * 16 + 12).fma(c4, off))
++        comptime if FIX:
++            # A row that sees no key in this tile contributes exactly 0.
++            e0 = dead.select(F4(0), e0)
++            e1 = dead.select(F4(0), e1)
++            e2 = dead.select(F4(0), e2)
++            e3 = dead.select(F4(0), e3)
++        s += (e0 + e1) + (e2 + e3)
++        var q0 = bitcast[DType.uint32, 2](_bf16(e0))
++        var q1 = bitcast[DType.uint32, 2](_bf16(e1))
++        var q2 = bitcast[DType.uint32, 2](_bf16(e2))
++        var q3 = bitcast[DType.uint32, 2](_bf16(e3))
++        # (r0 k0k1, r1 k0k1) and (r0 k2k3, r1 k2k3) -> r0 k0..k3 | r1 k0..k3
++        pp.unsafe_store[width=8](
++            ((2 * blk) * RP + rp) * 8,
++            bitcast[DType.bfloat16, 8](q0.interleave(q1)),
++        )
++        pp.unsafe_store[width=8](
++            ((2 * blk + 1) * RP + rp) * 8,
++            bitcast[DType.bfloat16, 8](q2.interleave(q3)),
++        )
++    lp.unsafe_store(r0, lp.unsafe_load(r0) * a4[0] + (s[0] + s[1]))
++    if live:
++        lp.unsafe_store(r1, lp.unsafe_load(r1) * a4[2] + (s[2] + s[3]))
++
++
++# ---------------------------------------------------------------------------
++# P@V: acc += alpha * (P @ V) in passes of 8 dims
++# ---------------------------------------------------------------------------
++@always_inline
++def _pv[
++    hd: Int, RP: Int
++](vd: Int, kgn: Int, pb: Int, acc: Int, alpha: Int, sub: Int, k0: Int, nkg: Int):
++    var ap = ptr[Float32](alpha)
++    var accp = ptr[Float32](acc)
++    var vbase = ptr[BFloat16](vd)
++    var pbase = ptr[BFloat16](pb)
++    for dc in range(hd // 8):
++        var accs = Array[F4, RP * 4](fill=F4(0))
++        if k0 > 0:
++            # (the driver zeroes the accumulator, so the first tile skips this)
++            comptime for rp in range(RP):
++                var r1 = min(2 * rp + 1, sub - 1)
++                var a0 = ap.unsafe_load(2 * rp)
++                var a1 = ap.unsafe_load(r1)
++                var a4 = F4(a0, a0, a1, a1)
++                comptime for i in range(4):
++                    var lo = accp.unsafe_load[width=2]((2 * rp) * hd + dc * 8 + 2 * i)
++                    var hi = accp.unsafe_load[width=2]((2 * rp + 1) * hd + dc * 8 + 2 * i)
++                    accs[rp * 4 + i] = lo.join(hi) * a4
++        var vp = vbase + (dc * kgn + (k0 >> 2)) * 32
++        var pp = pbase
++        var kg = 0
++        while kg + 2 <= nkg:
++            comptime for u in range(2):
++                var vb = Array[B8, 4](uninitialized=True)
++                comptime for i in range(4):
++                    vb[i] = vp.unsafe_load[width=8](u * 32 + i * 8)
++                comptime for rp in range(RP):
++                    var pa = pp.unsafe_load[width=8]((u * RP + rp) * 8)
++                    comptime for i in range(4):
++                        accs[rp * 4 + i] = _bfmmla(accs[rp * 4 + i], pa, vb[i])
++            vp += 64
++            pp += 2 * RP * 8
++            kg += 2
++        if kg < nkg:
++            var vb = Array[B8, 4](uninitialized=True)
++            comptime for i in range(4):
++                vb[i] = vp.unsafe_load[width=8](i * 8)
++            comptime for rp in range(RP):
++                var pa = pp.unsafe_load[width=8](rp * 8)
++                comptime for i in range(4):
++                    accs[rp * 4 + i] = _bfmmla(accs[rp * 4 + i], pa, vb[i])
++        comptime for rp in range(RP):
++            comptime for i in range(4):
++                var t = accs[rp * 4 + i]
++                accp.unsafe_store[width=2]((2 * rp) * hd + dc * 8 + 2 * i, t.slice[2, offset=0]())
++                accp.unsafe_store[width=2]((2 * rp + 1) * hd + dc * 8 + 2 * i, t.slice[2, offset=2]())
++
++
++# ---------------------------------------------------------------------------
++# scratch layout (bytes): logits | P | Q panel | row maxima
++# ---------------------------------------------------------------------------
++comptime LG_BYTES = RQT * KT * 4
++comptime P_BYTES = (RQT // 2) * (KT // 4) * 16
++
++
++@always_inline
++def _tile[
++    hd: Int, RP: Int
++](
++    job: FlashJob,
++    slab: Int,
++    q0: Int,
++    sub: Int,
++    k0: Int,
++    nk: Int,
++    limit0: Int,
++    c: Float32,
++    scratch: Int,
++    acc: Int,
++    m: Int,
++    l: Int,
++    alpha: Int,
++):
++    comptime DG = hd // 4
++    var pad = _pad(job.seq_k)
++    var lg = scratch
++    var pb = scratch + LG_BYTES
++    var qp = pb + P_BYTES
++    var mxo = qp + (RQT // 2) * DG * 16
++    # Q panel [dim group][row pair][8]: four dims of row 2p, then of row 2p+1.
++    var qb = ptr[BFloat16](q0)
++    var qpp = ptr[BFloat16](qp)
++    var zero = B4(0)
++    for dg in range(DG):
++        comptime for rp in range(RP):
++            var lo = zero
++            var hi = zero
++            if 2 * rp < sub:
++                lo = (qb + (2 * rp) * job.qt).unsafe_load[width=4](dg * 4)
++            if 2 * rp + 1 < sub:
++                hi = (qb + (2 * rp + 1) * job.qt).unsafe_load[width=4](dg * 4)
++            qpp.unsafe_store[width=8]((dg * RP + rp) * 8, lo.join(hi))
++    _qk[hd, RP](slab, qp, lg, mxo, k0, nk, limit0)
++    var nblk = (nk + 7) >> 3
++    var mxp = ptr[Float32](mxo)
++    comptime for rp in range(RP):
++        var mxv = mxp.unsafe_load[width=4](rp * 4)
++        # A row is dead when it sees no key in this tile (both lanes -inf).
++        var mt = _vmax(mxv, _swap(mxv))
++        var any_dead = mt.eq(_ninf()).reduce_or()
++        if any_dead:
++            _softmax[RP, True](lg, pb, mxv, rp, nblk, c, sub, m, l, alpha)
++        else:
++            _softmax[RP, False](lg, pb, mxv, rp, nblk, c, sub, m, l, alpha)
++    _pv[hd, RP](slab + pad * hd * 2, pad >> 2, pb, acc, alpha, sub, k0, (nk + 3) >> 2)
++
++
++struct NeonMmlaPolicy[hd: Int](FlashPolicy):
++    comptime DT = DType.bfloat16
++    comptime HD = Self.hd
++    comptime RQT = RQT
++    comptime KT = KT
++
++    @staticmethod
++    def slab_bytes(seq_k: Int) -> Int:
++        return 2 * _pad(seq_k) * Self.hd * 2
++
++    @staticmethod
++    def tile_bytes() -> Int:
++        return LG_BYTES + P_BYTES + (RQT // 2) * (Self.hd // 4) * 16 + (RQT // 2) * 16
++
++    @staticmethod
++    def pack(job: FlashJob, b: Int, kvh: Int, slab: Int):
++        _pack[Self.hd](job, b, kvh, slab)
++
++    @staticmethod
++    def tile(
++        job: FlashJob,
++        slab: Int,
++        b: Int,
++        kvh: Int,
++        q0: Int,
++        sub: Int,
++        k0: Int,
++        nk: Int,
++        limit0: Int,
++        c: Float32,
++        scratch: Int,
++        acc: Int,
++        m: Int,
++        l: Int,
++        alpha: Int,
++    ):
++        # A partial register tile dispatches fewer row pairs.
++        if sub <= 2:
++            _tile[Self.hd, 1](job, slab, q0, sub, k0, nk, limit0, c, scratch, acc, m, l, alpha)
++        elif sub <= 4:
++            _tile[Self.hd, 2](job, slab, q0, sub, k0, nk, limit0, c, scratch, acc, m, l, alpha)
++        elif sub <= 6:
++            _tile[Self.hd, 3](job, slab, q0, sub, k0, nk, limit0, c, scratch, acc, m, l, alpha)
++        else:
++            _tile[Self.hd, 4](job, slab, q0, sub, k0, nk, limit0, c, scratch, acc, m, l, alpha)
++
++
++# ===========================================================================
++# fp32: lane-indexed fma, probabilities row-major in place
++# ===========================================================================
++comptime KT32 = 256  # keys per softmax tile
++comptime ROWS32 = 8  # query rows per register tile
++
++
++@always_inline
++def _qk32[
++    hd: Int, ROWS: Int
++](
++    kd: Int,
++    qp: Int,
++    k0: Int,
++    nkeys: Int,
++    limit0: Int,
++    nrows: Int,
++    logits: Int,
++    tmax: Int,
++):
++    """Logits for ROWS rows x nkeys keys, 8 keys per pass: one K vector load
++    feeds ROWS lane-indexed fmas (`fmla v, v, v.s[i]`) against a Q vector."""
++    var kend = k0 + nkeys
++    var lim = min(kend, limit0 + 1)
++    var kp0 = ptr[Float32](kd)
++    var qpp = ptr[Float32](qp)
++    var lg = ptr[Float32](logits)
++    var mx = Array[F4, ROWS](fill=F4(NEG))
++    var j = 0
++    while j < nkeys:
++        var jj = k0 + j
++        var kp = kp0 + (jj >> 6) * (hd * 64) + (jj & 63)
++        var c = Array[F4, ROWS * 2](fill=F4(0))
++        var d0 = 0
++        while d0 < hd:
++            var kv = Array[F4, 8](uninitialized=True)
++            comptime for dd in range(4):
++                kv[2 * dd] = kp.unsafe_load[width=4]((d0 + dd) * 64)
++                kv[2 * dd + 1] = kp.unsafe_load[width=4]((d0 + dd) * 64 + 4)
++            comptime for r in range(ROWS):
++                var qv = qpp.unsafe_load[width=4](r * hd + d0)
++                comptime for dd in range(4):
++                    c[2 * r] = kv[2 * dd].fma(F4(qv[dd]), c[2 * r])
++                    c[2 * r + 1] = kv[2 * dd + 1].fma(F4(qv[dd]), c[2 * r + 1])
++            d0 += 4
++        if jj + 8 <= lim:
++            comptime for r in range(ROWS):
++                if r < nrows:
++                    lg.unsafe_store[width=4](r * KT32 + j, c[2 * r])
++                    lg.unsafe_store[width=4](r * KT32 + j + 4, c[2 * r + 1])
++                    mx[r] = _vmax(mx[r], _vmax(c[2 * r], c[2 * r + 1]))
++        else:
++            var i0 = SIMD[DType.int32, 4](Int32(jj), Int32(jj + 1), Int32(jj + 2), Int32(jj + 3))
++            var i1 = i0 + Int32(4)
++            var ke = Int32(kend)
++            comptime for r in range(ROWS):
++                if r < nrows:
++                    var lr = Int32(limit0 + r)
++                    var b0 = i0.ge(SIMD[DType.int32, 4](ke)) | i0.gt(SIMD[DType.int32, 4](lr))
++                    var b1 = i1.ge(SIMD[DType.int32, 4](ke)) | i1.gt(SIMD[DType.int32, 4](lr))
++                    var x0 = b0.select(F4(NEG), c[2 * r])
++                    var x1 = b1.select(F4(NEG), c[2 * r + 1])
++                    lg.unsafe_store[width=4](r * KT32 + j, x0)
++                    lg.unsafe_store[width=4](r * KT32 + j + 4, x1)
++                    mx[r] = _vmax(mx[r], _vmax(x0, x1))
++        j += 8
++    comptime for r in range(ROWS):
++        if r < nrows:
++            ptr[Float32](tmax).unsafe_store(r, mx[r].reduce_max())
++
++
++@always_inline
++def _softmax32(logits: Int, nrows: Int, nkeys: Int, c: Float32, m: Int, l: Int, alpha: Int):
++    var lg = ptr[Float32](logits)
++    var mp = ptr[Float32](m)
++    var lp = ptr[Float32](l)
++    var ap = ptr[Float32](alpha)
++    var c4 = F4(c)
++    for r in range(nrows):
++        var row = lg + r * KT32
++        var tm = ap.unsafe_load(r)  # the tile max `_qk32` left here
++        if tm == NEG:
++            # No visible key in this tile: exact zeros, state untouched.
++            ap.unsafe_store(r, 1.0)
++            var j = 0
++            while j < nkeys:
++                row.unsafe_store[width=4](j, F4(0))
++                j += 4
++            continue
++        var mo = mp.unsafe_load(r)
++        var mn = max(mo, tm * c)
++        var a = _exp2[4](F4(mo - mn))[0]
++        mp.unsafe_store(r, mn)
++        ap.unsafe_store(r, a)
++        var off = F4(0) - F4(mn)
++        var s0 = F4(0)
++        var s1 = F4(0)
++        var j = 0
++        while j < nkeys:
++            var e0 = _exp2[4](row.unsafe_load[width=4](j).fma(c4, off))
++            var e1 = _exp2[4](row.unsafe_load[width=4](j + 4).fma(c4, off))
++            row.unsafe_store[width=4](j, e0)
++            row.unsafe_store[width=4](j + 4, e1)
++            s0 += e0
++            s1 += e1
++            j += 8
++        lp.unsafe_store(r, lp.unsafe_load(r) * a + (s0 + s1).reduce_add())
++
++
++@always_inline
++def _pv32[
++    hd: Int, ROWS: Int
++](vsrc: Int, vstride: Int, k0: Int, nk: Int, logits: Int, acc: Int, alpha: Int, sub: Int):
++    var ap = ptr[Float32](alpha)
++    var accp = ptr[Float32](acc)
++    var lg = ptr[Float32](logits)
++    var vp = ptr[Float32](vsrc)
++    for dc in range(0, hd, 8):
++        var a = Array[F4, ROWS * 2](fill=F4(0))
++        if k0 > 0:
++            comptime for r in range(ROWS):
++                var al = F4(ap.unsafe_load(min(r, sub - 1)))
++                a[2 * r] = accp.unsafe_load[width=4](r * hd + dc) * al
++                a[2 * r + 1] = accp.unsafe_load[width=4](r * hd + dc + 4) * al
++        var kk = 0
++        while kk + 4 <= nk:
++            var v = Array[F4, 8](uninitialized=True)
++            comptime for jj in range(4):
++                var row = (k0 + kk + jj) * vstride + dc
++                v[2 * jj] = vp.unsafe_load[width=4](row)
++                v[2 * jj + 1] = vp.unsafe_load[width=4](row + 4)
++            comptime for r in range(ROWS):
++                var pv = lg.unsafe_load[width=4](r * KT32 + kk)
++                comptime for jj in range(4):
++                    a[2 * r] = v[2 * jj].fma(F4(pv[jj]), a[2 * r])
++                    a[2 * r + 1] = v[2 * jj + 1].fma(F4(pv[jj]), a[2 * r + 1])
++            kk += 4
++        while kk < nk:
++            var row = (k0 + kk) * vstride + dc
++            var v0 = vp.unsafe_load[width=4](row)
++            var v1 = vp.unsafe_load[width=4](row + 4)
++            comptime for r in range(ROWS):
++                var p = F4(lg.unsafe_load(r * KT32 + kk))
++                a[2 * r] = v0.fma(p, a[2 * r])
++                a[2 * r + 1] = v1.fma(p, a[2 * r + 1])
++            kk += 1
++        comptime for r in range(ROWS):
++            accp.unsafe_store[width=4](r * hd + dc, a[2 * r])
++            accp.unsafe_store[width=4](r * hd + dc + 4, a[2 * r + 1])
++
++
++@always_inline
++def _tile32[
++    hd: Int, ROWS: Int
++](
++    job: FlashJob,
++    slab: Int,
++    vsrc: Int,
++    vstride: Int,
++    q0: Int,
++    sub: Int,
++    k0: Int,
++    nk: Int,
++    limit0: Int,
++    c: Float32,
++    scratch: Int,
++    acc: Int,
++    m: Int,
++    l: Int,
++    alpha: Int,
++):
++    var lg = scratch
++    var qp = scratch + ROWS32 * KT32 * 4
++    # Q rows into one contiguous panel (rows past `sub` repeat the last real
++    # row: finite, and never stored): the caller's rows are a token stride apart.
++    var qpp = ptr[Float32](qp)
++    for r in range(ROWS):
++        var src = ptr[Float32](q0) + min(r, sub - 1) * job.qt
++        comptime for d in range(0, hd, 4):
++            qpp.unsafe_store[width=4](r * hd + d, src.unsafe_load[width=4](d))
++    _qk32[hd, ROWS](slab, qp, k0, nk, limit0, sub, lg, alpha)
++    _softmax32(lg, sub, (nk + 7) & ~7, c, m, l, alpha)
++    _pv32[hd, ROWS](vsrc, vstride, k0, nk, lg, acc, alpha, sub)
++
++
++struct NeonF32Policy[hd: Int](FlashPolicy):
++    comptime DT = DType.float32
++    comptime HD = Self.hd
++    comptime RQT = ROWS32
++    comptime KT = KT32
++
++    @staticmethod
++    def slab_bytes(seq_k: Int) -> Int:
++        return 2 * _pad_vec(seq_k) * Self.hd * 4
++
++    @staticmethod
++    def tile_bytes() -> Int:
++        return ROWS32 * KT32 * 4 + ROWS32 * Self.hd * 4
++
++    @staticmethod
++    def pack(job: FlashJob, b: Int, kvh: Int, slab: Int):
++        _pack_vec[DType.float32, Self.hd](job, b, kvh, slab)
++
++    @staticmethod
++    def tile(
++        job: FlashJob,
++        slab: Int,
++        b: Int,
++        kvh: Int,
++        q0: Int,
++        sub: Int,
++        k0: Int,
++        nk: Int,
++        limit0: Int,
++        c: Float32,
++        scratch: Int,
++        acc: Int,
++        m: Int,
++        l: Int,
++        alpha: Int,
++    ):
++        var vsrc = slab + _pad_vec(job.seq_k) * Self.hd * 4
++        var vstride = Self.hd
++        if job.v_direct:
++            vsrc = job.v + (b * job.vb + kvh * job.vh) * 4
++            vstride = job.vt
++        if sub <= 2:
++            _tile32[Self.hd, 2](job, slab, vsrc, vstride, q0, sub, k0, nk, limit0, c, scratch, acc, m, l, alpha)
++        elif sub <= 4:
++            _tile32[Self.hd, 4](job, slab, vsrc, vstride, q0, sub, k0, nk, limit0, c, scratch, acc, m, l, alpha)
++        else:
++            _tile32[Self.hd, 8](job, slab, vsrc, vstride, q0, sub, k0, nk, limit0, c, scratch, acc, m, l, alpha)

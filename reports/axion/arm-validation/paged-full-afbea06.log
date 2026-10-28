@@ -1,0 +1,222 @@
+/home/ducviet00/agent-arm/.venv/lib/python3.14/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+{
+ "git": "afbea06509ab3440c1a329c77c70561fa4c49f2d",
+ "mojo": "Mojo 1.2.0 (2016d0cd)",
+ "torch": "2.14.1+cpu",
+ "threads": 8,
+ "governor": null,
+ "arms": {
+  "mojo_new": {
+   "backend": "mojo",
+   "env": {},
+   "origin": "afbea06",
+   "lib": "/tmp/ca_arms_j2o1dvu6/mojo_new/ca_mojo_new/_C_aarch64-bf16.so",
+   "tier": "aarch64-bf16"
+  },
+  "mojo_ctrl": {
+   "backend": "mojo",
+   "env": {},
+   "origin": "afbea06",
+   "lib": "/tmp/ca_arms_j2o1dvu6/mojo_ctrl/ca_mojo_ctrl/_C_aarch64-bf16.so",
+   "tier": "aarch64-bf16"
+  },
+  "mojo_old": {
+   "backend": "mojo",
+   "env": {},
+   "origin": "mojo-oracle-v1.1",
+   "lib": "/tmp/ca_arms_j2o1dvu6/mojo_old/ca_mojo_old/_C.so"
+  },
+  "cpp_neon": {
+   "backend": "cpp",
+   "env": {
+    "CPU_ATTENTION_ISA": "neon"
+   },
+   "origin": "mojo-oracle-v1.1",
+   "lib": "/tmp/ca_arms_j2o1dvu6/cpp_neon/ca_cpp_neon/_C_cpp.so",
+   "isa": "neon"
+  },
+  "cpp_scalar": {
+   "backend": "cpp",
+   "env": {
+    "CPU_ATTENTION_ISA": "scalar"
+   },
+   "origin": "mojo-oracle-v1.1",
+   "lib": "/tmp/ca_arms_j2o1dvu6/cpp_scalar/ca_cpp_scalar/_C_cpp.so",
+   "isa": "scalar"
+  }
+ }
+}
+paged engine self b=1 ctx=256 bf16               new       17.6 cpp_neon        7.8 ratio 2.253 ctrl 0.026 loss /mojo_old 1.396 /vllm 1.470
+paged engine self b=1 ctx=256 fp32               new       16.3 cpp_neon       11.6 ratio 1.409 ctrl 0.069 loss /mojo_old 0.990 /vllm 0.785
+paged engine cross b=1 ctx=256 bf16              new       15.8 cpp_neon        6.9 ratio 2.295 ctrl 0.024 loss /mojo_old 1.378 /vllm 1.802
+paged engine cross b=1 ctx=256 fp32              new       15.2 cpp_neon       10.7 ratio 1.421 ctrl 0.030 loss /mojo_old 1.041 /vllm 0.987
+paged engine self b=8 ctx=256 bf16               new       88.2 cpp_neon       46.8 ratio 1.882 ctrl 0.015 loss /mojo_old 1.730 /vllm 1.010
+paged engine self b=8 ctx=256 fp32               new      111.8 cpp_neon      103.3 ratio 1.082 ctrl 0.048 loss /mojo_old 1.011 /vllm 0.788
+paged engine cross b=8 ctx=256 bf16              new       86.3 cpp_neon       46.7 ratio 1.849 ctrl 0.018 loss /mojo_old 1.524 /vllm 1.080
+paged engine cross b=8 ctx=256 fp32              new       99.1 cpp_neon      101.5 ratio 0.976 ctrl 0.012 unresolved /mojo_old 0.937 /vllm 0.692
+paged engine self b=8 ctx=1024 bf16              new      446.6 cpp_neon      287.7 ratio 1.553 ctrl 0.004 loss /mojo_old 1.298 /vllm 1.321
+paged engine self b=8 ctx=1024 fp32              new      647.7 cpp_neon      701.2 ratio 0.924 ctrl 0.044 win /mojo_old 0.923 /vllm 0.940
+paged engine cross b=8 ctx=1024 bf16             new      458.1 cpp_neon      276.9 ratio 1.654 ctrl 0.012 loss /mojo_old 1.297 /vllm 1.370
+paged engine cross b=8 ctx=1024 fp32             new      667.1 cpp_neon      678.5 ratio 0.983 ctrl 0.015 unresolved /mojo_old 0.986 /vllm 0.967
+paged engine self b=32 ctx=1024 bf16             new     1859.6 cpp_neon     1406.0 ratio 1.323 ctrl 0.048 loss /mojo_old 1.166 /vllm 1.129
+paged engine self b=32 ctx=1024 fp32             new     2985.0 cpp_neon     2969.3 ratio 1.005 ctrl 0.052 unresolved /mojo_old 1.071 /vllm 0.973
+paged engine cross b=32 ctx=1024 bf16            new     1825.1 cpp_neon     1330.9 ratio 1.371 ctrl 0.006 loss /mojo_old 1.157 /vllm 1.079
+paged engine cross b=32 ctx=1024 fp32            new     3004.4 cpp_neon     3033.6 ratio 0.990 ctrl 0.013 unresolved /mojo_old 1.039 /vllm 0.933
+paged engine self b=1 ctx=4096 bf16              new      203.8 cpp_neon      147.9 ratio 1.378 ctrl 0.018 loss /mojo_old 1.280 /vllm 1.279
+paged engine self b=1 ctx=4096 fp32              new      298.1 cpp_neon      290.9 ratio 1.025 ctrl 0.030 unresolved /mojo_old 0.990 /vllm 0.979
+paged engine cross b=1 ctx=4096 bf16             new      205.6 cpp_neon      144.9 ratio 1.419 ctrl 0.017 loss /mojo_old 1.359 /vllm 1.298
+paged engine cross b=1 ctx=4096 fp32             new      297.8 cpp_neon      300.8 ratio 0.990 ctrl 0.018 unresolved /mojo_old 0.997 /vllm 0.980
+paged engine self b=8 ctx=255 bf16               new       88.5 cpp_neon       46.7 ratio 1.896 ctrl 0.012 loss /mojo_old 1.582 /vllm 1.040
+paged engine self b=8 ctx=255 fp32               new      105.2 cpp_neon      102.2 ratio 1.030 ctrl 0.066 unresolved /mojo_old 0.993 /vllm 0.710
+paged engine cross b=8 ctx=255 bf16              new       85.5 cpp_neon       46.6 ratio 1.834 ctrl 0.019 loss /mojo_old 1.734 /vllm 1.029
+paged engine cross b=8 ctx=255 fp32              new      106.8 cpp_neon      105.6 ratio 1.011 ctrl 0.041 unresolved /mojo_old 1.038 /vllm 0.745
+paged engine self b=8 ctx=257 bf16               new       87.8 cpp_neon       54.2 ratio 1.619 ctrl 0.022 loss /mojo_old 1.611 /vllm 0.934
+paged engine self b=8 ctx=257 fp32               new      115.7 cpp_neon      116.7 ratio 0.991 ctrl 0.035 unresolved /mojo_old 1.014 /vllm 0.827
+paged engine cross b=8 ctx=257 bf16              new       86.9 cpp_neon       53.9 ratio 1.611 ctrl 0.004 loss /mojo_old 1.543 /vllm 1.029
+paged engine cross b=8 ctx=257 fp32              new      108.8 cpp_neon      105.5 ratio 1.031 ctrl 0.003 loss /mojo_old 0.942 /vllm 0.760
+paged engine self b=8 ctx=1023 bf16              new      453.6 cpp_neon      282.1 ratio 1.608 ctrl 0.016 loss /mojo_old 1.344 /vllm 1.406
+paged engine self b=8 ctx=1023 fp32              new      642.9 cpp_neon      670.2 ratio 0.959 ctrl 0.017 win /mojo_old 0.974 /vllm 0.945
+paged engine cross b=8 ctx=1023 bf16             new      443.4 cpp_neon      279.5 ratio 1.586 ctrl 0.023 loss /mojo_old 1.327 /vllm 1.338
+paged engine cross b=8 ctx=1023 fp32             new      654.3 cpp_neon      677.0 ratio 0.966 ctrl 0.004 win /mojo_old 0.985 /vllm 0.946
+paged engine self b=8 ctx=1025 bf16              new      447.2 cpp_neon      283.9 ratio 1.576 ctrl 0.021 loss /mojo_old 1.309 /vllm 1.323
+paged engine self b=8 ctx=1025 fp32              new      634.4 cpp_neon      671.8 ratio 0.944 ctrl 0.023 win /mojo_old 0.926 /vllm 0.930
+paged engine cross b=8 ctx=1025 bf16             new      442.5 cpp_neon      280.3 ratio 1.579 ctrl 0.028 loss /mojo_old 1.290 /vllm 1.331
+paged engine cross b=8 ctx=1025 fp32             new      640.0 cpp_neon      650.9 ratio 0.983 ctrl 0.018 unresolved /mojo_old 0.965 /vllm 0.925
+paged engine self b=1 ctx=4097 bf16              new      206.1 cpp_neon      146.4 ratio 1.408 ctrl 0.041 loss /mojo_old 1.365 /vllm 1.288
+paged engine self b=1 ctx=4097 fp32              new      308.7 cpp_neon      296.5 ratio 1.041 ctrl 0.038 loss /mojo_old 0.997 /vllm 0.998
+paged engine cross b=1 ctx=4097 bf16             new      201.7 cpp_neon      144.1 ratio 1.400 ctrl 0.011 loss /mojo_old 1.302 /vllm 1.271
+paged engine cross b=1 ctx=4097 fp32             new      309.1 cpp_neon      296.1 ratio 1.044 ctrl 0.038 loss /mojo_old 0.981 /vllm 1.014
+paged engine self b=8 ctx=1024 page=16 bf16      new      447.2 cpp_neon      284.0 ratio 1.575 ctrl 0.018 loss /mojo_old 1.362 /vllm 1.371
+paged engine self b=8 ctx=1024 page=16 fp32      new      636.5 cpp_neon      670.6 ratio 0.949 ctrl 0.015 win /mojo_old 0.958 /vllm 0.936
+paged engine self b=8 ctx=1024 page=48 bf16      new      402.7 cpp_neon      205.4 ratio 1.960 ctrl 0.020 loss /mojo_old 1.713 /vllm 1.485
+paged engine self b=8 ctx=1024 page=48 fp32      new      497.1 cpp_neon      528.8 ratio 0.940 ctrl 0.021 win /mojo_old 0.967 /vllm 0.854
+paged engine self b=8 ctx=1024 page=64 bf16      new      417.4 cpp_neon      241.1 ratio 1.731 ctrl 0.000 loss /mojo_old 1.583 /vllm 1.584
+paged engine self b=8 ctx=1024 page=64 fp32      new      529.0 cpp_neon      522.0 ratio 1.014 ctrl 0.020 unresolved /mojo_old 0.979 /vllm 0.928
+paged engine self b=8 ctx=1024 h=16/4 bf16       new      186.0 cpp_neon      116.2 ratio 1.601 ctrl 0.043 loss /mojo_old 1.249 /vllm 2.282
+paged engine self b=8 ctx=1024 h=16/4 fp32       new      205.7 cpp_neon      288.3 ratio 0.714 ctrl 0.049 win /mojo_old 0.685 /vllm 1.099
+paged engine cross b=8 ctx=1024 h=16/4 bf16      new      184.1 cpp_neon      111.7 ratio 1.648 ctrl 0.032 loss /mojo_old 1.357 /vllm 2.429
+paged engine cross b=8 ctx=1024 h=16/4 fp32      new      198.5 cpp_neon      275.3 ratio 0.721 ctrl 0.086 win /mojo_old 0.683 /vllm 1.090
+paged engine cross b=8 ctx=1024 h=16/1 bf16      new      168.7 cpp_neon       82.4 ratio 2.047 ctrl 0.011 loss /mojo_old 1.751 /vllm 4.351
+paged engine cross b=8 ctx=1024 h=16/1 fp32      new      134.9 cpp_neon      137.9 ratio 0.978 ctrl 0.003 unresolved /mojo_old 0.913 /vllm 1.595
+paged engine self b=8 ctx=het bf16               /mojo_old 1.635 /vllm 3.624  INVALID ['mojo_old', 'cpp_neon', 'vllm']
+paged engine self b=8 ctx=het fp32               new     1029.8 cpp_neon     1074.4 ratio 0.958 ctrl 0.024 win /mojo_old 0.959 /vllm 2.576
+paged engine cross b=8 ctx=het bf16              /mojo_old 1.445 /vllm 3.511  INVALID ['mojo_old', 'cpp_neon', 'vllm']
+paged engine cross b=8 ctx=het fp32              new     1035.8 cpp_neon     1073.5 ratio 0.965 ctrl 0.040 unresolved /mojo_old 0.969 /vllm 2.562
+paged engine cross b=8 ctx=1024 d=32 bf16        new      187.0 cpp_neon      110.3 ratio 1.696 ctrl 0.016 loss /mojo_old 1.423 /vllm 1.347
+paged engine cross b=8 ctx=1024 d=32 fp32        new      345.5 cpp_neon      338.0 ratio 1.022 ctrl 0.019 unresolved /mojo_old 1.007 /vllm 1.027
+paged engine cross b=8 ctx=1024 d=128 bf16       new      426.6 cpp_neon      222.2 ratio 1.920 ctrl 0.035 loss /mojo_old 1.311 /vllm 1.518
+paged engine cross b=8 ctx=1024 d=128 fp32       new      538.0 cpp_neon      511.4 ratio 1.052 ctrl 0.041 loss /mojo_old 1.028 /vllm 0.912
+paged store store b=32 ctx=1 bf16                new        7.0 cpp_scalar        7.2 ratio 0.965 ctrl 0.018 win /mojo_old 0.877
+paged store store b=32 ctx=1 fp32                new        9.8 cpp_neon        9.4 ratio 1.036 ctrl 0.010 loss /mojo_old 0.933
+paged store store b=1 ctx=1024 bf16              new       73.0 cpp_neon       80.8 ratio 0.903 ctrl 0.009 win /mojo_old 0.749
+paged store store b=1 ctx=1024 fp32              new      119.4 cpp_neon      113.9 ratio 1.048 ctrl 0.011 loss /mojo_old 1.001
+paged engine_out self b=1 ctx=256 bf16           new       13.7 cpp_neon        5.8 ratio 2.346 ctrl 0.053 loss /mojo_old 1.633 /vllm 1.135
+paged engine_out self b=1 ctx=256 fp32           new       13.3 cpp_neon       11.7 ratio 1.136 ctrl 0.053 loss /mojo_old 1.148 /vllm 0.680
+paged engine_out cross b=1 ctx=256 bf16          new       13.0 cpp_neon        5.5 ratio 2.373 ctrl 0.042 loss /mojo_old 1.604 /vllm 1.571
+paged engine_out cross b=1 ctx=256 fp32          new       13.1 cpp_neon        9.1 ratio 1.445 ctrl 0.200 loss /mojo_old 0.989 /vllm 0.779
+paged engine_out self b=8 ctx=256 bf16           new       82.3 cpp_neon       44.5 ratio 1.851 ctrl 0.002 loss /mojo_old 1.777 /vllm 0.908
+paged engine_out self b=8 ctx=256 fp32           new       99.1 cpp_neon      102.1 ratio 0.971 ctrl 0.006 unresolved /mojo_old 0.948 /vllm 0.672
+paged engine_out cross b=8 ctx=256 bf16          new       81.2 cpp_neon       45.4 ratio 1.792 ctrl 0.002 loss /mojo_old 1.738 /vllm 0.956
+paged engine_out cross b=8 ctx=256 fp32          new       94.3 cpp_neon      101.6 ratio 0.928 ctrl 0.119 unresolved /mojo_old 0.850 /vllm 0.663
+paged engine_out self b=8 ctx=1024 bf16          new      438.7 cpp_neon      285.1 ratio 1.539 ctrl 0.019 loss /mojo_old 1.310 /vllm 1.293
+paged engine_out self b=8 ctx=1024 fp32          new      640.7 cpp_neon      656.4 ratio 0.976 ctrl 0.011 unresolved /mojo_old 0.970 /vllm 0.934
+paged engine_out cross b=8 ctx=1024 bf16         new      450.8 cpp_neon      288.0 ratio 1.565 ctrl 0.025 loss /mojo_old 1.275 /vllm 1.325
+paged engine_out cross b=8 ctx=1024 fp32         new      635.5 cpp_neon      647.8 ratio 0.981 ctrl 0.004 unresolved /mojo_old 0.984 /vllm 0.948
+paged engine_out self b=32 ctx=1024 bf16         new     1797.5 cpp_neon     1338.6 ratio 1.343 ctrl 0.007 loss /mojo_old 1.147 /vllm 1.101
+paged engine_out self b=32 ctx=1024 fp32         new     2822.7 cpp_neon     2825.2 ratio 0.999 ctrl 0.008 unresolved /mojo_old 0.960 /vllm 0.950
+paged engine_out cross b=32 ctx=1024 bf16        new     1805.2 cpp_neon     1402.1 ratio 1.288 ctrl 0.018 loss /mojo_old 1.104 /vllm 1.079
+paged engine_out cross b=32 ctx=1024 fp32        new     2950.9 cpp_neon     3005.8 ratio 0.982 ctrl 0.008 unresolved /mojo_old 1.004 /vllm 0.952
+paged engine_out self b=1 ctx=4096 bf16          new      200.2 cpp_neon      144.6 ratio 1.384 ctrl 0.004 loss /mojo_old 1.363 /vllm 1.238
+paged engine_out self b=1 ctx=4096 fp32          new      290.3 cpp_neon      293.5 ratio 0.989 ctrl 0.033 unresolved /mojo_old 0.951 /vllm 0.957
+paged engine_out cross b=1 ctx=4096 bf16         new      200.7 cpp_neon      142.7 ratio 1.406 ctrl 0.021 loss /mojo_old 1.346 /vllm 1.276
+paged engine_out cross b=1 ctx=4096 fp32         new      294.2 cpp_neon      298.8 ratio 0.985 ctrl 0.030 unresolved /mojo_old 0.943 /vllm 0.989
+paged api self b=1 ctx=256 bf16                  new       53.6 cpp_neon       46.6 ratio 1.150 ctrl 0.001 loss /mojo_old 1.067
+paged api self b=1 ctx=256 fp32                  new       56.7 cpp_neon       51.4 ratio 1.105 ctrl 0.012 loss /mojo_old 0.919
+paged api cross b=1 ctx=256 bf16                 new       23.9 cpp_neon       14.7 ratio 1.623 ctrl 0.004 loss /mojo_old 1.192
+paged api cross b=1 ctx=256 fp32                 new       24.6 cpp_neon       20.2 ratio 1.219 ctrl 0.028 loss /mojo_old 0.862
+paged api self b=8 ctx=1024 bf16                 new      479.7 cpp_neon      341.0 ratio 1.407 ctrl 0.017 loss /mojo_old 1.275
+paged api self b=8 ctx=1024 fp32                 new      739.7 cpp_neon      729.5 ratio 1.014 ctrl 0.030 unresolved /mojo_old 1.018
+paged api cross b=8 ctx=1024 bf16                new      432.5 cpp_neon      285.9 ratio 1.513 ctrl 0.022 loss /mojo_old 1.388
+paged api cross b=8 ctx=1024 fp32                new      660.1 cpp_neon      667.1 ratio 0.990 ctrl 0.027 unresolved /mojo_old 1.026
+
+90 rows: 11 win, 24 unresolved, 55 loss, 0 invalid
+  loss       paged engine self b=1 ctx=256 bf16  ratio 2.253 vs cpp_neon
+  loss       paged engine self b=1 ctx=256 fp32  ratio 1.409 vs cpp_neon
+  loss       paged engine cross b=1 ctx=256 bf16  ratio 2.295 vs cpp_neon
+  loss       paged engine cross b=1 ctx=256 fp32  ratio 1.421 vs cpp_neon
+  loss       paged engine self b=8 ctx=256 bf16  ratio 1.882 vs cpp_neon
+  loss       paged engine self b=8 ctx=256 fp32  ratio 1.082 vs cpp_neon
+  loss       paged engine cross b=8 ctx=256 bf16  ratio 1.849 vs cpp_neon
+  unresolved paged engine cross b=8 ctx=256 fp32  ratio 0.976 vs cpp_neon
+  loss       paged engine self b=8 ctx=1024 bf16  ratio 1.553 vs cpp_neon
+  loss       paged engine cross b=8 ctx=1024 bf16  ratio 1.654 vs cpp_neon
+  unresolved paged engine cross b=8 ctx=1024 fp32  ratio 0.983 vs cpp_neon
+  loss       paged engine self b=32 ctx=1024 bf16  ratio 1.323 vs cpp_neon
+  unresolved paged engine self b=32 ctx=1024 fp32  ratio 1.005 vs cpp_neon
+  loss       paged engine cross b=32 ctx=1024 bf16  ratio 1.371 vs cpp_neon
+  unresolved paged engine cross b=32 ctx=1024 fp32  ratio 0.990 vs cpp_neon
+  loss       paged engine self b=1 ctx=4096 bf16  ratio 1.378 vs cpp_neon
+  unresolved paged engine self b=1 ctx=4096 fp32  ratio 1.025 vs cpp_neon
+  loss       paged engine cross b=1 ctx=4096 bf16  ratio 1.419 vs cpp_neon
+  unresolved paged engine cross b=1 ctx=4096 fp32  ratio 0.990 vs cpp_neon
+  loss       paged engine self b=8 ctx=255 bf16  ratio 1.896 vs cpp_neon
+  unresolved paged engine self b=8 ctx=255 fp32  ratio 1.030 vs cpp_neon
+  loss       paged engine cross b=8 ctx=255 bf16  ratio 1.834 vs cpp_neon
+  unresolved paged engine cross b=8 ctx=255 fp32  ratio 1.011 vs cpp_neon
+  loss       paged engine self b=8 ctx=257 bf16  ratio 1.619 vs cpp_neon
+  unresolved paged engine self b=8 ctx=257 fp32  ratio 0.991 vs cpp_neon
+  loss       paged engine cross b=8 ctx=257 bf16  ratio 1.611 vs cpp_neon
+  loss       paged engine cross b=8 ctx=257 fp32  ratio 1.031 vs cpp_neon
+  loss       paged engine self b=8 ctx=1023 bf16  ratio 1.608 vs cpp_neon
+  loss       paged engine cross b=8 ctx=1023 bf16  ratio 1.586 vs cpp_neon
+  loss       paged engine self b=8 ctx=1025 bf16  ratio 1.576 vs cpp_neon
+  loss       paged engine cross b=8 ctx=1025 bf16  ratio 1.579 vs cpp_neon
+  unresolved paged engine cross b=8 ctx=1025 fp32  ratio 0.983 vs cpp_neon
+  loss       paged engine self b=1 ctx=4097 bf16  ratio 1.408 vs cpp_neon
+  loss       paged engine self b=1 ctx=4097 fp32  ratio 1.041 vs cpp_neon
+  loss       paged engine cross b=1 ctx=4097 bf16  ratio 1.400 vs cpp_neon
+  loss       paged engine cross b=1 ctx=4097 fp32  ratio 1.044 vs cpp_neon
+  loss       paged engine self b=8 ctx=1024 page=16 bf16  ratio 1.575 vs cpp_neon
+  loss       paged engine self b=8 ctx=1024 page=48 bf16  ratio 1.960 vs cpp_neon
+  loss       paged engine self b=8 ctx=1024 page=64 bf16  ratio 1.731 vs cpp_neon
+  unresolved paged engine self b=8 ctx=1024 page=64 fp32  ratio 1.014 vs cpp_neon
+  loss       paged engine self b=8 ctx=1024 h=16/4 bf16  ratio 1.601 vs cpp_neon
+  loss       paged engine cross b=8 ctx=1024 h=16/4 bf16  ratio 1.648 vs cpp_neon
+  loss       paged engine cross b=8 ctx=1024 h=16/1 bf16  ratio 2.047 vs cpp_neon
+  unresolved paged engine cross b=8 ctx=1024 h=16/1 fp32  ratio 0.978 vs cpp_neon
+  unresolved paged engine cross b=8 ctx=het fp32  ratio 0.965 vs cpp_neon
+  loss       paged engine cross b=8 ctx=1024 d=32 bf16  ratio 1.696 vs cpp_neon
+  unresolved paged engine cross b=8 ctx=1024 d=32 fp32  ratio 1.022 vs cpp_neon
+  loss       paged engine cross b=8 ctx=1024 d=128 bf16  ratio 1.920 vs cpp_neon
+  loss       paged engine cross b=8 ctx=1024 d=128 fp32  ratio 1.052 vs cpp_neon
+  loss       paged store store b=32 ctx=1 fp32  ratio 1.036 vs cpp_neon
+  loss       paged store store b=1 ctx=1024 fp32  ratio 1.048 vs cpp_neon
+  loss       paged engine_out self b=1 ctx=256 bf16  ratio 2.346 vs cpp_neon
+  loss       paged engine_out self b=1 ctx=256 fp32  ratio 1.136 vs cpp_neon
+  loss       paged engine_out cross b=1 ctx=256 bf16  ratio 2.373 vs cpp_neon
+  loss       paged engine_out cross b=1 ctx=256 fp32  ratio 1.445 vs cpp_neon
+  loss       paged engine_out self b=8 ctx=256 bf16  ratio 1.851 vs cpp_neon
+  unresolved paged engine_out self b=8 ctx=256 fp32  ratio 0.971 vs cpp_neon
+  loss       paged engine_out cross b=8 ctx=256 bf16  ratio 1.792 vs cpp_neon
+  unresolved paged engine_out cross b=8 ctx=256 fp32  ratio 0.928 vs cpp_neon
+  loss       paged engine_out self b=8 ctx=1024 bf16  ratio 1.539 vs cpp_neon
+  unresolved paged engine_out self b=8 ctx=1024 fp32  ratio 0.976 vs cpp_neon
+  loss       paged engine_out cross b=8 ctx=1024 bf16  ratio 1.565 vs cpp_neon
+  unresolved paged engine_out cross b=8 ctx=1024 fp32  ratio 0.981 vs cpp_neon
+  loss       paged engine_out self b=32 ctx=1024 bf16  ratio 1.343 vs cpp_neon
+  unresolved paged engine_out self b=32 ctx=1024 fp32  ratio 0.999 vs cpp_neon
+  loss       paged engine_out cross b=32 ctx=1024 bf16  ratio 1.288 vs cpp_neon
+  unresolved paged engine_out cross b=32 ctx=1024 fp32  ratio 0.982 vs cpp_neon
+  loss       paged engine_out self b=1 ctx=4096 bf16  ratio 1.384 vs cpp_neon
+  unresolved paged engine_out self b=1 ctx=4096 fp32  ratio 0.989 vs cpp_neon
+  loss       paged engine_out cross b=1 ctx=4096 bf16  ratio 1.406 vs cpp_neon
+  unresolved paged engine_out cross b=1 ctx=4096 fp32  ratio 0.985 vs cpp_neon
+  loss       paged api self b=1 ctx=256 bf16  ratio 1.150 vs cpp_neon
+  loss       paged api self b=1 ctx=256 fp32  ratio 1.105 vs cpp_neon
+  loss       paged api cross b=1 ctx=256 bf16  ratio 1.623 vs cpp_neon
+  loss       paged api cross b=1 ctx=256 fp32  ratio 1.219 vs cpp_neon
+  loss       paged api self b=8 ctx=1024 bf16  ratio 1.407 vs cpp_neon
+  unresolved paged api self b=8 ctx=1024 fp32  ratio 1.014 vs cpp_neon
+  loss       paged api cross b=8 ctx=1024 bf16  ratio 1.513 vs cpp_neon
+  unresolved paged api cross b=8 ctx=1024 fp32  ratio 0.990 vs cpp_neon

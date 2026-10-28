@@ -74,6 +74,12 @@ Notes on the API:
 
 ## Performance
 
+The tables below are the **historical C++ campaign**, not results for the
+current unified Mojo build. The ongoing Mojo campaign, including losing and
+unresolved rows, is tracked in [`docs/Mojo.md`](docs/Mojo.md). Its acceptance
+criterion is a clear per-row win over the fastest valid applicable C++ path;
+that objective is **not yet met**.
+
 **Setup.**
 * **Boxes:** Ryzen 7 7840H (8 cores, AVX-512 + BF16, no AMX) at 8 threads;
   Google Axion Neoverse-V2 (GCP c4a, 8 cores) at 8 threads; Xeon Platinum 8581C

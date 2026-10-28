@@ -327,7 +327,8 @@ def _kv_build(query, key, value, k_cache, page_table, do_store, do_attend):
                 key, value = key.contiguous(), value.contiguous()
             entry(plan, query.data_ptr(), key.data_ptr(), value.data_ptr(),
                   k_cache.data_ptr(), v_cache.data_ptr(), out.data_ptr(),
-                  slots.data_ptr(), block_table.data_ptr(), lens.data_ptr(),
+                  0 if slots is None else slots.data_ptr(),
+                  block_table.data_ptr(), lens.data_ptr(),
                   q_stride, kv_stride, scale)
     elif do_attend:
         def fn(out, query, key, value, k_cache, v_cache, slots, block_table,
@@ -363,7 +364,7 @@ def _kv_plans():
 # ---------------------------------------------------------------------------
 _HDR = 24  # header slots before the plan entries (KV_ENTRY0 / FL_ENTRY0 in _C.mojo)
 _KV_W = 32  # int64 slots per plan entry (see _C.mojo kv_fast)
-_KV_CAP = 32
+_KV_CAP = 64
 _KV_TABLE = threading.local()
 _KV_GEN = [0]  # bumped by set_num_workers / _drop_workspace: tables are rebuilt
 _LAYOUT = None  # calibrated header slots, or False when the fast path is off
@@ -467,7 +468,7 @@ def _kv_table():
     return t
 
 
-def _kv_register(fn, query, key, value, k_cache, page_table, do_store):
+def _kv_register(fn, query, key, value, k_cache, page_table, mode):
     """Record the plan `fn` just ran so the next call with this layout runs from
     Mojo. Only plans that needed no copies qualify."""
     if fn.fast is None or _kv_table() is None or query.dtype not in _DT_CODE:
@@ -478,11 +479,16 @@ def _kv_register(fn, query, key, value, k_cache, page_table, do_store):
         t[11] = n = 0
         _KV_TABLE.keep = []
     buf, q_stride, kv_stride = fn.fast
-    e = [_DT_CODE[query.dtype], int(do_store), torch.get_num_threads(),
-         *query.shape, *query.stride(), *k_cache.shape, *page_table.shape,
+    hd = query.shape[-1]
+    default_scale = struct.unpack("<i", struct.pack("<f", float(hd ** -0.5)))[0] & 0xFFFFFFFF
+    do_store = mode != 0
+    pt_shape = page_table.shape if page_table is not None else (0, 0)
+    e = [_DT_CODE[query.dtype], int(mode), torch.get_num_threads(),
+         *query.shape, *query.stride(), *k_cache.shape, *pt_shape,
          *(key.stride() if do_store else (0, 0, 0)),
          *(value.stride() if do_store else (0, 0, 0)),
-         buf.data_ptr(), q_stride, kv_stride, query.element_size()]
+         buf.data_ptr(), q_stride, kv_stride, query.element_size(),
+         default_scale]
     off = _HDR + n * _KV_W
     t[off:off + len(e)] = torch.tensor(e, dtype=torch.int64)
     _KV_TABLE.keep.append(buf)
@@ -491,6 +497,11 @@ def _kv_register(fn, query, key, value, k_cache, page_table, do_store):
 
 def _kv_store(key, value, k_cache, v_cache, slots):
     """reshape_and_cache on the Mojo backend: one token per `key` row."""
+    table = getattr(_KV_TABLE, "t", None)
+    if table is not None and _KV_TABLE.gen == _KV_GEN[0] and _entry("kv_fast")(
+            _KV_TABLE.addr, None, key, value, k_cache, v_cache, slots,
+            None, None, None, None):
+        return
     plans = _kv_plans()
     k = (key.shape, key.stride(), value.stride(), k_cache.shape,
          _get_num_threads(), _OVERRIDE, key.dtype, "store")
@@ -500,6 +511,7 @@ def _kv_store(key, value, k_cache, v_cache, slots):
             plans.clear()
         fn = plans[k] = _kv_build(key, key, value, k_cache, None, True, False)
     fn(None, key, key, value, k_cache, v_cache, slots, None, None, 1.0)
+    _kv_register(fn, key, key, value, k_cache, None, 3)
 
 
 def _paged(
@@ -538,10 +550,11 @@ def _paged(
     # One tuple, one lookup: the key carries the strides, so the layout checks
     # run only when a plan is built (0.75 us of Python per call before).
     plans = _kv_plans()
+    mode = (1 if slots is not None else 2) if do_store else 0
     if do_store:
         k = (query.shape, query.stride(), key.stride(), value.stride(),
              k_cache.shape, page_table.shape, _get_num_threads(), _OVERRIDE,
-             query.dtype)
+             query.dtype, mode)
     else:
         k = (query.shape, query.stride(), k_cache.shape, page_table.shape,
              _get_num_threads(), _OVERRIDE, query.dtype)
@@ -552,7 +565,7 @@ def _paged(
         fn = plans[k] = _kv_build(query, key, value, k_cache, page_table,
                                   do_store, True)
     fn(out, query, key, value, k_cache, v_cache, slots, page_table, lens, scale)
-    _kv_register(fn, query, key, value, k_cache, page_table, do_store)
+    _kv_register(fn, query, key, value, k_cache, page_table, mode)
     return out
 
 
@@ -793,8 +806,8 @@ def _flash_plan(geom, k, causal):
     seq_k, kv_heads = k.shape[1], k.shape[2]
     tasks_q = -(-seq_q // 64)
     dt = _DTYPE_CODES[dtype]
-    # The policy id: 1 = AMX (bf16, or fp32 as hi/lo unless switched off), else
-    # the vector policy. Part of the key because the toggles flip between calls.
+    # Policy ids: 0 vector, 1 AMX (fp32 hi/lo unless switched off), 2 ARM
+    # bfmmla/lane-FMA. The toggles can change between calls, so key on the id.
     isa = (2 if module().tier() == "aarch64-bf16" else
            1 if amx_available() and (dt == 1 or _AMX_FP32_ENV) else 0)
     key = (geom, k.shape, causal, _OVERRIDE, torch.get_num_threads(),
@@ -805,6 +818,11 @@ def _flash_plan(geom, k, causal):
             # Two 32-row AMX register tiles per work item: K/V tiles are loaded
             # once per 64 rows.
             rq = 64
+        elif (isa == 2 and dt == 0 and hd == 128 and causal and
+              seq_q == seq_k and seq_q >= 2048):
+            # Axion: amortize the K/V scan on long fp32 D=128 calls (6-9%);
+            # applying this globally regressed short rows by up to 9.5%.
+            rq = 128
         else:
             # Rows per work item: the accumulator (rq x hd fp32) stays near 16 KB,
             # so it is still in L1 when the next key tile arrives.

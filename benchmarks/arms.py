@@ -16,6 +16,7 @@ times each C++ ISA path.
 """
 
 import glob
+import hashlib
 import importlib.util
 import os
 import shutil
@@ -49,7 +50,14 @@ class Arm:
     def describe(self):
         mod = self.module()
         info = {"backend": self.backend, "env": self.env, "origin": self.origin,
-                "lib": getattr(mod, "__file__", None)}
+                 "lib": getattr(mod, "__file__", None)}
+        root = os.path.dirname(self.pkg.__file__)
+        info["sha256"] = {}
+        for path in sorted(glob.glob(os.path.join(root, "*.py")) +
+                           glob.glob(os.path.join(root, "_C*.so"))):
+            with open(path, "rb") as f:
+                info["sha256"][os.path.basename(path)] = hashlib.sha256(
+                    f.read()).hexdigest()
         self.enter()
         for probe in ("isa", "tier", "backend"):
             fn = getattr(mod, probe, None)
@@ -103,6 +111,14 @@ def current(name, backend, env=None):
                             "cpu_attention"], capture_output=True,
                            text=True).stdout.strip()
     return Arm(name, pkg, backend, env or {}, f"{rev}{'+dirty' if dirty else ''}")
+
+
+def snapshot(name, directory, backend="mojo", env=None):
+    directory = os.path.abspath(directory)
+    libs = {os.path.basename(p): p for p in glob.glob(
+        os.path.join(directory, "_C*.so"))}
+    pkg = _import(name, directory, libs, backend, env or {})
+    return Arm(name, pkg, backend, env or {}, directory)
 
 
 def tagged(name, tag, backend, libs, env=None):
