@@ -636,6 +636,7 @@ def _drop_workspace() -> None:
     # AMX plans contain raw addresses into the same scratch tensors. Clearing
     # only the non-AMX plans made an on/off/on A/B reuse freed memory.
     _AMX_PLANS.__dict__.pop("p", None)
+    _FLASH.__dict__.pop("ws", None)
 
 
 def _scratch(kind, shape, dtype):
@@ -1367,6 +1368,76 @@ def _dense_cpp(q, k, v, scale: float, causal: bool, geom=None):
     return out
 
 
+_OLD_DENSE = os.environ.get("CPU_ATTENTION_OLD_DENSE") == "1"
+_FLASH = threading.local()
+"""Per-thread flash_attn_func plans and workspace (the Mojo backend)."""
+
+
+def _flash_ws(nbytes):
+    """This thread's workspace, grown on demand and never shrunk: a large
+    `torch.empty` is an mmap, and freeing it means faulting the pages in again
+    on the next call (docs/CPP.md §3). `_drop_workspace` releases it."""
+    ws = getattr(_FLASH, "ws", None)
+    if ws is None or ws.numel() < nbytes:
+        _FLASH.ws = ws = torch.empty(nbytes + 4096, dtype=torch.uint8)
+    return (ws.data_ptr() + 63) & ~63
+
+
+def _flash_plan(geom, k, causal):
+    """Plan buffer for one geometry: the int64 slots `FlashJob` reads."""
+    plans = getattr(_FLASH, "p", None)
+    if plans is None:
+        plans = _FLASH.p = {}
+    qshape, qs, ks, vs, dtype = geom
+    batch, seq_q, heads, hd = qshape
+    seq_k, kv_heads = k.shape[1], k.shape[2]
+    tasks_q = -(-seq_q // 64)
+    key = (geom, k.shape, causal, _OVERRIDE, torch.get_num_threads(),
+           _llc_bytes())
+    plan = plans.get(key)
+    if plan is None:
+        # Rows per work item: the accumulator (rq x hd fp32) stays near 16 KB,
+        # so it is still in L1 when the next key tile arrives.
+        rq = max(16, min(128, 16384 // (hd * 4)))
+        rq = min(rq, max(seq_q, 1))
+        nqb = -(-seq_q // rq)
+        workers = _workers(batch * heads * nqb, 8)
+        dt = _DTYPE_CODES[dtype]
+        slab, aux = _entry("flash_sizes")(seq_k, rq, hd, dt)
+        nbh = batch * kv_heads
+        llc = _llc_bytes()
+        # Fused (pack own head, attend, no barrier) while every worker's slab
+        # fits 0.6 of the LLC and the heads divide evenly; MHA only.
+        fuse = (heads == kv_heads and nbh >= workers and nbh % workers == 0 and
+                slab * workers <= llc * 3 // 5)
+        # fp32 V is read in place while all of it fits half the LLC: the copy
+        # only buys a unit stride (C++ measurement, docs/CPP.md §5).
+        v_direct = dt == 0 and batch * kv_heads * seq_k * hd * 4 <= llc // 2
+        cells = workers if fuse else nbh
+        total = cells * slab + workers * aux + 64
+        buf = torch.tensor([
+            batch, seq_q, seq_k, heads, kv_heads, hd,
+            qs[0], qs[1], qs[2], ks[0], ks[1], ks[2], vs[0], vs[1], vs[2],
+            seq_q * heads * hd, heads * hd, hd,
+            dt, int(bool(causal)), workers, int(fuse), rq, 0, slab, aux,
+            int(v_direct), 0], dtype=torch.int64)
+        if len(plans) > 64:
+            plans.clear()
+        plans[key] = plan = (buf, buf.data_ptr(), total)
+    return plan
+
+
+def _flash_mojo(q, k, v, scale, causal, geom=None):
+    """flash_attn_func on the Mojo backend: one call, seven arguments."""
+    if geom is None:
+        geom = (q.shape, q.stride(), k.stride(), v.stride(), q.dtype)
+    _buf, plan, total = _flash_plan(geom, k, causal)
+    out = torch.empty_like(q, memory_format=torch.contiguous_format)
+    _entry("flash_forward")(plan, q.data_ptr(), k.data_ptr(), v.data_ptr(),
+                            out.data_ptr(), _flash_ws(total), scale)
+    return out
+
+
 def _dense(q, k, v, scale: float, causal: bool, geom=None):
     """Run the dense kernel over contiguous-``head_dim`` q/k/v (already checked).
 
@@ -1394,6 +1465,8 @@ def _dense(q, k, v, scale: float, causal: bool, geom=None):
     out = _amx_dense(q, k, v, scale, causal)
     if out is not None:
         return out
+    if not _OLD_DENSE:
+        return _flash_mojo(q, k, v, scale, causal, geom)
     if geom is None:
         geom = (q.shape, q.stride(), k.stride(), v.stride(), q.dtype)
     # Two knobs that are not part of the geometry but do change the plan, so

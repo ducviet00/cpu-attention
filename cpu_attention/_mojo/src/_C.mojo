@@ -9,10 +9,11 @@ Build with:  pixi run build        (from ``cpu_attention/_mojo``)
 
 from std.os import abort
 from std.memory import bitcast
-from std.python import PythonObject
+from std.python import Python, PythonObject
 from std.python.bindings import PythonModuleBuilder
 from attention import Job, run
 from kvcache import PagedJob, paged_run
+from flash_attn import FlashJob, flash_run, flash_aux_bytes, flash_slab_bytes
 from isa import ptr, tier_name
 from dense import (
     INT8_QK,
@@ -536,6 +537,8 @@ def PyInit__C() abi("C") -> PythonObject:
         var m = PythonModuleBuilder("_C")
         m.def_function[attention]("attention")
         m.def_function[kv_attention]("kv_attention")
+        m.def_function[flash_forward]("flash_forward")
+        m.def_function[flash_sizes]("flash_sizes")
         m.def_function[tier]("tier")
         m.def_function[dense_attention]("dense_attention")
         m.def_function[dense_forward]("dense_forward")
@@ -561,6 +564,34 @@ def tier() raises -> PythonObject:
     """The build tier of this shared object (see `scripts/build.py`)."""
     return PythonObject(tier_name())
 
+
+
+def flash_sizes(seq_k: PythonObject, rq: PythonObject, hd: PythonObject, dtype: PythonObject) raises -> PythonObject:
+    """(slab bytes per (batch, kv head), scratch bytes per thread)."""
+    var sk = Int(py=seq_k)
+    var h = Int(py=hd)
+    return Python.tuple(
+        flash_slab_bytes(sk, h, Int(py=dtype)), flash_aux_bytes(Int(py=rq), h)
+    )
+
+
+def flash_forward(
+    plan: PythonObject,
+    q: PythonObject,
+    k: PythonObject,
+    v: PythonObject,
+    dst: PythonObject,
+    ws: PythonObject,
+    scale: PythonObject,
+) raises:
+    """flash_attn_func from a plan buffer (see `_kernel._flash_plan`)."""
+    var job = FlashJob(
+        Int(py=plan), Int(py=q), Int(py=k), Int(py=v), Int(py=dst),
+        Float32(Float64(py=scale)),
+    )
+    job.ws = Int(py=ws)
+    var p = ptr[Int64](Int(py=plan))
+    flash_run(job, Int(p.unsafe_load(18)), Int(p.unsafe_load(5)))
 
 def kv_attention(
     plan: PythonObject,
