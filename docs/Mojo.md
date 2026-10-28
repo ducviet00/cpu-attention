@@ -1,266 +1,243 @@
 # The Mojo backend
 
-`cpu_attention/_mojo/` is the original kernel: a Mojo port of the hot path of
-vLLM's `csrc/cpu` attention, plus a dense kernel built from vLLM's structure
-(vLLM has no cache-free kernel to port). It is the default backend and the
-oracle the C++ backend (`docs/CPP.md`) is checked against.
+`cpu_attention/_mojo/` is the default backend: one unified CPU attention for
+both public APIs, `flash_attn_func` (FlashAttention over supplied Q/K/V) and
+`flash_attn_with_kvcache` (one-token paged decode, PagedAttention), built with
+Mojo 1.2.0 (pinned in `pyproject.toml`). The C++ backend (`docs/CPP.md`) is the
+performance competitor; the previous Mojo build is kept as the oracle at tag
+`mojo-oracle-v1.1`.
 
 ```bash
-uv sync --extra build                                   # torch + the mojo wheel
-uv run --extra build python scripts/build.py --tests    # -> cpu_attention/_C.so + kernel tests
+uv sync --extra build                                   # torch + mojo==1.2.0
+uv run --extra build python scripts/build.py --tests    # every tier + the standalone kernel test
 ```
-
-`mojo` comes from the PyPI wheel; there is no separate toolchain. `mojo build`
-targets the **host CPU**, so rebuild per machine. `mojo run` cannot run the
-kernel: its JIT cannot resolve `GOMP_parallel`, which is why the tests are a
-built binary.
 
 ## 1. Status
 
-Against vLLM, from the final three-box matrices (2026-10-28, same harness as
-the README), as `mojo / vllm` (below 1 is faster):
+Ryzen 7 7840H, full 170-row manifest (`benchmarks/manifest.py`), against the
+fastest numerically valid C++ path per row (`cpp_vec` or `cpp_scalar`), one
+process, independently loaded arms, 41 rounds (paged: 41 x 40-call blocks),
+governor pinned (`reports/ryzen/checkpoint-6f9040d.json`):
 
-| box | dense bf16 | dense fp32 | paged bf16 | paged fp32 |
-|---|---|---|---|---|
-| Ryzen 7840H (vLLM VEC) | 0.70-1.06, 10/11 faster | 0.99-1.60, 2/11 | 0.69-1.27, 9/10 | 0.93-1.14, 7/10 |
-| Axion Neoverse-V2 (vLLM NEON) | 0.88-1.00, 11/11 | 0.79-1.00, 10/11 | 0.68-1.53, 7/10 | 0.76-1.11, 8/10 |
-| Xeon 8581C (vLLM AMX bf16 / VEC fp32) | 0.80-1.01, 10/11 | 0.54-0.85, 11/11 | 0.83-1.39, 6/10 | 0.75-1.06, 5/10 |
+| rows | win | unresolved | loss |
+|---|---:|---:|---:|
+| flash_attn_func bf16 (39) | 38 | 1 | 0 |
+| flash_attn_func fp32 (39) | 12 | 27 | 0 |
+| decode / store / public API (92) | 33 | 47 | 12 |
+| **all (170)** | **83** | **75** | **12** |
 
-- **Against C++:** C++ beats this backend on 122 of 126 rows.
-- **Where Mojo is still the faster baseline:** Axion dense, where C++ is at
-  parity on 7 rows, and the Ryzen paged b=32 ctx=1024 bf16 rows.
-- **Against SDPA:** every dense row is faster.
-- **Numerics:**
-  - x86 paged bf16 matches vLLM `csrc` to 0-2 bf16 ulp; fp32 agrees to
-    1.5-2.6e-7.
-  - ARM rounds probabilities to bf16 like `csrc`, so it is within 1e-3.
-  - Dense fp32 is <= 4e-6 against the reference on ARM, and 3-8e-5 on AMX
-    (hi/lo).
+A win is below `1 - max(0.03, control spread)`, a loss above `1 + band`;
+anything else is unresolved, not a win. The starting point (the oracle build,
+`reports/ryzen/baseline-bb7dc9a.json`) was 7 / 21 / 142.
+
+**Where it does not win on the Ryzen.**
+- The 12 losses (1.03-1.12) are decode rows that stream 16-32 MB of cache per
+  call (b=8 ctx~1024, b=1 ctx~4096, page 64): both backends run at the box's
+  DRAM bandwidth there (b=8 ctx=1024 bf16 is ~360 us for 32 MB). They are at a
+  shared roof rather than behind a missing technique; neither a page-64
+  specialization nor extra dot chains moved them (§9).
+- fp32 flash_attn_func is FMA-roof bound in both backends (~80% of one zmm FMA
+  per cycle, single-thread parity at every shape measured); 27 of 39 rows are
+  unresolved.
+
+**Axion and Xeon** results are pending the ARM (bfmmla) and AMX policy work;
+until those land the objective is not met on those boxes and no result is
+claimed for them.
 
 ## 2. Layout
 
 ```
-_mojo/src/attention.mojo    paged kernel: Job, store, generic + dot-product attention, dispatch
-_mojo/src/dense.mojo        dense kernels: row kernels, K transpose/pack, bfmmla kernel
-_mojo/src/dense_small.mojo  short-sequence dense kernel (seq_k <= 256)
-_mojo/src/dense_amx.mojo    AMX dense kernel (default on AMX CPUs)
-_mojo/src/dense_amx_v2.mojo opt-in second AMX kernel (CPU_ATTENTION_AMX2=1)
-_mojo/src/amx.mojo          AMX primitives as inline assembly
-_mojo/src/_C.mojo           Python extension (PyInit__C) and the call entries
-_mojo/tests/test_attention.mojo   standalone parity test vs a scalar fp32 reference
-_mojo/tests/amx_smoke.mojo        16x16x32 AMX GEMM vs a scalar reference
-_mojo/tests/bfmmla_layout.mojo    bfmmla operand-layout check
+_mojo/src/isa.mojo        tier flags, LANES, ptr, one exp2[degree], dot_bf16, AMX permission
+_mojo/src/parallel.mojo   one GOMP_parallel region on torch's OpenMP pool, barrier
+_mojo/src/kvcache.mojo    flash_attn_with_kvcache decode + reshape_and_cache (store)
+_mojo/src/flash_attn.mojo flash_attn_func: FlashJob, FlashPolicy trait, the generic driver
+_mojo/src/flash_vec.mojo  the vector policy (AVX-512 / AVX2 / NEON-fp32, LANES-generic)
+_mojo/src/dispatch.mojo   runtime dtype x head_dim x ISA-policy selection
+_mojo/src/pyview.mojo     reads torch tensors natively (the fast call paths, §6)
+_mojo/src/amx.mojo        AMX tile primitives (inline asm, x86 only)
+_mojo/src/_C.mojo         the Python extension
+_mojo/tests/test_attention.mojo   standalone decode parity test vs a scalar fp32 reference
 ```
 
-## 3. Paged kernel (`attention.mojo`)
+## 3. One design for both APIs
 
-**Contract.** Exactly one query token per sequence, attending every cached
-position, so the causal mask is the cache tail.
+**The page layout is shared.** flash_attn_func packs each (batch, kv head) into a
+private slab whose K^T is blocked every 64 keys -- exactly a KV-cache page of 64
+tokens: `[tile][hd][64]` fp32, `[tile][hd/2][64][2]` bf16 (the dim pair a dot
+instruction contracts). The decode cache uses the same dim-pair K layout per
+page. So Q@K^T, the online softmax and P@V are the same register-tile
+algorithm over pages of keys:
+- decode: rows = the query heads of one kv group;
+- flash_attn_func: rows = consecutive query positions.
 
-**Work item = one (sequence, head).** It owns that head's cache slice end to
-end: no KV split, no scratch, no cross-thread reduction.
-- **Dispatch:** `GOMP_parallel` on torch's own OpenMP pool.
-- **Workers:** `min(torch threads, physical cores, tasks)`. A single inline
-  worker is used when `tasks * pages <= 32`.
+**flash_attn_func driver / policy split.** `flash_attn.mojo` owns scheduling,
+the bottom-right causal bound (row i sees keys `j <= i + seq_k - seq_q`, exact
+per register tile, fully masked tiles skipped), the online-softmax state, the
+accumulator and the epilogue (a row with no visible key is exactly 0). An ISA
+supplies a `FlashPolicy` struct (pack, slab/tile sizes, one register tile of
+rows). `dispatch.mojo` picks the policy at runtime; the abstraction is zero-cost
+(1024:8:64 bf16 single-thread 4.61 -> 4.56 ms across the refactor). Scheduling:
+*fused* (a thread packs a head, then attends all of its query blocks, no
+barrier) while the workers' slabs fit 0.6 of the LLC, else *split* (pack all,
+barrier, dynamic boustrophedon over query blocks through an atomic counter).
 
-**Tiles.** KV is scored in tiles of 32 (or 16) positions, with `GROUP = 4`
-tiles per online-softmax step. The group loop resolves `(page, offset)` per
-tile and shares it between Q@K^T and P@V. Walking pages instead of tiles was a
-bug: it silently scored the first tile of each multi-tile page (§8).
+**Vector policy.** 8-row x 16-key Q@K^T tile with the query broadcast folded into
+the instruction (`vdpbf16ps ... {1to16}` / `vfmadd ... {1to16}`), the tile
+maximum tracked in registers during Q@K^T (no max pass), degree-2 `exp2` for bf16
+probabilities (they are rounded to bf16 right after), degree 5 for fp32; bf16
+P@V by `dpbf16ps` on key pairs (V packed `[key/2][hd][2]`); fp32 V read in place
+while all of V fits LLC/2. Partial tiles instantiate 2- and 4-row variants.
 
-**Page layouts** (one page = `block_size * head_dim`):
+**Decode.** Work item = (sequence, kv head, chunk of that head's query heads):
+every query head of a GQA/MQA group is a row of one register tile, so the group
+shares one scan of the cache (0.52-0.73 of C++ on the GQA/MQA rows, where C++
+rescans per query head). Groups are split into chunks only when there are fewer
+(sequence, kv head) pairs than workers; stores then precede a barrier.
+x86 keeps C++'s numerics class (dpbf16ps Q@K^T, fp32 P@V, degree-2 exp2 for
+bf16, degree-6 fp32) so the 2-ulp cross-backend bf16 gate is meaningful; bf16 V
+is widened even/odd split (`w << 16`, `w & 0xffff0000`: 2 instructions per 32
+values instead of 4), bit-identical. The page size is a compile-time constant
+for 16 and 32 (the engine defaults). P@V never reads past `lens`, a negative slot
+skips its store, a zero-length context returns 0.
 
-| | layout | why |
+## 4. Tiers and runtime ISA selection
+
+`scripts/build.py` builds one shared object per tier for an explicit target --
+never the build host -- and `cpu_attention._kernel` loads the best tier the CPU
+reports in `/proc/cpuinfo` (a listed AVX-512 flag is also an OS-state check):
+
+| tier | target | selected when |
 |---|---|---|
-| K, dot paths | `[hd/2][block][2]` | one token per column |
-| K, fp32 fallback | `[hd][block]` | |
-| V, x86 | `[block][hd]` | |
-| V, ARM | `[block/2][hd][2]` | `bfdot` contracts two adjacent keys |
+| `x86-avx512bf16` | `x86-64-v4 +avx512bf16,+avx512vnni` (+ AMX kernels) | AVX-512 F/BW/VL/DQ/CD + BF16 + VNNI |
+| `x86-avx2` | `x86-64-v3` | AVX2, FMA, BMI1/2, F16C, MOVBE |
+| `x86-64` | `x86-64` | always |
+| `aarch64-bf16` | `neoverse-n1 +bf16,+i8mm` | asimd + bf16 + i8mm |
+| `aarch64-neon` | `generic` | always |
 
-**Online softmax.** `m' = max(m, max(group))`, `l = l*exp(m-m') +
-sum(exp(group-m'))`, `acc = acc*exp(m-m') + P@V`. The probabilities stay in
-registers.
+`CPU_ATTENTION_ISA=amx|vec|avx2|scalar|neon` forces a tier (and turns AMX off
+except for `amx`); a tier the CPU lacks is refused with an error. AMX code sits in
+the AVX-512-BF16 tier (inline asm assembles for any x86 target) and runs only
+when the CPU reports `amx_tile`/`amx_bf16` and `arch_prctl` grants tile state.
+`_C.so` is a copy of the host's best tier for older callers. Every tier the CPU
+supports passes the gates (Ryzen: avx512bf16, avx2, x86-64; Xeon: vec, avx2,
+scalar). bf16 K is dim pairs on every tier, so a cache written under one tier
+is read correctly under another.
 
-**Arithmetic.**
-- On the dot path, Q stays bf16 and the scale multiplies the logits; never
-  round Q through a scaled multiply.
-- x86 bf16 does Q@K^T with `vdpbf16ps` and keeps P@V in fp32. That keeps
-  bit-parity with `csrc` and is 1.87x on the QK phase.
-- ARM bf16 uses `bfdot` for both phases.
+## 5. Numerics and gates
 
-**Strides.** q/k/v are chunks of the fused `qkv_proj` output (token stride
-`3*d_model`), so `q_stride` / `kv_stride` / `dst_stride` are explicit.
-Assuming contiguity gave every sequence sequence 0's output (§8).
+| gate | limit | Ryzen result |
+|---|---|---|
+| flash_attn_func fp32 vs naive fp32 reference | 2e-4 | test_dense 82/82, fuzz 80/80 (worst 0.52x tol) |
+| flash_attn_func bf16 | 3e-2 | same |
+| paged fp32 | 1e-6 (fp64 arbitrates an out-of-gate fp32 reference) | sweep 504/504, worst 8.9e-7 |
+| paged bf16 x86 | <= 2 bf16 ulp at the row peak vs C++ | worst 1.89 |
+| regressions (`tests/test_regressions.py`) | as above | 412/412 |
+| fast-encdec `tests/test_cpu_attention.py` (strided fused q/k/v) | 45 checks | 45/45 |
 
-## 4. Dense kernels
-
-**Generic row kernels (`dense.mojo`).**
-- **Work item.** `qt` consecutive query rows of one (batch, head), swept over
-  the whole key range, so the accumulator stays in registers. `qt` comes from
-  `_kernel._qt_for` per (ISA, dtype, head_dim, seq_k): x86 fp32 8, ARM 8, x86
-  bf16 4-8. `CPU_ATTENTION_QT` overrides it.
-- **Three row kernels:**
-  - register accumulator, while `qt*hd <= 512`;
-  - L1 accumulator with the head dim tiled, for head_dim 128 without spills;
-  - the bf16 dot kernel.
-- **K/V packing.** Per (batch, kv head) contiguous K/V (vLLM's page layout)
-  was worth 2.0x. K^T is blocked every 64 keys; one blocked transpose pass runs
-  at 40-70 GB/s against 11-15 GB/s for `torch.permute().contiguous()`.
-- **Masking and bounds.**
-  - The causal limit is bottom-right aligned and *inclusive*
-    (`j <= i + seq_k - seq_q`). Only the boundary tile builds a lane mask.
-  - P@V walks only keys that exist (`0 * garbage` is not 0).
-  - Query rows past `seq_q` are never loaded.
-- **The (batch, head) work item.** A thread packs that head and then attends all
-  of its query blocks, with no phase barrier. `perf` had put 29% of a short call
-  in the OpenMP barrier.
-
-**ARM: `bfmmla` for both phases.**
-- **Tiles.** Q@K^T is 2 rows x 4 dims against 2 keys x 4 dims; P@V is 2 rows x
-  4 keys against 2 dims x 4 keys. A task lives in 2x2 fp32 tiles, and the logits
-  *are* the Q@K^T accumulators.
-- **Layouts.** K is `[hd/4][seq/2][8]` and V `[hd/2][seq/4][8]`, packed in one
-  pass.
-- **Exponential.** `_exp2_fast` uses magic-constant rounding, a polynomial and
-  an exponent insert: degree 4 for fp32, degree 2 for bf16, ~10 instructions
-  against `std.math.exp`'s ~22. Clamping at -127 makes masked lanes exactly 0.
-- **Result.** 2.2-3.2x over the previous kernel.
-
-**Short sequences (`dense_small.mojo`, `seq_k <= 256`).** Rounds key coverage
-to 8 keys instead of 16 and packs in the same region.
-
-**AMX (`dense_amx.mojo`, default on AMX CPUs).**
-- **Work item = (batch, kv head).** It packs that head's K/V and attends every
-  query block of it, so the head's 32 KB of operands stay in L1.
-- **Matmuls.** 16-row tiles, `tdpbf16ps` for both phases, and fp32 as bf16
-  hi/lo.
-- **Call path.** A 5-argument plan entry (`dense_amx_plan`), whose geometry is
-  in an int64 buffer cached per (shapes, strides, dtype, causal, kt, workers).
-  Going from 36 arguments to 5 took 43.1 -> 37.0 us at 128:8:64.
-- **Gains.** 2.8-9.8x over the AVX-512 path.
-- **Machine facts:**
-  - one `tdpbf16ps` is ~5 ns (3.0-3.4 TFLOP/s/core);
-  - tile loads are free behind dots;
-  - AMX and the vector pipes overlap.
-- **`CPU_ATTENTION_AMX=0`** falls back to AVX-512.
-
-**AMX from Mojo.** LLVM's AMX intrinsics take the `x86_amx` type, which Mojo
-cannot name. `amx.mojo` therefore spells the tile number inside inline assembly
-(`ldtilecfg`, `tileloadd`, `tdpbf16ps`, `tilestored`, `tilezero`), with the tile
-as a compile-time parameter.
-- LLVM does not model tile registers, so every primitive carries a `~{memory}`
-  clobber against a `tileloadd` being hoisted above a `tdpbf16ps` that still
-  reads it.
-- In AT&T operand order the destination tile is last.
-
-## 5. One source, several ISAs
-
-```mojo
-comptime X86_DOT  = CompilationTarget.is_x86() and CompilationTarget._has_feature["avx512bf16"]()
-comptime NEON_DOT = CompilationTarget.has_neon() and CompilationTarget._has_feature["bf16"]()
-comptime LANES = simd_width_of[DType.float32]()     # 16 AVX-512, 4 NEON
-```
-
-Intrinsics go through `llvm_intrinsic[..., has_side_effect=False]`:
-`llvm.x86.avx512bf16.dpbf16ps.512`, `llvm.aarch64.neon.bfdot` and
-`llvm.aarch64.neon.bfmmla`. **Without `has_side_effect=False` the calls are
-ordered and the phase is ~4x slower.**
-
-Tile sizes must be lane-relative (`KT_TILE = 4 * LANES`), not x86-relative.
-Verify both targets without the hardware:
-
-```bash
-mojo build --emit llvm cpu_attention/_mojo/src/_C.mojo -o /tmp/x86.ll && grep -c dpbf16ps /tmp/x86.ll
-mojo build --emit llvm --target-triple aarch64-unknown-linux-gnu --target-cpu neoverse-v3 \
-    cpu_attention/_mojo/src/_C.mojo -o /tmp/arm.ll && grep -c neon.bfdot /tmp/arm.ll
-```
-
-`--target-cpu` is not optional. Without it the build has no `+bf16`, so it
-silently compiles the portable path.
+**ARM bf16 "<= 1e-3 against the reference".** Taken literally (absolute error to
+the real-valued result) no bf16 output can meet it: at short contexts both
+backends sit 3-4e-3 from the fp32 reference while agreeing to 0.45-1.5 ulp, and
+the earlier campaign measured 77/252 Axion sweep cases where rounding the exact
+result to bf16 alone exceeds 1e-3 (worst 6.6e-3). The tests therefore check the
+error *above the bf16 output-rounding floor*, `max(|out - ref| - |ref -
+bf16(ref)|) <= 1e-3` (`tests/reference.bf16_excess`), on top of the 2-ulp
+cross-backend gate. This is a stated interpretation of an unattainable literal
+gate, not a passed literal gate. The scale used by the changed-scale regression
+stays where the 1e-6 fp32 gate is defined: at scale 0.9 the fp32 *reference* is
+6.4e-6 from fp64.
 
 ## 6. Call path and threading
 
-- **Run on torch's pool.** `GOMP_parallel` on torch's libgomp pool costs 2.4 us
-  warm and 2.7 us after a 1 ms gap. MAX's `parallelize` was 6.3 / 103-140 us
-  and a hand-rolled pthread pool 9.4 / 103 us. In the engine that took an
-  attention call from 180-196 us to 29.8 us. Do not build a private pool.
-- **Use the team size.** libgomp slices must use `omp_get_num_threads()`, not
-  the requested count: `GOMP_parallel` clamps to `OMP_NUM_THREADS`.
-- **Linking libgomp.**
-  - On x86 the extension leaves the libgomp symbols undefined; torch loads
-    `libgomp.so.1` first.
-  - On aarch64 torch's copy is `RTLD_LOCAL`, so `scripts/build.py` links it into
-    the extension.
-- **Plans.** The paged path keeps a per-thread plan in Python that patches only
-  the data pointers, and the dense path uses plan-buffer entries. The paged call
-  path is ~3.4 us, of which the extension marshal is 1.2 us.
+- **Torch's OpenMP pool.** One `GOMP_parallel` region per call (~2.4 us warm);
+  MAX's `parallelize` and private pools were slower (`docs/CPP.md` §8). Slices
+  use `omp_get_num_threads()`; workers are capped at physical cores.
+- **Native tensor reads (`pyview.mojo`).** `data_ptr()`/`.shape` cost ~50 ns each
+  from Python, and a decode call needs a dozen. At import, `_kernel._calibrate_layout`
+  finds the TensorImpl/StorageImpl field offsets by matching what torch reports
+  (`tensor._cdata` is the TensorImpl, `untyped_storage()._cdata` the StorageImpl),
+  verifies them on probe tensors (views with offsets, transposes, 1-4 dims, five
+  dtypes, `nn.Parameter`) through ctypes and again through the module's reader,
+  and disables the path on any disagreement (`CPU_ATTENTION_KV_FAST=0` turns it
+  off). `kv_fast` / `flash_fast` accept only exact `torch.Tensor`/`Parameter`
+  objects whose dtype, dims, sizes, strides, causal flag, scale and thread count
+  match a per-thread plan registered after a fully validated call; anything else
+  returns to the checked Python path. A grown workspace, `set_num_workers` and
+  `_drop_workspace` invalidate every table.
+  - b=1 ctx=256 decode with `out=`: 4.4 -> 2.75 us (C++ 3.06).
+  - flash_attn_func 17:8:64 bf16: 5.26 -> 3.05 us (C++ 5.28).
+- **Workspace** is per thread, grown on demand, never shrunk (a freed large
+  tensor is an mmap that faults in again).
 
-## 7. Mojo language notes (the ones that cost time)
+## 7. Measuring
 
-- **Syntax.**
-  - `def`, not `fn` (which is also reserved as a name: use `task_fn`).
-  - `@__parameter`, and no `@__parameter` on nested closures: use capture lists
-    (`{imm}`, `{mut x}`).
-- **No mutable globals.** Module-level `comptime` constants are fine.
-- **Compile time.**
-  - `comptime` ternaries do not fold to comptime integers;
-    `simd_width_of[...]()` does.
-  - `comptime if` arms are type-checked even when dead, hence the separate
-    per-tile-width functions.
-- **SIMD.**
-  - A runtime index into a SIMD spills it to the stack; use `comptime for`.
-  - SIMD comparisons (`a < b`) reduce to `Bool`. Use `.lt/.le/.gt/.eq` and
-    `mask.select(a, b)` for lanes.
-- **Arithmetic.**
-  - `std.math.exp` on SIMD is ~22 instructions; the hand-rolled `_vexp` /
-    `_exp2_fast` are 18-20% on bf16.
-  - Multiply/add pairs do not contract on their own; use `fma()` explicitly.
-- **FFI.** `external_call["GOMP_parallel", ...]`, and `@export def f() abi("C")`.
-  A struct holding a thin function value must be `ImplicitlyCopyable`.
-- **Buffers.** Prefer `stack_allocation` or torch tensors over `List` for
-  anything read through raw pointers.
+`benchmarks/bench.py` is the harness (docs/CPP.md §7 rules): every arm is an
+independently loaded copy of the package (`benchmarks/arms.py`) -- `mojo_new`,
+`mojo_ctrl` (a second copy: the noise floor), `mojo_old` (the oracle tag), one
+`cpp_<isa>` per applicable C++ path -- plus pinned vLLM and SDPA, interleaved
+with rotated order, minimum as the statistic, raw samples kept, every arm's
+output validated, the environment recorded in the JSON. Each arm stages its own
+cache through its own `reshape_and_cache`; repeated appends rewrite the same
+slot. `scripts/pin_governor.sh` pins `performance` and restores each CPU's
+original setting. Paged rows on the Ryzen use 40-call blocks, which keep a
+16 MB working set warm; that is the documented protocol, not a cold-cache
+number.
 
-## 8. Failure modes we hit (each has a regression test)
+## 8. Defects found and fixed (each has a regression test)
 
-1. **Token strides.** The fused-projection chunks are not contiguous.
-   Explicit strides fixed it; the engine test covers it.
-2. **Page-vs-tile walk.** At block 64 it was silently 2046/2048 wrong.
-   `test_attention.mojo` covers blocks 48/64 with multi-tile pages.
-3. **K/V page layout per path.** Store and load must read the same `comptime`
-   predicate, or one dtype or block size is bit-exact but wrong.
-4. **The inclusive causal limit.** `t < limit` dropped the diagonal, and only
-   under `causal`.
-5. **P@V past `seq_k`.** It read past the tensor: NaN on some runs and 4e-7 on
-   others.
-6. **Loading rows past `seq_q`.** The garbage NaN'd through `exp`.
-7. **Blind engine tests.** The engine's token comparison is degenerate on the
-   tiny model, so the standalone scalar-reference test is the real gate.
-8. **Freed workspace under AMX.** `_drop_workspace()` must also drop the AMX
-   plans that hold the workspace's addresses (fixed).
+1. **Old Mojo: negative slot** stored at a negative offset (segfault). C++ skips
+   the store; so does the new kernel.
+2. **Old Mojo: zero-length context** returned NaN; now exactly 0.
+3. **AMX plan key** left out `softmax_scale` (and the worker override): a second
+   call with a different scale reused the first one (Xeon, errors 2-4).
+4. **aarch64 misaligned atomic**: the split order's Int64 work counter sat after
+   an odd-sized scratch block; ARM atomics fault (SIGBUS) where x86 does not.
+   Scratch is 64-byte aligned.
+5. **Mojo 1.2.0 assembles inline asm in dead instantiations**: the AMX asm
+   reached the ARM assembler. The primitives are `comptime if is_x86()`.
+6. **LLVM ISel crash** (`Do not know how to split this operator's operand`) in
+   the old bf16 dense kernel for non-AVX-512-BF16 targets; the old kernel is gone.
+7. **Lower tiers read bf16 K wrongly** when the dot path was gated on the
+   instruction rather than the layout; bf16 always goes through `dot_bf16`
+   (one instruction, or widened).
+8. **C++ (not fixed, reported):** on Axion the C++ NEON bf16 decode returns NaN
+   when unused cache slots/padding hold NaN, and a non-finite row for a
+   zero-length context (`test_regressions.py` on the cpp backend).
 
-## 9. Levers exhausted (do not redo)
+## 9. Falsification ledger (this campaign)
 
-| lever | result |
-|---|---|
-| per-head-contiguous K/V | **2.0x**, ported |
-| rows per K/V sweep (`qt`) | 1.14-1.19x x86, 1.42-1.73x ARM fp32 D=128, ported |
-| `bfmmla` both phases on ARM | 2.2-3.2x, ported |
-| AMX via inline assembly | 2.8-9.8x bf16 on AMX boxes, ported |
-| fast exp | +18% x86 bf16 D=128, ported |
-| register-tiled GEMM micro-kernel | 1.63x slower |
-| L2-sized logits tile / memory-resident logits | 0.74-0.81x, twice |
-| 32-key softmax step | 0.84x (spills) |
-| deferred row sum + FA4 -8 threshold | 1.00x |
-| one row pair at a time / L1-staged logits / softmax pipelining | -11% / 0% / -11% |
-| AMX: pipelining the softmax under the dots | 0.73-0.91x |
-| AMX: cheaper exponential (`ldexp`, degree 3) | +8% single-thread, -10..-27% on four threads |
-| KV splits, mask-by-range, probability aliasing | <= 4%, not needed for MHA |
-| private thread pool, any form | slower than torch's pool |
-| software prefetch of the next page | neutral to worse |
-| int8 `smmla` for Q@K^T on ARM | 3x MAC rate, but fails the 3e-2 gate |
+Measured in one process against an independent control; reverted unless it beat
+the control by more than 3-5%.
 
-**What is left** is fused-loop IPC on the D=128 long rows. The C++ backend's
-results show which of these levers paid off (`docs/CPP.md` §5):
-- bf16 P@V via `dpbf16ps` on key pairs (2.05x on the phase);
-- non-temporal output stores;
-- in-place V while it fits the cache.
+| idea | result | decision |
+|---|---|---|
+| page size as a compile-time constant (16/32) | decode bf16 1.015 -> 0.956 us/head, fp32 2.79 -> 2.46 | kept |
+| even/odd split bf16 V widen | 0.956 -> 0.86 us/head, bit-identical | kept |
+| runtime head-dim loop in Q@K^T (no hoisted, spilled broadcasts) | decode bf16 0.86 -> 0.72 us/head (C++ 0.83) | kept |
+| query/probability as the last `vdpbf16ps` source (broadcast folds) | dense bf16 5.72 -> 5.06 ms | kept |
+| degree-2 exp2 for bf16 dense probabilities | 5.08 -> 4.92 ms | kept |
+| tile maximum tracked in Q@K^T (no max pass) | 4.92 -> 4.61 ms | kept |
+| native tensor reads (decode / flash) | 4.4 -> 2.75 us; 5.26 -> 3.05 us | kept |
+| x86 decode P@V via `dpbf16ps` key pairs | rounding P to bf16 alone adds up to 1.81 peak ulp; with the existing 1.89 it breaks the 2-ulp gate | rejected on arithmetic |
+| two dot chains per key group in decode Q@K^T | 0.86 -> 0.86 us/head (L3-bound) | reverted |
+| one dim vector per P@V pass (fold the probability broadcast) | fp32 hd=128 1.28x slower (V re-read), others neutral | reverted |
+| page 64 as a compile-time constant | 0.972 bf16 / 0.999 fp32 vs the previous build | reverted |
+| fp32 scratch without the bf16 probability buffer | no change (104.6 vs 104.6 us) | kept for sizing only |
+| fp32 flash multi-thread gap on short shapes (before the fast path) | single-thread parity at every shape; 3-8% multi-thread, more L1/LLC misses, cause not found | open |
+
+Earlier campaigns' ledgers (`docs/CPP.md` §8 and the oracle's notes at
+`mojo-oracle-v1.1`) still apply; nothing on them was re-run without a new
+mechanism.
+
+## 10. Mojo 1.2.0 notes (the ones that cost time)
+
+- `--fp-mode contract=fast` is the default: `a + b*c` contracts into FMA across
+  statements.
+- `Int` has no `bit_length`; `Atomic[Int64].fetch_add(ptr, 1)`; there is no
+  `memset_zero`; positional pointer indexing is deprecated (`unsafe_load`).
+- A fully `comptime for`-unrolled head-dim loop lets LLVM hoist every query
+  broadcast out of the key loop and spill it: keep a runtime loop with a small
+  unroll.
+- `llvm_intrinsic[..., has_side_effect=False]` for dot instructions, or the calls
+  stay ordered (~4x slower).
+- `out` is a keyword (not an argument name); `PythonObject._obj_ptr` is the raw
+  object; stack arrays of megabytes overflow the 8 MB stack.
