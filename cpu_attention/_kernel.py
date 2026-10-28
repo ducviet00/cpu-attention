@@ -230,6 +230,7 @@ def set_num_workers(workers: int) -> None:
     """
     global _OVERRIDE
     _OVERRIDE = str(workers) if workers else None
+    _KV_GEN[0] += 1
 
 
 def _workers(num_tasks: int, pages: int = 1) -> int:
@@ -344,6 +345,8 @@ def _kv_build(query, key, value, k_cache, page_table, do_store, do_attend):
             entry(plan, 0, key.data_ptr(), value.data_ptr(), k_cache.data_ptr(),
                   v_cache.data_ptr(), 0, slots.data_ptr(), 0, 0, 0, kv_stride,
                   1.0)
+    # What `kv_fast` needs to run this plan without Python (no copies needed).
+    fn.fast = (buf, q_stride, kv_stride) if q_ok and kv_ok else None
     return fn
 
 
@@ -352,6 +355,136 @@ def _kv_plans():
     if plans is None:
         plans = _PAGED_PLANS.p = {}
     return plans
+
+
+
+# ---------------------------------------------------------------------------
+# kv_fast: the decode call with the tensors read in Mojo (pyview.mojo)
+# ---------------------------------------------------------------------------
+_KV_W = 32  # int64 slots per plan entry (see _C.mojo kv_fast)
+_KV_CAP = 32
+_KV_TABLE = threading.local()
+_KV_GEN = [0]  # bumped by set_num_workers / _drop_workspace: tables are rebuilt
+_LAYOUT = None  # calibrated header slots, or False when the fast path is off
+_DT_CODE = {}
+
+
+def _calibrate_layout():
+    """TensorImpl/StorageImpl field offsets, found by matching what torch reports
+    (`tensor._cdata` is the TensorImpl address) and verified on probe tensors,
+    first through ctypes and then through the module's own reader. Any
+    disagreement disables the fast path (False); nothing is assumed."""
+    import ctypes
+
+    def words(a, n):
+        return [ctypes.c_int64.from_address(a + 8 * i).value for i in range(n)]
+
+    def u16(a):
+        return ctypes.c_uint16.from_address(a).value
+
+    try:
+        p0 = torch.empty(3, 5, 7)
+        w = words(p0._cdata, 48)
+        st = p0.untyped_storage()
+        o_st = [i for i, x in enumerate(w) if x == st._cdata]
+        o_dp = [i for i, x in enumerate(words(st._cdata, 16)) if x == st.data_ptr()]
+        o_sz = [i for i in range(45) if w[i:i + 3] == [3, 5, 7]]
+        o_sd = [i for i in range(45) if w[i:i + 3] == [35, 7, 1]]
+        wv = words(torch.empty(100)[13:].view(29, 3)._cdata, 48)
+        o_off = [i for i, x in enumerate(wv) if x == 13 and w[i] == 0]
+        w2 = words(torch.empty(2, 2)._cdata, 48)
+        w1 = words(torch.empty(4)._cdata, 48)
+        o_dim = [i for i in range(48) if (w[i], w2[i], w1[i]) == (3, 2, 1)]
+        dts = (torch.float32, torch.bfloat16, torch.int32, torch.int64,
+               torch.float16)
+        pairs = [(torch.empty(3, 5, dtype=d), torch.empty(7, dtype=d)) for d in dts]
+        o_dt = [b for b in range(0, 384, 2)
+                if all(u16(a._cdata + b) == u16(c._cdata + b) for a, c in pairs)
+                and len({u16(a._cdata + b) for a, _ in pairs}) == len(dts)]
+        if not (o_st and o_dp and o_sz and o_sd and o_off and o_dim and o_dt):
+            return False
+        o_st, o_dp, o_sz, o_sd, o_off, o_dim, o_dt = (
+            o_st[0], o_dp[0], o_sz[0], o_sd[0], o_off[0], o_dim[0], o_dt[0])
+        codes = {d: u16(a._cdata + o_dt) for d, (a, _) in zip(dts, pairs)}
+        base = torch.randn(64, 3 * 16 * 8)
+        probes = [
+            torch.randn(5), torch.randn(4, 6), torch.randn(2, 3, 4),
+            torch.randn(2, 3, 4, 5).bfloat16(), torch.randn(9, 7)[2:].t(),
+            torch.arange(50, dtype=torch.int32)[7:], torch.arange(9)[1::2],
+            base[:, 16 * 8:32 * 8].view(64, 16, 8),
+            torch.nn.Parameter(torch.randn(6, 2)),
+            torch.empty(3, 16, 32, 64, dtype=torch.bfloat16)[1:],
+        ]
+
+        def ref(t):
+            return (t.untyped_storage().data_ptr(), t.dim(), list(t.shape),
+                    list(t.stride()), codes.get(t.dtype), t.storage_offset())
+
+        for t in probes:
+            im = t._cdata
+            got = (words(words(im + 8 * o_st, 1)[0] + 8 * o_dp, 1)[0],
+                   words(im + 8 * o_dim, 1)[0], words(im + 8 * o_sz, t.dim()),
+                   words(im + 8 * o_sd, t.dim()), u16(im + o_dt),
+                   words(im + 8 * o_off, 1)[0])
+            if got != ref(t):
+                return False
+        hdr = [0, 8 * o_st, 8 * o_dp, 8 * o_off, 8 * o_dim, 8 * o_sz, 8 * o_sd,
+               o_dt, id(torch.Tensor), id(torch.nn.Parameter), id(None), 0,
+               codes[torch.int32], codes[torch.int64], 0, 0]
+        probe = module().tensor_probe
+        buf = torch.tensor(hdr, dtype=torch.int64)
+        for t in probes:
+            r = probe(buf.data_ptr(), t)
+            n = r[1]
+            mine = (r[0], n, r[2:2 + n], r[2 + n:2 + 2 * n], r[2 + 2 * n],
+                    r[3 + 2 * n])
+            if mine != ref(t) or not r[4 + 2 * n]:
+                return False
+        _DT_CODE.update(codes)
+        return hdr
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _kv_table():
+    """This thread's kv_fast table (int64 tensor), or None if the fast path is
+    off (calibration failed, or CPU_ATTENTION_KV_FAST=0)."""
+    global _LAYOUT
+    t = getattr(_KV_TABLE, "t", None)
+    if t is not None and _KV_TABLE.gen == _KV_GEN[0]:
+        return t
+    if _LAYOUT is None:
+        _LAYOUT = (os.environ.get("CPU_ATTENTION_KV_FAST", "1") != "0" and
+                   _calibrate_layout())
+    if not _LAYOUT:
+        return None
+    t = torch.zeros(16 + _KV_CAP * _KV_W, dtype=torch.int64)
+    t[:16] = torch.tensor(_LAYOUT, dtype=torch.int64)
+    _KV_TABLE.t, _KV_TABLE.gen, _KV_TABLE.keep = t, _KV_GEN[0], []
+    _KV_TABLE.addr = t.data_ptr()
+    return t
+
+
+def _kv_register(fn, query, key, value, k_cache, page_table, do_store):
+    """Record the plan `fn` just ran so the next call with this layout runs from
+    Mojo. Only plans that needed no copies qualify."""
+    if fn.fast is None or _kv_table() is None or query.dtype not in _DT_CODE:
+        return
+    t = _KV_TABLE.t
+    n = int(t[11])
+    if n == _KV_CAP:
+        t[11] = n = 0
+        _KV_TABLE.keep = []
+    buf, q_stride, kv_stride = fn.fast
+    e = [_DT_CODE[query.dtype], int(do_store), torch.get_num_threads(),
+         *query.shape, *query.stride(), *k_cache.shape, *page_table.shape,
+         *(key.stride() if do_store else (0, 0, 0)),
+         *(value.stride() if do_store else (0, 0, 0)),
+         buf.data_ptr(), q_stride, kv_stride, query.element_size()]
+    off = 16 + n * _KV_W
+    t[off:off + len(e)] = torch.tensor(e, dtype=torch.int64)
+    _KV_TABLE.keep.append(buf)
+    t[11] = n + 1
 
 
 def _kv_store(key, value, k_cache, v_cache, slots):
@@ -391,6 +524,15 @@ def _paged(
             res = call(query, key, value, k_cache, v_cache, slots, page_table,
                        lens, scale, out)
         return res
+    if out is None:
+        # Paged queries have contiguous heads/dims; a fused-projection token
+        # gap is compacted by empty_like without a memory-format keyword.
+        out = torch.empty_like(query)
+    table = getattr(_KV_TABLE, "t", None)
+    if table is not None and _KV_TABLE.gen == _KV_GEN[0] and _entry("kv_fast")(
+            _KV_TABLE.addr, query, key, value, k_cache, v_cache, slots,
+            page_table, lens, scale, out):
+        return out
     # One tuple, one lookup: the key carries the strides, so the layout checks
     # run only when a plan is built (0.75 us of Python per call before).
     plans = _kv_plans()
@@ -407,11 +549,8 @@ def _paged(
             plans.clear()
         fn = plans[k] = _kv_build(query, key, value, k_cache, page_table,
                                   do_store, True)
-    if out is None:
-        # Paged queries have contiguous heads/dims; a fused-projection token
-        # gap is compacted by empty_like without a memory-format keyword.
-        out = torch.empty_like(query)
     fn(out, query, key, value, k_cache, v_cache, slots, page_table, lens, scale)
+    _kv_register(fn, query, key, value, k_cache, page_table, do_store)
     return out
 
 
@@ -502,6 +641,7 @@ def _drop_workspace() -> None:
     _AMX_PLANS.__dict__.pop("p", None)
     _FLASH.__dict__.pop("ws", None)
     _FLASH.__dict__.pop("p", None)
+    _KV_GEN[0] += 1
 
 
 def _scratch(kind, shape, dtype):

@@ -15,6 +15,8 @@ from kvcache import PagedJob, paged_run
 from flash_attn import FlashJob
 from dispatch import flash_run, flash_sizes as _flash_sizes
 from isa import ptr, tier_name
+from std.ffi import external_call
+from pyview import data_ptr, dims, dtype_code, hdr_at, impl, is_tensor, size, stride, word
 from amx import amx_init
 from dense_amx import AMX, AmxJob, PackJob, run_dense_amx
 from dense_amx_v2 import (
@@ -228,6 +230,8 @@ def PyInit__C() abi("C") -> PythonObject:
     try:
         var m = PythonModuleBuilder("_C")
         m.def_function[kv_attention]("kv_attention")
+        m.def_function[kv_fast]("kv_fast")
+        m.def_function[tensor_probe]("tensor_probe")
         m.def_function[flash_forward]("flash_forward")
         m.def_function[flash_sizes]("flash_sizes")
         m.def_function[tier]("tier")
@@ -274,6 +278,158 @@ def flash_forward(
     job.ws = Int(py=ws)
     var p = ptr[Int64](Int(py=plan))
     flash_run(job, Int(p.unsafe_load(18)), Int(p.unsafe_load(5)), Int(p.unsafe_load(27)))
+
+
+comptime KV_ENTRY0 = 16  # first plan entry slot in the kv_fast table
+comptime KV_ENTRY_W = 32  # slots per entry
+
+
+def tensor_probe(table: PythonObject, t: PythonObject) raises -> PythonObject:
+    """(storage base, dim, sizes..., strides..., dtype code, storage offset,
+    accepted type) as this module reads
+    them; the Python calibration compares it with torch before enabling
+    `kv_fast`."""
+    var hdr = Int(py=table)
+    var im = impl(Int(t._obj_ptr))
+    var n = dims(hdr, im)
+    var out = Python.list()
+    out.append(word(word(im + hdr_at(hdr, 1)) + hdr_at(hdr, 2)))  # storage base
+    out.append(n)
+    for i in range(min(n, 5)):
+        out.append(size(hdr, im, i))
+    for i in range(min(n, 5)):
+        out.append(stride(hdr, im, i))
+    out.append(dtype_code(hdr, im))
+    out.append(word(im + hdr_at(hdr, 3)))
+    out.append(is_tensor(hdr, Int(t._obj_ptr)))
+    return out
+
+
+@always_inline
+def _match3(e: Int, at: Int, hdr: Int, im: Int, strides: Bool) -> Bool:
+    comptime for i in range(3):
+        var x = stride(hdr, im, i) if strides else size(hdr, im, i)
+        if x != word(e + 8 * (at + i)):
+            return False
+    return True
+
+
+def kv_fast(
+    table: PythonObject,
+    q: PythonObject,
+    k: PythonObject,
+    v: PythonObject,
+    k_cache: PythonObject,
+    v_cache: PythonObject,
+    slots: PythonObject,
+    block_table: PythonObject,
+    lens: PythonObject,
+    scale: PythonObject,
+    dst: PythonObject,
+) raises -> PythonObject:
+    """KV-cache attention with the tensors read here (see pyview.mojo): True if
+    a plan in `table` matched this call's layout and it ran, False for the
+    caller's checked path (which then registers a plan)."""
+    var hdr = Int(py=table)
+    var none = hdr_at(hdr, 10)
+    var qo = Int(q._obj_ptr)
+    var kco = Int(k_cache._obj_ptr)
+    var vco = Int(v_cache._obj_ptr)
+    var bto = Int(block_table._obj_ptr)
+    var lo = Int(lens._obj_ptr)
+    var oo = Int(dst._obj_ptr)
+    var ko = Int(k._obj_ptr)
+    var store = ko != none
+    if not (is_tensor(hdr, qo) and is_tensor(hdr, kco) and is_tensor(hdr, vco)
+            and is_tensor(hdr, bto) and is_tensor(hdr, lo) and is_tensor(hdr, oo)):
+        return False
+    var qi = impl(qo)
+    var kci = impl(kco)
+    var vci = impl(vco)
+    var bti = impl(bto)
+    var li = impl(lo)
+    var oi = impl(oo)
+    if dims(hdr, qi) != 3 or dims(hdr, kci) != 4 or dims(hdr, vci) != 4 or dims(hdr, bti) != 2 or dims(hdr, oi) != 3:
+        return False
+    var code = dtype_code(hdr, qi)
+    var i32 = hdr_at(hdr, 12)
+    if dtype_code(hdr, kci) != code or dtype_code(hdr, vci) != code or dtype_code(hdr, oi) != code:
+        return False
+    if dtype_code(hdr, bti) != i32 or dtype_code(hdr, li) != i32:
+        return False
+    # The kernel writes a contiguous [seqs, heads, hd] output and reads V with
+    # the K cache's geometry.
+    var nh = size(hdr, qi, 1)
+    var hd = size(hdr, qi, 2)
+    if size(hdr, oi, 0) != size(hdr, qi, 0) or size(hdr, oi, 1) != nh or size(hdr, oi, 2) != hd:
+        return False
+    if stride(hdr, oi, 0) != nh * hd or stride(hdr, oi, 1) != hd or stride(hdr, oi, 2) != 1:
+        return False
+    comptime for i in range(4):
+        if size(hdr, vci, i) != size(hdr, kci, i) or stride(hdr, vci, i) != stride(hdr, kci, i):
+            return False
+    var vo = Int(v._obj_ptr)
+    var so = Int(slots._obj_ptr)
+    var ki = 0
+    var vi = 0
+    var si = 0
+    if store:
+        if not (is_tensor(hdr, ko) and is_tensor(hdr, vo) and is_tensor(hdr, so)):
+            return False
+        ki = impl(ko)
+        vi = impl(vo)
+        si = impl(so)
+        if dims(hdr, ki) != 3 or dims(hdr, vi) != 3 or dtype_code(hdr, ki) != code or dtype_code(hdr, vi) != code:
+            return False
+        if dtype_code(hdr, si) != hdr_at(hdr, 13):
+            return False
+    var threads = Int(external_call["omp_get_max_threads", Int32]())
+    var n = hdr_at(hdr, 11)
+    for e_i in range(n):
+        var e = hdr + 8 * (KV_ENTRY0 + KV_ENTRY_W * e_i)
+        if word(e) != code or word(e + 8) != Int(store) or word(e + 16) != threads:
+            continue
+        if not (_match3(e, 3, hdr, qi, False) and _match3(e, 6, hdr, qi, True)):
+            continue
+        var ok = True
+        comptime for i in range(4):
+            if size(hdr, kci, i) != word(e + 8 * (9 + i)):
+                ok = False
+        if not ok or size(hdr, bti, 0) != word(e + 8 * 13) or size(hdr, bti, 1) != word(e + 8 * 14):
+            continue
+        if store and not (_match3(e, 15, hdr, ki, True) and _match3(e, 18, hdr, vi, True)):
+            continue
+        var item = word(e + 8 * 24)
+        var p = ptr[Int64](word(e + 8 * 21))
+        var job = PagedJob()
+        job.num_seqs = Int(p[0])
+        job.num_heads = Int(p[1])
+        job.kv_heads = Int(p[2])
+        job.head_dim = Int(p[3])
+        job.page = Int(p[4])
+        job.bt_stride = Int(p[5])
+        job.out_stride = Int(p[6])
+        job.dtype = Int(p[7])
+        job.workers = Int(p[8])
+        job.do_store = p[9] != 0
+        job.do_attend = p[10] != 0
+        job.chunks = Int(p[11])
+        job.q = data_ptr(hdr, qi, item)
+        job.k_cache = data_ptr(hdr, kci, item)
+        job.v_cache = data_ptr(hdr, vci, item)
+        job.out = data_ptr(hdr, oi, item)
+        job.block_table = data_ptr(hdr, bti, 4)
+        job.lens = data_ptr(hdr, li, 4)
+        job.q_stride = word(e + 8 * 22)
+        job.kv_stride = word(e + 8 * 23)
+        if store:
+            job.k = data_ptr(hdr, ki, item)
+            job.v = data_ptr(hdr, vi, item)
+            job.slots = data_ptr(hdr, si, 8)
+        job.scale = Float32(Float64(py=scale))
+        paged_run(job)
+        return True
+    return False
 
 def kv_attention(
     plan: PythonObject,
