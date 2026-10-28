@@ -317,8 +317,10 @@ def _qk_groups[
                         var qv = SIMD[DType.int32, LANES](
                             qp.unsafe_load(r * (hd // 2) + d2)
                         )
+                        # Query last: `vdpbf16ps` folds a broadcast load
+                        # only as its last source (exact, symmetric products).
                         cv[r * G + g] = dot_bf16[LANES](
-                            cv[r * G + g], bitcast_bf16[LANES](qv), kv
+                            cv[r * G + g], kv, bitcast_bf16[LANES](qv)
                         )
     else:
         # CH independent partial dot products per (row, group): one chain over

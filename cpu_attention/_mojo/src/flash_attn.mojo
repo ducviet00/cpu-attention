@@ -222,8 +222,10 @@ def _qk[
                         var qv = SIMD[DType.int32, LANES](
                             ptr[Int32](q0 + rr * job.qt * 2).unsafe_load(d2 + u)
                         )
+                        # The query pair goes last: `vdpbf16ps` folds a
+                        # 32-bit memory broadcast only as its last source.
                         c[r] = dot_bf16[LANES](
-                            c[r], bitcast[DType.bfloat16, 2 * LANES](qv), kv
+                            c[r], kv, bitcast[DType.bfloat16, 2 * LANES](qv)
                         )
         else:
             var kp = ptr[Scalar[dtype]](kd)
@@ -322,8 +324,8 @@ def _pv[
                 comptime for r in range(ROWS):
                     var w = SIMD[DType.int32, LANES](pp.unsafe_load((r * KT + j) >> 1))
                     var pa = bitcast[DType.bfloat16, 2 * LANES](w)
-                    c0[r] = dot_bf16[LANES](c0[r], pa, v0)
-                    c1[r] = dot_bf16[LANES](c1[r], pa, v1)
+                    c0[r] = dot_bf16[LANES](c0[r], v0, pa)
+                    c1[r] = dot_bf16[LANES](c1[r], v1, pa)
                 j += 2
         else:
             var vp = ptr[Scalar[dtype]](vsrc)
