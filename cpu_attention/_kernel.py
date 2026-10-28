@@ -819,7 +819,7 @@ def _flash_plan(geom, k, causal):
         nqb = -(-seq_q // rq)
         workers = _workers(batch * heads * nqb, 8)
         dt = _DTYPE_CODES[dtype]
-        isa = 0  # the vector policy; AMX/bfmmla policies select here
+        isa = 2 if module().tier() == "aarch64-bf16" else 0  # 0 vector policy, 2 bfmmla
         slab, aux = _entry("flash_sizes")(seq_k, rq, hd, dt, isa)
         nbh = batch * kv_heads
         llc = _llc_bytes()
