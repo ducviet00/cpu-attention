@@ -1,5 +1,0 @@
-*.so
-*.data
-*.bundle
-__pycache__/
-rq128-package/

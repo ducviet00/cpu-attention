@@ -1,7 +1,7 @@
 """The benchmark: unified Mojo vs every applicable C++ path, one process.
 
     scripts/pin_governor.sh uv run python benchmarks/bench.py --manifest full \
-        --json reports/ryzen/<rev>.json [--vllm-bf16 X.so --vllm-fp32 Y.so]
+        --json /path/outside/the/repo/<rev>.json [--vllm-bf16 X.so --vllm-fp32 Y.so]
 
 Rules (docs/CPP.md §7):
 

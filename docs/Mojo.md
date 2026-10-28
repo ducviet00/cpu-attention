@@ -20,12 +20,11 @@ in-progress Axion merge (`afbea06`) has been resolved retaining both policy IDs
 (AMX 1, ARM 2); only AMX uses the AMX-specific 64-row work-item rule. All three
 x86 tiers build with Mojo 1.2.0. On Ryzen, both backends pass `test_dense`,
 `test_flash_api`, 80-case fuzz, the 504-case paged sweep, 412 regressions, and
-fast-encdec's engine test. AMX tests skip on this non-AMX CPU. Logs are in
-`reports/ryzen/integration-c7f1c28/`; the engine test uses fast-encdec's own
+fast-encdec's engine test. AMX tests skip on this non-AMX CPU. The engine test uses fast-encdec's own
 environment (torch 2.14.1+cpu, transformers 5.19.0). This is a correctness
 checkpoint, not a claim that the performance objective is met.
 
-The integration baseline (`reports/ryzen/integration-c7f1c28/baseline.json`),
+The integration baseline (raw JSON kept outside the repo),
 41 rounds / 41 x 40-call paged blocks, measured all 170 rows with valid outputs:
 
 | rows | win | unresolved | loss |
@@ -36,8 +35,7 @@ The integration baseline (`reports/ryzen/integration-c7f1c28/baseline.json`),
 | **all (170)** | **88** | **65** | **17** |
 
 These are observations from that run, not an across-process speedup claim over
-the older checkpoint below. Every non-win and its band is also listed in
-`reports/ryzen/integration-c7f1c28/nonwins.json`. A fresh C++ build reproduced
+the older checkpoint below. A fresh C++ build reproduced
 the baseline library's SHA256 exactly. The baseline's in-process Mojo-version
 subprocess failed after loading the extensions; `compiler.txt` records the
 compiler separately. The harness now probes it before loading any extension.
@@ -45,7 +43,7 @@ compiler separately. The harness now probes it before loading any extension.
 Ryzen 7 7840H, full 170-row manifest (`benchmarks/manifest.py`), against the
 fastest numerically valid C++ path per row (`cpp_vec` or `cpp_scalar`), one
 process, independently loaded arms, 41 rounds (paged: 41 x 40-call blocks),
-governor pinned (`reports/ryzen/checkpoint-6f9040d.json`):
+governor pinned:
 
 | rows | win | unresolved | loss |
 |---|---:|---:|---:|
@@ -56,7 +54,7 @@ governor pinned (`reports/ryzen/checkpoint-6f9040d.json`):
 
 A win is below `1 - max(0.03, control spread)`, a loss above `1 + band`;
 anything else is unresolved, not a win. The starting point (the oracle build,
-`reports/ryzen/baseline-bb7dc9a.json`) was 7 / 21 / 142.
+ was 7 / 21 / 142.
 
 **Where it does not win on the Ryzen.**
 - The 12 losses (1.03-1.12) are decode rows that stream 16-32 MB of cache per
@@ -71,8 +69,7 @@ anything else is unresolved, not a win. The starting point (the oracle build,
 **Axion.** The ARM hi/lo-probability `bfdot` P@V policy (`8b6521a`) improved all
 44 bf16 decode/API rows by 8-41% beyond their saved-build controls, but the full
 92-row paged/store run still had 12 wins / 27 unresolved / 53 losses against
-valid C++. See `reports/axion/arm-validation/SUMMARY.md` and its per-row raw
-JSON. A globally larger work item regressed short calls; a guarded long-square
+valid C++.  A globally larger work item regressed short calls; a guarded long-square
 causal fp32 D=128 rule is under integration validation. Default C++ NEON still
 fails poisoned-tail regressions; the scalar path passes. Invalid C++ arms are
 excluded per row, not silently accepted as references.

@@ -1,6 +1,0 @@
-test_dense exit=0
-test_flash_api exit=0
-fuzz_dense exit=0
-test_paged_sweep exit=0
-test_regressions exit=0
-HILO_DONE exit=0

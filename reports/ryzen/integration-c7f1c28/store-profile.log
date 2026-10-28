@@ -1,7 +1,0 @@
-pin_governor: pinned 32 settings to performance
-/home/ducviet00/cpu-attention/.venv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
-  cpu = _conversion_method_template(device=torch.device("cpu"))
-{'profile': (3.129243850708008e-07, True)}
-[ perf record: Woken up 3 times to write data ]
-[ perf record: Captured and wrote 0.664 MB /tmp/opencode/unified-start/store-perf-root.data (5096 samples) ]
-pin_governor: restored 32 settings
