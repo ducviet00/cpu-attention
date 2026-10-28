@@ -212,7 +212,7 @@ def _attend_rows[
         # ---- Q@K^T. A small register tile scores G key groups per step so the
         # dot chains are independent (one bf16 chain over head_dim is latency
         # bound: ~6 cycles per `vdpbf16ps`); groups resolve their own pages.
-        comptime G = 4 if R == 1 else (2 if R == 2 else 1)
+        comptime G = 1 if dtype == DType.float32 else (4 if R == 1 else (2 if R == 2 else 1))
         var j = 0
         while j + G * LANES <= nk:
             _qk_groups[dtype, hd, R, G, KT, PAGE](
@@ -302,32 +302,41 @@ def _qk_groups[
         )
     var cv = Array[V, R * G](fill=V(0))
     comptime if DOT:
-        comptime for d2 in range(hd // 2):
-            comptime for g in range(G):
-                var kv = ptr[BFloat16](base[g]).unsafe_load[width = 2 * LANES](
-                    d2 * page * 2
-                )
-                comptime for r in range(R):
-                    var qv = SIMD[DType.int32, LANES](
-                        qp.unsafe_load(r * (hd // 2) + d2)
+        # A runtime loop over head-dim pairs (unrolled by U): fully unrolled,
+        # LLVM hoists every query broadcast out of the key loop and spills
+        # them, so each dot pays a stack reload (30% of samples, measured).
+        comptime U = 4
+        for d0 in range(0, hd // 2, U):
+            comptime for u in range(U):
+                var d2 = d0 + u
+                comptime for g in range(G):
+                    var kv = ptr[BFloat16](base[g]).unsafe_load[width = 2 * LANES](
+                        d2 * page * 2
                     )
-                    cv[r * G + g] = dot_bf16[LANES](
-                        cv[r * G + g], bitcast_bf16[LANES](qv), kv
-                    )
+                    comptime for r in range(R):
+                        var qv = SIMD[DType.int32, LANES](
+                            qp.unsafe_load(r * (hd // 2) + d2)
+                        )
+                        cv[r * G + g] = dot_bf16[LANES](
+                            cv[r * G + g], bitcast_bf16[LANES](qv), kv
+                        )
     else:
         # CH independent partial dot products per (row, group): one chain over
         # all of head_dim 128 rounds past the 1e-6 fp32 gate (1.2-1.6e-6
         # measured), and the chains also overlap the K loads.
         comptime CH = max(1, min(4, 16 // (R * G)))
         var part = Array[V, R * G * CH](fill=V(0))
-        comptime for d in range(hd):
-            comptime for g in range(G):
-                var kv = ptr[Scalar[dtype]](base[g]).unsafe_load[width=LANES](
-                    d * page
-                ).cast[DType.float32]()
-                comptime for r in range(R):
-                    comptime i = (r * G + g) * CH + d % CH
-                    part[i] = V(qf.unsafe_load(r * hd + d)).fma(kv, part[i])
+        comptime U = max(CH, 4)
+        for d0 in range(0, hd, U):
+            comptime for u in range(U):
+                var d = d0 + u
+                comptime for g in range(G):
+                    var kv = ptr[Scalar[dtype]](base[g]).unsafe_load[width=LANES](
+                        d * page
+                    ).cast[DType.float32]()
+                    comptime for r in range(R):
+                        comptime i = (r * G + g) * CH + u % CH
+                        part[i] = V(qf.unsafe_load(r * hd + d)).fma(kv, part[i])
         comptime for rg in range(R * G):
             var sum = part[rg * CH]
             comptime for c in range(1, CH):
