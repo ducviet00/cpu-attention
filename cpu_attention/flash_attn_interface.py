@@ -8,6 +8,7 @@ name so ``from cpu_attention.flash_attn_interface import flash_attn_func`` works
 
 import torch
 
+from . import _kernel
 from ._kernel import _DTYPE_CODES, _HEAD_DIMS, _dense, _paged, supported
 
 _SCALES = {}
@@ -254,6 +255,16 @@ def flash_attn_func(q, k, v, softmax_scale=None, causal=False):
     ``deterministic`` and ``return_attn_probs`` (inference-only forward pass, no
     local attention, no bias terms).
     """
+    # Mojo fast path: a layout a validated call already registered runs with
+    # the tensors read in the extension (no Python checks or plan lookup).
+    table = _kernel._FLASH.__dict__.get("t")
+    if (table is not None and _kernel._FLASH.gen == _kernel._KV_GEN[0] and
+            type(q) is torch.Tensor and _kernel._BACKEND == "mojo"):
+        out = torch.empty_like(q, memory_format=torch.contiguous_format)
+        if _kernel._entry("flash_fast")(_kernel._FLASH.addr, q, k, v,
+                                        softmax_scale, causal, out):
+            return out
+    q0, k0, v0 = q, k, v
     if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
         raise ValueError(
             "cpu_attention: q/k/v must be [batch, seqlen, nheads, headdim]"
@@ -303,7 +314,10 @@ def flash_attn_func(q, k, v, softmax_scale=None, causal=False):
     if stv[3] != 1:
         v = v.contiguous()
         stv = v.stride()
-    return _dense(q, k, v, scale, causal, (qs, stq, stk, stv, q.dtype))
+    out = _dense(q, k, v, scale, causal, (qs, stq, stk, stv, q.dtype))
+    if _kernel._BACKEND == "mojo" and q is q0 and k is k0 and v is v0:
+        _kernel._flash_register(q, k, v, softmax_scale, causal)
+    return out
 
 
 def flash_attn_varlen_func(

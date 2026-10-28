@@ -361,6 +361,7 @@ def _kv_plans():
 # ---------------------------------------------------------------------------
 # kv_fast: the decode call with the tensors read in Mojo (pyview.mojo)
 # ---------------------------------------------------------------------------
+_HDR = 24  # header slots before the plan entries (KV_ENTRY0 / FL_ENTRY0 in _C.mojo)
 _KV_W = 32  # int64 slots per plan entry (see _C.mojo kv_fast)
 _KV_CAP = 32
 _KV_TABLE = threading.local()
@@ -430,7 +431,8 @@ def _calibrate_layout():
                 return False
         hdr = [0, 8 * o_st, 8 * o_dp, 8 * o_off, 8 * o_dim, 8 * o_sz, 8 * o_sd,
                o_dt, id(torch.Tensor), id(torch.nn.Parameter), id(None), 0,
-               codes[torch.int32], codes[torch.int64], 0, 0]
+               codes[torch.int32], codes[torch.int64], id(True), id(False),
+               id(float), 0]
         probe = module().tensor_probe
         buf = torch.tensor(hdr, dtype=torch.int64)
         for t in probes:
@@ -458,8 +460,8 @@ def _kv_table():
                    _calibrate_layout())
     if not _LAYOUT:
         return None
-    t = torch.zeros(16 + _KV_CAP * _KV_W, dtype=torch.int64)
-    t[:16] = torch.tensor(_LAYOUT, dtype=torch.int64)
+    t = torch.zeros(_HDR + _KV_CAP * _KV_W, dtype=torch.int64)
+    t[:len(_LAYOUT)] = torch.tensor(_LAYOUT, dtype=torch.int64)
     _KV_TABLE.t, _KV_TABLE.gen, _KV_TABLE.keep = t, _KV_GEN[0], []
     _KV_TABLE.addr = t.data_ptr()
     return t
@@ -481,7 +483,7 @@ def _kv_register(fn, query, key, value, k_cache, page_table, do_store):
          *(key.stride() if do_store else (0, 0, 0)),
          *(value.stride() if do_store else (0, 0, 0)),
          buf.data_ptr(), q_stride, kv_stride, query.element_size()]
-    off = 16 + n * _KV_W
+    off = _HDR + n * _KV_W
     t[off:off + len(e)] = torch.tensor(e, dtype=torch.int64)
     _KV_TABLE.keep.append(buf)
     t[11] = n + 1
@@ -936,6 +938,7 @@ def _flash_ws(nbytes):
     ws = getattr(_FLASH, "ws", None)
     if ws is None or ws.numel() < nbytes:
         _FLASH.ws = ws = torch.empty(nbytes + 4096, dtype=torch.uint8)
+        _KV_GEN[0] += 1  # fast-path plans hold the old workspace address
     return (ws.data_ptr() + 63) & ~63
 
 
@@ -988,11 +991,62 @@ def _flash_mojo(q, k, v, scale, causal, geom=None):
     """flash_attn_func on the Mojo backend: one call, seven arguments."""
     if geom is None:
         geom = (q.shape, q.stride(), k.stride(), v.stride(), q.dtype)
-    _buf, plan, total = _flash_plan(geom, k, causal)
+    buf, plan, total = _flash_plan(geom, k, causal)
     out = torch.empty_like(q, memory_format=torch.contiguous_format)
+    ws = _flash_ws(total)
     _entry("flash_forward")(plan, q.data_ptr(), k.data_ptr(), v.data_ptr(),
-                            out.data_ptr(), _flash_ws(total), scale)
+                            out.data_ptr(), ws, scale)
+    _FLASH.last = (buf, ws, scale)
     return out
+
+
+_FL_W = 32
+
+
+def _flash_table():
+    """This thread's flash_fast table, or None (see `_kv_table`)."""
+    global _LAYOUT
+    t = getattr(_FLASH, "t", None)
+    if t is not None and _FLASH.gen == _KV_GEN[0]:
+        return t
+    if _LAYOUT is None:
+        _LAYOUT = (os.environ.get("CPU_ATTENTION_KV_FAST", "1") != "0" and
+                   _calibrate_layout())
+    if not _LAYOUT:
+        return None
+    t = torch.zeros(_HDR + _KV_CAP * _FL_W, dtype=torch.int64)
+    t[:len(_LAYOUT)] = torch.tensor(_LAYOUT, dtype=torch.int64)
+    _FLASH.t, _FLASH.gen, _FLASH.keep = t, _KV_GEN[0], []
+    _FLASH.addr = t.data_ptr()
+    return t
+
+
+def _flash_register(q, k, v, softmax_scale, causal):
+    """After a validated Mojo flash call: record its plan for `flash_fast`."""
+    last = _FLASH.__dict__.pop("last", None)
+    if last is None or _flash_table() is None or q.dtype not in _DT_CODE:
+        return
+    if softmax_scale is not None and type(softmax_scale) is not float:
+        return
+    if type(causal) is not bool:
+        return
+    buf, ws, scale = last
+    t = _FLASH.t
+    n = int(t[11])
+    if n == _KV_CAP:
+        t[11] = n = 0
+        _FLASH.keep = []
+    import struct as _struct
+    e = [_DT_CODE[q.dtype], int(causal), torch.get_num_threads(),
+         int(softmax_scale is None),
+         _struct.unpack("<q", _struct.pack("<d", float(softmax_scale or 0.0)))[0],
+         *q.shape, *q.stride(), *k.shape, *k.stride(), *v.stride(),
+         buf.data_ptr(), ws, q.element_size(),
+         _struct.unpack("<i", _struct.pack("<f", float(scale)))[0] & 0xFFFFFFFF]
+    off = _HDR + n * _FL_W
+    t[off:off + len(e)] = torch.tensor(e, dtype=torch.int64)
+    _FLASH.keep.append(buf)
+    t[11] = n + 1
 
 
 def _dense(q, k, v, scale: float, causal: bool, geom=None):

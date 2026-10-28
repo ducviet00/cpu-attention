@@ -231,6 +231,7 @@ def PyInit__C() abi("C") -> PythonObject:
         var m = PythonModuleBuilder("_C")
         m.def_function[kv_attention]("kv_attention")
         m.def_function[kv_fast]("kv_fast")
+        m.def_function[flash_fast]("flash_fast")
         m.def_function[tensor_probe]("tensor_probe")
         m.def_function[flash_forward]("flash_forward")
         m.def_function[flash_sizes]("flash_sizes")
@@ -280,7 +281,7 @@ def flash_forward(
     flash_run(job, Int(p.unsafe_load(18)), Int(p.unsafe_load(5)), Int(p.unsafe_load(27)))
 
 
-comptime KV_ENTRY0 = 16  # first plan entry slot in the kv_fast table
+comptime KV_ENTRY0 = 24  # first plan entry slot (after the pyview header)
 comptime KV_ENTRY_W = 32  # slots per entry
 
 
@@ -428,6 +429,94 @@ def kv_fast(
             job.slots = data_ptr(hdr, si, 8)
         job.scale = Float32(Float64(py=scale))
         paged_run(job)
+        return True
+    return False
+
+
+comptime FL_ENTRY0 = 24  # first plan entry slot (after the pyview header)
+comptime FL_ENTRY_W = 32
+
+
+@always_inline
+def _match4(e: Int, at: Int, hdr: Int, im: Int, strides: Bool) -> Bool:
+    comptime for i in range(4):
+        var x = stride(hdr, im, i) if strides else size(hdr, im, i)
+        if x != word(e + 8 * (at + i)):
+            return False
+    return True
+
+
+def flash_fast(
+    table: PythonObject,
+    q: PythonObject,
+    k: PythonObject,
+    v: PythonObject,
+    scale: PythonObject,
+    causal: PythonObject,
+    dst: PythonObject,
+) raises -> PythonObject:
+    """flash_attn_func with the tensors read here: True if a plan registered by
+    a validated call matches this call exactly (layout, dtype, causal, scale,
+    threads) and it ran; False for the caller's checked path."""
+    var hdr = Int(py=table)
+    var qo = Int(q._obj_ptr)
+    var ko = Int(k._obj_ptr)
+    var vo = Int(v._obj_ptr)
+    var oo = Int(dst._obj_ptr)
+    if not (is_tensor(hdr, qo) and is_tensor(hdr, ko) and is_tensor(hdr, vo) and is_tensor(hdr, oo)):
+        return False
+    var qi = impl(qo)
+    var ki = impl(ko)
+    var vi = impl(vo)
+    var oi = impl(oo)
+    if dims(hdr, qi) != 4 or dims(hdr, ki) != 4 or dims(hdr, vi) != 4 or dims(hdr, oi) != 4:
+        return False
+    var code = dtype_code(hdr, qi)
+    if dtype_code(hdr, ki) != code or dtype_code(hdr, vi) != code or dtype_code(hdr, oi) != code:
+        return False
+    var row = size(hdr, qi, 2) * size(hdr, qi, 3)
+    comptime for i in range(4):
+        if size(hdr, oi, i) != size(hdr, qi, i) or size(hdr, vi, i) != size(hdr, ki, i):
+            return False
+    if (stride(hdr, oi, 3) != 1 or stride(hdr, oi, 2) != size(hdr, qi, 3)
+            or stride(hdr, oi, 1) != row or stride(hdr, oi, 0) != row * size(hdr, qi, 1)):
+        return False
+    var co = Int(causal._obj_ptr)
+    var cflag = 1 if co == hdr_at(hdr, 14) else (0 if co == hdr_at(hdr, 15) else -1)
+    if cflag < 0:
+        return False
+    var so = Int(scale._obj_ptr)
+    var default_scale = so == hdr_at(hdr, 10)
+    var sval = Float64(0)
+    if not default_scale:
+        if word(so + 8) != hdr_at(hdr, 16):  # exactly a Python float
+            return False
+        sval = Float64(py=scale)
+    var threads = Int(external_call["omp_get_max_threads", Int32]())
+    var n = hdr_at(hdr, 11)
+    for e_i in range(n):
+        var e = hdr + 8 * (FL_ENTRY0 + FL_ENTRY_W * e_i)
+        if word(e) != code or word(e + 8) != cflag or word(e + 16) != threads:
+            continue
+        if default_scale:
+            if word(e + 24) != 1:
+                continue
+        elif word(e + 24) != 0 or ptr[Float64](e + 32).unsafe_load(0) != sval:
+            continue
+        if not (_match4(e, 5, hdr, qi, False) and _match4(e, 9, hdr, qi, True)
+                and _match4(e, 13, hdr, ki, False) and _match4(e, 17, hdr, ki, True)
+                and _match4(e, 21, hdr, vi, True)):
+            continue
+        var item = word(e + 8 * 27)
+        var plan = word(e + 8 * 25)
+        var job = FlashJob(
+            plan, data_ptr(hdr, qi, item), data_ptr(hdr, ki, item),
+            data_ptr(hdr, vi, item), data_ptr(hdr, oi, item),
+            ptr[Float32](e + 8 * 28).unsafe_load(0),
+        )
+        job.ws = word(e + 8 * 26)
+        var p = ptr[Int64](plan)
+        flash_run(job, Int(p.unsafe_load(18)), Int(p.unsafe_load(5)), Int(p.unsafe_load(27)))
         return True
     return False
 
