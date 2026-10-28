@@ -80,16 +80,13 @@ from amx import (
     tile_zero,
 )
 
-comptime AMX = (
-    CompilationTarget.is_x86()
-    and CompilationTarget._has_feature["amx-tile"]()
-    and CompilationTarget._has_feature["amx-bf16"]()
-)
-"""Whether this build targets a CPU with AMX.
+comptime AMX = CompilationTarget.is_x86() and CompilationTarget._has_feature[
+    "avx512bf16"
+]()
+"""Whether this build tier carries the AMX kernel (the AVX-512-BF16 tier).
 
-Everything below is instantiated only when this is true, so a non-AMX target
-emits no tile code at all -- no second source file and no runtime dispatch are
-needed to keep older CPUs working.
+Whether it runs is decided at runtime: the CPU must report AMX and the OS must
+grant tile state (`amx_init`); `cpu_attention._kernel.amx_available` checks both.
 """
 
 comptime QROWS = 32

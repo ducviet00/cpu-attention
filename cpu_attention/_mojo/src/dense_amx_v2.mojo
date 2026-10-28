@@ -125,11 +125,9 @@ from amx import (
     tile_zero,
 )
 
-comptime AMX2 = (
-    CompilationTarget.is_x86()
-    and CompilationTarget._has_feature["amx-tile"]()
-    and CompilationTarget._has_feature["amx-bf16"]()
-)
+comptime AMX2 = CompilationTarget.is_x86() and CompilationTarget._has_feature[
+    "avx512bf16"
+]()
 """Whether this build targets a CPU with AMX (the whole kernel is behind this).
 """
 

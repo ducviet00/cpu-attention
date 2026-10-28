@@ -581,7 +581,11 @@ def amx_available() -> bool:
         gate = getattr(mod, "dense_has_amx", None) if mod else None
         init = getattr(mod, "dense_amx_init", None) if mod else None
         global _AMX_PLAN
-        if gate is None or init is None or not gate() or not init():
+        # The tier carries the kernel; the CPU must report AMX (and the OS grant
+        # tile state, `init`) before a tile instruction may run.
+        cpu = {"amx_tile", "amx_bf16"} <= _cpu_flags()
+        if (gate is None or init is None or not cpu or not gate() or
+                not init()):
             _AMX_ENTRY = False
         else:
             _AMX_ENTRIES["v1"] = mod.dense_amx_attention
