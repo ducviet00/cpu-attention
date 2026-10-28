@@ -102,6 +102,10 @@ trait FlashPolicy:
     comptime HD: Int
     comptime RQT: Int  # query rows per register tile
     comptime KT: Int  # keys per tile (also the logits row width)
+    comptime ZEROES_ACC: Bool = False
+    """The policy's first P@V on a row writes the accumulator instead of adding
+    to it, so the driver need not clear it (16 KB of stores per work item at
+    rq=64, hd=64)."""
 
     @staticmethod
     def slab_bytes(seq_k: Int) -> Int:
@@ -171,8 +175,9 @@ def _attend[
     var diag = job.seq_k - job.seq_q
     var limit0 = (q0 + diag) if job.causal else (1 << 30)
     var accp = ptr[Float32](acc)
-    for i in range(0, arows * hd, LANES):
-        accp.unsafe_store[width=LANES](i, V(0))
+    comptime if not P.ZEROES_ACC:
+        for i in range(0, arows * hd, LANES):
+            accp.unsafe_store[width=LANES](i, V(0))
     for r in range(nrows):
         ptr[Float32](m).unsafe_store(r, NEG)
         ptr[Float32](l).unsafe_store(r, 0)
@@ -200,8 +205,14 @@ def _attend[
         var lr = ptr[Float32](l).unsafe_load(r)
         var inv = Float32(1) / lr if lr > 0 else Float32(0)
         var src = ptr[Float32](acc + r * hd * 4)
-        comptime for d in range(0, hd, LANES):
-            o.unsafe_store[width=LANES](d, (src.unsafe_load[width=LANES](d) * inv).cast[dtype]())
+        if lr > 0:
+            comptime for d in range(0, hd, LANES):
+                o.unsafe_store[width=LANES](d, (src.unsafe_load[width=LANES](d) * inv).cast[dtype]())
+        else:
+            # A row that saw no key: exactly 0, without reading an accumulator
+            # that a ZEROES_ACC policy never initialised (NaN * 0 is NaN).
+            comptime for d in range(0, hd, LANES):
+                o.unsafe_store[width=LANES](d, SIMD[dtype, LANES](0))
 
 
 # ---------------------------------------------------------------------------
