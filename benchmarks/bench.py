@@ -7,7 +7,7 @@ Rules (docs/CPP.md §7):
 
 * Every arm is an independently loaded copy of the package (benchmarks/arms.py):
   ``mojo_new`` (this checkout), ``mojo_ctrl`` (a second, independent copy of it:
-  the noise floor), ``mojo_old`` (the oracle build at tag ``mojo-oracle-v1``),
+  the noise floor), ``mojo_old`` (the oracle build at tag ``mojo-oracle-v1.1``),
   one ``cpp_<isa>`` arm per C++ ISA path applicable on this CPU (oracle-tag glue,
   this checkout's ``_C_cpp.so``), plus vLLM and SDPA as secondary references.
 * Arms are interleaved, the order rotated every round; the minimum decides and
@@ -372,7 +372,7 @@ def main():
     ap.add_argument("--arms", default="mojo_new,mojo_ctrl,mojo_old,cpp,sdpa,vllm")
     ap.add_argument("--oracle", default=os.path.join(
         _ROOT, "cpu_attention", "_mojo", "oracle", "_C_oracle.so"))
-    ap.add_argument("--oracle-tag", default="mojo-oracle-v1")
+    ap.add_argument("--oracle-tag", default="mojo-oracle-v1.1")
     ap.add_argument("--vllm-bf16", default=os.environ.get("VLLM_REF_BF16", ""),
                     help="vLLM build for bf16 rows (AMX build on AMX boxes)")
     ap.add_argument("--vllm-fp32", default=os.environ.get("VLLM_REF_FP32", ""))

@@ -15,10 +15,11 @@ import cpu_attention as attn
 
 def main():
     if not attn.is_available():
+        # A gate that cannot run has not passed.
         print(
-            "SKIP: cpu_attention/_C.so is not built (uv run --extra build python scripts/build.py)"
+            "FAIL: the selected backend is not built (uv run --extra build python scripts/build.py)"
         )
-        return
+        return 1
 
     fails = flash_api()
     try:
@@ -343,4 +344,4 @@ def flash_api():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
