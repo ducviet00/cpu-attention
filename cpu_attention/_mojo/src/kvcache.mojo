@@ -17,7 +17,7 @@ from std.math import iota
 from std.memory import bitcast, stack_allocation
 from std.sys.info import CompilationTarget
 
-from isa import LANES, LOG2E, BF16_DOT, dot_bf16, exp2, exp2s, ptr
+from isa import LANES, LOG2E, dot_bf16, exp2, exp2s, ptr
 from parallel import barrier, parallel
 
 comptime V_PAIRS_ARM = CompilationTarget.has_neon()
@@ -174,7 +174,9 @@ def _attend_rows[
     comptime KT = _kt[hd]()
     comptime NV = hd // LANES
     comptime DEG = 2 if dtype == DType.bfloat16 else 6
-    comptime DOT = dtype == DType.bfloat16 and BF16_DOT
+    # bf16 K is dim pairs on every tier; `dot_bf16` widens where there is no
+    # dot instruction.
+    comptime DOT = dtype == DType.bfloat16
     var page = PAGE if PAGE else job.page
     var len = Int(ptr[Int32](job.lens).unsafe_load(seq))
     var bt = ptr[Int32](job.block_table + seq * job.bt_stride * 4)
@@ -289,7 +291,9 @@ def _qk_groups[
     """logits[r][j + g*LANES ..] for G groups of LANES keys starting at `key0`;
     lanes at or past `valid` (only with G == 1) are masked to -max."""
     comptime L = PageLayout[dtype, hd]
-    comptime DOT = dtype == DType.bfloat16 and BF16_DOT
+    # bf16 K is dim pairs on every tier; `dot_bf16` widens where there is no
+    # dot instruction.
+    comptime DOT = dtype == DType.bfloat16
     comptime V = SIMD[DType.float32, LANES]
     var page = PAGE if PAGE else job.page
     var base = Array[Int, G](fill=0)

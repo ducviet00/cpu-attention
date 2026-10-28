@@ -12,7 +12,7 @@ from std.math import iota
 from std.memory import bitcast
 
 from flash_attn import FlashJob, FlashPolicy, NEG, V
-from isa import BF16_DOT, LANES, dot_bf16, exp2, exp2s, ptr
+from isa import LANES, dot_bf16, exp2, exp2s, ptr
 
 comptime KP = 64  # keys per K^T block
 comptime KT = 256  # keys per softmax tile
@@ -125,7 +125,9 @@ def _qk[
     """Also writes each row's tile maximum to `tmax` (the softmax then skips its
     max pass over the tile)."""
     comptime BF = dtype == DType.bfloat16
-    comptime DOT = BF and BF16_DOT
+    # bf16 K is stored as dim pairs on every tier, so bf16 always goes through
+    # `dot_bf16` (one instruction with AVX-512-BF16/NEON-BF16, widened otherwise).
+    comptime DOT = BF
     var kend = k0 + nkeys
     var mx = Array[V, ROWS](fill=V(NEG))
     var lim = min(kend, limit0 + 1)
@@ -246,7 +248,9 @@ def _pv[
     dtype: DType, hd: Int, ROWS: Int
 ](vsrc: Int, vstride: Int, k0: Int, nk: Int, logits: Int, acc: Int):
     comptime BF = dtype == DType.bfloat16
-    comptime DOT = BF and BF16_DOT
+    # bf16 K is stored as dim pairs on every tier, so bf16 always goes through
+    # `dot_bf16` (one instruction with AVX-512-BF16/NEON-BF16, widened otherwise).
+    comptime DOT = BF
     comptime DC = 2 * LANES
     var ap = ptr[Float32](acc)
     var lg = ptr[Float32](logits)

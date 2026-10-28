@@ -28,4 +28,4 @@ include = ["cpu_attention*"]
 namespaces = false
 
 [tool.setuptools.package-data]
-cpu_attention = ["_C.so"]
+cpu_attention = ["_C.so", "_C_*.so"]
