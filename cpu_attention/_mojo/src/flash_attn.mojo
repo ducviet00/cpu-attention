@@ -198,10 +198,14 @@ def _qk[
     nkeys: Int,
     limit0: Int,
     logits: Int,
+    tmax: Int,
 ):
+    """Also writes each row's tile maximum to `tmax` (the softmax then skips its
+    max pass over the tile)."""
     comptime BF = dtype == DType.bfloat16
     comptime DOT = BF and BF16_DOT
     var kend = k0 + nkeys
+    var mx = Array[V, ROWS](fill=V(NEG))
     var lim = min(kend, limit0 + 1)
     var lg = ptr[Float32](logits)
     var j = 0
@@ -244,14 +248,20 @@ def _qk[
             comptime for r in range(ROWS):
                 if r < nrows:
                     lg.unsafe_store[width=LANES](r * KT + j, c[r])
+                    mx[r] = max(mx[r], c[r])
         else:
             var idx = iota[DType.int32, LANES](Int32(jj))
             var past = idx.ge(SIMD[DType.int32, LANES](Int32(kend)))
             comptime for r in range(ROWS):
                 if r < nrows:
                     var bad = past | idx.gt(SIMD[DType.int32, LANES](Int32(limit0 + r)))
-                    lg.unsafe_store[width=LANES](r * KT + j, bad.select(V(NEG), c[r]))
+                    var x = bad.select(V(NEG), c[r])
+                    lg.unsafe_store[width=LANES](r * KT + j, x)
+                    mx[r] = max(mx[r], x)
         j += LANES
+    comptime for r in range(ROWS):
+        if r < nrows:
+            ptr[Float32](tmax).unsafe_store(r, mx[r].reduce_max())
 
 
 # ---------------------------------------------------------------------------
@@ -269,21 +279,34 @@ def _softmax[
     var ap = ptr[Float32](alpha)
     for r in range(nrows):
         var row = lg + r * KT
-        var mx = V(NEG)
+        var tm = ap.unsafe_load(r)  # the tile max `_qk` left here
         var j = 0
-        while j < nkeys:
-            mx = max(mx, row.unsafe_load[width=LANES](j))
-            j += LANES
-        var mxv = mx.reduce_max() * c
+        if tm == NEG:
+            # No visible key in this tile (a causal row inside a register tile
+            # whose last row does see keys): zero what P@V reads. Going through
+            # exp2 would compare two roundings of -MAX*c, whose difference is far
+            # outside exp2's range in either direction.
+            ap.unsafe_store(r, 1.0)
+            while j < nkeys:
+                comptime if BF:
+                    (pp + r * KT).unsafe_store[width=LANES](j, SIMD[DType.bfloat16, LANES](0))
+                else:
+                    row.unsafe_store[width=LANES](j, V(0))
+                j += LANES
+            continue
+        var mxv = tm * c
         var mo = mp.unsafe_load(r)
         var mn = max(mo, mxv)
         var a = exp2s[5](mo - mn)
         mp.unsafe_store(r, mn)
         ap.unsafe_store(r, a)
         var sum = V(0)
-        j = 0
         while j < nkeys:
-            var e = exp2[5, LANES](row.unsafe_load[width=LANES](j).fma(V(c), V(-mn)))
+            # bf16 probabilities are rounded to 8 bits right after this, so a
+            # degree-2 polynomial (relative 1.7e-3) is inside that rounding.
+            var e = exp2[2 if BF else 5, LANES](
+                row.unsafe_load[width=LANES](j).fma(V(c), V(-mn))
+            )
             comptime if BF:
                 (pp + r * KT).unsafe_store[width=LANES](j, e.cast[DType.bfloat16]())
             else:
@@ -365,7 +388,7 @@ def _tile[
     l: Int,
     alpha: Int,
 ):
-    _qk[dtype, hd, ROWS](job, kd, q0, sub, k0, nk, limit0, aux)
+    _qk[dtype, hd, ROWS](job, kd, q0, sub, k0, nk, limit0, aux, alpha)
     _softmax[dtype](aux, sub, nk, c, m, l, alpha)
     var ap = ptr[Float32](alpha)
     var acp = ptr[Float32](acc)
