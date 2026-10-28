@@ -1403,7 +1403,8 @@ def _flash_plan(geom, k, causal):
         nqb = -(-seq_q // rq)
         workers = _workers(batch * heads * nqb, 8)
         dt = _DTYPE_CODES[dtype]
-        slab, aux = _entry("flash_sizes")(seq_k, rq, hd, dt)
+        isa = 0  # the vector policy; AMX/bfmmla policies select here
+        slab, aux = _entry("flash_sizes")(seq_k, rq, hd, dt, isa)
         nbh = batch * kv_heads
         llc = _llc_bytes()
         # Fused (pack own head, attend, no barrier) while every worker's slab
@@ -1420,7 +1421,7 @@ def _flash_plan(geom, k, causal):
             qs[0], qs[1], qs[2], ks[0], ks[1], ks[2], vs[0], vs[1], vs[2],
             seq_q * heads * hd, heads * hd, hd,
             dt, int(bool(causal)), workers, int(fuse), rq, 0, slab, aux,
-            int(v_direct), 0], dtype=torch.int64)
+            int(v_direct), isa], dtype=torch.int64)
         if len(plans) > 64:
             plans.clear()
         plans[key] = plan = (buf, buf.data_ptr(), total)

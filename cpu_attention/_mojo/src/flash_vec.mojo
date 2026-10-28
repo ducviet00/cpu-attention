@@ -1,0 +1,379 @@
+"""The vector policy of flash_attn_func: AVX-512 (AVX-512-BF16 dot products),
+AVX2, and NEON fp32 from one LANES-generic source.
+
+Layouts: K^T blocked every KP keys, `[tile][hd][KP]` (bf16 `[tile][hd/2][KP][2]`,
+the dim pair a dot instruction contracts); V row-major (fp32, read in place
+while all of V fits LLC/2) or bf16 key pairs `[key/2][hd][2]` for a `dpbf16ps`
+P@V. Q@K^T is an RQT-row x LANES-key register tile; P@V an RQT-row x 2*LANES-dim
+tile.
+"""
+
+from std.math import iota
+from std.memory import bitcast
+
+from flash_attn import FlashJob, FlashPolicy, NEG, V
+from isa import BF16_DOT, LANES, dot_bf16, exp2, exp2s, ptr
+
+comptime KP = 64  # keys per K^T block
+comptime KT = 256  # keys per softmax tile
+comptime RQT = 8  # query rows per register tile
+
+
+@always_inline
+def _pad(n: Int) -> Int:
+    return (n + KP - 1) // KP * KP
+
+
+@always_inline
+def _k_off[dtype: DType, hd: Int](j: Int, d: Int) -> Int:
+    """Element offset of key j, dim d in the K^T slab."""
+    comptime if dtype == DType.bfloat16:
+        return ((j // KP) * (hd // 2 * KP) + (d >> 1) * KP + j % KP) * 2 + (d & 1)
+    else:
+        return (j // KP) * (hd * KP) + d * KP + j % KP
+
+
+# ---------------------------------------------------------------------------
+# pack
+# ---------------------------------------------------------------------------
+@always_inline
+def _transpose(mut r: Array[V, LANES]):
+    """LANES x LANES in registers: log2(LANES) rounds of interleaving row i
+    with row i + LANES/2."""
+    comptime ROUNDS = 4 if LANES == 16 else (3 if LANES == 8 else 2)
+    comptime for _s in range(ROUNDS):
+        var t = Array[V, LANES](uninitialized=True)
+        comptime for i in range(LANES // 2):
+            var w = r[i].interleave(r[i + LANES // 2])
+            t[2 * i] = w.slice[LANES, offset=0]()
+            t[2 * i + 1] = w.slice[LANES, offset=LANES]()
+        r = t^
+
+
+def _pack[dtype: DType, hd: Int](job: FlashJob, b: Int, kvh: Int, slab: Int):
+    comptime E = 2 if dtype == DType.bfloat16 else 4
+    comptime BF = dtype == DType.bfloat16
+    var pad = _pad(job.seq_k)
+    var ks = ptr[Scalar[dtype]](job.k + (b * job.kb + kvh * job.kh) * E)
+    var vs = ptr[Scalar[dtype]](job.v + (b * job.vb + kvh * job.vh) * E)
+    var kd = ptr[Scalar[dtype]](slab)
+    var vd = ptr[Scalar[dtype]](slab + pad * hd * E)
+    var t0 = 0
+    while t0 + LANES <= job.seq_k:
+        comptime for d0 in range(0, hd, LANES):
+            var r = Array[V, LANES](uninitialized=True)
+            comptime for i in range(LANES):
+                r[i] = ks.unsafe_load[width=LANES]((t0 + i) * job.kt + d0).cast[
+                    DType.float32
+                ]()
+            _transpose(r)
+            comptime if BF:
+                comptime for d in range(0, LANES, 2):
+                    kd.unsafe_store[width = 2 * LANES](
+                        _k_off[dtype, hd](t0, d0 + d),
+                        r[d].interleave(r[d + 1]).cast[dtype](),
+                    )
+            else:
+                comptime for d in range(LANES):
+                    kd.unsafe_store[width=LANES](
+                        _k_off[dtype, hd](t0, d0 + d), r[d].cast[dtype]()
+                    )
+        t0 += LANES
+    # Tail tokens; the unused lanes of their group are masked in Q@K^T.
+    for t in range(t0, job.seq_k):
+        for d in range(hd):
+            kd.unsafe_store(_k_off[dtype, hd](t, d), ks.unsafe_load(t * job.kt + d))
+    comptime if BF:
+        # V as key pairs [key/2][hd][2]; an odd last key pairs with zeros.
+        var t = 0
+        while t < job.seq_k:
+            var a = vs + t * job.vt
+            var dst = vd + (t >> 1) * hd * 2
+            comptime for d0 in range(0, hd, LANES):
+                var va = a.unsafe_load[width=LANES](d0)
+                var vb = SIMD[dtype, LANES](0)
+                if t + 1 < job.seq_k:
+                    vb = (a + job.vt).unsafe_load[width=LANES](d0)
+                dst.unsafe_store[width = 2 * LANES](2 * d0, va.interleave(vb))
+            t += 2
+    else:
+        if not job.v_direct:
+            for t in range(job.seq_k):
+                comptime for d0 in range(0, hd, LANES):
+                    vd.unsafe_store[width=LANES](
+                        t * hd + d0, (vs + t * job.vt).unsafe_load[width=LANES](d0)
+                    )
+
+
+# ---------------------------------------------------------------------------
+# Q@K^T: logits[r][j] for ROWS rows x nkeys keys, masked
+# ---------------------------------------------------------------------------
+@always_inline
+def _qk[
+    dtype: DType, hd: Int, ROWS: Int
+](
+    job: FlashJob,
+    kd: Int,
+    q0: Int,
+    nrows: Int,
+    k0: Int,
+    nkeys: Int,
+    limit0: Int,
+    logits: Int,
+    tmax: Int,
+):
+    """Also writes each row's tile maximum to `tmax` (the softmax then skips its
+    max pass over the tile)."""
+    comptime BF = dtype == DType.bfloat16
+    comptime DOT = BF and BF16_DOT
+    var kend = k0 + nkeys
+    var mx = Array[V, ROWS](fill=V(NEG))
+    var lim = min(kend, limit0 + 1)
+    var lg = ptr[Float32](logits)
+    var j = 0
+    while j < nkeys:
+        var jj = k0 + j
+        var c = Array[V, ROWS](fill=V(0))
+        comptime if DOT:
+            var kp = ptr[BFloat16](kd)
+            # Runtime loop over dim pairs: fully unrolled, LLVM hoists the
+            # query broadcasts out of the key loop and spills them.
+            for d2 in range(0, hd // 2, 4):
+                comptime for u in range(4):
+                    var kv = kp.unsafe_load[width = 2 * LANES](
+                        _k_off[dtype, hd](jj, 2 * (d2 + u))
+                    )
+                    comptime for r in range(ROWS):
+                        var rr = min(r, nrows - 1)
+                        var qv = SIMD[DType.int32, LANES](
+                            ptr[Int32](q0 + rr * job.qt * 2).unsafe_load(d2 + u)
+                        )
+                        # The query pair goes last: `vdpbf16ps` folds a
+                        # 32-bit memory broadcast only as its last source.
+                        c[r] = dot_bf16[LANES](
+                            c[r], kv, bitcast[DType.bfloat16, 2 * LANES](qv)
+                        )
+        else:
+            var kp = ptr[Scalar[dtype]](kd)
+            for d in range(0, hd, 4):
+                comptime for u in range(4):
+                    var kv = kp.unsafe_load[width=LANES](
+                        _k_off[dtype, hd](jj, d + u)
+                    ).cast[DType.float32]()
+                    comptime for r in range(ROWS):
+                        var rr = min(r, nrows - 1)
+                        var qs = Float32(
+                            ptr[Scalar[dtype]](q0 + rr * job.qt * 4).unsafe_load(d + u)
+                        )
+                        c[r] = V(qs).fma(kv, c[r])
+        if jj + LANES <= lim:
+            comptime for r in range(ROWS):
+                if r < nrows:
+                    lg.unsafe_store[width=LANES](r * KT + j, c[r])
+                    mx[r] = max(mx[r], c[r])
+        else:
+            var idx = iota[DType.int32, LANES](Int32(jj))
+            var past = idx.ge(SIMD[DType.int32, LANES](Int32(kend)))
+            comptime for r in range(ROWS):
+                if r < nrows:
+                    var bad = past | idx.gt(SIMD[DType.int32, LANES](Int32(limit0 + r)))
+                    var x = bad.select(V(NEG), c[r])
+                    lg.unsafe_store[width=LANES](r * KT + j, x)
+                    mx[r] = max(mx[r], x)
+        j += LANES
+    comptime for r in range(ROWS):
+        if r < nrows:
+            ptr[Float32](tmax).unsafe_store(r, mx[r].reduce_max())
+
+
+# ---------------------------------------------------------------------------
+# online softmax over one tile; the scale is folded into exp2
+# ---------------------------------------------------------------------------
+@always_inline
+def _softmax[
+    dtype: DType
+](logits: Int, nrows: Int, nkeys: Int, c: Float32, m: Int, l: Int, alpha: Int):
+    comptime BF = dtype == DType.bfloat16
+    var lg = ptr[Float32](logits)
+    var pp = ptr[BFloat16](logits + RQT * KT * 4)  # bf16 probabilities
+    var mp = ptr[Float32](m)
+    var lp = ptr[Float32](l)
+    var ap = ptr[Float32](alpha)
+    for r in range(nrows):
+        var row = lg + r * KT
+        var tm = ap.unsafe_load(r)  # the tile max `_qk` left here
+        var j = 0
+        if tm == NEG:
+            # No visible key in this tile (a causal row inside a register tile
+            # whose last row does see keys): zero what P@V reads. Going through
+            # exp2 would compare two roundings of -MAX*c, whose difference is far
+            # outside exp2's range in either direction.
+            ap.unsafe_store(r, 1.0)
+            while j < nkeys:
+                comptime if BF:
+                    (pp + r * KT).unsafe_store[width=LANES](j, SIMD[DType.bfloat16, LANES](0))
+                else:
+                    row.unsafe_store[width=LANES](j, V(0))
+                j += LANES
+            continue
+        var mxv = tm * c
+        var mo = mp.unsafe_load(r)
+        var mn = max(mo, mxv)
+        var a = exp2s[5](mo - mn)
+        mp.unsafe_store(r, mn)
+        ap.unsafe_store(r, a)
+        var sum = V(0)
+        while j < nkeys:
+            # bf16 probabilities are rounded to 8 bits right after this, so a
+            # degree-2 polynomial (relative 1.7e-3) is inside that rounding.
+            var e = exp2[2 if BF else 5, LANES](
+                row.unsafe_load[width=LANES](j).fma(V(c), V(-mn))
+            )
+            comptime if BF:
+                (pp + r * KT).unsafe_store[width=LANES](j, e.cast[DType.bfloat16]())
+            else:
+                row.unsafe_store[width=LANES](j, e)
+            sum += e
+            j += LANES
+        lp.unsafe_store(r, lp.unsafe_load(r) * a + sum.reduce_add())
+
+
+# ---------------------------------------------------------------------------
+# P@V: acc[r][hd] += p[r][0:nk] @ V[k0:k0+nk], dims in register chunks
+# ---------------------------------------------------------------------------
+@always_inline
+def _pv[
+    dtype: DType, hd: Int, ROWS: Int
+](vsrc: Int, vstride: Int, k0: Int, nk: Int, logits: Int, acc: Int):
+    comptime BF = dtype == DType.bfloat16
+    comptime DOT = BF and BF16_DOT
+    comptime DC = 2 * LANES
+    var ap = ptr[Float32](acc)
+    var lg = ptr[Float32](logits)
+    var pp = ptr[Int32](logits + RQT * KT * 4)  # bf16 key pairs as words
+    comptime for dc in range(0, hd, DC):
+        var c0 = Array[V, ROWS](uninitialized=True)
+        var c1 = Array[V, ROWS](uninitialized=True)
+        comptime for r in range(ROWS):
+            c0[r] = ap.unsafe_load[width=LANES](r * hd + dc)
+            c1[r] = ap.unsafe_load[width=LANES](r * hd + dc + LANES)
+        comptime if BF:
+            # Key pairs: one `dpbf16ps` folds two keys x LANES dims (2.05x the
+            # phase over fp32 FMA in the C++ measurement).
+            var vp = ptr[BFloat16](vsrc)
+            var j = 0
+            while j < nk:
+                var row = ((k0 + j) >> 1) * hd * 2 + dc * 2
+                var v0 = vp.unsafe_load[width = 2 * LANES](row)
+                var v1 = vp.unsafe_load[width = 2 * LANES](row + 2 * LANES)
+                comptime for r in range(ROWS):
+                    var w = SIMD[DType.int32, LANES](pp.unsafe_load((r * KT + j) >> 1))
+                    var pa = bitcast[DType.bfloat16, 2 * LANES](w)
+                    c0[r] = dot_bf16[LANES](c0[r], v0, pa)
+                    c1[r] = dot_bf16[LANES](c1[r], v1, pa)
+                j += 2
+        else:
+            var vp = ptr[Scalar[dtype]](vsrc)
+            for j in range(nk):
+                var row = (k0 + j) * vstride + dc
+                var v0 = vp.unsafe_load[width=LANES](row).cast[DType.float32]()
+                var v1 = vp.unsafe_load[width=LANES](row + LANES).cast[DType.float32]()
+                comptime for r in range(ROWS):
+                    var pr = V(lg.unsafe_load(r * KT + j))
+                    c0[r] = pr.fma(v0, c0[r])
+                    c1[r] = pr.fma(v1, c1[r])
+        comptime for r in range(ROWS):
+            ap.unsafe_store[width=LANES](r * hd + dc, c0[r])
+            ap.unsafe_store[width=LANES](r * hd + dc + LANES, c1[r])
+
+
+# ---------------------------------------------------------------------------
+# one work item: rq query rows of (b, h)
+# ---------------------------------------------------------------------------
+@always_inline
+def _tile[
+    dtype: DType, hd: Int, ROWS: Int
+](
+    job: FlashJob,
+    kd: Int,
+    vsrc: Int,
+    vstride: Int,
+    q0: Int,
+    sub: Int,
+    k0: Int,
+    nk: Int,
+    limit0: Int,
+    c: Float32,
+    aux: Int,
+    acc: Int,
+    m: Int,
+    l: Int,
+    alpha: Int,
+):
+    _qk[dtype, hd, ROWS](job, kd, q0, sub, k0, nk, limit0, aux, alpha)
+    _softmax[dtype](aux, sub, nk, c, m, l, alpha)
+    var ap = ptr[Float32](alpha)
+    var acp = ptr[Float32](acc)
+    for r in range(sub):
+        var a = ap.unsafe_load(r)
+        # a == 1: no-op; a == 0: the row's first contributing tile, where the
+        # accumulator is still exactly 0.
+        if a != 1.0 and a != 0.0:
+            comptime for d in range(0, hd, LANES):
+                acp.unsafe_store[width=LANES](
+                    r * hd + d, acp.unsafe_load[width=LANES](r * hd + d) * a
+                )
+    _pv[dtype, hd, ROWS](vsrc, vstride, k0, nk, aux, acc)
+
+
+struct VecPolicy[dtype: DType, hd: Int](FlashPolicy):
+    comptime DT = Self.dtype
+    comptime HD = Self.hd
+    comptime RQT = RQT
+    comptime KT = KT
+
+    @staticmethod
+    def slab_bytes(seq_k: Int) -> Int:
+        return 2 * _pad(seq_k) * Self.hd * (2 if Self.dtype == DType.bfloat16 else 4)
+
+    @staticmethod
+    def tile_bytes() -> Int:
+        # fp32 logits | bf16 probabilities
+        return RQT * KT * 4 + RQT * KT * 2
+
+    @staticmethod
+    def pack(job: FlashJob, b: Int, kvh: Int, slab: Int):
+        _pack[Self.dtype, Self.hd](job, b, kvh, slab)
+
+    @staticmethod
+    def tile(
+        job: FlashJob,
+        slab: Int,
+        b: Int,
+        kvh: Int,
+        q0: Int,
+        sub: Int,
+        k0: Int,
+        nk: Int,
+        limit0: Int,
+        c: Float32,
+        scratch: Int,
+        acc: Int,
+        m: Int,
+        l: Int,
+        alpha: Int,
+    ):
+        comptime E = 2 if Self.dtype == DType.bfloat16 else 4
+        var vsrc = slab + _pad(job.seq_k) * Self.hd * E
+        var vstride = Self.hd
+        if job.v_direct:
+            vsrc = job.v + (b * job.vb + kvh * job.vh) * E
+            vstride = job.vt
+        # A partial register tile dispatches a smaller instantiation instead of
+        # repeating the last query row.
+        if sub <= 2:
+            _tile[Self.dtype, Self.hd, 2](job, slab, vsrc, vstride, q0, sub, k0, nk, limit0, c, scratch, acc, m, l, alpha)
+        elif sub <= 4:
+            _tile[Self.dtype, Self.hd, 4](job, slab, vsrc, vstride, q0, sub, k0, nk, limit0, c, scratch, acc, m, l, alpha)
+        else:
+            _tile[Self.dtype, Self.hd, RQT](job, slab, vsrc, vstride, q0, sub, k0, nk, limit0, c, scratch, acc, m, l, alpha)

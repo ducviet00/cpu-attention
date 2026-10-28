@@ -13,7 +13,8 @@ from std.python import Python, PythonObject
 from std.python.bindings import PythonModuleBuilder
 from attention import Job, run
 from kvcache import PagedJob, paged_run
-from flash_attn import FlashJob, flash_run, flash_aux_bytes, flash_slab_bytes
+from flash_attn import FlashJob
+from dispatch import flash_run, flash_sizes as _flash_sizes
 from isa import ptr, tier_name
 from dense import (
     INT8_QK,
@@ -566,13 +567,12 @@ def tier() raises -> PythonObject:
 
 
 
-def flash_sizes(seq_k: PythonObject, rq: PythonObject, hd: PythonObject, dtype: PythonObject) raises -> PythonObject:
+def flash_sizes(
+    seq_k: PythonObject, rq: PythonObject, hd: PythonObject, dtype: PythonObject, isa: PythonObject
+) raises -> PythonObject:
     """(slab bytes per (batch, kv head), scratch bytes per thread)."""
-    var sk = Int(py=seq_k)
-    var h = Int(py=hd)
-    return Python.tuple(
-        flash_slab_bytes(sk, h, Int(py=dtype)), flash_aux_bytes(Int(py=rq), h)
-    )
+    var s = _flash_sizes(Int(py=seq_k), Int(py=rq), Int(py=hd), Int(py=dtype), Int(py=isa))
+    return Python.tuple(s[0], s[1])
 
 
 def flash_forward(
@@ -591,7 +591,7 @@ def flash_forward(
     )
     job.ws = Int(py=ws)
     var p = ptr[Int64](Int(py=plan))
-    flash_run(job, Int(p.unsafe_load(18)), Int(p.unsafe_load(5)))
+    flash_run(job, Int(p.unsafe_load(18)), Int(p.unsafe_load(5)), Int(p.unsafe_load(27)))
 
 def kv_attention(
     plan: PythonObject,
