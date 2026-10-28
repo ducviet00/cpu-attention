@@ -1,0 +1,216 @@
+/home/ducviet00/agent-amx/.venv/lib/python3.14/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+{
+ "git": "b7b83fe5968c5e33b5534583ca961c22be354b5a",
+ "mojo": "Mojo 1.2.0 (2016d0cd)",
+ "torch": "2.14.1+cpu",
+ "threads": 4,
+ "governor": null,
+ "arms": {
+  "mojo_new": {
+   "backend": "mojo",
+   "env": {},
+   "origin": "b7b83fe",
+   "lib": "/tmp/ca_arms_8xgqtpr9/mojo_new/ca_mojo_new/_C_x86-avx512bf16.so",
+   "tier": "x86-avx512bf16"
+  },
+  "mojo_ctrl": {
+   "backend": "mojo",
+   "env": {},
+   "origin": "b7b83fe",
+   "lib": "/tmp/ca_arms_8xgqtpr9/mojo_ctrl/ca_mojo_ctrl/_C_x86-avx512bf16.so",
+   "tier": "x86-avx512bf16"
+  },
+  "mojo_old": {
+   "backend": "mojo",
+   "env": {},
+   "origin": "mojo-oracle-v1.1",
+   "lib": "/tmp/ca_arms_8xgqtpr9/mojo_old/ca_mojo_old/_C.so"
+  },
+  "cpp_amx": {
+   "backend": "cpp",
+   "env": {
+    "CPU_ATTENTION_ISA": "amx"
+   },
+   "origin": "mojo-oracle-v1.1",
+   "lib": "/tmp/ca_arms_8xgqtpr9/cpp_amx/ca_cpp_amx/_C_cpp.so",
+   "isa": "amx"
+  },
+  "cpp_vec": {
+   "backend": "cpp",
+   "env": {
+    "CPU_ATTENTION_ISA": "vec"
+   },
+   "origin": "mojo-oracle-v1.1",
+   "lib": "/tmp/ca_arms_8xgqtpr9/cpp_vec/ca_cpp_vec/_C_cpp.so",
+   "isa": "vec"
+  },
+  "cpp_scalar": {
+   "backend": "cpp",
+   "env": {
+    "CPU_ATTENTION_ISA": "scalar"
+   },
+   "origin": "mojo-oracle-v1.1",
+   "lib": "/tmp/ca_arms_8xgqtpr9/cpp_scalar/ca_cpp_scalar/_C_cpp.so",
+   "isa": "scalar"
+  }
+ }
+}
+flash 128:8:64 bf16                              new       29.3 cpp_amx       27.1 ratio 1.080 ctrl 0.031 loss /mojo_old 1.033
+flash 128:8:64 fp32                              new       52.8 cpp_amx       47.0 ratio 1.125 ctrl 0.039 loss /mojo_old 1.022
+flash 512:8:64 bf16                              new      238.9 cpp_amx      181.6 ratio 1.315 ctrl 0.004 loss /mojo_old 1.016
+flash 512:8:64 fp32                              new      423.2 cpp_amx      340.5 ratio 1.243 ctrl 0.014 loss /mojo_old 1.011
+flash 1024:8:64 bf16                             new      831.3 cpp_amx      644.5 ratio 1.290 ctrl 0.003 loss /mojo_old 1.004
+flash 1024:8:64 fp32                             new     1399.1 cpp_amx     1148.5 ratio 1.218 ctrl 0.020 loss /mojo_old 1.014
+flash 2048:8:64 bf16                             new     3131.2 cpp_amx     2349.2 ratio 1.333 ctrl 0.008 loss /mojo_old 1.018
+flash 2048:8:64 fp32                             new     5161.9 cpp_amx     4173.3 ratio 1.237 ctrl 0.003 loss /mojo_old 1.004
+flash 4096:8:64 bf16                             new    12079.3 cpp_amx     9002.3 ratio 1.342 ctrl 0.000 loss /mojo_old 1.003
+flash 4096:8:64 fp32                             new    20682.7 cpp_amx    17371.9 ratio 1.191 ctrl 0.003 loss /mojo_old 1.011
+flash 256:16:128 bf16                            new      231.5 cpp_amx      186.2 ratio 1.243 ctrl 0.064 loss /mojo_old 0.989
+flash 256:16:128 fp32                            new      462.8 cpp_amx      385.8 ratio 1.199 ctrl 0.023 loss /mojo_old 0.986
+flash 1024:16:128 bf16                           new     2531.5 cpp_amx     1913.7 ratio 1.323 ctrl 0.047 loss /mojo_old 1.032
+flash 1024:16:128 fp32                           new     4576.1 cpp_amx     3541.8 ratio 1.292 ctrl 0.013 loss /mojo_old 0.995
+flash 2048:16:128 bf16                           new     9090.8 cpp_amx     6997.0 ratio 1.299 ctrl 0.003 loss /mojo_old 1.008
+flash 2048:16:128 fp32                           new    17575.6 cpp_amx    14777.9 ratio 1.189 ctrl 0.006 loss /mojo_old 0.993
+flash 4096:16:128 bf16                           new    35463.4 cpp_amx    28223.1 ratio 1.257 ctrl 0.009 loss /mojo_old 1.013
+flash 4096:16:128 fp32                           new    93240.6 cpp_amx    77915.0 ratio 1.197 ctrl 0.025 loss /mojo_old 1.045
+flash 512:32:128 bf16                            new     1466.9 cpp_amx     1160.0 ratio 1.265 ctrl 0.022 loss /mojo_old 0.995
+flash 512:32:128 fp32                            new     3077.6 cpp_amx     2154.4 ratio 1.428 ctrl 0.008 loss /mojo_old 0.976
+flash 1024:8:32 bf16                             new      618.5 cpp_amx      474.2 ratio 1.304 ctrl 0.007 loss /mojo_old 1.002
+flash 1024:8:32 fp32                             new     1013.1 cpp_amx      874.1 ratio 1.159 ctrl 0.002 loss /mojo_old 0.999
+flash 17:8:64 bf16                               new       11.1 cpp_amx        9.6 ratio 1.148 ctrl 0.012 loss /mojo_old 0.951
+flash 17:8:64 fp32                               new       13.4 cpp_vec       10.3 ratio 1.306 ctrl 0.063 loss /mojo_old 1.028
+flash 65:8:64 bf16                               new       22.4 cpp_amx       18.1 ratio 1.242 ctrl 0.018 loss /mojo_old 1.062
+flash 65:8:64 fp32                               new       32.8 cpp_amx       26.5 ratio 1.239 ctrl 0.036 loss /mojo_old 1.018
+flash 129:8:64 bf16                              new       36.5 cpp_amx       31.2 ratio 1.168 ctrl 0.003 loss /mojo_old 1.014
+flash 129:8:64 fp32                              new       67.8 cpp_amx       55.2 ratio 1.227 ctrl 0.043 loss /mojo_old 1.043
+flash 257:8:64 bf16                              new       76.9 cpp_amx       63.4 ratio 1.213 ctrl 0.003 loss /mojo_old 0.999
+flash 257:8:64 fp32                              new      162.7 cpp_amx      131.4 ratio 1.238 ctrl 0.031 loss /mojo_old 1.027
+flash 513:8:64 bf16                              new      266.4 cpp_amx      194.6 ratio 1.369 ctrl 0.006 loss /mojo_old 1.037
+flash 513:8:64 fp32                              new      457.0 cpp_amx      363.6 ratio 1.257 ctrl 0.000 loss /mojo_old 0.993
+flash 1025:8:64 bf16                             new      886.0 cpp_amx      665.1 ratio 1.332 ctrl 0.002 loss /mojo_old 1.001
+flash 1025:8:64 fp32                             new     1490.4 cpp_amx     1201.5 ratio 1.240 ctrl 0.004 loss /mojo_old 1.010
+flash 2049:8:64 bf16                             new     3255.8 cpp_amx     2374.8 ratio 1.371 ctrl 0.033 loss /mojo_old 1.028
+flash 2049:8:64 fp32                             new     5295.8 cpp_amx     4316.7 ratio 1.227 ctrl 0.008 loss /mojo_old 0.995
+flash 4097:8:64 bf16                             new    12283.7 cpp_amx     9052.7 ratio 1.357 ctrl 0.001 loss /mojo_old 1.007
+flash 4097:8:64 fp32                             new    21235.5 cpp_amx    17786.7 ratio 1.194 ctrl 0.003 loss /mojo_old 1.033
+flash 129:16:128 bf16                            new       96.5 cpp_amx       78.7 ratio 1.225 ctrl 0.002 loss /mojo_old 0.986
+flash 129:16:128 fp32                            new      223.6 cpp_amx      181.2 ratio 1.234 ctrl 0.018 loss /mojo_old 0.979
+flash 257:16:128 bf16                            new      275.0 cpp_amx      222.6 ratio 1.235 ctrl 0.090 loss /mojo_old 1.010
+flash 257:16:128 fp32                            new      569.6 cpp_amx      432.8 ratio 1.316 ctrl 0.020 loss /mojo_old 1.040
+flash 1025:16:128 bf16                           new     2642.5 cpp_amx     1989.0 ratio 1.329 ctrl 0.014 loss /mojo_old 1.002
+flash 1025:16:128 fp32                           new     4838.0 cpp_amx     3783.8 ratio 1.279 ctrl 0.004 loss /mojo_old 0.990
+flash 2049:16:128 bf16                           new     9259.6 cpp_amx     7070.0 ratio 1.310 ctrl 0.001 loss /mojo_old 1.006
+flash 2049:16:128 fp32                           new    17530.1 cpp_amx    15189.1 ratio 1.154 ctrl 0.007 loss /mojo_old 0.997
+flash 1025:8:32 bf16                             new      638.3 cpp_amx      484.1 ratio 1.319 ctrl 0.001 loss /mojo_old 0.999
+flash 1025:8:32 fp32                             new     1069.9 cpp_amx      889.7 ratio 1.203 ctrl 0.002 loss /mojo_old 0.996
+flash 1x129:8:64 bf16                            new       17.0 cpp_vec       13.5 ratio 1.263 ctrl 0.045 loss /mojo_old 1.033
+flash 1x129:8:64 fp32                            new       25.9 cpp_vec       11.9 ratio 2.180 ctrl 0.023 loss /mojo_old 0.991
+flash 17x301:8:64 bf16                           new       28.2 cpp_amx       24.2 ratio 1.161 ctrl 0.028 loss /mojo_old 1.010
+flash 17x301:8:64 fp32                           new       52.5 cpp_vec       46.6 ratio 1.126 ctrl 0.010 loss /mojo_old 0.978
+flash 127x129:8:64 bf16                          new       35.6 cpp_amx       32.3 ratio 1.101 ctrl 0.003 loss /mojo_old 0.976
+flash 127x129:8:64 fp32                          new       62.6 cpp_amx       61.1 ratio 1.025 ctrl 0.047 unresolved /mojo_old 1.034
+flash 129x127:8:64 bf16                          new       34.4 cpp_amx       30.7 ratio 1.121 ctrl 0.022 loss /mojo_old 0.996
+flash 129x127:8:64 fp32                          new       63.5 cpp_amx       62.8 ratio 1.011 ctrl 0.023 unresolved /mojo_old 1.010
+flash 257x513:8:64 bf16                          new      197.8 cpp_amx      151.0 ratio 1.310 ctrl 0.025 loss /mojo_old 1.040
+flash 257x513:8:64 fp32                          new      333.7 cpp_amx      267.1 ratio 1.250 ctrl 0.009 loss /mojo_old 0.986
+flash 513x257:8:64 bf16                          new       82.7 cpp_amx       73.9 ratio 1.119 ctrl 0.007 loss /mojo_old 1.010
+flash 513x257:8:64 fp32                          new      184.8 cpp_amx      156.0 ratio 1.185 ctrl 0.002 loss /mojo_old 1.019
+flash 1025x2049:8:64 bf16                        new     2378.4 cpp_amx     1775.1 ratio 1.340 ctrl 0.005 loss /mojo_old 1.006
+flash 1025x2049:8:64 fp32                        new     3878.6 cpp_amx     3260.8 ratio 1.189 ctrl 0.012 loss /mojo_old 0.999
+flash 2049x1025:8:64 bf16                        new      927.9 cpp_amx      707.6 ratio 1.311 ctrl 0.004 loss /mojo_old 1.020
+flash 2049x1025:8:64 fp32                        new     1640.5 cpp_amx     1280.2 ratio 1.282 ctrl 0.031 loss /mojo_old 1.059
+flash 1024:8:64 noncausal bf16                   new     1484.4 cpp_amx     1167.4 ratio 1.272 ctrl 0.002 loss /mojo_old 0.997
+flash 1024:8:64 noncausal fp32                   new     2371.9 cpp_amx     2001.4 ratio 1.185 ctrl 0.001 loss /mojo_old 0.992
+flash 1025:8:64 noncausal bf16                   new     1624.6 cpp_amx     1228.8 ratio 1.322 ctrl 0.007 loss /mojo_old 1.014
+flash 1025:8:64 noncausal fp32                   new     2546.4 cpp_amx     2203.9 ratio 1.155 ctrl 0.006 loss /mojo_old 0.988
+flash 1024:16:128 noncausal bf16                 new     4387.5 cpp_amx     3353.2 ratio 1.308 ctrl 0.002 loss /mojo_old 1.006
+flash 1024:16:128 noncausal fp32                 new     7662.8 cpp_amx     6300.9 ratio 1.216 ctrl 0.012 loss /mojo_old 0.990
+flash 1024:32/8:128 bf16                         new     4572.1 cpp_amx     3791.6 ratio 1.206 ctrl 0.009 loss /mojo_old 0.999
+flash 1024:32/8:128 fp32                         new     8278.3 cpp_amx     7332.9 ratio 1.129 ctrl 0.151 unresolved /mojo_old 0.998
+flash 1024:16/1:64 bf16                          new     1691.4 cpp_amx     1248.1 ratio 1.355 ctrl 0.038 loss /mojo_old 1.020
+flash 1024:16/1:64 fp32                          new     2698.8 cpp_amx     2251.0 ratio 1.199 ctrl 0.016 loss /mojo_old 0.999
+flash 1024:8:64 fused bf16                       new      830.6 cpp_amx      648.9 ratio 1.280 ctrl 0.005 loss /mojo_old 1.004
+flash 1024:8:64 fused fp32                       new     1394.4 cpp_amx     1148.0 ratio 1.215 ctrl 0.035 loss /mojo_old 1.044
+flash 257:16:128 fused bf16                      new      281.6 cpp_amx      227.3 ratio 1.239 ctrl 0.006 loss /mojo_old 1.024
+flash 257:16:128 fused fp32                      new      559.3 cpp_amx      439.4 ratio 1.273 ctrl 0.072 loss /mojo_old 1.083
+
+78 rows: 0 win, 3 unresolved, 75 loss, 0 invalid
+  loss       flash 128:8:64 bf16  ratio 1.080 vs cpp_amx
+  loss       flash 128:8:64 fp32  ratio 1.125 vs cpp_amx
+  loss       flash 512:8:64 bf16  ratio 1.315 vs cpp_amx
+  loss       flash 512:8:64 fp32  ratio 1.243 vs cpp_amx
+  loss       flash 1024:8:64 bf16  ratio 1.290 vs cpp_amx
+  loss       flash 1024:8:64 fp32  ratio 1.218 vs cpp_amx
+  loss       flash 2048:8:64 bf16  ratio 1.333 vs cpp_amx
+  loss       flash 2048:8:64 fp32  ratio 1.237 vs cpp_amx
+  loss       flash 4096:8:64 bf16  ratio 1.342 vs cpp_amx
+  loss       flash 4096:8:64 fp32  ratio 1.191 vs cpp_amx
+  loss       flash 256:16:128 bf16  ratio 1.243 vs cpp_amx
+  loss       flash 256:16:128 fp32  ratio 1.199 vs cpp_amx
+  loss       flash 1024:16:128 bf16  ratio 1.323 vs cpp_amx
+  loss       flash 1024:16:128 fp32  ratio 1.292 vs cpp_amx
+  loss       flash 2048:16:128 bf16  ratio 1.299 vs cpp_amx
+  loss       flash 2048:16:128 fp32  ratio 1.189 vs cpp_amx
+  loss       flash 4096:16:128 bf16  ratio 1.257 vs cpp_amx
+  loss       flash 4096:16:128 fp32  ratio 1.197 vs cpp_amx
+  loss       flash 512:32:128 bf16  ratio 1.265 vs cpp_amx
+  loss       flash 512:32:128 fp32  ratio 1.428 vs cpp_amx
+  loss       flash 1024:8:32 bf16  ratio 1.304 vs cpp_amx
+  loss       flash 1024:8:32 fp32  ratio 1.159 vs cpp_amx
+  loss       flash 17:8:64 bf16  ratio 1.148 vs cpp_amx
+  loss       flash 17:8:64 fp32  ratio 1.306 vs cpp_vec
+  loss       flash 65:8:64 bf16  ratio 1.242 vs cpp_amx
+  loss       flash 65:8:64 fp32  ratio 1.239 vs cpp_amx
+  loss       flash 129:8:64 bf16  ratio 1.168 vs cpp_amx
+  loss       flash 129:8:64 fp32  ratio 1.227 vs cpp_amx
+  loss       flash 257:8:64 bf16  ratio 1.213 vs cpp_amx
+  loss       flash 257:8:64 fp32  ratio 1.238 vs cpp_amx
+  loss       flash 513:8:64 bf16  ratio 1.369 vs cpp_amx
+  loss       flash 513:8:64 fp32  ratio 1.257 vs cpp_amx
+  loss       flash 1025:8:64 bf16  ratio 1.332 vs cpp_amx
+  loss       flash 1025:8:64 fp32  ratio 1.240 vs cpp_amx
+  loss       flash 2049:8:64 bf16  ratio 1.371 vs cpp_amx
+  loss       flash 2049:8:64 fp32  ratio 1.227 vs cpp_amx
+  loss       flash 4097:8:64 bf16  ratio 1.357 vs cpp_amx
+  loss       flash 4097:8:64 fp32  ratio 1.194 vs cpp_amx
+  loss       flash 129:16:128 bf16  ratio 1.225 vs cpp_amx
+  loss       flash 129:16:128 fp32  ratio 1.234 vs cpp_amx
+  loss       flash 257:16:128 bf16  ratio 1.235 vs cpp_amx
+  loss       flash 257:16:128 fp32  ratio 1.316 vs cpp_amx
+  loss       flash 1025:16:128 bf16  ratio 1.329 vs cpp_amx
+  loss       flash 1025:16:128 fp32  ratio 1.279 vs cpp_amx
+  loss       flash 2049:16:128 bf16  ratio 1.310 vs cpp_amx
+  loss       flash 2049:16:128 fp32  ratio 1.154 vs cpp_amx
+  loss       flash 1025:8:32 bf16  ratio 1.319 vs cpp_amx
+  loss       flash 1025:8:32 fp32  ratio 1.203 vs cpp_amx
+  loss       flash 1x129:8:64 bf16  ratio 1.263 vs cpp_vec
+  loss       flash 1x129:8:64 fp32  ratio 2.180 vs cpp_vec
+  loss       flash 17x301:8:64 bf16  ratio 1.161 vs cpp_amx
+  loss       flash 17x301:8:64 fp32  ratio 1.126 vs cpp_vec
+  loss       flash 127x129:8:64 bf16  ratio 1.101 vs cpp_amx
+  unresolved flash 127x129:8:64 fp32  ratio 1.025 vs cpp_amx
+  loss       flash 129x127:8:64 bf16  ratio 1.121 vs cpp_amx
+  unresolved flash 129x127:8:64 fp32  ratio 1.011 vs cpp_amx
+  loss       flash 257x513:8:64 bf16  ratio 1.310 vs cpp_amx
+  loss       flash 257x513:8:64 fp32  ratio 1.250 vs cpp_amx
+  loss       flash 513x257:8:64 bf16  ratio 1.119 vs cpp_amx
+  loss       flash 513x257:8:64 fp32  ratio 1.185 vs cpp_amx
+  loss       flash 1025x2049:8:64 bf16  ratio 1.340 vs cpp_amx
+  loss       flash 1025x2049:8:64 fp32  ratio 1.189 vs cpp_amx
+  loss       flash 2049x1025:8:64 bf16  ratio 1.311 vs cpp_amx
+  loss       flash 2049x1025:8:64 fp32  ratio 1.282 vs cpp_amx
+  loss       flash 1024:8:64 noncausal bf16  ratio 1.272 vs cpp_amx
+  loss       flash 1024:8:64 noncausal fp32  ratio 1.185 vs cpp_amx
+  loss       flash 1025:8:64 noncausal bf16  ratio 1.322 vs cpp_amx
+  loss       flash 1025:8:64 noncausal fp32  ratio 1.155 vs cpp_amx
+  loss       flash 1024:16:128 noncausal bf16  ratio 1.308 vs cpp_amx
+  loss       flash 1024:16:128 noncausal fp32  ratio 1.216 vs cpp_amx
+  loss       flash 1024:32/8:128 bf16  ratio 1.206 vs cpp_amx
+  unresolved flash 1024:32/8:128 fp32  ratio 1.129 vs cpp_amx
+  loss       flash 1024:16/1:64 bf16  ratio 1.355 vs cpp_amx
+  loss       flash 1024:16/1:64 fp32  ratio 1.199 vs cpp_amx
+  loss       flash 1024:8:64 fused bf16  ratio 1.280 vs cpp_amx
+  loss       flash 1024:8:64 fused fp32  ratio 1.215 vs cpp_amx
+  loss       flash 257:16:128 fused bf16  ratio 1.239 vs cpp_amx
+  loss       flash 257:16:128 fused fp32  ratio 1.273 vs cpp_amx

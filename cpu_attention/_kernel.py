@@ -638,9 +638,8 @@ def _drop_workspace() -> None:
     plans = getattr(_SCRATCH, "plans", None)
     if plans is not None:
         plans.clear()
-    # AMX plans contain raw addresses into the same scratch tensors. Clearing
-    # only the non-AMX plans made an on/off/on A/B reuse freed memory.
-    _AMX_PLANS.__dict__.pop("p", None)
+    # The flash plans (AMX included) hold the workspace's raw addresses: dropping
+    # only some of them made an on/off/on A/B reuse freed memory.
     _FLASH.__dict__.pop("ws", None)
     _FLASH.__dict__.pop("p", None)
     _KV_GEN[0] += 1
@@ -686,190 +685,30 @@ def clear_scratch() -> None:
 
 _AMX_ENV = (os.environ.get("CPU_ATTENTION_AMX", "1") != "0" and
             os.environ.get("CPU_ATTENTION_ISA", "amx") == "amx")
-# fp32 goes through the same kernel with bf16 hi/lo operand splitting (three
+# fp32 goes through the same AMX policy with bf16 hi/lo operand splitting (three
 # products per phase); this switch is for A/B and for falling back if a future
-# CPU disagrees with the measured 5.5-7.6e-5 error.
+# CPU disagrees with the measured 3-8e-5 error (gate 2e-4).
 _AMX_FP32_ENV = os.environ.get("CPU_ATTENTION_AMX_FP32", "1") != "0"
 
-# Profiling only (phase ablations): 1 skips the K/V pack, 2 skips
-# the attention. The results are garbage in either mode; timings only.
-# Profiling only: 1 skip pack, 2 skip attention, 4/8 skip V/K pack, 16/32/64
-# skip Q@K^T / softmax / P@V. Results are garbage in any of these; timings only.
-_AMX_MODE_V = int(os.environ.get("CPU_ATTENTION_AMX_MODE", "0") or 0)
-
-_AMX_ENTRY = None
-
-# v2 of the AMX kernel (`dense_amx_v2.mojo`: one softmax pass per logit instead
-# of two). Opt-in so a regression cannot reach the engine:
-# `CPU_ATTENTION_AMX2=1` at import, or flip `_AMX_IMPL` between calls (which is
-# how an in-process A/B interleaves the two in one process).
-_AMX_IMPL = os.environ.get("CPU_ATTENTION_AMX2", "0") == "1" and "v2" or "v1"
-_AMX_ENTRIES = {}
+_AMX_OK = None
 
 
 def amx_available() -> bool:
-    """True when this build can run the AMX dense kernel (bf16 or fp32).
+    """True when this build and process can run the AMX flash policy.
 
-    Cached: the first call asks the kernel for tile-data permission
-    (`arch_prctl`), which is a syscall, and the answer cannot change inside a
-    process. Doing it here (rather than per call) is also what makes the tile
-    instructions legal at all -- `#XF` state is off by default, and the first
-    tile instruction is SIGILL without it. Torch's oneDNN normally asks for it
-    too, but that is an implementation detail of the wheel, not a guarantee.
+    The CPU must report AMX and the OS must grant tile-data permission
+    (`arch_prctl`, a syscall: the answer is cached, and the first tile
+    instruction is SIGILL without it). Torch's oneDNN normally asks too, but that
+    is an implementation detail of the wheel, not a guarantee. The ``_AMX_ENV``
+    toggle is separate and is read per call, so on/off/on works in one process.
     """
-    global _AMX_ENTRY
-    if _AMX_ENTRY is None:
+    global _AMX_OK
+    if _AMX_OK is None:
         mod = module()
-        gate = getattr(mod, "dense_has_amx", None) if mod else None
-        init = getattr(mod, "dense_amx_init", None) if mod else None
-        global _AMX_PLAN
-        # The tier carries the kernel; the CPU must report AMX (and the OS grant
-        # tile state, `init`) before a tile instruction may run.
+        gate = getattr(mod, "amx_available", None) if mod else None
         cpu = {"amx_tile", "amx_bf16"} <= _cpu_flags()
-        if (gate is None or init is None or not cpu or not gate() or
-                not init()):
-            _AMX_ENTRY = False
-        else:
-            _AMX_ENTRIES["v1"] = mod.dense_amx_attention
-            gate2 = getattr(mod, "dense_amx2_has_amx", None)
-            if gate2 is not None and gate2():
-                _AMX_ENTRIES["v2"] = mod.dense_amx2_attention
-            _AMX_ENTRY = True
-            _AMX_PLAN = getattr(mod, "dense_amx_plan", None)
-    return _AMX_ENTRY is not False and _AMX_ENTRY is not None and _AMX_ENV
-
-
-_AMX_PLAN = None
-"""``dense_amx_plan``: the 5-argument entry (see ``_amx_plan_buffer``)."""
-
-_AMX_PLANS = threading.local()
-"""Geometry -> the int64 buffer that entry reads, per thread.
-
-The AMX call marshalled 36 Python objects and rebuilt twelve derived ints on
-every call. Rebuilding them is 3.7 us of a 43 us call at 128:8:64 -- the row
-where the kernel is already faster than vLLM's, so the call path *is* the
-margin there. Everything in the buffer changes only with the geometry and the
-tensor strides; the four tensor addresses still cross per call.
-
-Bounded by entry count and dropped by `clear_scratch`, like the other
-workspace. The buffer holds the two packed-K/V workspace addresses, so a
-cleared workspace must not leave a stale plan behind.
-"""
-
-AMX_PLAN_MAGIC = 0x414D58504C414E31
-"""Mirrors ``_C.AMX_PLAN_MAGIC``: the kernel rejects a buffer without it."""
-
-_AMX_KT = int(os.environ.get("CPU_ATTENTION_AMX_KT") or 256)
-
-
-def _amx_plan_key(q, k, v, fp32: bool, causal: bool, scale: float):
-    # The plan buffer holds the scale and the worker count, so both are part of
-    # the key: without them a changed softmax_scale reused the old one.
-    return (q.shape, k.shape, q.stride(), k.stride(), v.stride(), fp32,
-            causal, _AMX_KT, _AMX_MODE_V, torch.get_num_threads(), _OVERRIDE,
-            scale)
-
-
-def _amx_plan_buffer(q, k, v, fp32, causal, kp, vp, kp_bh, vp_bh, kb16, kb32,
-                     dc32, dc16, scale, kt, workers):
-    """Pack one AMX call's geometry into an int64 buffer for ``dense_amx_plan``.
-
-    Field order is fixed and mirrored in ``_C.dense_amx_plan``; slot 32 is a
-    magic word so a stale buffer is refused rather than misread. The strides
-    are the caller's element strides (the kernel scales by the element size),
-    and the output strides are derived, not read: the output is a fresh
-    contiguous tensor.
-    """
-    batch, seq_q, num_heads, head_dim = q.shape
-    seq_k, num_kv_heads = k.shape[1], k.shape[2]
-    qs, ks, vs = q.stride(), k.stride(), v.stride()
-    scale_bits = struct.unpack("<i", struct.pack("<f", float(scale)))[0]
-    plan = torch.tensor([
-        kp.data_ptr(), vp.data_ptr(),
-        batch, num_heads, num_kv_heads, seq_k, seq_q, head_dim,
-        ks[0], ks[1], ks[2],
-        vs[0], vs[1], vs[2],
-        qs[0], qs[1], qs[2],
-        seq_q * num_heads * head_dim, num_heads * head_dim, head_dim,
-        kp_bh, vp_bh, kb16, kb32, dc32, dc16,
-        scale_bits, int(bool(causal)), kt, workers, int(fp32),
-        int(_AMX_MODE_V), AMX_PLAN_MAGIC,
-    ], dtype=torch.int64)
-    return plan
-
-
-def _amx_dense(q, k, v, scale: float, causal: bool):
-    """Run the AMX kernel, or return None when it cannot take this call.
-
-    bf16 is native; fp32 runs the same kernel with every operand split into bf16
-    hi/lo and three products per phase (fp32-accurate at 3x the tile ops). One
-    work item is 32 query rows of one (batch, head); anything else -- no AMX in
-    this build, an unsupported head dim, the switch turned off -- falls back to
-    the AVX-512 path in this file.
-    """
-    if not amx_available():
-        return None
-    if q.shape[-1] not in (32, 64, 128) or q.dtype not in _DTYPE_CODES:
-        return None
-    fp32 = q.dtype == torch.float32
-    plans = _AMX_PLANS.__dict__.get("p") if _AMX_IMPL == "v1" else None
-    if plans:
-        plan = plans.get(_amx_plan_key(q, k, v, fp32, causal, scale))
-        if plan is not None:
-            out = torch.empty_like(q, memory_format=torch.contiguous_format)
-            _AMX_PLAN(plan.data_ptr(), q.data_ptr(), k.data_ptr(),
-                      v.data_ptr(), out.data_ptr())
-            return out
-    if fp32 and not _AMX_FP32_ENV:
-        return None
-    batch, seq_q, num_heads, head_dim = q.shape
-    seq_k, num_kv_heads = k.shape[1], k.shape[2]
-    if seq_q < 1 or seq_k < 1 or num_kv_heads < 1:
-        return None
-    # The layouts the kernel reads: one 1 KB tile per (key block, dim chunk);
-    # fp32 packs an (hi, lo) slab pair, so the pitch is 1024 bf16, not 512.
-    kb32 = -(-seq_k // 32)          # V blocks: 32 keys
-    kb16 = kb32 * 2                 # K blocks: 16 keys
-    dc32, dc16 = head_dim // 32, head_dim // 16
-    slab = 1024 if fp32 else 512
-    kp_bh, vp_bh = kb16 * dc32 * slab, kb32 * dc16 * slab
-    nbh = batch * num_kv_heads
-    kp = _scratch("amx_kp", (nbh * kp_bh,), torch.bfloat16)
-    vp = _scratch("amx_vp", (nbh * vp_bh,), torch.bfloat16)
-    out = torch.empty_like(q, memory_format=torch.contiguous_format)
-    qs, ks, vs, os_ = q.stride(), k.stride(), v.stride(), out.stride()
-    # 256-key super-tiles measured best on the Xeon (128 is 6% slower, 384/512
-    # lose the logits+prob+acc working set out of L1).
-    kt = _AMX_KT
-    tasks = batch * num_heads * (-(-seq_q // 32))
-    workers = _workers(tasks, 8)
-    # The plan entry only exists for v1 (v2 has its own packed layouts but the
-    # same arguments), so a v2 call takes the 36-argument path.
-    _AMX_ENTRIES.get(_AMX_IMPL, _AMX_ENTRIES["v1"])(
-        q.data_ptr(), kp.data_ptr(), vp.data_ptr(), out.data_ptr(),
-        k.data_ptr(), v.data_ptr(),
-        batch, seq_q, seq_k, num_heads, num_kv_heads, head_dim,
-        qs[0], qs[1], qs[2],
-        ks[0], ks[1], ks[2],
-        vs[0], vs[1], vs[2],
-        os_[0], os_[1], os_[2],
-        kp_bh, vp_bh, kb16, kb32, dc32, dc16,
-        float(scale), int(bool(causal)), kt,
-        workers, int(fp32), int(_AMX_MODE_V),
-    )
-    if _AMX_PLAN is not None and _AMX_IMPL == "v1":
-        plans = _AMX_PLANS.__dict__.get("p")
-        if plans is None:
-            plans = _AMX_PLANS.p = {}
-        if len(plans) > 64:
-            plans.clear()
-        plans[_amx_plan_key(q, k, v, fp32, causal, scale)] = _amx_plan_buffer(
-            q, k, v, fp32, causal, kp, vp, kp_bh, vp_bh, kb16, kb32, dc32,
-            dc16, scale, kt, workers,
-        )
-    return out
-
-
+        _AMX_OK = bool(cpu and gate is not None and gate())
+    return _AMX_OK and _AMX_ENV
 
 
 _CPP_PLANS = threading.local()
@@ -929,6 +768,8 @@ def _dense_cpp(q, k, v, scale: float, causal: bool, geom=None):
 
 _FLASH = threading.local()
 """Per-thread flash_attn_func plans and workspace (the Mojo backend)."""
+_AMX_PLANS = _FLASH
+"""AMX is a policy id in the flash plan, so its plans live in the same place."""
 
 
 def _flash_ws(nbytes):
@@ -951,18 +792,25 @@ def _flash_plan(geom, k, causal):
     batch, seq_q, heads, hd = qshape
     seq_k, kv_heads = k.shape[1], k.shape[2]
     tasks_q = -(-seq_q // 64)
+    dt = _DTYPE_CODES[dtype]
+    # The policy id: 1 = AMX (bf16, or fp32 as hi/lo unless switched off), else
+    # the vector policy. Part of the key because the toggles flip between calls.
+    isa = 1 if amx_available() and (dt == 1 or _AMX_FP32_ENV) else 0
     key = (geom, k.shape, causal, _OVERRIDE, torch.get_num_threads(),
-           _llc_bytes())
+           _llc_bytes(), isa)
     plan = plans.get(key)
     if plan is None:
-        # Rows per work item: the accumulator (rq x hd fp32) stays near 16 KB,
-        # so it is still in L1 when the next key tile arrives.
-        rq = max(16, min(128, 16384 // (hd * 4)))
+        if isa:
+            # Two 32-row AMX register tiles per work item: K/V tiles are loaded
+            # once per 64 rows.
+            rq = 64
+        else:
+            # Rows per work item: the accumulator (rq x hd fp32) stays near 16 KB,
+            # so it is still in L1 when the next key tile arrives.
+            rq = max(16, min(128, 16384 // (hd * 4)))
         rq = min(rq, max(seq_q, 1))
         nqb = -(-seq_q // rq)
         workers = _workers(batch * heads * nqb, 8)
-        dt = _DTYPE_CODES[dtype]
-        isa = 0  # the vector policy; AMX/bfmmla policies select here
         slab, aux = _entry("flash_sizes")(seq_k, rq, hd, dt, isa)
         nbh = batch * kv_heads
         llc = _llc_bytes()
@@ -972,7 +820,8 @@ def _flash_plan(geom, k, causal):
                 slab * workers <= llc * 3 // 5)
         # fp32 V is read in place while all of it fits half the LLC: the copy
         # only buys a unit stride (C++ measurement, docs/CPP.md §5).
-        v_direct = dt == 0 and batch * kv_heads * seq_k * hd * 4 <= llc // 2
+        v_direct = (dt == 0 and not isa and
+                    batch * kv_heads * seq_k * hd * 4 <= llc // 2)
         cells = workers if fuse else nbh
         total = cells * slab + workers * aux + 64
         buf = torch.tensor([
@@ -1058,7 +907,4 @@ def _dense(q, k, v, scale: float, causal: bool, geom=None):
     """
     if _BACKEND == "cpp":
         return _dense_cpp(q, k, v, scale, causal, geom)
-    out = _amx_dense(q, k, v, scale, causal)
-    if out is not None:
-        return out
     return _flash_mojo(q, k, v, scale, causal, geom)
