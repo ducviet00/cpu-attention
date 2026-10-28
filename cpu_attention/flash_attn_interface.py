@@ -258,7 +258,7 @@ def flash_attn_func(q, k, v, softmax_scale=None, causal=False):
     # Mojo fast path: a layout a validated call already registered runs with
     # the tensors read in the extension (no Python checks or plan lookup).
     table = _kernel._FLASH.__dict__.get("t")
-    if (table is not None and _kernel._FLASH.gen == _kernel._KV_GEN[0] and
+    if (table is not None and _kernel._FLASH.gen == _kernel._flash_gen() and
             type(q) is torch.Tensor and _kernel._BACKEND == "mojo"):
         out = torch.empty_like(q, memory_format=torch.contiguous_format)
         if _kernel._entry("flash_fast")(_kernel._FLASH.addr, q, k, v,

@@ -852,11 +852,18 @@ def _flash_mojo(q, k, v, scale, causal, geom=None):
 _FL_W = 32
 
 
+def _flash_gen():
+    """Validity of this thread's flash_fast plans: the global generation plus
+    the AMX toggles, which choose the policy a plan runs and may be flipped
+    between calls (an A/B, or `CPU_ATTENTION_AMX` on/off/on)."""
+    return (_KV_GEN[0], _AMX_ENV, _AMX_FP32_ENV)
+
+
 def _flash_table():
     """This thread's flash_fast table, or None (see `_kv_table`)."""
     global _LAYOUT
     t = getattr(_FLASH, "t", None)
-    if t is not None and _FLASH.gen == _KV_GEN[0]:
+    if t is not None and _FLASH.gen == _flash_gen():
         return t
     if _LAYOUT is None:
         _LAYOUT = (os.environ.get("CPU_ATTENTION_KV_FAST", "1") != "0" and
@@ -865,7 +872,7 @@ def _flash_table():
         return None
     t = torch.zeros(_HDR + _KV_CAP * _FL_W, dtype=torch.int64)
     t[:len(_LAYOUT)] = torch.tensor(_LAYOUT, dtype=torch.int64)
-    _FLASH.t, _FLASH.gen, _FLASH.keep = t, _KV_GEN[0], []
+    _FLASH.t, _FLASH.gen, _FLASH.keep = t, _flash_gen(), []
     _FLASH.addr = t.data_ptr()
     return t
 
