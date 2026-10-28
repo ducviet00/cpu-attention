@@ -219,7 +219,7 @@ CPU_ATTENTION_BACKEND=cpp uv run python tests/test_dense.py        # dense vs a 
 CPU_ATTENTION_BACKEND=cpp uv run python tests/test_flash_api.py    # flash-shaped API and its rejections
 CPU_ATTENTION_BACKEND=cpp uv run python tests/fuzz_dense.py --cases 80 --max-seq 900
 CPU_ATTENTION_BACKEND=cpp uv run python tests/test_paged_sweep.py  # 504 paged cases, both dtypes
-uv run python tests/test_amx.py                                    # Mojo AMX entries (AMX boxes)
+uv run python tests/test_amx.py                                    # AMX flash policy (AMX boxes; fails if AMX is present but unusable)
 ```
 
 Drop `CPU_ATTENTION_BACKEND=cpp` to test the Mojo backend.

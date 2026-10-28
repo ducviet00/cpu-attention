@@ -43,8 +43,7 @@ the README), as `mojo / vllm` (below 1 is faster):
 _mojo/src/attention.mojo    paged kernel: Job, store, generic + dot-product attention, dispatch
 _mojo/src/dense.mojo        dense kernels: row kernels, K transpose/pack, bfmmla kernel
 _mojo/src/dense_small.mojo  short-sequence dense kernel (seq_k <= 256)
-_mojo/src/dense_amx.mojo    AMX dense kernel (default on AMX CPUs)
-_mojo/src/dense_amx_v2.mojo opt-in second AMX kernel (CPU_ATTENTION_AMX2=1)
+_mojo/src/flash_amx.mojo    AMX policy of the unified flash kernel (default on AMX CPUs)
 _mojo/src/amx.mojo          AMX primitives as inline assembly
 _mojo/src/_C.mojo           Python extension (PyInit__C) and the call entries
 _mojo/tests/test_attention.mojo   standalone parity test vs a scalar fp32 reference
@@ -129,20 +128,33 @@ Assuming contiguity gave every sequence sequence 0's output (§8).
 **Short sequences (`dense_small.mojo`, `seq_k <= 256`).** Rounds key coverage
 to 8 keys instead of 16 and packs in the same region.
 
-**AMX (`dense_amx.mojo`, default on AMX CPUs).**
-- **Work item = (batch, kv head).** It packs that head's K/V and attends every
-  query block of it, so the head's 32 KB of operands stay in L1.
-- **Matmuls.** 16-row tiles, `tdpbf16ps` for both phases, and fp32 as bf16
-  hi/lo.
-- **Call path.** A 5-argument plan entry (`dense_amx_plan`), whose geometry is
-  in an int64 buffer cached per (shapes, strides, dtype, causal, kt, workers).
-  Going from 36 arguments to 5 took 43.1 -> 37.0 us at 128:8:64.
-- **Gains.** 2.8-9.8x over the AVX-512 path.
-- **Machine facts:**
-  - one `tdpbf16ps` is ~5 ns (3.0-3.4 TFLOP/s/core);
-  - tile loads are free behind dots;
-  - AMX and the vector pipes overlap.
-- **`CPU_ATTENTION_AMX=0`** falls back to AVX-512.
+**AMX (`flash_amx.mojo`, a `FlashPolicy`; default on AMX CPUs).**
+- **Tiles.** A register tile is 32 query rows (two 16-row groups) x 32 keys: four
+  fp32 accumulators, `tdpbf16ps` for both phases, fp32 as bf16 hi/lo (3 products).
+  Keys are walked in super-tiles of 256 (bf16) / 512 (fp32): Q@K^T into an fp32
+  logits buffer, one softmax pass writing bf16 P, then P@V into the driver's
+  accumulator. `rq = 64` rows per work item (`_kernel._flash_plan`).
+- **Selection.** `isa = 1` in the plan when the CPU reports AMX, `arch_prctl` grants
+  tile data and `CPU_ATTENTION_AMX` / `_AMX_FP32` / `CPU_ATTENTION_ISA` allow it;
+  the toggles are read per call and are part of the plan key.
+- **What made it faster than the old standalone kernel (Xeon, 4 threads):**
+  - `vscalefps` exponential with finite masks (-1e30): 4-9% (the old ledger entry
+    "cheaper exponential" lost because it kept the clamp and `-inf`);
+  - `max()` on SIMD floats compiles to compare + masked max + move (3 uops per
+    vector, also in the exponent clamp): `a.gt(b).select(a, b)` is one `vmaxps`;
+  - row max / row sum / running-max state reduced 16 rows at a time by a shuffle
+    network instead of per-row horizontal reductions and a branch-free scalar
+    update (which evaluated `exp2` for every row);
+  - one `vcvtne2ps2bf16` per 32 probabilities, logit/P strides padded by 64 B,
+    `ldtilecfg` once per query sweep, no accumulator clear (`ZEROES_ACC`).
+- **Machine facts (Xeon 8581C, core ~3.08 GHz):**
+  - a 32x32 Q@K^T step is 8 `tdpbf16ps` = 128 cycles of TMUL; with the four
+    `tilestored` into a 35 KB logits buffer it takes ~340 cycles, ~210 when the
+    logits fit L1 (KT <= 128): the stores are L1<->L2 bound, not TMUL bound;
+  - shrinking the logits to L1 in the kernel (64-key chunks, deferred P@V) did not
+    pay: the extra per-chunk statistics and the P@V flush cost more than the QK
+    saving (0.87-1.13x);
+  - `CPU_ATTENTION_AMX=0` falls back to AVX-512.
 
 **AMX from Mojo.** LLVM's AMX intrinsics take the `x86_amx` type, which Mojo
 cannot name. `amx.mojo` therefore spells the tile number inside inline assembly
@@ -253,7 +265,10 @@ silently compiles the portable path.
 | deferred row sum + FA4 -8 threshold | 1.00x |
 | one row pair at a time / L1-staged logits / softmax pipelining | -11% / 0% / -11% |
 | AMX: pipelining the softmax under the dots | 0.73-0.91x |
-| AMX: cheaper exponential (`ldexp`, degree 3) | +8% single-thread, -10..-27% on four threads |
+| AMX: cheaper exponential (`ldexp`, degree 3, clamp kept) | +8% single-thread, -10..-27% on four threads (the unified kernel's clamp-free `vscalefps` form with finite masks is +4-9%, kept) |
+| AMX: software prefetch of the K/V source rows in the pack | 0.92-1.02x |
+| AMX: 64-key chunks with L1-resident logits, deferred P@V | 0.87-1.13x |
+| AMX: rows per work item 32 / 96 / 128 vs 64 | within noise |
 | KV splits, mask-by-range, probability aliasing | <= 4%, not needed for MHA |
 | private thread pool, any form | slower than torch's pool |
 | software prefetch of the next page | neutral to worse |
