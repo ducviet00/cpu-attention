@@ -12,6 +12,8 @@ from std.memory import bitcast
 from std.python import PythonObject
 from std.python.bindings import PythonModuleBuilder
 from attention import Job, run
+from kvcache import PagedJob, paged_run
+from isa import ptr, tier_name
 from dense import (
     INT8_QK,
     DenseJob,
@@ -533,6 +535,8 @@ def PyInit__C() abi("C") -> PythonObject:
     try:
         var m = PythonModuleBuilder("_C")
         m.def_function[attention]("attention")
+        m.def_function[kv_attention]("kv_attention")
+        m.def_function[tier]("tier")
         m.def_function[dense_attention]("dense_attention")
         m.def_function[dense_forward]("dense_forward")
         m.def_function[dense_forward_plan]("dense_forward_plan")
@@ -551,6 +555,58 @@ def PyInit__C() abi("C") -> PythonObject:
     except e:
         abort(String("error creating cpu_attention._C: ", e))
 
+
+
+def tier() raises -> PythonObject:
+    """The build tier of this shared object (see `scripts/build.py`)."""
+    return PythonObject(tier_name())
+
+
+def kv_attention(
+    plan: PythonObject,
+    q: PythonObject,
+    k: PythonObject,
+    v: PythonObject,
+    k_cache: PythonObject,
+    v_cache: PythonObject,
+    dst: PythonObject,
+    slots: PythonObject,
+    block_table: PythonObject,
+    lens: PythonObject,
+    q_stride: PythonObject,
+    kv_stride: PythonObject,
+    scale: PythonObject,
+) raises:
+    """KV-cache attention / store. `plan` addresses int64 geometry slots:
+    num_seqs, num_heads, kv_heads, head_dim, page, bt_stride, out_stride, dtype,
+    workers, do_store, do_attend, chunks."""
+    var p = ptr[Int64](Int(py=plan))
+    var job = PagedJob()
+    job.num_seqs = Int(p[0])
+    job.num_heads = Int(p[1])
+    job.kv_heads = Int(p[2])
+    job.head_dim = Int(p[3])
+    job.page = Int(p[4])
+    job.bt_stride = Int(p[5])
+    job.out_stride = Int(p[6])
+    job.dtype = Int(p[7])
+    job.workers = Int(p[8])
+    job.do_store = p[9] != 0
+    job.do_attend = p[10] != 0
+    job.chunks = Int(p[11])
+    job.q = Int(py=q)
+    job.k = Int(py=k)
+    job.v = Int(py=v)
+    job.k_cache = Int(py=k_cache)
+    job.v_cache = Int(py=v_cache)
+    job.out = Int(py=dst)
+    job.slots = Int(py=slots)
+    job.block_table = Int(py=block_table)
+    job.lens = Int(py=lens)
+    job.q_stride = Int(py=q_stride)
+    job.kv_stride = Int(py=kv_stride)
+    job.scale = Float32(Float64(py=scale))
+    paged_run(job)
 
 def attention(
     q: PythonObject,
