@@ -620,9 +620,12 @@ AMX_PLAN_MAGIC = 0x414D58504C414E31
 _AMX_KT = int(os.environ.get("CPU_ATTENTION_AMX_KT") or 256)
 
 
-def _amx_plan_key(q, k, v, fp32: bool, causal: bool):
+def _amx_plan_key(q, k, v, fp32: bool, causal: bool, scale: float):
+    # The plan buffer holds the scale and the worker count, so both are part of
+    # the key: without them a changed softmax_scale reused the old one.
     return (q.shape, k.shape, q.stride(), k.stride(), v.stride(), fp32,
-            causal, _AMX_KT, _AMX_MODE_V, torch.get_num_threads())
+            causal, _AMX_KT, _AMX_MODE_V, torch.get_num_threads(), _OVERRIDE,
+            scale)
 
 
 def _amx_plan_buffer(q, k, v, fp32, causal, kp, vp, kp_bh, vp_bh, kb16, kb32,
@@ -669,10 +672,7 @@ def _amx_dense(q, k, v, scale: float, causal: bool):
     fp32 = q.dtype == torch.float32
     plans = _AMX_PLANS.__dict__.get("p") if _AMX_IMPL == "v1" else None
     if plans:
-        plan = plans.get(
-            (q.shape, k.shape, q.stride(), k.stride(), v.stride(), fp32,
-             causal, _AMX_KT, _AMX_MODE_V, torch.get_num_threads())
-        )
+        plan = plans.get(_amx_plan_key(q, k, v, fp32, causal, scale))
         if plan is not None:
             out = torch.empty_like(q, memory_format=torch.contiguous_format)
             _AMX_PLAN(plan.data_ptr(), q.data_ptr(), k.data_ptr(),
@@ -721,7 +721,7 @@ def _amx_dense(q, k, v, scale: float, causal: bool):
             plans = _AMX_PLANS.p = {}
         if len(plans) > 64:
             plans.clear()
-        plans[_amx_plan_key(q, k, v, fp32, causal)] = _amx_plan_buffer(
+        plans[_amx_plan_key(q, k, v, fp32, causal, scale)] = _amx_plan_buffer(
             q, k, v, fp32, causal, kp, vp, kp_bh, vp_bh, kb16, kb32, dc32,
             dc16, scale, kt, workers,
         )
