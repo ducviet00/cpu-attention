@@ -303,10 +303,13 @@ def paged_row(r, arms_, vllm, args, page):
             return err, err <= 1e-6
         # bf16: <= 2 bf16 ulps at the row peak against the C++ reference arm
         # (the test_paged_sweep gate); on aarch64 also <= 1e-3 vs the reference.
+        # On aarch64 also 1e-3 above the bf16 output-rounding floor (the literal
+        # absolute 1e-3 is below that floor; reference.bf16_excess).
         unit = ref.abs().max().clamp_min(1e-30).item() * 2 ** -8
         err_ref = (got - ref).abs().max().item()
         err = (got - peer["ref"]).abs().max().item() / unit
-        ok = err <= 2.0 and err_ref <= 3e-2 and (err_ref <= 1e-3 or not ARM64)
+        ok = err <= 2.0 and err_ref <= 3e-2 and (
+            not ARM64 or R.bf16_excess(got, ref) <= 1e-3)
         return err, ok
 
     def check_all(names):

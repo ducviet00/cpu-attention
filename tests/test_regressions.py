@@ -257,6 +257,8 @@ def test_two_builds():
 # flash_attn_with_kvcache / engine
 # ---------------------------------------------------------------------------
 def paged_tol(dt):
+    # bf16 on aarch64: 1e-3 above the bf16 output-rounding floor (see
+    # reference.bf16_excess); x86 bf16 parity is test_paged_sweep's 2-ulp gate.
     return 1e-6 if dt == torch.float32 else (1e-3 if ARM64 else 3e-2)
 
 
@@ -308,6 +310,8 @@ def paged_ref(pc, dtype=torch.float32):
 
 def paged_err(pc, got):
     ref = paged_ref(pc)
+    if pc["q"].dtype == torch.bfloat16 and ARM64:
+        return R.bf16_excess(got, ref)
     err = (got.float() - ref).abs().max().item()
     if pc["q"].dtype == torch.float32 and err > 1e-6:
         truth = paged_ref(pc, torch.float64)

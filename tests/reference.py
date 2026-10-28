@@ -82,6 +82,20 @@ def ref_decode(q, k, v, dtype=torch.float32, scale=None, lens=None):
     return torch.einsum("bhs,bhsd->bhd", p, vf)
 
 
+def bf16_excess(got, ref):
+    """Largest error of `got` against the fp32 `ref` beyond the unavoidable
+    bf16 output rounding: max(|got - ref| - |ref - bf16(ref)|).
+
+    The ARM paged bf16 gate reads "<= 1e-3 against the reference". Taken as an
+    absolute error to the real-valued result it cannot be met by any bf16
+    output: rounding the exact output to bf16 alone exceeds 1e-3 on 77/252 of
+    the Axion sweep cases (worst 6.6e-3, docs/Mojo.md). This measures the error
+    the kernel adds on top of that floor; the raw |got - ref| is reported too.
+    """
+    floor = (ref - ref.bfloat16().float()).abs()
+    return ((got.float() - ref).abs() - floor).max().item()
+
+
 def stats(samples):
     return {
         "min": min(samples),
