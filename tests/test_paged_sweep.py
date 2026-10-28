@@ -11,6 +11,7 @@ are strided chunks of a fused projection (what the engine actually passes).
 
 import itertools
 import os
+import platform
 import sys
 
 import torch
@@ -22,6 +23,8 @@ sys.path.insert(0, os.path.join(_ROOT, "tests"))
 import reference as C  # noqa: E402
 import cpu_attention as attn  # noqa: E402
 from cpu_attention import _kernel  # noqa: E402
+
+ARM64 = platform.machine() in ("aarch64", "arm64")
 
 
 def strided_chunk(t, proj_width):
@@ -155,6 +158,12 @@ def main():
                               (got_x.float() - got_xo.float()).abs().max().item())
                     err /= peak.item()
                     tol = 2.0
+                    if ARM64:
+                        # aarch64 is also held to 1e-3 against the reference.
+                        abs_err = max((got.float() - ref).abs().max().item(),
+                                      (got_x.float() - ref).abs().max().item())
+                        if abs_err > 1e-3:
+                            err = max(err, tol * abs_err / 1e-3)
                 if err > worst[dtype]:
                     worst[dtype] = err
                     worst_at[dtype] = (hd, page, heads, kvh, ctx, batch, strided)

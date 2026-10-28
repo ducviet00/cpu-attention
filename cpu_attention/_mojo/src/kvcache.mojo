@@ -173,7 +173,10 @@ def _attend_rows[
     comptime E = 2 if dtype == DType.bfloat16 else 4
     comptime KT = _kt[hd]()
     comptime NV = hd // LANES
-    comptime DEG = 2 if dtype == DType.bfloat16 else 6
+    # bf16 on x86: degree 2, inside the bf16 output rounding, the C++ class the
+    # x86 gate compares against (2 ulp). aarch64's gate is also <= 1e-3 against
+    # the fp32 reference, which degree 2 (relative 1.7e-3) misses by 4x.
+    comptime DEG = (2 if not V_PAIRS_ARM else 5) if dtype == DType.bfloat16 else 6
     # bf16 K is dim pairs on every tier; `dot_bf16` widens where there is no
     # dot instruction.
     comptime DOT = dtype == DType.bfloat16

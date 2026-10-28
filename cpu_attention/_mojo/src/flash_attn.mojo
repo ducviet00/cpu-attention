@@ -144,7 +144,10 @@ trait FlashPolicy:
 def aux_bytes[P: FlashPolicy](rq: Int) -> Int:
     """Per-thread scratch: tile scratch | accumulator | m, l, alpha."""
     var arows = (rq + P.RQT - 1) // P.RQT * P.RQT
-    return P.tile_bytes() + arows * P.HD * 4 + 3 * rq * 4 + 64
+    var n = P.tile_bytes() + arows * P.HD * 4 + 3 * rq * 4
+    # 64-byte multiples: the split order's work counter (an Int64 atomic) sits
+    # after the per-thread scratch, and aarch64 atomics fault when misaligned.
+    return (n + 63) // 64 * 64
 
 
 def _attend[
