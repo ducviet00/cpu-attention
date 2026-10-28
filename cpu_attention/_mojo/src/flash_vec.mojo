@@ -17,6 +17,7 @@ from isa import LANES, dot_bf16, exp2, exp2s, ptr
 comptime KP = 64  # keys per K^T block
 comptime KT = 256  # keys per softmax tile
 comptime RQT = 8  # query rows per register tile
+comptime PV_VECS = 2  # dim vectors per P@V pass: 1 was 1.28x slower at hd=128 fp32 (V re-read)
 
 
 @always_inline
@@ -247,20 +248,18 @@ def _softmax[
 def _pv[
     dtype: DType, hd: Int, ROWS: Int
 ](vsrc: Int, vstride: Int, k0: Int, nk: Int, logits: Int, acc: Int):
+    """acc[r] += p[r] @ V over `nk` keys, in passes of NV dim vectors."""
     comptime BF = dtype == DType.bfloat16
-    # bf16 K is stored as dim pairs on every tier, so bf16 always goes through
-    # `dot_bf16` (one instruction with AVX-512-BF16/NEON-BF16, widened otherwise).
-    comptime DOT = BF
-    comptime DC = 2 * LANES
+    comptime NV = PV_VECS
+    comptime DC = NV * LANES
     var ap = ptr[Float32](acc)
     var lg = ptr[Float32](logits)
     var pp = ptr[Int32](logits + RQT * KT * 4)  # bf16 key pairs as words
     comptime for dc in range(0, hd, DC):
-        var c0 = Array[V, ROWS](uninitialized=True)
-        var c1 = Array[V, ROWS](uninitialized=True)
+        var c = Array[V, ROWS * NV](uninitialized=True)
         comptime for r in range(ROWS):
-            c0[r] = ap.unsafe_load[width=LANES](r * hd + dc)
-            c1[r] = ap.unsafe_load[width=LANES](r * hd + dc + LANES)
+            comptime for i in range(NV):
+                c[r * NV + i] = ap.unsafe_load[width=LANES](r * hd + dc + i * LANES)
         comptime if BF:
             # Key pairs: one `dpbf16ps` folds two keys x LANES dims (2.05x the
             # phase over fp32 FMA in the C++ measurement).
@@ -268,27 +267,29 @@ def _pv[
             var j = 0
             while j < nk:
                 var row = ((k0 + j) >> 1) * hd * 2 + dc * 2
-                var v0 = vp.unsafe_load[width = 2 * LANES](row)
-                var v1 = vp.unsafe_load[width = 2 * LANES](row + 2 * LANES)
+                var vv = Array[SIMD[DType.bfloat16, 2 * LANES], NV](uninitialized=True)
+                comptime for i in range(NV):
+                    vv[i] = vp.unsafe_load[width = 2 * LANES](row + i * 2 * LANES)
                 comptime for r in range(ROWS):
                     var w = SIMD[DType.int32, LANES](pp.unsafe_load((r * KT + j) >> 1))
                     var pa = bitcast[DType.bfloat16, 2 * LANES](w)
-                    c0[r] = dot_bf16[LANES](c0[r], v0, pa)
-                    c1[r] = dot_bf16[LANES](c1[r], v1, pa)
+                    comptime for i in range(NV):
+                        c[r * NV + i] = dot_bf16[LANES](c[r * NV + i], vv[i], pa)
                 j += 2
         else:
             var vp = ptr[Scalar[dtype]](vsrc)
             for j in range(nk):
                 var row = (k0 + j) * vstride + dc
-                var v0 = vp.unsafe_load[width=LANES](row).cast[DType.float32]()
-                var v1 = vp.unsafe_load[width=LANES](row + LANES).cast[DType.float32]()
+                var vv = Array[V, NV](uninitialized=True)
+                comptime for i in range(NV):
+                    vv[i] = vp.unsafe_load[width=LANES](row + i * LANES).cast[DType.float32]()
                 comptime for r in range(ROWS):
                     var pr = V(lg.unsafe_load(r * KT + j))
-                    c0[r] = pr.fma(v0, c0[r])
-                    c1[r] = pr.fma(v1, c1[r])
+                    comptime for i in range(NV):
+                        c[r * NV + i] = pr.fma(vv[i], c[r * NV + i])
         comptime for r in range(ROWS):
-            ap.unsafe_store[width=LANES](r * hd + dc, c0[r])
-            ap.unsafe_store[width=LANES](r * hd + dc + LANES, c1[r])
+            comptime for i in range(NV):
+                ap.unsafe_store[width=LANES](r * hd + dc + i * LANES, c[r * NV + i])
 
 
 # ---------------------------------------------------------------------------
@@ -342,8 +343,8 @@ struct VecPolicy[dtype: DType, hd: Int](FlashPolicy):
 
     @staticmethod
     def tile_bytes() -> Int:
-        # fp32 logits | bf16 probabilities
-        return RQT * KT * 4 + RQT * KT * 2
+        # fp32 logits | bf16 probabilities (bf16 only)
+        return RQT * KT * 4 + (RQT * KT * 2 if Self.dtype == DType.bfloat16 else 0)
 
     @staticmethod
     def pack(job: FlashJob, b: Int, kvh: Int, slab: Int):
