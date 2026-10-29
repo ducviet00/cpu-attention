@@ -23,7 +23,7 @@ from std.memory import bitcast
 from std.sys import llvm_intrinsic
 
 from flash_attn import FlashJob, FlashPolicy, NEG
-from isa import ptr
+from isa import exp2, ptr, vmax
 
 comptime F4 = SIMD[DType.float32, 4]
 comptime F2 = SIMD[DType.float32, 2]
@@ -50,12 +50,6 @@ def _bfmmla(acc: F4, a: B8, b: B8) -> F4:
 
 
 @always_inline
-def _vmax(a: F4, b: F4) -> F4:
-    """One `fmaxnm`: the compare-and-select spelling is two instructions."""
-    return llvm_intrinsic["llvm.maxnum.v4f32", F4, has_side_effect=False](a, b)
-
-
-@always_inline
 def _ninf() -> F4:
     return F4(bitcast[DType.float32, 1](SIMD[DType.uint32, 1](0xFF800000))[0])
 
@@ -64,31 +58,6 @@ def _ninf() -> F4:
 def _swap(v: F4) -> F4:
     """(v1, v0, v3, v2): exchange the two key lanes of each row."""
     return v.shuffle[1, 0, 3, 2]()
-
-
-@always_inline
-def _exp2[degree: Int](x: F4) -> F4:
-    """`2^x` for `x <= 0`; Remez minimax on [-0.5, 0.5], relative error 1.7e-3
-    (degree 2, inside the bf16 rounding that follows) or 2.6e-6 (degree 4, the
-    fp32 path and the rescale factor). The magic-constant add rounds x without
-    the fcvtns/scvtf pair, which issue on one pipe at 1/cycle (measured) against
-    ~3/cycle for add/sub. The exponent is an integer add, so a masked lane
-    (clamped at -126) is ~1e-38, not exactly 0."""
-    var xc = _vmax(x, F4(-126.0))
-    var y = xc + F4(12582912.0)
-    var r = xc - (y - F4(12582912.0))
-    var p: F4
-    comptime if degree <= 2:
-        p = (r * F4(2.384289358e-1) + F4(7.034480059e-1)) * r + F4(1.000443142)
-    else:
-        p = F4(9.570101908e-3)
-        p = p.fma(r, 5.591786032e-2)
-        p = p.fma(r, 2.402474483e-1)
-        p = p.fma(r, 6.931218147e-1)
-        p = p.fma(r, 9.999992614e-1)
-    return bitcast[DType.float32, 4](
-        bitcast[DType.int32, 4](p) + (bitcast[DType.int32, 4](y) << SIMD[DType.int32, 4](23))
-    )
 
 
 @always_inline
@@ -217,11 +186,11 @@ def _qk[
                 var o = lgp + (rp * (KT // 2) + (j >> 1)) * 4
                 comptime for kp in range(4):
                     o.unsafe_store[width=4](kp * 4, accs[rp * 4 + kp])
-                mx[rp] = _vmax(
+                mx[rp] = vmax[4](
                     mx[rp],
-                    _vmax(
-                        _vmax(accs[rp * 4], accs[rp * 4 + 1]),
-                        _vmax(accs[rp * 4 + 2], accs[rp * 4 + 3]),
+                    vmax[4](
+                        vmax[4](accs[rp * 4], accs[rp * 4 + 1]),
+                        vmax[4](accs[rp * 4 + 2], accs[rp * 4 + 3]),
                     ),
                 )
         else:
@@ -237,8 +206,8 @@ def _qk[
                 comptime for kp in range(4):
                     var x = (ib + Int32(2 * kp)).gt(lv).select(ninf, accs[rp * 4 + kp])
                     o.unsafe_store[width=4](kp * 4, x)
-                    m4 = _vmax(m4, x)
-                mx[rp] = _vmax(mx[rp], m4)
+                    m4 = vmax[4](m4, x)
+                mx[rp] = vmax[4](mx[rp], m4)
         j += 8
     comptime for rp in range(RP):
         ptr[Float32](mxo).unsafe_store[width=4](rp * 4, mx[rp])
@@ -267,12 +236,12 @@ def _softmax[
     var mp = ptr[Float32](m)
     var lp = ptr[Float32](l)
     var ap = ptr[Float32](alpha)
-    var mt = _vmax(mxv, _swap(mxv))  # (r0, r0, r1, r1) tile max, logit units
+    var mt = vmax[4](mxv, _swap(mxv))  # (r0, r0, r1, r1) tile max, logit units
     var mo0 = mp.unsafe_load(r0)
     var mo1 = mp.unsafe_load(r1)
     var mo = F4(mo0, mo0, mo1, mo1)
-    var mn = _vmax(mo, mt * F4(c))
-    var a4 = _exp2[4](mo - mn)
+    var mn = vmax[4](mo, mt * F4(c))
+    var a4 = exp2[4, 4](mo - mn)
     var live = 2 * rp + 1 < sub
     mp.unsafe_store(r0, mn[0])
     ap.unsafe_store(r0, a4[0])
@@ -288,10 +257,10 @@ def _softmax[
     comptime if FIX:
         dead = mt.eq(_ninf())
     for blk in range(nblk):
-        var e0 = _exp2[2](lgp.unsafe_load[width=4](blk * 16).fma(c4, off))
-        var e1 = _exp2[2](lgp.unsafe_load[width=4](blk * 16 + 4).fma(c4, off))
-        var e2 = _exp2[2](lgp.unsafe_load[width=4](blk * 16 + 8).fma(c4, off))
-        var e3 = _exp2[2](lgp.unsafe_load[width=4](blk * 16 + 12).fma(c4, off))
+        var e0 = exp2[2, 4](lgp.unsafe_load[width=4](blk * 16).fma(c4, off))
+        var e1 = exp2[2, 4](lgp.unsafe_load[width=4](blk * 16 + 4).fma(c4, off))
+        var e2 = exp2[2, 4](lgp.unsafe_load[width=4](blk * 16 + 8).fma(c4, off))
+        var e3 = exp2[2, 4](lgp.unsafe_load[width=4](blk * 16 + 12).fma(c4, off))
         comptime if FIX:
             # A row that sees no key in this tile contributes exactly 0.
             e0 = dead.select(F4(0), e0)
@@ -421,7 +390,7 @@ def _tile[
     comptime for rp in range(RP):
         var mxv = mxp.unsafe_load[width=4](rp * 4)
         # A row is dead when it sees no key in this tile (both lanes -inf).
-        var mt = _vmax(mxv, _swap(mxv))
+        var mt = vmax[4](mxv, _swap(mxv))
         var any_dead = mt.eq(_ninf()).reduce_or()
         if any_dead:
             _softmax[RP, True](lg, pb, mxv, rp, nblk, c, sub, m, l, alpha)

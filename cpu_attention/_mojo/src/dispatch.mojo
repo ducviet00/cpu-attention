@@ -1,7 +1,9 @@
 """Runtime choice of dtype, head_dim and ISA policy for flash_attn_func.
 
-Every policy compiled into this tier is listed here; `isa` comes from the plan
-(the Python loader picks it from the tier and the runtime toggles).
+`_with_policy` is the one table from (dtype, head_dim, isa) to the `FlashPolicy`
+compiled into this tier; running a call and sizing its workspace both go through
+it. `isa` comes from the plan (the Python loader picks it from the tier and the
+runtime toggles).
 """
 
 from flash_attn import FlashJob, FlashPolicy, aux_bytes, flash_drive
@@ -12,78 +14,55 @@ from isa import AMX_TIER, NEON_BF16
 
 comptime ISA_VEC = 0
 comptime ISA_AMX = 1
-comptime ISA_NEON_MMLA = 2
+comptime ISA_MMA_ARM = 2
+"""aarch64-bf16: `bfmmla` for bf16, the vector policy for fp32."""
 
 
-def _policy[dtype: DType, hd: Int](job: FlashJob, isa: Int) raises:
+def _with_isa[dtype: DType, hd: Int, body: def[P: FlashPolicy]() raises capturing -> None](isa: Int) raises:
     if isa == ISA_VEC:
-        flash_drive[VecPolicy[dtype, hd]](job)
-    elif isa == ISA_AMX:
+        body[VecPolicy[dtype, hd]]()
+        return
+    if isa == ISA_AMX:
         comptime if AMX_TIER:
-            flash_drive[AmxPolicy[dtype, hd]](job)
-        else:
-            raise Error("cpu_attention: ISA policy not in this build")
-    elif isa == ISA_NEON_MMLA:
+            body[AmxPolicy[dtype, hd]]()
+            return
+    if isa == ISA_MMA_ARM:
         comptime if NEON_BF16:
             comptime if dtype == DType.bfloat16:
-                flash_drive[NeonMmlaPolicy[hd]](job)
+                body[NeonMmlaPolicy[hd]]()
             else:
-                flash_drive[VecPolicy[dtype, hd]](job)
-        else:
-            raise Error("cpu_attention: ISA policy not in this build")
-    else:
-        raise Error("cpu_attention: ISA policy not in this build")
+                body[VecPolicy[dtype, hd]]()
+            return
+    raise Error("cpu_attention: ISA policy not in this build")
 
 
-def _hd[dtype: DType](job: FlashJob, hd: Int, isa: Int) raises:
-    if hd == 64:
-        _policy[dtype, 64](job, isa)
-    elif hd == 128:
-        _policy[dtype, 128](job, isa)
-    elif hd == 32:
-        _policy[dtype, 32](job, isa)
-    else:
+def _with_policy[body: def[P: FlashPolicy]() raises capturing -> None](dtype: Int, hd: Int, isa: Int) raises:
+    if dtype != 0 and dtype != 1:
+        raise Error("cpu_attention: unsupported dtype")
+    if hd != 32 and hd != 64 and hd != 128:
         raise Error("cpu_attention: head_dim must be 32, 64 or 128")
+    comptime for d in range(2):
+        comptime dt = DType.float32 if d == 0 else DType.bfloat16
+        if dtype == d:
+            comptime for h in range(3):
+                comptime hdc = 32 << h
+                if hd == hdc:
+                    _with_isa[dt, hdc, body](isa)
 
 
 def flash_run(job: FlashJob, dtype: Int, hd: Int, isa: Int) raises:
-    if dtype == 0:
-        _hd[DType.float32](job, hd, isa)
-    elif dtype == 1:
-        _hd[DType.bfloat16](job, hd, isa)
-    else:
-        raise Error("cpu_attention: unsupported dtype")
+    def run[P: FlashPolicy]() raises capturing:
+        flash_drive[P](job)
 
-
-def _sizes[P: FlashPolicy](seq_k: Int, rq: Int) -> Tuple[Int, Int]:
-    return (P.slab_bytes(seq_k), aux_bytes[P](rq))
-
-
-def _sizes_isa[dtype: DType, hd: Int](seq_k: Int, rq: Int, isa: Int) raises -> Tuple[Int, Int]:
-    if isa == ISA_VEC:
-        return _sizes[VecPolicy[dtype, hd]](seq_k, rq)
-    if isa == ISA_AMX:
-        comptime if AMX_TIER:
-            return _sizes[AmxPolicy[dtype, hd]](seq_k, rq)
-    if isa == ISA_NEON_MMLA:
-        comptime if NEON_BF16:
-            comptime if dtype == DType.bfloat16:
-                return _sizes[NeonMmlaPolicy[hd]](seq_k, rq)
-            else:
-                return _sizes[VecPolicy[dtype, hd]](seq_k, rq)
-    raise Error("cpu_attention: ISA policy not in this build")
+    _with_policy[run](dtype, hd, isa)
 
 
 def flash_sizes(seq_k: Int, rq: Int, hd: Int, dtype: Int, isa: Int) raises -> Tuple[Int, Int]:
     """(slab bytes per (batch, kv head), scratch bytes per thread)."""
-    if dtype == 1:
-        if hd == 64:
-            return _sizes_isa[DType.bfloat16, 64](seq_k, rq, isa)
-        elif hd == 128:
-            return _sizes_isa[DType.bfloat16, 128](seq_k, rq, isa)
-        return _sizes_isa[DType.bfloat16, 32](seq_k, rq, isa)
-    if hd == 64:
-        return _sizes_isa[DType.float32, 64](seq_k, rq, isa)
-    elif hd == 128:
-        return _sizes_isa[DType.float32, 128](seq_k, rq, isa)
-    return _sizes_isa[DType.float32, 32](seq_k, rq, isa)
+    var sizes = (0, 0)
+
+    def size[P: FlashPolicy]() raises capturing:
+        sizes = (P.slab_bytes(seq_k), aux_bytes[P](rq))
+
+    _with_policy[size](dtype, hd, isa)
+    return sizes
