@@ -289,7 +289,9 @@ def _pv[
     var ap = ptr[Float32](acc)
     var lg = ptr[Float32](logits)
     var pp = ptr[Int32](logits + RQT * KT * 4)  # bf16 key pairs as words
-    comptime for dc in range(0, hd, DC):
+
+    @always_inline
+    def chunk(dc: Int) capturing:
         var c = Array[V, ROWS * NV](uninitialized=True)
         comptime for r in range(ROWS):
             comptime for i in range(NV):
@@ -339,6 +341,15 @@ def _pv[
         comptime for r in range(ROWS):
             comptime for i in range(NV):
                 ap.unsafe_store[width=LANES](r * hd + dc + i * LANES, c[r * NV + i])
+
+    # Few chunks unroll (x86: 2-4); 8-dim NEON chunks (8-16 of them) loop, as
+    # an unrolled copy of the key loop per chunk costs instruction cache.
+    comptime if hd // DC <= 4:
+        comptime for dc in range(0, hd, DC):
+            chunk(dc)
+    else:
+        for dc in range(0, hd, DC):
+            chunk(dc)
 
 
 # ---------------------------------------------------------------------------
