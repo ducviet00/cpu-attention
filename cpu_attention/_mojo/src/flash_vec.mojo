@@ -209,9 +209,13 @@ def _qk[
             else:
                 var idx = iota[DType.int32, LANES](Int32(ji))
                 var past = idx.ge(SIMD[DType.int32, LANES](Int32(kend)))
+                # Row r sees key k iff k - limit0 <= r: one subtraction, then a
+                # compile-time constant per row (8 runtime per-row limits spilled
+                # and were reloaded on every masked pass on NEON).
+                var rel = idx - Int32(limit0)
                 comptime for r in range(ROWS):
                     if r < nrows:
-                        var bad = past | idx.gt(SIMD[DType.int32, LANES](Int32(limit0 + r)))
+                        var bad = past | rel.gt(SIMD[DType.int32, LANES](Int32(r)))
                         var x = bad.select(V(NEG), c[r * KV + i])
                         lg.unsafe_store[width=LANES](r * KT + j + i * LANES, x)
                         mx[r] = vmax[LANES](mx[r], x)
