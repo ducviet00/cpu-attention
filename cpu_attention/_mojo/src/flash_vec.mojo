@@ -13,7 +13,7 @@ from std.math import iota
 from std.memory import bitcast
 
 from flash_attn import FlashJob, FlashPolicy, NEG, V
-from isa import BCAST_FOLD, LANES, dot_bf16, exp2, exp2s, ptr
+from isa import BCAST_FOLD, LANES, dot_bf16, exp2, exp2s, ptr, vmax
 
 comptime KP = 64  # keys per K^T block
 comptime KT = 256  # keys per softmax tile
@@ -205,7 +205,7 @@ def _qk[
                 comptime for r in range(ROWS):
                     if r < nrows:
                         lg.unsafe_store[width=LANES](r * KT + j + i * LANES, c[r * KV + i])
-                        mx[r] = max(mx[r], c[r * KV + i])
+                        mx[r] = vmax[LANES](mx[r], c[r * KV + i])
             else:
                 var idx = iota[DType.int32, LANES](Int32(ji))
                 var past = idx.ge(SIMD[DType.int32, LANES](Int32(kend)))
@@ -214,7 +214,7 @@ def _qk[
                         var bad = past | idx.gt(SIMD[DType.int32, LANES](Int32(limit0 + r)))
                         var x = bad.select(V(NEG), c[r * KV + i])
                         lg.unsafe_store[width=LANES](r * KT + j + i * LANES, x)
-                        mx[r] = max(mx[r], x)
+                        mx[r] = vmax[LANES](mx[r], x)
         j += KV * LANES
     comptime for r in range(ROWS):
         if r < nrows:
