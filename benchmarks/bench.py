@@ -407,6 +407,9 @@ def build_arms(args):
     want = args.arms.split(",")
     if "mojo_new" in want:
         factories.append(lambda: A.current("mojo_new", "mojo"))
+    if "mojo_vec" in want:  # Mojo with the AMX policy off: the vector policy only
+        factories.append(lambda: A.current("mojo_vec", "mojo",
+                                           {"CPU_ATTENTION_ISA": "vec"}))
     if "mojo_ctrl" in want:
         if args.previous:
             factories.append(lambda: A.snapshot("mojo_ctrl", args.previous))

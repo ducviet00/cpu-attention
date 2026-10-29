@@ -796,7 +796,25 @@ def _flash_ws(nbytes):
     return (ws.data_ptr() + 63) & ~63
 
 
-def _flash_plan(geom, k, causal):
+def _vector_beats_amx(dt, hd, seq_q, seq_k, scale):
+    """Few query rows leave AMX's 16-row tiles mostly empty (and fp32 pays three
+    products per phase), so the vector policy is faster there. Crossovers
+    measured on the Xeon 8581C, 4 threads (vector / AMX time): fp32 hd=64 up to
+    65 rows 0.39-0.94, fp32 hd=128 up to 17 rows 0.80-0.97 (or a 33-key sequence: 0.59), bf16 1-2 rows 0.76-0.89
+    (hd=128 only while seq_k <= 256: AMX packs a long K/V faster)."""
+    if dt == 0:
+        # fp32 on AMX is bf16 hi/lo products (the dropped lo*lo term): accurate
+        # to 3-8e-5 at the usual scale, but a logit std above ~6 (scale*sqrt(hd)
+        # for unit-variance inputs; 1 at the default scale) makes the
+        # probabilities peaked enough to reach 2.03e-4 against the 2e-4 gate
+        # (scale 1.7 at hd=64). Such a call takes the exact-fp32 vector policy.
+        if scale * hd ** 0.5 > 6.0:
+            return True
+        return seq_q <= (65 if hd <= 64 else 24) or seq_k <= 64
+    return seq_q <= 2 and (hd <= 64 or seq_k <= 256)
+
+
+def _flash_plan(geom, k, causal, scale):
     """Plan buffer for one geometry: the int64 slots `FlashJob` reads."""
     plans = getattr(_FLASH, "p", None)
     if plans is None:
@@ -810,6 +828,8 @@ def _flash_plan(geom, k, causal):
     # bfmmla/lane-FMA. The toggles can change between calls, so key on the id.
     isa = (2 if module().tier() == "aarch64-bf16" else
            1 if amx_available() and (dt == 1 or _AMX_FP32_ENV) else 0)
+    if isa == 1 and _vector_beats_amx(dt, hd, seq_q, seq_k, scale):
+        isa = 0
     key = (geom, k.shape, causal, _OVERRIDE, torch.get_num_threads(),
            _llc_bytes(), isa)
     plan = plans.get(key)
@@ -859,7 +879,7 @@ def _flash_mojo(q, k, v, scale, causal, geom=None):
     """flash_attn_func on the Mojo backend: one call, seven arguments."""
     if geom is None:
         geom = (q.shape, q.stride(), k.stride(), v.stride(), q.dtype)
-    buf, plan, total = _flash_plan(geom, k, causal)
+    buf, plan, total = _flash_plan(geom, k, causal, scale)
     out = torch.empty_like(q, memory_format=torch.contiguous_format)
     ws = _flash_ws(total)
     _entry("flash_forward")(plan, q.data_ptr(), k.data_ptr(), v.data_ptr(),
