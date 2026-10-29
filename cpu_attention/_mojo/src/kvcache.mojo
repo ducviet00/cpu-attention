@@ -325,13 +325,20 @@ def _unit_bases[E: Int, hd: Int, PAGE: Int](
     kbase: MutPointer[Int64, _],
     vbase: MutPointer[Int64, _],
 ):
-    """K and V addresses of the first key of each 16-key unit from `k0`."""
+    """K and V addresses of the first key of each 16-key unit from `k0`: one
+    block-table lookup per page, its units at a constant stride."""
     var head_bytes = page * hd * E
-    for g in range(units):
+    var g = 0
+    while g < units:
         var d = _div_page[PAGE](k0 + g * 16, page)
         var blk = (Int(bt.unsafe_load(d[0])) * job.kv_heads + kvh) * head_bytes
-        kbase.unsafe_store(g, Int64(job.k_cache + blk + d[1] * 4))
-        vbase.unsafe_store(g, Int64(job.v_cache + blk + d[1] * hd * E))
+        var kb = job.k_cache + blk + d[1] * 4
+        var vb = job.v_cache + blk + d[1] * hd * E
+        var n = min(units - g, (page - d[1]) >> 4)
+        for u in range(n):
+            kbase.unsafe_store(g + u, Int64(kb + u * 64))
+            vbase.unsafe_store(g + u, Int64(vb + u * 16 * hd * E))
+        g += n
 
 
 @always_inline
@@ -350,10 +357,19 @@ def _qk[
     lane max; with MASK, lanes at or past nk are -max and vectors past nk are
     neither scored into the max nor stored."""
     comptime V = SIMD[DType.float32, LANES]
-    var kb = Array[Int, G](uninitialized=True)
-    comptime for g in range(G):
-        var key = j + g * LANES
-        kb[g] = Int(kbase.unsafe_load(key >> 4)) + (key & 15) * 4
+    # A call of whole units (j is then a multiple of 16) addresses each unit's
+    # base plus compile-time offsets for its key vectors: 16 runtime group
+    # pointers cost NEON an address add per load. A call inside one unit
+    # (G < GPU) starts mid-unit.
+    comptime GPU = 16 // LANES
+    comptime GU = GPU if G >= GPU else G  # key vectors per unit in this call
+    comptime UC = G // GU  # units in this call
+    var kb = Array[Int, UC](uninitialized=True)
+    comptime if G >= GPU:
+        comptime for u in range(UC):
+            kb[u] = Int(kbase.unsafe_load((j >> 4) + u))
+    else:
+        kb[0] = Int(kbase.unsafe_load(j >> 4)) + (j & 15) * 4
     var cv = Array[V, R * G](fill=V(0))
     comptime if dtype == DType.bfloat16:
         # bf16 K and Q are dim pairs. A runtime loop over them (unrolled by U):
@@ -365,7 +381,7 @@ def _qk[
             comptime for u in range(U):
                 var d2 = d0 + u
                 comptime for g in range(G):
-                    var k = ptr[BFloat16](kb[g]).unsafe_load[width = 2 * LANES](d2 * page * 2)
+                    var k = ptr[BFloat16](kb[g // GU] + (g % GU) * LANES * 4).unsafe_load[width = 2 * LANES](d2 * page * 2)
                     comptime for r in range(R):
                         # Query last: `vdpbf16ps` folds a broadcast load only
                         # as its last source (exact, symmetric products).
@@ -389,7 +405,7 @@ def _qk[
             comptime for u in range(U):
                 var d = d0 + u
                 comptime for g in range(G):
-                    var k = ptr[Float32](kb[g]).unsafe_load[width=LANES](d * page)
+                    var k = ptr[Float32](kb[g // GU] + (g % GU) * LANES * 4).unsafe_load[width=LANES](d * page)
                     comptime for r in range(R):
                         comptime i = (r * G + g) * CH + u % CH
                         part[i] = V(qv[r][u]).fma(k, part[i])
