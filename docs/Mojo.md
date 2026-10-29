@@ -39,11 +39,11 @@ by row family:
 ```
 _mojo/src/isa.mojo        tier flags, LANES, ptr, one exp2[degree], dot_bf16, AMX permission
 _mojo/src/parallel.mojo   one GOMP_parallel region on torch's OpenMP pool, barrier
-_mojo/src/kvcache.mojo    flash_attn_with_kvcache decode + reshape_and_cache (store)
+_mojo/src/kvcache.mojo    flash_attn_with_kvcache decode (one driver, `Decode` + `PVKernel`) + reshape_and_cache
 _mojo/src/flash_attn.mojo flash_attn_func: FlashJob, FlashPolicy trait, the generic driver
-_mojo/src/flash_vec.mojo  the vector policy (AVX-512 / AVX2 / NEON-fp32, LANES-generic)
+_mojo/src/flash_vec.mojo  the vector policy (AVX-512 / AVX2 / NEON fp32, LANES-generic; target constants)
 _mojo/src/flash_amx.mojo  the AMX policy (bf16, fp32 as bf16 hi/lo), x86 only
-_mojo/src/flash_neon.mojo the aarch64 bfmmla (bf16) and lane-FMA (fp32) policies
+_mojo/src/flash_neon.mojo the aarch64 bfmmla policy (bf16; fp32 is the vector policy)
 _mojo/src/dispatch.mojo   runtime dtype x head_dim x ISA-policy selection
 _mojo/src/pyview.mojo     reads torch tensors natively (the fast call paths, §6)
 _mojo/src/amx.mojo        AMX tile primitives (inline asm, x86 only)
@@ -76,21 +76,40 @@ barrier, dynamic boustrophedon over query blocks through an atomic counter).
 **Vector policy.** 8-row x 16-key Q@K^T tile with the query broadcast folded into
 the instruction (`vdpbf16ps ... {1to16}` / `vfmadd ... {1to16}`), the tile
 maximum tracked in registers during Q@K^T (no max pass), degree-2 `exp2` for bf16
-probabilities (they are rounded to bf16 right after), degree 5 for fp32; bf16
-P@V by `dpbf16ps` on key pairs (V packed `[key/2][hd][2]`); fp32 V read in place
-while all of V fits LLC/2. Partial tiles instantiate 2- and 4-row variants.
+probabilities (they are rounded to bf16 right after), degree 4 (minimax) for fp32;
+bf16 P@V by `dpbf16ps` on key pairs (V packed `[key/2][hd][2]`); fp32 V read in
+place while all of V fits LLC/2. Partial tiles instantiate 2- and 4-row variants.
+The same source is the fp32 policy on aarch64: per target only compile-time
+constants differ (`KV32` key vectors per Q@K^T pass, `NS` partial sums, and where
+a broadcast does not fold into the FMA, `isa.BCAST_FOLD` false, query dims and
+probabilities as vectors used by lane, 4 keys per P@V step, and a contiguous Q
+panel). The bf16 matrix engines (AMX, `bfmmla`) keep their own policies.
 
 **Decode.** Work item = (sequence, kv head, chunk of that head's query heads):
 every query head of a GQA/MQA group is a row of one register tile, so the group
 shares one scan of the cache (0.52-0.73 of C++ on the GQA/MQA rows, where C++
 rescans per query head). Groups are split into chunks only when there are fewer
-(sequence, kv head) pairs than workers; stores then precede a barrier.
-x86 keeps C++'s numerics class (dpbf16ps Q@K^T, fp32 P@V, degree-2 exp2 for
-bf16, degree-6 fp32) so the 2-ulp cross-backend bf16 gate is meaningful; bf16 V
-is widened even/odd split (`w << 16`, `w & 0xffff0000`: 2 instructions per 32
-values instead of 4), bit-identical. The page size is a compile-time constant
-for 16 and 32 (the engine defaults). P@V never reads past `lens`, a negative slot
-skips its store, a zero-length context returns 0.
+(sequence, kv head) pairs than workers; stores then precede a barrier. P@V never
+reads past `lens`, a negative slot skips its store, a zero-length context returns
+0. The page size is a compile-time constant for 16/32/48/64.
+
+**One decode driver for every tier** (`kvcache._attend_rows`). A softmax step of
+`KT` keys is resolved into 16-key units (page % 16 == 0, so a unit never
+straddles a page): one key vector on AVX-512, two on AVX2, four on NEON. Q@K^T
+scores `G` key vectors per call (independent dot chains) with a masked tail that
+stays inside one unit, tracks the step maximum as a tree, and the softmax keeps
+`NS` partial sums. What differs per target is compile-time only:
+- `Decode[dtype, hd, R]` holds the shape as `comptime` members computed from
+  `simd_width_of` and `CompilationTarget` (`KT`, `G`, `G_TAIL`, `DEG`, `NS`, `NC`,
+  `FULL`); `comptime assert` pins the tiling invariants.
+- `Decode.PV` is the one per-target kernel, a type conforming to the `PVKernel`
+  trait (as `InnerMatmulKernel` in Modular's unified matmul): `PVRows` keeps
+  fp32 P against V rows, the x86 choice (C++'s numerics class, so the 2-ulp
+  cross-backend bf16 gate is meaningful; bf16 V is widened even/odd split,
+  `w << 16` / `w & 0xffff0000`, 2 instructions per 32 values); `PVPairs` keeps
+  bf16 P against bf16 V key pairs with `dot_bf16` (`bfdot`, plus P's low residual
+  below 128 keys), the aarch64 choice (widening V was 70% of the kernel there).
+  The V layout follows (`PageLayout.V_PAIRS`).
 
 ## 4. Tiers and runtime ISA selection
 
@@ -259,6 +278,30 @@ noted; the results that count are the three GCP VMs in the README.
 | x86 decode key tile 256/512 -> 2048 keys (R=1), C4D | single-process cache-rotation A/B: bf16 b=1 ctx=4096 0.96 of the previous build, others within 2%; full-manifest harness with an independent previous-build control: median 0.994 over 92 paged rows, b=1 ctx=4096 bf16 1.06-1.09 (control spread up to 1.07-1.28 on memory-bound rows) | reverted: not reproducible beyond control spread |
 | x86 fp32 decode Q@K^T with 4 key groups per step (`G=4`, R=1), C4D | per core 0.90-0.95 of the previous build on one thread (b=1 ctx 4096, b=8 ctx 256-1024), 0.96 on two, 0.98-1.00 on four in a single-process A/B; but the full 170-row harness with an independent previous-build control (4 threads): fp32 paged median 0.995, and 7 fp32 rows 4-7% slower, among them b=8 ctx 255-257, the rows it was meant to help (the control itself moved 1-5% there) | reverted: per-core gain does not carry to the 4-thread manifest condition |
 | compile-time `PAGE=48` decode body removed (runtime page), C4D | bf16 b=8 ctx=1008 page 48 1 thread: 0.949 of the specialized build and 0.99 of C++ (the specialized body is 8% slower than C++ per core, while pages 16/32/64 are 2-6% faster than C++); 4 threads 1.010 (DRAM-bound, the manifest condition); fp32 1.01; b=1 ctx=240 bf16 4 threads 1.03 slower | reverted: no gain at the 4-thread manifest condition. Open: why the 48-key body loses 7% per core in bf16 only |
+
+**Unification campaign (branch `mojo-unified-decode`, all three boxes, full manifest
+against an independent copy of `5b3d1ba`; paged median new/previous Axion / C4D / Xeon).**
+Goal: one implementation across CPUs, then latency (AGENTS.md).
+
+| idea | result | decision |
+|---|---|---|
+| one decode driver: `Decode[dtype, hd, R]` compile-time shape, 16-key units, masked tail inside a unit | 1.014 / 1.013 / 1.008; gates pass on every tier | kept, cost won back below |
+| Q@K^T call max as a tree (a 16-deep `vmax` chain sat on the softmax path), NEON by-element fp32 Q, P@V over contiguous unit runs | 1.010 / 1.015 / 1.011 | kept |
+| P@V as a `PVKernel` trait (`PVRows` x86, `PVPairs` aarch64) | 1.009 / 1.011 / 1.001 (codegen-neutral) | kept |
+| unit bases resolved per page; Q@K^T unit bases + compile-time offsets | 1.015 / 1.009 / 1.012 | superseded |
+| per-page bases instead of per-unit bookkeeping (`perf stat`, Zen 4, one thread: per-unit +5-11% instructions per call against the old x86 page walk, per-page +1-4% with cycles within noise) | 0.999 / 1.001 / 1.002 | kept |
+| NEON by-lane probabilities in `PVRows`, two-vector bf16 P stores | ARM decode bf16 1.017, fp32 0.985 | kept |
+| `NeonF32Policy` folded into `VecPolicy` (`KV32`, `NS`, `KU32`, `BCAST_FOLD`) | Axion fp32 flash 1.082 of the dedicated policy, vs C++ 15 / 10 / 14 | kept with the fixes below |
+| `isa.exp2` on NEON: exponent from the magic-added value's bits (`fcvt*` issues on one pipe at 1/cycle) | fp32 flash 1.065, C++ losses 14 -> 3; ARM fp32 decode faster | kept |
+| `exp2` degree 4 as a Remez minimax (2.6e-6, degree 5's class) for fp32 flash | 1.049, losses 2 | kept |
+| NEON fp32 Q@K^T: K for 4 dims first, one query vector per row; P@V chunk loop at runtime on NEON | 1.051 / 1.049 (no change) | kept (the old policy's shape, smaller code) |
+| NEON fp32 Q through a contiguous panel (32 heads x 128 dims: rows 16 KB apart, one L1 set) | GQA rows 1.09 -> ~1.0; C++ losses 2 -> 0 | kept |
+| lane max through `isa.vmax` (one `fmaxnm` / `vmaxps` against compare + select) | round 6 (all above): Axion fp32 flash 1.050 (19 / 20 / 0 vs C++), flash elsewhere 0.99-1.00 | kept |
+
+Result: decode unification at no measured cost; Axion fp32 `flash_attn_func` is ~5% slower
+than the dedicated NEON policy (wins became ties, no losses), accepted for the unification
+(2026-10-29) and open: the separate accumulator-rescale pass (the old policy fused alpha into
+P@V's accumulator load) and the first-tile write (`ZEROES_ACC`) are the remaining differences.
 
 **Axion decode ledger (c4a-standard-8, one process, independent control, vs `2fc4652`).**
 

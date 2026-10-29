@@ -28,6 +28,11 @@ comptime NEON_BF16 = CompilationTarget.has_neon() and CompilationTarget._has_fea
 
 comptime BF16_DOT = X86_BF16 or NEON_BF16
 
+comptime BCAST_FOLD = CompilationTarget.is_x86()
+"""A scalar broadcast folds into the FMA's memory operand (`{1to16}`), so a
+broadcast per query dim / probability is free; NEON instead loads 4 values as a
+vector and multiplies by a lane (`fmla v, v, v.s[i]`)."""
+
 comptime AMX_TIER = X86_BF16
 """The AVX-512-BF16 tier also carries the AMX kernels (inline asm assembles for
 any x86 target); they run only after `amx_permitted()`."""
@@ -73,14 +78,21 @@ def exp2[
     """`2^x` for `x <= 0`: round to nearest, a polynomial on the fraction, the
     integer part inserted into the exponent. About 9-10 instructions against
     `std.math.exp`'s ~22 (docs/Mojo.md §7). Inputs below -127 clamp, so a masked
-    lane (-inf) yields exactly 0 rather than NaN.
+    lane (-inf) yields exactly 0 rather than NaN (on NEON ~1e-38, see below).
 
     `degree` trades accuracy for instructions: 2 sits inside a bf16 rounding
-    (relative 2e-3), 5 is a minimax at 3e-6, 6 (Taylor) at 1.2e-7 -- the paged
-    fp32 gate (1e-6 absolute) needs 6.
+    (relative 2e-3), 4 and 5 are minimax at 2.6e-6 and 3e-6, 6 (Taylor) at
+    1.2e-7 -- the paged fp32 gate (1e-6 absolute) needs 6.
     """
-    var xc = vmax(x, SIMD[DType.float32, width](-127.0))
+    # NEON takes the exponent from the bits of the magic-added value: `fcvt*`
+    # issues on one pipe at 1/cycle on Neoverse (measured), so converting n cost
+    # the fp32 flash softmax ~8%. The integer exponent add needs x >= -126 (a
+    # masked lane is then ~1e-38, not 0; fully masked rows are zeroed by the
+    # callers).
+    comptime NEON_EXP = CompilationTarget.has_neon()
+    var xc = vmax(x, SIMD[DType.float32, width](-126.0 if NEON_EXP else -127.0))
     var n: SIMD[DType.float32, width]
+    var y = SIMD[DType.float32, width](0)
     comptime if X86_BF16 and width == 16:
         var x16 = rebind[SIMD[DType.float32, 16]](xc)
         n = rebind[SIMD[DType.float32, width]](
@@ -92,18 +104,20 @@ def exp2[
         )
     else:
         comptime MAGIC = 12582912.0  # 1.5 * 2^23: adding it rounds to nearest
-        n = (xc + MAGIC) - MAGIC
+        y = xc + MAGIC
+        n = y - MAGIC
     var r = xc - n
     var p: SIMD[DType.float32, width]
     comptime if degree <= 2:
         p = r.fma(2.3473140e-1, 6.9335938e-1)
         p = p.fma(r, 1.0)
     elif degree <= 4:
-        p = SIMD[DType.float32, width](9.618129107628477e-3)
-        p = p.fma(r, 5.550410866482158e-2)
-        p = p.fma(r, 2.402265069591007e-1)
-        p = p.fma(r, 6.931471805599453e-1)
-        p = p.fma(r, 1.0)
+        # Remez minimax on [-0.5, 0.5]: relative 2.6e-6, degree 5's class.
+        p = SIMD[DType.float32, width](9.570101908e-3)
+        p = p.fma(r, 5.591786032e-2)
+        p = p.fma(r, 2.402474483e-1)
+        p = p.fma(r, 6.931218147e-1)
+        p = p.fma(r, 9.999992614e-1)
     elif degree == 5:
         p = SIMD[DType.float32, width](1.3392112e-3)
         p = p.fma(r, 9.6180963e-3)
@@ -119,6 +133,10 @@ def exp2[
         p = p.fma(r, 2.4022651e-1)
         p = p.fma(r, 6.9314718e-1)
         p = p.fma(r, 1.0)
+    comptime if NEON_EXP:
+        return bitcast[DType.float32, width](
+            bitcast[DType.int32, width](p) + (bitcast[DType.int32, width](y) << 23)
+        )
     var e = (n.cast[DType.int32]() + 127) << 23
     return p * bitcast[DType.float32, width](e)
 
