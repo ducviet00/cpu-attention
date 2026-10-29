@@ -27,6 +27,8 @@ comptime NS = max(1, 8 // LANES)
 comptime KU32 = 1 if BCAST_FOLD else 4
 """fp32 P@V keys per step: 4 probabilities as one vector, a lane each, where a
 broadcast does not fold into the FMA."""
+comptime QPANEL = not BCAST_FOLD
+"""fp32 query rows through a contiguous panel where they are loaded as vectors."""
 
 
 @always_inline
@@ -125,6 +127,7 @@ def _qk[
     job: FlashJob,
     kd: Int,
     q0: Int,
+    qs: Int,
     nrows: Int,
     k0: Int,
     nkeys: Int,
@@ -132,8 +135,8 @@ def _qk[
     logits: Int,
     tmax: Int,
 ):
-    """Also writes each row's tile maximum to `tmax` (the softmax then skips its
-    max pass over the tile)."""
+    """Query rows are `qs` elements apart. Also writes each row's tile maximum
+    to `tmax` (the softmax then skips its max pass over the tile)."""
     comptime BF = dtype == DType.bfloat16
     # bf16 K is stored as dim pairs on every tier, so bf16 always goes through
     # `dot_bf16` (one instruction with AVX-512-BF16/NEON-BF16, widened otherwise).
@@ -159,7 +162,7 @@ def _qk[
                     comptime for r in range(ROWS):
                         var rr = min(r, nrows - 1)
                         var qv = SIMD[DType.int32, LANES](
-                            ptr[Int32](q0 + rr * job.qt * 2).unsafe_load(d2 + u)
+                            ptr[Int32](q0 + rr * qs * 2).unsafe_load(d2 + u)
                         )
                         # The query pair goes last: `vdpbf16ps` folds a
                         # 32-bit memory broadcast only as its last source.
@@ -178,9 +181,9 @@ def _qk[
                             ).cast[DType.float32]()
                         comptime for r in range(ROWS):
                             var rr = min(r, nrows - 1)
-                            var qs = Float32(ptr[Scalar[dtype]](q0 + rr * job.qt * 4).unsafe_load(d + u))
+                            var qd = Float32(ptr[Scalar[dtype]](q0 + rr * qs * 4).unsafe_load(d + u))
                             comptime for i in range(KV):
-                                c[r * KV + i] = V(qs).fma(kv[i], c[r * KV + i])
+                                c[r * KV + i] = V(qd).fma(kv[i], c[r * KV + i])
                 else:
                     # K for 4 dims first, then per row one 4-dim query vector
                     # used by lane (one live query register).
@@ -192,7 +195,7 @@ def _qk[
                             ).cast[DType.float32]()
                     comptime for r in range(ROWS):
                         var rr = min(r, nrows - 1)
-                        var qv = ptr[Scalar[dtype]](q0 + rr * job.qt * 4).unsafe_load[width=4](d).cast[DType.float32]()
+                        var qv = ptr[Scalar[dtype]](q0 + rr * qs * 4).unsafe_load[width=4](d).cast[DType.float32]()
                         comptime for u in range(4):
                             comptime for i in range(KV):
                                 c[r * KV + i] = V(qv[u]).fma(kv[u * KV + i], c[r * KV + i])
@@ -350,9 +353,9 @@ def _pv[
             comptime for i in range(NV):
                 ap.unsafe_store[width=LANES](r * hd + dc + i * LANES, c[r * NV + i])
 
-    # Few chunks unroll (x86: 2-4); 8-dim NEON chunks (8-16 of them) loop, as
-    # an unrolled copy of the key loop per chunk costs instruction cache.
-    comptime if hd // DC <= 4:
+    # Few small chunk bodies unroll (x86: 2-4 chunks, one key per step); NEON's
+    # 4-key bodies loop, as an unrolled copy per chunk costs instruction cache.
+    comptime if (hd // DC) * (1 if BF else KU32) <= 4:
         comptime for dc in range(0, hd, DC):
             chunk(dc)
     else:
@@ -383,7 +386,17 @@ def _tile[
     l: Int,
     alpha: Int,
 ):
-    _qk[dtype, hd, ROWS](job, kd, q0, sub, k0, nk, limit0, aux, alpha)
+    comptime if QPANEL and dtype == DType.float32:
+        # The caller's rows are a token stride apart (16 KB at 32 heads x 128
+        # dims: all rows in one L1 set): copy them into a contiguous panel.
+        var panel = aux + RQT * KT * 4
+        for r in range(ROWS):
+            var src = ptr[Float32](q0) + min(r, sub - 1) * job.qt
+            comptime for d in range(0, hd, 4):
+                ptr[Float32](panel).unsafe_store[width=4](r * hd + d, src.unsafe_load[width=4](d))
+        _qk[dtype, hd, ROWS](job, kd, panel, hd, sub, k0, nk, limit0, aux, alpha)
+    else:
+        _qk[dtype, hd, ROWS](job, kd, q0, job.qt, sub, k0, nk, limit0, aux, alpha)
     _softmax[dtype](aux, sub, nk, c, m, l, alpha)
     var ap = ptr[Float32](alpha)
     var acp = ptr[Float32](acc)
@@ -411,8 +424,9 @@ struct VecPolicy[dtype: DType, hd: Int](FlashPolicy):
 
     @staticmethod
     def tile_bytes() -> Int:
-        # fp32 logits | bf16 probabilities (bf16 only)
-        return RQT * KT * 4 + (RQT * KT * 2 if Self.dtype == DType.bfloat16 else 0)
+        # fp32 logits | bf16 probabilities (bf16) or the Q panel (fp32, QPANEL)
+        comptime BF = Self.dtype == DType.bfloat16
+        return RQT * KT * 4 + (RQT * KT * 2 if BF else (RQT * Self.hd * 4 if QPANEL else 0))
 
     @staticmethod
     def pack(job: FlashJob, b: Int, kvh: Int, slab: Int):
