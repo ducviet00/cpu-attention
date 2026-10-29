@@ -220,8 +220,10 @@ def _store_block[dtype: DType, hd: Int, PAGE: Int](job: PagedJob, kvh: Int, s0: 
         var first = Int(sl.unsafe_load(s0))
         var d = _div_page[PAGE](first, page)
         var run = first >= 0 and d[1] + LANES <= page
-        for i in range(1, LANES):
-            run = run and Int(sl.unsafe_load(s0 + i)) == first + i
+        var i = 1
+        while run and i < LANES:  # scattered slots (one token per sequence) stop at once
+            run = Int(sl.unsafe_load(s0 + i)) == first + i
+            i += 1
         if run:
             var base = ((d[0] * job.kv_heads + kvh) * page * hd) * E
             var src = (s0 * job.kv_stride + kvh * hd) * E
