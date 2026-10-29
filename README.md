@@ -121,12 +121,12 @@ C4D, NEON on the Axion) and torch SDPA are secondary references.
 
 | rows | C4D | Axion | Xeon |
 |---|---|---|---|
-| `flash_attn_func` (78) | 68 / 10 / 0 | 77 / 1 / 0 | 40 / 27 / 11 |
-| decode, allocating the output (60) | 7 / 26 / 27 | 18 / 19 / 23 | 14 / 30 / 16 |
-| decode with `out=` (20) | 3 / 10 / 7 | 3 / 10 / 7 | 3 / 14 / 3 |
-| public `flash_attn_with_kvcache` decode (8) | 4 / 2 / 2 | 7 / 1 / 0 | 4 / 4 / 0 |
-| store-only (4) | 2 / 2 / 0 | 3 / 1 / 0 | 3 / 1 / 0 |
-| **all (170)** | **84 / 50 / 36** | **108 / 32 / 30** | **64 / 76 / 30** |
+| `flash_attn_func` (78) | 68 / 10 / 0 | 77 / 1 / 0 | 47 / 23 / 8 |
+| decode, allocating the output (60) | 7 / 26 / 27 | 18 / 19 / 23 | 19 / 32 / 9 |
+| decode with `out=` (20) | 3 / 10 / 7 | 3 / 10 / 7 | 7 / 11 / 2 |
+| public `flash_attn_with_kvcache` decode (8) | 4 / 2 / 2 | 7 / 1 / 0 | 4 / 3 / 1 |
+| store-only (4) | 2 / 2 / 0 | 3 / 1 / 0 | 0 / 3 / 1 |
+| **all (170)** | **84 / 50 / 36** | **108 / 32 / 30** | **77 / 72 / 21** |
 
 **Where Mojo does not clearly win.**
 * **C4D**: 36 losses, none in `flash_attn_func` (68 wins, 10 ties); the rest
@@ -141,12 +141,14 @@ C4D, NEON on the Axion) and torch SDPA are secondary references.
   (0.6 us hot) and C++ allocates natively, so ~5 us batch-1 calls lose by
   1.1-1.2. The `out=` rows still lose at batch 1 (up to 1.23, fp32) and at
   batch 8-32 bf16 (1.06). Every `flash_attn_func` row wins except one tie.
-* **Xeon**: 30 losses. `flash_attn_func`: 11, 1.04-1.11, head_dim-128 rows at
-  256-512 tokens (256:16:128, 257:16:128, 512:32:128). At 129 tokens in bf16 the
-  AMX K/V pack was measured ~30% slower than C++'s (single thread, sampled
-  profile), worth 5-10% of such a call; the rest of that gap is unexplained.
-  Decode: 19, up to 1.43, mostly fp32 at batch 8, context ~1024 (see the
-  caveat).
+* **Xeon** (re-measured Oct 2026 after the bf16 Q-panel change; the other two boxes
+  are as measured before it): 21 losses. `flash_attn_func`: 8, 1.04-1.12, seven of
+  them fp32 head_dim 128 at 129-1025 tokens (and `513x257:8:64` fp32), plus bf16
+  `129:16:128`. On four threads the fp32 head_dim-128 rows run 4-5% behind C++
+  while Mojo is 3% *faster* on one thread; the cause is not found (not SMT
+  placement, workspace alignment or offset). Decode: 13, most of them fp32 at
+  batch 8, context ~1024, which move 0.82-1.02 with the allocation order (see the
+  caveat). Store-only `b=32 ctx=1` fp32 lost once (1.07 against `cpp_scalar`).
 
 **Caveats.**
 * Rows bound by memory placement swing 20-30% with allocation order. The Xeon
@@ -157,6 +159,7 @@ C4D, NEON on the Axion) and torch SDPA are secondary references.
 * Two Xeon runs of identical code differed by 5-10% on a few fp32 AMX
   `flash_attn_func` rows (the control arm moved with it, C++ did not); the
   cause is not found.
+* Run-to-run: two Xeon runs of the same decode code gave 64 / 76 / 30 (earlier table) and 70 / 80 / 20 (Oct 2026, no oracle arm: the `mojo-oracle-v1.1` tag is absent from this clone), so single-run counts on this box move by about 6 rows, and the non-`flash_attn_func` Xeon rows above are within that noise of the earlier run. The consistent Xeon losses in both runs are the fp32 decode rows at batch 8, context ~1024 (1.06-1.31) and `flash_attn_func` head_dim 128 at 257-512 tokens (1.03-1.10).
 * Each box was measured once. On the C4D the 32 MB L3 makes the verdict of
   decode rows with a 15-30 MB working set depend on which arm's cache happened
   to be resident; repeat them with `--load-seed` before believing a gap.

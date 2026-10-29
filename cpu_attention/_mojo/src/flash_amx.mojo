@@ -281,13 +281,20 @@ def _q_operand[
     dtype: DType, hd: Int
 ](job: FlashJob, qaddr: Int, nrows: Int, panel: Int) -> Tuple[Int, Int, Int]:
     """(hi address, lo address, row stride in bytes) of the A operand: the caller's
-    Q when the block is full bf16 (any stride works, the tile load takes it in
-    bytes), else a zero-padded hi/lo panel -- a partial block still computes RQT
-    rows and the padding must not reach the logits; fp32 needs its halves."""
+    Q when the block is full bf16 (the tile load takes any stride in bytes), else a
+    contiguous zero-padded hi/lo panel -- a partial block still computes RQT rows
+    and the padding must not reach the logits; fp32 needs its halves.
+
+    A full bf16 block is also panelled when its rows are >= 2 KB apart (heads * hd
+    * 2) and the sweep has >= 256 keys: all 32 rows then share one L1 set (12 ways)
+    and the physical L2 sets vary per process. 257:16:128 on 4 threads was bimodal,
+    208-226 us in place against 197-200 us through the panel; 512:32:128 -10%,
+    1024:16:128 -6%. Below that the copy is a net cost (129:16:128 +6%, 2048:8:64
+    +2%), and C++ reads Q in place everywhere."""
     comptime BF = dtype == DType.bfloat16
     comptime E = 2 if BF else 4
     comptime DC32 = hd // 32
-    if BF and nrows == RQT:
+    if BF and nrows == RQT and not (job.qt * E >= 2048 and job.seq_k >= 256):
         return (qaddr, 0, job.qt * E)
     var ph = ptr[BFloat16](panel)
     var pl = ptr[BFloat16](panel + RQT * hd * 2)
