@@ -17,7 +17,7 @@ from std.math import iota
 from std.memory import bitcast, stack_allocation
 from std.sys.info import CompilationTarget
 
-from isa import LANES, LOG2E, NEON_BF16, dot_bf16, exp2, exp2s, ptr, vmax
+from isa import LANES, LOG2E, dot_bf16, exp2, exp2s, ptr, vmax
 from parallel import barrier, parallel
 
 comptime V_PAIRS_ARM = CompilationTarget.has_neon()
@@ -86,29 +86,14 @@ struct PagedJob(ImplicitlyCopyable, Movable):
 struct PageLayout[dtype: DType, hd: Int]:
     """Where token `t` of a (page, kv head) lives. K is dim-major so one vector
     load is LANES consecutive tokens of one dimension; bf16 pairs the two
-    dimensions a dot instruction contracts: `[hd/2][page][2]`."""
+    dimensions a dot instruction contracts: `[hd/2][page][2]`. V is `[page][hd]`,
+    bf16 on aarch64 key pairs `[page/2][hd][2]` (the `dot_bf16` operand)."""
 
     comptime BF = Self.dtype == DType.bfloat16
     comptime V_PAIRS = Self.BF and V_PAIRS_ARM
     comptime SPLIT = Self.BF and not Self.V_PAIRS and Self.hd % (2 * LANES) == 0
     """bf16 V is widened even/odd-split, so the fp32 accumulator holds each
     2*LANES block of dims as [even dims][odd dims] (see `_pv`)."""
-
-    @staticmethod
-    @always_inline
-    def k_elem(page: Int, t: Int, d: Int) -> Int:
-        comptime if Self.BF:
-            return ((d >> 1) * page + t) * 2 + (d & 1)
-        else:
-            return d * page + t
-
-    @staticmethod
-    @always_inline
-    def v_elem(page: Int, t: Int, d: Int) -> Int:
-        comptime if Self.V_PAIRS:
-            return ((t >> 1) * Self.hd + d) * 2 + (t & 1)
-        else:
-            return t * Self.hd + d
 
     @staticmethod
     @always_inline
@@ -199,12 +184,66 @@ def _store_kv[dtype: DType, hd: Int, PAGE: Int](job: PagedJob, seq: Int, kvh: In
 # ---------------------------------------------------------------------------
 # attend: R query rows of one kv head against one sequence's pages
 # ---------------------------------------------------------------------------
-@always_inline
-def _kt[hd: Int, R: Int]() -> Int:
-    # Keys per softmax step. At hd <= 64, 256 keys (1 KB) covers ctx=256 in a
-    # single pass; at hd == 128 and R == 1 on x86, 512 keys (2 KB) matches C++
-    # vec::Paged; larger R or NEON keeps R x KT inside L1 next to the K stream.
+# One driver for every tier. A softmax step of KT keys is resolved into 16-key
+# units (page % 16 == 0 is checked at dispatch, so a unit never straddles a
+# page): one key vector on AVX-512, two on AVX2, four on NEON. Per target only
+# compile-time constants (`Decode`) and the P@V operand differ:
+#   x86      fp32 P against V rows (bf16 V widened): the C++ class the 2-ulp x86
+#            bf16 gate compares against;
+#   aarch64  bf16 P against bf16 V key pairs with `dot_bf16` (`bfdot`): widening
+#            V was 70% of the kernel on Axion (docs/Mojo.md §9).
+
+
+def _kt(hd: Int, R: Int) -> Int:
+    """Keys per softmax step. aarch64: 64 (the four unit bases of a step stay in
+    registers). x86: at hd <= 64, 256 keys (1 KB) covers ctx=256 in a single
+    pass; at hd == 128 and R == 1 on 16 lanes, 512 keys (2 KB) matches C++
+    vec::Paged; larger R keeps R x KT inside L1 next to the K stream."""
+    if V_PAIRS_ARM:
+        return 64
     return 256 if hd <= 64 else (512 if (LANES == 16 and R == 1) else 128)
+
+
+def _groups(bf: Bool, R: Int) -> Int:
+    """Key vectors scored per Q@K^T call: independent dot chains (one bf16 chain
+    over head_dim is latency bound, ~6 cycles per `vdpbf16ps`) that fit the
+    registers. aarch64 bf16 R == 1 scores a whole 64-key step in one sweep."""
+    if bf:
+        if V_PAIRS_ARM:
+            return 16 if R == 1 else (4 if R == 2 else 2)
+        return 4 if R == 1 else (2 if R == 2 else 1)
+    return 4 if (V_PAIRS_ARM and R == 1) else 1
+
+
+struct Decode[dtype: DType, hd: Int, R: Int]:
+    """The decode kernel's compile-time shape on this tier."""
+
+    comptime BF = Self.dtype == DType.bfloat16
+    comptime E = 2 if Self.BF else 4
+    comptime UNIT = 16
+    comptime GPU = Self.UNIT // LANES
+    """Key vectors per unit."""
+    comptime KT = _kt(Self.hd, Self.R)
+    comptime UNITS = Self.KT // Self.UNIT
+    comptime G = _groups(Self.BF, Self.R)
+    comptime G_TAIL = min(Self.G, Self.GPU)
+    """A masked tail call never leaves its unit (only resolved units are read)."""
+    comptime PAIRS = PageLayout[Self.dtype, Self.hd].V_PAIRS
+    # bf16 on x86: degree 2, inside the bf16 output rounding (the C++ class of
+    # the x86 gate). aarch64's gate is also <= 1e-3 against the fp32 reference,
+    # which degree 2 (relative 1.7e-3) misses by 4x.
+    comptime DEG = (5 if V_PAIRS_ARM else 2) if Self.BF else 6
+    comptime NS = 2 if V_PAIRS_ARM else 1
+    """Partial row sums in the softmax (independent adds on 4-lane NEON)."""
+    comptime FULL = V_PAIRS_ARM and Self.R == 1
+    """A full R == 1 step gets its own P@V body with constant unit lengths."""
+    comptime NC = (Self.hd // LANES) if Self.R * Self.hd // LANES <= 16 else max(
+        2 if PageLayout[Self.dtype, Self.hd].SPLIT else 1, 16 // Self.R
+    )
+    """P@V dim vectors per register chunk: R x NC accumulators stay in registers."""
+    comptime LN = 2 if (not Self.PAIRS and Self.R * Self.NC <= 8) else 1
+    """Key-parity accumulators while the tile is small: even and odd keys feed
+    independent FMA chains (one chain per dim vector is latency bound at R=1)."""
 
 
 @always_inline
@@ -274,338 +313,9 @@ def _store_rows[dtype: DType, hd: Int, R: Int](
                 )
 
 
-def _attend_rows[
-    dtype: DType, hd: Int, R: Int, PAGE: Int
-](job: PagedJob, seq: Int, kvh: Int, h0: Int, nrows: Int):
-    """Query heads `h0 .. h0+nrows-1` (nrows <= R, all of kv head `kvh`)."""
-    comptime if V_PAIRS_ARM and (dtype == DType.float32 or NEON_BF16):
-        _attend_rows_arm[dtype, hd, R, PAGE](job, seq, kvh, h0, nrows)
-        return
-    comptime L = PageLayout[dtype, hd]
-    comptime E = 2 if dtype == DType.bfloat16 else 4
-    comptime KT = _kt[hd, R]()
-    comptime NV = hd // LANES
-    # bf16 on x86: degree 2, inside the bf16 output rounding, the C++ class the
-    # x86 gate compares against (2 ulp). aarch64's gate is also <= 1e-3 against
-    # the fp32 reference, which degree 2 (relative 1.7e-3) misses by 4x.
-    comptime DEG = (2 if not V_PAIRS_ARM else 5) if dtype == DType.bfloat16 else 6
-    # bf16 K is dim pairs on every tier; `dot_bf16` widens where there is no
-    # dot instruction.
-    comptime DOT = dtype == DType.bfloat16
-    var page = PAGE if PAGE else job.page
-    var len = Int(ptr[Int32](job.lens).unsafe_load(seq)) + (
-        1 if (job.do_store and job.slots == 0) else 0
-    )
-    var bt = ptr[Int32](job.block_table + seq * job.bt_stride * 4)
-    var head_bytes = page * hd * E  # one (page, kv head) block
-    var c = job.scale * Float32(LOG2E)
-
-    # Queries: at R == 1 read directly from `job.q`; for R > 1 pack R rows into
-    # a contiguous stack buffer.
-    var qf_buf = stack_allocation[
-        (R * hd) if (R > 1 and not DOT) else 1, DType.float32, alignment=64
-    ]()
-    var qp_buf = stack_allocation[
-        (R * hd // 2) if (R > 1 and DOT) else 1, DType.int32, alignment=64
-    ]()
-    var q0_addr = job.q + (seq * job.q_stride + h0 * hd) * E
-    var qf = ptr[Float32](q0_addr) if R == 1 else qf_buf
-    var qp = ptr[Int32](q0_addr) if R == 1 else qp_buf
-    comptime if R > 1:
-        for r in range(R):
-            var rr = min(r, nrows - 1)
-            var src = job.q + (seq * job.q_stride + (h0 + rr) * hd) * E
-            comptime if DOT:
-                var s = ptr[Int32](src)
-                comptime for d2 in range(hd // 2):
-                    qp_buf.unsafe_store(r * (hd // 2) + d2, s.unsafe_load(d2))
-            else:
-                var s = ptr[Scalar[dtype]](src)
-                comptime for d in range(0, hd, LANES):
-                    qf_buf.unsafe_store[width=LANES](
-                        r * hd + d, s.unsafe_load[width=LANES](d).cast[DType.float32]()
-                    )
-
-    var logits = stack_allocation[R * KT, DType.float32, alignment=64]()
-    var acc = stack_allocation[R * hd, DType.float32, alignment=64]()
-    var m = SIMD[DType.float32, R](-Float32.MAX)
-    var l = SIMD[DType.float32, R](0)
-
-    var k0 = 0
-    while k0 < len:
-        var nk = min(KT, len - k0)
-        # ---- Q@K^T. A small register tile scores G key groups per step so the
-        # dot chains are independent (one bf16 chain over head_dim is latency
-        # bound: ~6 cycles per `vdpbf16ps`); page pointers step incrementally.
-        comptime G = 1 if dtype == DType.float32 else (
-            (8 if V_PAIRS_ARM else 4) if R == 1 else (2 if R == 2 else 1)
-        )
-        var d0 = _div_page[PAGE](k0, page)
-        var pg = d0[0]
-        var off = d0[1]
-        var kpage = job.k_cache + (Int(bt.unsafe_load(pg)) * job.kv_heads + kvh) * head_bytes
-        var j = 0
-        while j + G * LANES <= nk:
-            var base = Array[Int, G](uninitialized=True)
-            comptime for g in range(G):
-                if off >= page:
-                    pg += 1
-                    off = 0
-                    kpage = job.k_cache + (
-                        Int(bt.unsafe_load(pg)) * job.kv_heads + kvh
-                    ) * head_bytes
-                base[g] = kpage + off * 4
-                off += LANES
-            _qk_groups[dtype, hd, R, G, KT, PAGE, False](
-                page, base, j, qf, qp, logits, LANES
-            )
-            j += G * LANES
-        while j < nk:
-            if off >= page:
-                pg += 1
-                off = 0
-                kpage = job.k_cache + (
-                    Int(bt.unsafe_load(pg)) * job.kv_heads + kvh
-                ) * head_bytes
-            var base1 = Array[Int, 1](fill=kpage + off * 4)
-            off += LANES
-            _qk_groups[dtype, hd, R, 1, KT, PAGE, True](
-                page, base1, j, qf, qp, logits, nk - j
-            )
-            j += LANES
-
-        # ---- online softmax per row; p = 2^(logit*c - m), m in scaled log2 units
-        var alpha = SIMD[DType.float32, R](1)
-        comptime for r in range(R):
-            var mx = SIMD[DType.float32, LANES](-Float32.MAX)
-            var t = 0
-            while t < nk:
-                mx = vmax(mx, logits.unsafe_load[width=LANES](r * KT + t))
-                t += LANES
-            var s = _rescale[DEG](k0, mx.reduce_max() * c, m[r])
-            m[r] = s[0]
-            alpha[r] = s[1]
-            var mn = s[0]
-            var sum = SIMD[DType.float32, LANES](0)
-            t = 0
-            while t < nk:
-                var e = exp2[DEG, LANES](
-                    logits.unsafe_load[width=LANES](r * KT + t).fma(
-                        SIMD[DType.float32, LANES](c), SIMD[DType.float32, LANES](-mn)
-                    )
-                )
-                logits.unsafe_store[width=LANES](r * KT + t, e)
-                sum += e
-                t += LANES
-            l[r] = (l[r] * alpha[r] if k0 > 0 else Float32(0)) + sum.reduce_add()
-
-        # ---- P@V over exactly nk keys (never past `len`: 0 * NaN is NaN)
-        _pv[dtype, hd, R, KT, PAGE](
-            job, bt, kvh, head_bytes, k0, nk, len, logits, acc, alpha
-        )
-        k0 += nk
-
-    _store_rows[dtype, hd, R](job, seq, h0, nrows, l, acc)
-
-
-@always_inline
-def _qk_groups[
-    dtype: DType, hd: Int, R: Int, G: Int, KT: Int, PAGE: Int, MASK: Bool
-](
-    page: Int,
-    base: Array[Int, G],
-    j: Int,
-    qf: MutPointer[Float32, _],
-    qp: MutPointer[Int32, _],
-    logits: MutPointer[Float32, _],
-    valid: Int,
-):
-    """logits[r][j + g*LANES ..] for G groups of LANES keys;
-    lanes at or past `valid` (only when MASK is True) are masked to -max."""
-    comptime DOT = dtype == DType.bfloat16
-    comptime V = SIMD[DType.float32, LANES]
-    var cv = Array[V, R * G](fill=V(0))
-    comptime if DOT:
-        # A runtime loop over head-dim pairs (unrolled by U): fully unrolled,
-        # LLVM hoists every query broadcast out of the key loop and spills
-        # them, so each dot pays a stack reload (30% of samples, measured).
-        comptime U = 4
-        for d0 in range(0, hd // 2, U):
-            comptime for u in range(U):
-                var d2 = d0 + u
-                comptime for g in range(G):
-                    var kv = ptr[BFloat16](base[g]).unsafe_load[width = 2 * LANES](
-                        d2 * page * 2
-                    )
-                    comptime for r in range(R):
-                        var qv = SIMD[DType.int32, LANES](
-                            qp.unsafe_load(r * (hd // 2) + d2)
-                        )
-                        # Query last: `vdpbf16ps` folds a broadcast load
-                        # only as its last source (exact, symmetric products).
-                        cv[r * G + g] = dot_bf16[LANES](
-                            cv[r * G + g], kv, bitcast_bf16[LANES](qv)
-                        )
-    else:
-        # CH independent partial dot products per (row, group): one chain over
-        # all of head_dim 128 rounds past the 1e-6 fp32 gate (1.2-1.6e-6
-        # measured), and the chains also overlap the K loads.
-        comptime CH = max(1, min(4, 16 // (R * G)))
-        var part = Array[V, R * G * CH](fill=V(0))
-        comptime U = max(CH, 4)
-        for d0 in range(0, hd, U):
-            comptime for u in range(U):
-                var d = d0 + u
-                comptime for g in range(G):
-                    var kv = ptr[Scalar[dtype]](base[g]).unsafe_load[width=LANES](
-                        d * page
-                    ).cast[DType.float32]()
-                    comptime for r in range(R):
-                        comptime i = (r * G + g) * CH + u % CH
-                        part[i] = V(qf.unsafe_load(r * hd + d)).fma(kv, part[i])
-        comptime for rg in range(R * G):
-            comptime if CH == 4:
-                cv[rg] = (part[rg * 4] + part[rg * 4 + 1]) + (
-                    part[rg * 4 + 2] + part[rg * 4 + 3]
-                )
-            else:
-                var sum = part[rg * CH]
-                comptime for c in range(1, CH):
-                    sum += part[rg * CH + c]
-                cv[rg] = sum
-    comptime for g in range(G):
-        comptime for r in range(R):
-            var v = cv[r * G + g]
-            comptime if MASK:
-                if valid < LANES:
-                    var lane = iota[DType.int32, LANES]()
-                    var keep = lane.lt(SIMD[DType.int32, LANES](Int32(valid)))
-                    v = keep.select(v, V(-Float32.MAX))
-            logits.unsafe_store[width=LANES](r * KT + j + g * LANES, v)
-
-
 @always_inline
 def bitcast_bf16[width: Int](x: SIMD[DType.int32, width]) -> SIMD[DType.bfloat16, 2 * width]:
-    from std.memory import bitcast
-
     return bitcast[DType.bfloat16, 2 * width](x)
-
-
-@always_inline
-def _pv[
-    dtype: DType, hd: Int, R: Int, KT: Int, PAGE: Int
-](
-    job: PagedJob,
-    bt: MutPointer[Int32, _],
-    kvh: Int,
-    head_bytes: Int,
-    k0: Int,
-    nk: Int,
-    len: Int,
-    p: MutPointer[Float32, _],
-    acc: MutPointer[Float32, _],
-    alpha: SIMD[DType.float32, R],
-):
-    """acc[r] = acc[r]*alpha[r] + sum_j p[r][j] * V[k0+j], dims in register
-    chunks of DC so R rows x DC dims stay inside the vector registers."""
-    comptime L = PageLayout[dtype, hd]
-    comptime V = SIMD[DType.float32, LANES]
-    comptime SPLIT = L.SPLIT
-    comptime DC = hd if R * hd // LANES <= 16 else max(
-        2 * LANES if SPLIT else LANES, 16 * LANES // R
-    )
-    comptime NC = DC // LANES
-    # Two key-parity lanes while the tile is small: the even and odd keys feed
-    # independent FMA chains (one chain per dim vector is latency-bound at R=1).
-    comptime LN = 2 if R * NC <= 8 else 1
-    var page = PAGE if PAGE else job.page
-    var d0 = _div_page[PAGE](k0, page)
-    comptime for dc in range(0, hd, DC):
-        var a = Array[V, LN * R * NC](fill=V(0))
-        _acc_load[hd, R, NC, LANES, LN * R * NC](a, acc, dc, k0, alpha)
-        var done = 0
-        var pg = d0[0]
-        var off = d0[1]
-        while done < nk:
-            var chunk = min(page - off, nk - done)
-            var blk = (Int(bt.unsafe_load(pg)) * job.kv_heads + kvh) * head_bytes
-            var vp = ptr[Scalar[dtype]](job.v_cache + blk)
-            var vp_off = vp + off * hd + dc
-
-            @always_inline
-            def vrow(t: Int, i: Int) capturing -> V:
-                comptime if SPLIT:
-                    # Dims are kept even/odd-split per 2*LANES block: one
-                    # 64-byte load is LANES words; `<< 16` is the even dims
-                    # and `& 0xffff0000` the odd ones, 2 instructions per 32
-                    # values against 4 for zero-extend + shift (the widen was
-                    # 28% of a bf16 decode). Each dim's fp32 math is unchanged.
-                    var w = bitcast[DType.int32, LANES](
-                        (vp_off + t * hd).unsafe_load[width = 2 * LANES](
-                            (i // 2) * 2 * LANES
-                        )
-                    )
-                    if i % 2 == 0:
-                        return bitcast[DType.float32, LANES](w << 16)
-                    return bitcast[DType.float32, LANES](w & Int32(-65536))
-                elif L.V_PAIRS:
-                    var pair = vp.unsafe_load[width = 2 * LANES](
-                        L.v_elem(page, (off + t) & ~1, dc + i * LANES)
-                    ).cast[DType.float32]().deinterleave()
-                    return rebind[V](pair[0]) if ((off + t) & 1) == 0 else rebind[V](pair[1])
-                else:
-                    return (vp_off + t * hd).unsafe_load[width=LANES](
-                        i * LANES
-                    ).cast[DType.float32]()
-
-            var t = 0
-            comptime if LN == 2:
-                while t + 1 < chunk:
-                    var p0 = Array[V, R](uninitialized=True)
-                    var p1 = Array[V, R](uninitialized=True)
-                    comptime for r in range(R):
-                        var base_p = r * KT + done + t
-                        p0[r] = V(p.unsafe_load(base_p))
-                        p1[r] = V(p.unsafe_load(base_p + 1))
-                    comptime for i in range(NC):
-                        var v0 = vrow(t, i)
-                        var v1 = vrow(t + 1, i)
-                        comptime for r in range(R):
-                            a[r * NC + i] = p0[r].fma(v0, a[r * NC + i])
-                            a[(R + r) * NC + i] = p1[r].fma(
-                                v1, a[(R + r) * NC + i]
-                            )
-                    t += 2
-            while t < chunk:
-                var p0 = Array[V, R](uninitialized=True)
-                comptime for r in range(R):
-                    p0[r] = V(p.unsafe_load(r * KT + done + t))
-                comptime for i in range(NC):
-                    var v0 = vrow(t, i)
-                    comptime for r in range(R):
-                        a[r * NC + i] = p0[r].fma(v0, a[r * NC + i])
-                t += 1
-            done += chunk
-            off = 0
-            pg += 1
-        comptime for r in range(R):
-            comptime for i in range(NC):
-                var s = a[r * NC + i]
-                comptime if LN == 2:
-                    s += a[(R + r) * NC + i]
-                acc.unsafe_store[width=LANES](r * hd + dc + i * LANES, s)
-
-
-# ---------------------------------------------------------------------------
-# attend, aarch64: 16-key page units
-# ---------------------------------------------------------------------------
-# Not `_attend_rows`/`_pv`: on 4-lane NEON a step is KT=64 keys as four 16-key
-# units whose K/V bases are resolved once per step (page % 16 == 0, so a unit
-# never straddles a page), short tails skip dead key groups, and bf16 P@V
-# contracts a key pair of V against bf16 P with `bfdot` instead of widening V
-# to fp32 (70% of the generic MHA kernel on Axion). b=8 ctx=1024 bf16: 0.80 of
-# the generic path (docs/Mojo.md §9).
-comptime V4 = SIMD[DType.float32, 4]
 
 
 @always_inline
@@ -619,6 +329,7 @@ def _unit_bases[E: Int, hd: Int, PAGE: Int](
     kbase: MutPointer[Int64, _],
     vbase: MutPointer[Int64, _],
 ):
+    """K and V addresses of the first key of each 16-key unit from `k0`."""
     var head_bytes = page * hd * E
     for g in range(units):
         var d = _div_page[PAGE](k0 + g * 16, page)
@@ -628,199 +339,132 @@ def _unit_bases[E: Int, hd: Int, PAGE: Int](
 
 
 @always_inline
-def _qk_units[
-    dtype: DType, hd: Int, R: Int, T: Int, H: Int
-](kb: Array[Int, T], page: Int, q: Int) -> Array[V4, R * T * H]:
-    """Logits of H groups of 4 keys at each of T K addresses, for R query rows
-    at `q` (bf16: dim pairs; fp32: rows of hd). Index `(r * T + g) * H + h`."""
-    var cv = Array[V4, R * T * H](fill=V4(0))
-    comptime if dtype == DType.bfloat16:
-        var qi = ptr[Int32](q)
-        for dp in range(0, hd // 2, 2):
-            var qa0 = Array[SIMD[DType.bfloat16, 8], R](uninitialized=True)
-            var qa1 = Array[SIMD[DType.bfloat16, 8], R](uninitialized=True)
-            comptime for r in range(R):
-                qa0[r] = bitcast_bf16[4](
-                    SIMD[DType.int32, 4](qi.unsafe_load(r * (hd // 2) + dp))
-                )
-                qa1[r] = bitcast_bf16[4](
-                    SIMD[DType.int32, 4](qi.unsafe_load(r * (hd // 2) + dp + 1))
-                )
-            comptime for g in range(T):
-                var kb0 = ptr[BFloat16](kb[g] + dp * page * 4)
-                var kb1 = ptr[BFloat16](kb[g] + (dp + 1) * page * 4)
-                comptime for h in range(H):
-                    var k = kb0.unsafe_load[width=8](h * 8)
-                    comptime for r in range(R):
-                        comptime i = (r * T + g) * H + h
-                        cv[i] = dot_bf16[4](cv[i], k, qa0[r])
-                comptime for h in range(H):
-                    var k = kb1.unsafe_load[width=8](h * 8)
-                    comptime for r in range(R):
-                        comptime i = (r * T + g) * H + h
-                        cv[i] = dot_bf16[4](cv[i], k, qa1[r])
-    else:
-        # CH partial chains per group: one chain over head_dim 128 rounds past
-        # the 1e-6 fp32 gate (see `_qk_groups`).
-        comptime CH = 4 if R <= 4 else 2
-        var qf = ptr[Float32](q)
-        var part = Array[V4, R * T * H * CH](fill=V4(0))
-        for d0 in range(0, hd, 4):
-            var qv = Array[V4, R](uninitialized=True)
-            comptime for r in range(R):
-                qv[r] = qf.unsafe_load[width=4](r * hd + d0)
-            comptime for u in range(4):
-                comptime for g in range(T):
-                    var kd = ptr[Float32](kb[g] + (d0 + u) * page * 4)
-                    comptime for h in range(H):
-                        var k = kd.unsafe_load[width=4](h * 4)
-                        comptime for r in range(R):
-                            comptime i = ((r * T + g) * H + h) * CH + u % CH
-                            part[i] = k.fma(V4(qv[r][u]), part[i])
-        comptime for i in range(R * T * H):
-            comptime if CH == 4:
-                cv[i] = (part[i * 4] + part[i * 4 + 1]) + (
-                    part[i * 4 + 2] + part[i * 4 + 3]
-                )
-            else:
-                cv[i] = part[i * 2] + part[i * 2 + 1]
-    return cv^
-
-
-@always_inline
-def _qk_full[dtype: DType, hd: Int](
-    page: Int, kbase: MutPointer[Int64, _], q: Int, logits: MutPointer[Float32, _]
-) -> V4:
-    """R == 1, all 64 keys live (no masks); returns the lane-wise max."""
-    comptime if dtype == DType.bfloat16:
-        # One head_dim sweep scores all 16 groups (16 accumulators).
-        var kb = Array[Int, 4](uninitialized=True)
-        comptime for g in range(4):
-            kb[g] = Int(kbase.unsafe_load(g))
-        var cv = _qk_units[dtype, hd, 1, 4, 4](kb, page, q)
-        var mx = Array[V4, 4](uninitialized=True)
-        comptime for g in range(4):
-            mx[g] = vmax[4](
-                vmax[4](cv[4 * g], cv[4 * g + 1]), vmax[4](cv[4 * g + 2], cv[4 * g + 3])
-            )
-        comptime for i in range(16):
-            logits.unsafe_store[width=4](4 * i, cv[i])
-        return vmax[4](vmax[4](mx[0], mx[1]), vmax[4](mx[2], mx[3]))
-    else:
-        # fp32 already holds 16 accumulators per unit (4 groups x 4 chains).
-        var mx = V4(-Float32.MAX)
-        for g in range(4):
-            var cv = _qk_units[dtype, hd, 1, 1, 4](
-                Array[Int, 1](fill=Int(kbase.unsafe_load(g))), page, q
-            )
-            comptime for h in range(4):
-                mx = vmax[4](mx, cv[h])
-                logits.unsafe_store[width=4](g * 16 + h * 4, cv[h])
-        return mx
-
-
-@always_inline
-def _qk_emit[
-    dtype: DType, hd: Int, R: Int, H: Int, KT: Int
+def _qk[
+    dtype: DType, hd: Int, R: Int, G: Int, KT: Int, MASK: Bool
 ](
-    kb: Int,
+    kbase: MutPointer[Int64, _],
     page: Int,
     q: Int,
-    base: Int,
+    j: Int,
     nk: Int,
     logits: MutPointer[Float32, _],
-    mut mx: Array[V4, R],
+    mut mx: Array[SIMD[DType.float32, LANES], R],
 ):
-    """Score H groups of 4 keys from key `base`; lanes at or past nk are -max."""
-    var cv = _qk_units[dtype, hd, R, 1, H](Array[Int, 1](fill=kb), page, q)
-    comptime for h in range(H):
-        var b = base + h * 4
-        if b < nk:
-            comptime for r in range(R):
-                var v = cv[r * H + h]
-                if b + 4 > nk:
-                    var idx = SIMD[DType.int32, 4](Int32(b)) + iota[DType.int32, 4]()
-                    v = idx.lt(SIMD[DType.int32, 4](Int32(nk))).select(
-                        v, V4(-Float32.MAX)
-                    )
-                mx[r] = vmax[4](mx[r], v)
-                logits.unsafe_store[width=4](r * KT + b, v)
+    """logits[r][j + g*LANES ..] for G key vectors from key j, and the running
+    lane max; with MASK, lanes at or past nk are -max and vectors past nk are
+    neither scored into the max nor stored."""
+    comptime V = SIMD[DType.float32, LANES]
+    var kb = Array[Int, G](uninitialized=True)
+    comptime for g in range(G):
+        var key = j + g * LANES
+        kb[g] = Int(kbase.unsafe_load(key >> 4)) + (key & 15) * 4
+    var cv = Array[V, R * G](fill=V(0))
+    comptime if dtype == DType.bfloat16:
+        # bf16 K and Q are dim pairs. A runtime loop over them (unrolled by U):
+        # fully unrolled, LLVM hoists every query broadcast out of the key loop
+        # and spills them (30% of samples on x86, measured).
+        var qp = ptr[Int32](q)
+        comptime U = 4
+        for d0 in range(0, hd // 2, U):
+            comptime for u in range(U):
+                var d2 = d0 + u
+                comptime for g in range(G):
+                    var k = ptr[BFloat16](kb[g]).unsafe_load[width = 2 * LANES](d2 * page * 2)
+                    comptime for r in range(R):
+                        # Query last: `vdpbf16ps` folds a broadcast load only
+                        # as its last source (exact, symmetric products).
+                        var qv = SIMD[DType.int32, LANES](qp.unsafe_load(r * (hd // 2) + d2))
+                        cv[r * G + g] = dot_bf16[LANES](cv[r * G + g], k, bitcast_bf16[LANES](qv))
+    else:
+        # CH independent partial dot products per (row, vector): one chain over
+        # all of head_dim 128 rounds past the 1e-6 fp32 gate (1.2-1.6e-6
+        # measured), and the chains also overlap the K loads.
+        var qf = ptr[Float32](q)
+        comptime CH = max(1, min(4, 16 // (R * G)))
+        var part = Array[V, R * G * CH](fill=V(0))
+        comptime U = max(CH, 4)
+        for d0 in range(0, hd, U):
+            comptime for u in range(U):
+                var d = d0 + u
+                comptime for g in range(G):
+                    var k = ptr[Float32](kb[g]).unsafe_load[width=LANES](d * page)
+                    comptime for r in range(R):
+                        comptime i = (r * G + g) * CH + u % CH
+                        part[i] = V(qf.unsafe_load(r * hd + d)).fma(k, part[i])
+        comptime for rg in range(R * G):
+            comptime if CH == 4:
+                cv[rg] = (part[rg * 4] + part[rg * 4 + 1]) + (part[rg * 4 + 2] + part[rg * 4 + 3])
+            else:
+                var sum = part[rg * CH]
+                comptime for c in range(1, CH):
+                    sum += part[rg * CH + c]
+                cv[rg] = sum
+    comptime for g in range(G):
+        var key = j + g * LANES
+        comptime if MASK:
+            if key >= nk:
+                continue
+        comptime for r in range(R):
+            var v = cv[r * G + g]
+            comptime if MASK:
+                if key + LANES > nk:
+                    var lane = iota[DType.int32, LANES]() + Int32(key)
+                    v = lane.lt(SIMD[DType.int32, LANES](Int32(nk))).select(v, V(-Float32.MAX))
+            mx[r] = vmax[LANES](mx[r], v)
+            logits.unsafe_store[width=LANES](r * KT + key, v)
 
 
 @always_inline
-def _exp_full[dtype: DType, DEG: Int, LO: Bool](
-    logits: MutPointer[Float32, _],
-    pbuf: MutPointer[BFloat16, _],
-    pbuf_lo: MutPointer[BFloat16, _],
-    vc: V4,
-    vmn: V4,
-) -> V4:
-    """P for a full R == 1 step (bf16 into pbuf, + low residual when LO; fp32
-    in place); returns the lane sums."""
-    var s0 = V4(0)
-    var s1 = V4(0)
-    for i in range(0, 16, 4):
-        var e = Array[V4, 4](uninitialized=True)
-        comptime for u in range(4):
-            e[u] = exp2[DEG, 4](logits.unsafe_load[width=4](4 * (i + u)).fma(vc, vmn))
-        comptime if dtype == DType.bfloat16:
-            comptime for u in range(0, 4, 2):
-                var hi0 = e[u].cast[DType.bfloat16]()
-                var hi1 = e[u + 1].cast[DType.bfloat16]()
-                pbuf.unsafe_store[width=8](4 * (i + u), hi0.join(hi1))
-                comptime if LO:
-                    var lo0 = (e[u] - hi0.cast[DType.float32]()).cast[DType.bfloat16]()
-                    var lo1 = (e[u + 1] - hi1.cast[DType.float32]()).cast[DType.bfloat16]()
-                    pbuf_lo.unsafe_store[width=8](4 * (i + u), lo0.join(lo1))
-        else:
-            comptime for u in range(4):
-                logits.unsafe_store[width=4](4 * (i + u), e[u])
-        s0 = (s0 + e[0]) + e[2]
-        s1 = (s1 + e[1]) + e[3]
-    return s0 + s1
-
-
-@always_inline
-def _exp_row[dtype: DType, DEG: Int, LO: Bool](
+def _exp_row[
+    NS: Int, DEG: Int, PAIRS: Bool, LO: Bool
+](
     logits: MutPointer[Float32, _],
     pbuf: MutPointer[BFloat16, _],
     pbuf_lo: MutPointer[BFloat16, _],
     row: Int,
     nk: Int,
-    vc: V4,
-    vmn: V4,
-) -> V4:
-    """P for one row of a partial or multi-row step. bf16 keeps fp32 P in
-    `logits` only when nk is odd: the unpaired last key is an fp32 FMA."""
-    var sum = V4(0)
-    var t = 0
-    while t < nk:
-        var e = exp2[DEG, 4](logits.unsafe_load[width=4](row + t).fma(vc, vmn))
-        comptime if dtype == DType.bfloat16:
+    c: Float32,
+    mn: Float32,
+) -> Float32:
+    """p = 2^(logit*c - mn) for one row of a step; returns the row sum. PAIRS:
+    bf16 P (+ its low residual when LO) for `dot_bf16`, and fp32 P only for an
+    odd step, whose unpaired last key is an fp32 FMA. Otherwise fp32 P in place."""
+    comptime V = SIMD[DType.float32, LANES]
+    var s = Array[V, NS](fill=V(0))
+
+    @always_inline
+    def one(t: Int) capturing -> V:
+        var e = exp2[DEG, LANES](logits.unsafe_load[width=LANES](row + t).fma(V(c), V(-mn)))
+        comptime if PAIRS:
             var hi = e.cast[DType.bfloat16]()
-            pbuf.unsafe_store[width=4](row + t, hi)
+            pbuf.unsafe_store[width=LANES](row + t, hi)
             comptime if LO:
-                pbuf_lo.unsafe_store[width=4](
+                pbuf_lo.unsafe_store[width=LANES](
                     row + t, (e - hi.cast[DType.float32]()).cast[DType.bfloat16]()
                 )
             if (nk & 1) == 1:
-                logits.unsafe_store[width=4](row + t, e)
+                logits.unsafe_store[width=LANES](row + t, e)
         else:
-            logits.unsafe_store[width=4](row + t, e)
-        sum += e
-        t += 4
-    return sum
+            logits.unsafe_store[width=LANES](row + t, e)
+        return e
+
+    var t = 0
+    while t + NS * LANES <= nk:
+        comptime for u in range(NS):
+            s[u] += one(t + u * LANES)
+        t += NS * LANES
+    while t < nk:
+        s[0] += one(t)
+        t += LANES
+    var sum = s[0]
+    comptime for u in range(1, NS):
+        sum += s[u]
+    return sum.reduce_add()
 
 
 @always_inline
-def _bf16x2(w: MutPointer[Int32, _], i: Int) -> SIMD[DType.bfloat16, 8]:
-    """Word `i` (a key pair of bf16 probabilities) in all 4 lanes."""
-    return bitcast_bf16[4](SIMD[DType.int32, 4](w.unsafe_load(i)))
-
-
-@always_inline
-def _pv_arm[
-    dtype: DType, hd: Int, R: Int, KT: Int, FULL: Bool
+def _pv[
+    dtype: DType, hd: Int, R: Int, FULL: Bool
 ](
     k0: Int,
     nk: Int,
@@ -833,141 +477,168 @@ def _pv_arm[
     p: MutPointer[Float32, _],
     acc: MutPointer[Float32, _],
 ):
-    """acc[r] = acc[r]*alpha[r] + sum_j P[r][j] * V[k0+j] over `units` 16-key
-    units (FULL: R == 1 and all 64 keys). bf16 V is key pairs: `bfdot` on bf16
-    P, plus its low residual when len < 128 (short contexts can have one
-    dominant key, where single-bf16 P misses the 1e-3 gate). fp32: FMA per key."""
-    comptime DC = min(hd, max(4, 64 // R))
-    comptime NC = DC // 4
+    """acc[r] = acc[r]*alpha[r] + sum_j P[r][j] * V[k0+j] over exactly nk keys
+    (never past `len`: 0 * a padded NaN is NaN), unit by unit (FULL: all units
+    of a step, 16 keys each), NC dim vectors at a time."""
+    comptime D = Decode[dtype, hd, R]
+    comptime L = PageLayout[dtype, hd]
+    comptime V = SIMD[DType.float32, LANES]
+    comptime KT = D.KT
+    comptime NC = D.NC
+    comptime LN = D.LN
     var pw = ptr[Int32](Int(pbuf))  # one bf16 key pair per word
     var plw = ptr[Int32](Int(pbuf_lo))
-    comptime for dc in range(0, hd, DC):
-        var a = Array[V4, R * NC](fill=V4(0))
-        _acc_load[hd, R, NC, 4, R * NC](a, acc, dc, k0, alpha)
-        for g in range(4 if FULL else units):
-            var kv = 16 if FULL else min(16, nk - g * 16)
-            var vbg = Int(vbase.unsafe_load(g)) + dc * 4
+    comptime for dc in range(0, hd, NC * LANES):
+        var a = Array[V, LN * R * NC](fill=V(0))
+        _acc_load[hd, R, NC, LANES, LN * R * NC](a, acc, dc, k0, alpha)
+        for g in range(D.UNITS if FULL else units):
+            var kv = D.UNIT if FULL else min(D.UNIT, nk - g * D.UNIT)
             var t = 0  # keys done in this unit
-            comptime if dtype == DType.bfloat16:
-                var w0 = g * 8  # P word (key pair) of this unit's first key
+            comptime if D.PAIRS:
+                # bf16 V key pairs `[key/2][hd][2]`: one load is LANES dims of a
+                # key pair, contracted against the pair's two probabilities.
+                var vbg = Int(vbase.unsafe_load(g)) + dc * 4
+                var w0 = g * (D.UNIT // 2)
+
+                @always_inline
+                def prob(w: MutPointer[Int32, _], r: Int, t: Int) capturing -> SIMD[DType.bfloat16, 2 * LANES]:
+                    return bitcast_bf16[LANES](SIMD[DType.int32, LANES](w.unsafe_load(r * (KT // 2) + w0 + (t >> 1))))
+
                 if len >= 128:
                     comptime if R == 1:
-                        # Unrolled by two key pairs.
+                        # Two key pairs per step.
                         while t + 3 < kv:
-                            var p0 = _bf16x2(pw, w0 + (t >> 1))
-                            var p1 = _bf16x2(pw, w0 + (t >> 1) + 1)
-                            var vp0 = ptr[BFloat16](vbg + t * (hd * 2))
-                            var vp1 = ptr[BFloat16](vbg + (t + 2) * (hd * 2))
+                            var p0 = prob(pw, 0, t)
+                            var p1 = prob(pw, 0, t + 2)
+                            var vp0 = ptr[BFloat16](vbg + t * hd * 2)
+                            var vp1 = ptr[BFloat16](vbg + (t + 2) * hd * 2)
                             comptime for i in range(NC):
-                                a[i] = dot_bf16[4](a[i], vp0.unsafe_load[width=8](i * 8), p0)
+                                a[i] = dot_bf16[LANES](a[i], vp0.unsafe_load[width = 2 * LANES](i * 2 * LANES), p0)
                             comptime for i in range(NC):
-                                a[i] = dot_bf16[4](a[i], vp1.unsafe_load[width=8](i * 8), p1)
+                                a[i] = dot_bf16[LANES](a[i], vp1.unsafe_load[width = 2 * LANES](i * 2 * LANES), p1)
                             t += 4
                     while t + 1 < kv:
-                        var pr = Array[SIMD[DType.bfloat16, 8], R](uninitialized=True)
+                        var pr = Array[SIMD[DType.bfloat16, 2 * LANES], R](uninitialized=True)
                         comptime for r in range(R):
-                            pr[r] = _bf16x2(pw, r * (KT // 2) + w0 + (t >> 1))
-                        var vp = ptr[BFloat16](vbg + t * (hd * 2))
+                            pr[r] = prob(pw, r, t)
+                        var vp = ptr[BFloat16](vbg + t * hd * 2)
                         comptime for i in range(NC):
-                            var v = vp.unsafe_load[width=8](i * 8)
+                            var v = vp.unsafe_load[width = 2 * LANES](i * 2 * LANES)
                             comptime for r in range(R):
-                                a[r * NC + i] = dot_bf16[4](a[r * NC + i], v, pr[r])
+                                a[r * NC + i] = dot_bf16[LANES](a[r * NC + i], v, pr[r])
                         t += 2
                 else:
+                    # Short contexts can have one dominant key, where single-bf16
+                    # P misses the 1e-3 gate: add P's low bf16 residual.
                     while t + 1 < kv:
-                        var pr = Array[SIMD[DType.bfloat16, 8], R](uninitialized=True)
-                        var lo = Array[SIMD[DType.bfloat16, 8], R](uninitialized=True)
+                        var pr = Array[SIMD[DType.bfloat16, 2 * LANES], R](uninitialized=True)
+                        var lo = Array[SIMD[DType.bfloat16, 2 * LANES], R](uninitialized=True)
                         comptime for r in range(R):
-                            pr[r] = _bf16x2(pw, r * (KT // 2) + w0 + (t >> 1))
-                            lo[r] = _bf16x2(plw, r * (KT // 2) + w0 + (t >> 1))
-                        var vp = ptr[BFloat16](vbg + t * (hd * 2))
+                            pr[r] = prob(pw, r, t)
+                            lo[r] = prob(plw, r, t)
+                        var vp = ptr[BFloat16](vbg + t * hd * 2)
                         comptime for i in range(NC):
-                            var v = vp.unsafe_load[width=8](i * 8)
+                            var v = vp.unsafe_load[width = 2 * LANES](i * 2 * LANES)
                             comptime for r in range(R):
-                                a[r * NC + i] = dot_bf16[4](a[r * NC + i], v, pr[r])
-                                a[r * NC + i] = dot_bf16[4](a[r * NC + i], v, lo[r])
+                                a[r * NC + i] = dot_bf16[LANES](a[r * NC + i], v, pr[r])
+                                a[r * NC + i] = dot_bf16[LANES](a[r * NC + i], v, lo[r])
                         t += 2
                 comptime if not FULL:
                     if t < kv:
-                        # The unpaired last key: only its half of the pair is
-                        # used (0 * a padded NaN is still NaN).
-                        var vp = ptr[BFloat16](vbg + t * (hd * 2))
+                        # The unpaired last key: only its half of the pair (0 *
+                        # a padded NaN is still NaN).
+                        var vp = ptr[BFloat16](vbg + t * hd * 2)
                         comptime for i in range(NC):
-                            var v = (
-                                vp.unsafe_load[width=8](i * 8)
-                                .shuffle[0, 2, 4, 6, 0, 2, 4, 6]()
-                                .slice[4]()
-                                .cast[DType.float32]()
+                            var v = rebind[V](
+                                vp.unsafe_load[width = 2 * LANES](i * 2 * LANES).cast[DType.float32]().deinterleave()[0]
                             )
                             comptime for r in range(R):
-                                var prob = p.unsafe_load(r * KT + g * 16 + t)
-                                a[r * NC + i] = V4(prob).fma(v, a[r * NC + i])
+                                a[r * NC + i] = V(p.unsafe_load(r * KT + g * D.UNIT + t)).fma(v, a[r * NC + i])
             else:
-                comptime if R == 1:
+                # V rows `[key][hd]`, fp32 P.
+                var vp = ptr[Scalar[dtype]](Int(vbase.unsafe_load(g)) + dc * D.E)
+
+                @always_inline
+                def vrow(t: Int, i: Int) capturing -> V:
+                    comptime if L.SPLIT:
+                        # Dims are kept even/odd-split per 2*LANES block: one
+                        # 64-byte load is LANES words; `<< 16` is the even dims
+                        # and `& 0xffff0000` the odd ones, 2 instructions per 32
+                        # values against 4 for zero-extend + shift (the widen was
+                        # 28% of a bf16 decode). Each dim's fp32 math is unchanged.
+                        var w = bitcast[DType.int32, LANES](
+                            (vp + t * hd).unsafe_load[width = 2 * LANES]((i // 2) * 2 * LANES)
+                        )
+                        if i % 2 == 0:
+                            return bitcast[DType.float32, LANES](w << 16)
+                        return bitcast[DType.float32, LANES](w & Int32(-65536))
+                    else:
+                        return (vp + t * hd).unsafe_load[width=LANES](i * LANES).cast[DType.float32]()
+
+                var pk = p + g * D.UNIT
+                comptime if LN == 2:
                     while t + 1 < kv:
-                        var p01 = p.unsafe_load[width=2](g * 16 + t)
-                        var vr0 = ptr[Float32](vbg + t * hd * 4)
-                        var vr1 = ptr[Float32](vbg + (t + 1) * hd * 4)
-                        comptime for i in range(NC):
-                            a[i] = V4(p01[0]).fma(vr0.unsafe_load[width=4](i * 4), a[i])
-                        comptime for i in range(NC):
-                            a[i] = V4(p01[1]).fma(vr1.unsafe_load[width=4](i * 4), a[i])
-                        t += 2
-                    comptime if not FULL:
-                        if t < kv:
-                            var vr0 = ptr[Float32](vbg + t * hd * 4)
-                            comptime for i in range(NC):
-                                a[i] = V4(p.unsafe_load(g * 16 + t)).fma(
-                                    vr0.unsafe_load[width=4](i * 4), a[i]
-                                )
-                else:
-                    while t < kv:
-                        var pr = Array[V4, R](uninitialized=True)
+                        var p0 = Array[V, R](uninitialized=True)
+                        var p1 = Array[V, R](uninitialized=True)
                         comptime for r in range(R):
-                            pr[r] = V4(p.unsafe_load(r * KT + g * 16 + t))
-                        var vr0 = ptr[Float32](vbg + t * hd * 4)
+                            p0[r] = V(pk.unsafe_load(r * KT + t))
+                            p1[r] = V(pk.unsafe_load(r * KT + t + 1))
                         comptime for i in range(NC):
-                            var v0 = vr0.unsafe_load[width=4](i * 4)
+                            var v0 = vrow(t, i)
+                            var v1 = vrow(t + 1, i)
                             comptime for r in range(R):
-                                a[r * NC + i] = pr[r].fma(v0, a[r * NC + i])
-                        t += 1
+                                a[r * NC + i] = p0[r].fma(v0, a[r * NC + i])
+                                a[(R + r) * NC + i] = p1[r].fma(v1, a[(R + r) * NC + i])
+                        t += 2
+                while t < kv:
+                    var p0 = Array[V, R](uninitialized=True)
+                    comptime for r in range(R):
+                        p0[r] = V(pk.unsafe_load(r * KT + t))
+                    comptime for i in range(NC):
+                        var v0 = vrow(t, i)
+                        comptime for r in range(R):
+                            a[r * NC + i] = p0[r].fma(v0, a[r * NC + i])
+                    t += 1
         comptime for r in range(R):
             comptime for i in range(NC):
-                acc.unsafe_store[width=4](r * hd + dc + i * 4, a[r * NC + i])
+                var s = a[r * NC + i]
+                comptime if LN == 2:
+                    s += a[(R + r) * NC + i]
+                acc.unsafe_store[width=LANES](r * hd + dc + i * LANES, s)
 
 
-def _attend_rows_arm[
+def _attend_rows[
     dtype: DType, hd: Int, R: Int, PAGE: Int
 ](job: PagedJob, seq: Int, kvh: Int, h0: Int, nrows: Int):
-    """`_attend_rows` on aarch64 (fp32, and bf16 with `bfdot`)."""
-    comptime BF = dtype == DType.bfloat16
-    comptime E = 2 if BF else 4
-    comptime KT = 64
-    comptime DEG = 5 if BF else 6
+    """Query heads `h0 .. h0+nrows-1` (nrows <= R, all of kv head `kvh`)."""
+    comptime D = Decode[dtype, hd, R]
+    comptime KT = D.KT
+    comptime assert D.UNIT % LANES == 0 and KT % D.UNIT == 0, "a step is whole units of whole vectors"
+    comptime assert hd % (D.NC * LANES) == 0, "P@V chunks tile head_dim"
+    comptime V = SIMD[DType.float32, LANES]
     var page = PAGE if PAGE else job.page
     var len = Int(ptr[Int32](job.lens).unsafe_load(seq)) + (
         1 if (job.do_store and job.slots == 0) else 0
     )
     var bt = ptr[Int32](job.block_table + seq * job.bt_stride * 4)
     var c = job.scale * Float32(LOG2E)
-    var vc = V4(c)
 
-    # Queries: at R == 1 read `job.q` directly; for R > 1 pack R rows.
-    comptime QW = hd * E // 4  # int32 words per row
+    # Queries as int32 words (bf16 dim pairs or fp32): at R == 1 read in place,
+    # for R > 1 pack R rows (the last one repeated) into a stack buffer.
+    comptime QW = hd * D.E // 4
     var qbuf = stack_allocation[(R * QW) if R > 1 else 1, DType.int32, alignment=64]()
-    var q = (job.q + (seq * job.q_stride + h0 * hd) * E) if R == 1 else Int(qbuf)
+    var q = (job.q + (seq * job.q_stride + h0 * hd) * D.E) if R == 1 else Int(qbuf)
     comptime if R > 1:
         for r in range(R):
-            var rr = min(r, nrows - 1)
-            var s = ptr[Int32](job.q + (seq * job.q_stride + (h0 + rr) * hd) * E)
+            var s = ptr[Int32](job.q + (seq * job.q_stride + (h0 + min(r, nrows - 1)) * hd) * D.E)
             comptime for w in range(0, QW, 4):
                 qbuf.unsafe_store[width=4](r * QW + w, s.unsafe_load[width=4](w))
 
-    var kbase = stack_allocation[4, DType.int64, alignment=32]()
-    var vbase = stack_allocation[4, DType.int64, alignment=32]()
+    var kbase = stack_allocation[D.UNITS, DType.int64, alignment=64]()
+    var vbase = stack_allocation[D.UNITS, DType.int64, alignment=64]()
     var logits = stack_allocation[R * KT, DType.float32, alignment=64]()
-    var pbuf = stack_allocation[(R * KT) if BF else 1, DType.bfloat16, alignment=64]()
-    var pbuf_lo = stack_allocation[(R * KT) if BF else 1, DType.bfloat16, alignment=64]()
+    var pbuf = stack_allocation[(R * KT) if D.PAIRS else 1, DType.bfloat16, alignment=64]()
+    var pbuf_lo = stack_allocation[(R * KT) if D.PAIRS else 1, DType.bfloat16, alignment=64]()
     var acc = stack_allocation[R * hd, DType.float32, alignment=64]()
     var m = SIMD[DType.float32, R](-Float32.MAX)
     var l = SIMD[DType.float32, R](0)
@@ -975,60 +646,47 @@ def _attend_rows_arm[
     var k0 = 0
     while k0 < len:
         var nk = min(KT, len - k0)
-        var units = (nk + 15) >> 4
-        _unit_bases[E, hd, PAGE](job, bt, kvh, page, k0, units, kbase, vbase)
-        comptime if R == 1:
-            if nk == KT:
-                var mx = _qk_full[dtype, hd](page, kbase, q, logits)
-                var s = _rescale[DEG](k0, mx.reduce_max() * c, m[0])
-                m[0] = s[0]
-                var vmn = V4(-s[0])
-                var sum: V4
-                if BF and len < 128:
-                    sum = _exp_full[dtype, DEG, True](logits, pbuf, pbuf_lo, vc, vmn)
-                else:
-                    sum = _exp_full[dtype, DEG, False](logits, pbuf, pbuf_lo, vc, vmn)
-                l[0] = (l[0] * s[1] if k0 > 0 else Float32(0)) + sum.reduce_add()
-                _pv_arm[dtype, hd, R, KT, True](
-                    k0, KT, len, 4, SIMD[DType.float32, R](s[1]),
-                    vbase, pbuf, pbuf_lo, logits, acc,
-                )
-                k0 += nk
-                continue
+        var units = (nk + D.UNIT - 1) // D.UNIT
+        _unit_bases[D.E, hd, PAGE](job, bt, kvh, page, k0, units, kbase, vbase)
 
-        # Partial step, or R > 1: H groups of 4 keys per scoring call (a
-        # register-tile shape per dtype and R).
-        comptime H = 4 if R == 1 else ((4 if R == 2 else 2) if BF else 1)
-        var mx = Array[V4, R](fill=V4(-Float32.MAX))
-        for g in range(units):
-            var kbg = Int(kbase.unsafe_load(g))
-            comptime if R == 1:
-                if nk - g * 16 <= 4:  # tail skip: score one group, not four
-                    _qk_emit[dtype, hd, R, 1, KT](kbg, page, q, g * 16, nk, logits, mx)
-                    continue
-            comptime for s in range(0, 4, H):
-                if g * 16 + s * 4 < nk:
-                    _qk_emit[dtype, hd, R, H, KT](
-                        kbg + s * 16, page, q, g * 16 + s * 4, nk, logits, mx
-                    )
+        # ---- Q@K^T: G key vectors per call; the tail in masked calls of at
+        # most one unit, and a single vector when that is all that is left.
+        var mx = Array[V, R](fill=V(-Float32.MAX))
+        var j = 0
+        while j + D.G * LANES <= nk:
+            _qk[dtype, hd, R, D.G, KT, False](kbase, page, q, j, nk, logits, mx)
+            j += D.G * LANES
+        while j < nk:
+            if nk - j <= LANES:
+                _qk[dtype, hd, R, 1, KT, True](kbase, page, q, j, nk, logits, mx)
+                break
+            _qk[dtype, hd, R, D.G_TAIL, KT, True](kbase, page, q, j, nk, logits, mx)
+            j += D.G_TAIL * LANES
+
+        # ---- online softmax per row; p = 2^(logit*c - m), m in scaled log2 units
         var alpha = SIMD[DType.float32, R](1)
         comptime for r in range(R):
-            var s = _rescale[DEG](k0, mx[r].reduce_max() * c, m[r])
+            var s = _rescale[D.DEG](k0, mx[r].reduce_max() * c, m[r])
             m[r] = s[0]
             alpha[r] = s[1]
-            var vmn = V4(-s[0])
-            var sum: V4
-            if BF and len < 128:
-                sum = _exp_row[dtype, DEG, True](logits, pbuf, pbuf_lo, r * KT, nk, vc, vmn)
+            var sum: Float32
+            if D.PAIRS and len < 128:
+                sum = _exp_row[D.NS, D.DEG, D.PAIRS, True](logits, pbuf, pbuf_lo, r * KT, nk, c, s[0])
             else:
-                sum = _exp_row[dtype, DEG, False](logits, pbuf, pbuf_lo, r * KT, nk, vc, vmn)
-            l[r] = (l[r] * alpha[r] if k0 > 0 else Float32(0)) + sum.reduce_add()
-        _pv_arm[dtype, hd, R, KT, False](
-            k0, nk, len, units, alpha, vbase, pbuf, pbuf_lo, logits, acc
-        )
+                sum = _exp_row[D.NS, D.DEG, D.PAIRS, False](logits, pbuf, pbuf_lo, r * KT, nk, c, s[0])
+            l[r] = (l[r] * alpha[r] if k0 > 0 else Float32(0)) + sum
+
+        # ---- P@V
+        comptime if D.FULL:
+            if nk == KT:
+                _pv[dtype, hd, R, True](k0, nk, len, units, alpha, vbase, pbuf, pbuf_lo, logits, acc)
+                k0 += nk
+                continue
+        _pv[dtype, hd, R, False](k0, nk, len, units, alpha, vbase, pbuf, pbuf_lo, logits, acc)
         k0 += nk
 
     _store_rows[dtype, hd, R](job, seq, h0, nrows, l, acc)
+
 
 
 # ---------------------------------------------------------------------------
