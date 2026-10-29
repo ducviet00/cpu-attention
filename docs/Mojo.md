@@ -244,6 +244,8 @@ noted; the results that count are the three GCP VMs in the README.
 | harness verdict band includes the spread of C++'s identical-code `amx` and `vec` paged arms | Xeon 67/61/42 -> 64/76/30 (win/unresolved/loss); no other box has such twins | kept |
 | `bench.py` memory growth | closures kept every arm's K/V cache alive until a GC pass: 8.1 GB RSS and an OOM kill at row 156 of 170 on an 11.6 GB machine; `gc.collect()` per row and `--resume` | fixed |
 | AMX partial query tile: configure only the live A/C rows (Xeon) | the hardware is cheaper with fewer rows (isolated tile-dot microbenchmark: 1-4 rows 3.0 ns, 8 rows 3.2, 16 rows 5.2 ns), but building the configuration from runtime row counts changed the full-row code: fp32 1024:8:32 1.125, 1025:8:32 1.080, fused 1024:8:64 1.104 against an independent previous build; one win (fp32 17x301, 0.94, where the vector policy is faster anyway) | rejected; next try would keep the constant full-tile configuration and patch only the row bytes on a tail |
+| x86 decode key tile 256/512 -> 2048 keys (R=1), C4D | single-process cache-rotation A/B: bf16 b=1 ctx=4096 0.96 of the previous build, others within 2%; full-manifest harness with an independent previous-build control: median 0.994 over 92 paged rows, b=1 ctx=4096 bf16 1.06-1.09 (control spread up to 1.07-1.28 on memory-bound rows) | reverted: not reproducible beyond control spread |
+| x86 fp32 decode Q@K^T with 4 key groups per step (`G=4`, R=1), C4D | 1 thread 0.90, 2 threads 0.96, 4 threads 1.00 of the previous build (DRAM-bound at 4) | reverted: no gain where the rows lose |
 
 **Axion decode ledger (c4a-standard-8, one process, independent control, vs `2fc4652`).**
 
