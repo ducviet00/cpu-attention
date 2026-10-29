@@ -17,7 +17,7 @@ def main():
     if not attn.is_available():
         # A gate that cannot run has not passed.
         print(
-            "FAIL: the selected backend is not built (uv run --extra build python scripts/build.py)"
+            "FAIL: the kernel is not built (uv run --extra build python scripts/build.py)"
         )
         return 1
 

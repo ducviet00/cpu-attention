@@ -3,16 +3,14 @@
 Every arm is its own copy of the ``cpu_attention`` package -- Python glue *and*
 shared objects -- in a private directory, imported under a unique module name.
 So two arms never share a plan cache, a workspace, a ``dlopen`` handle or
-module-level state, and a duplicate arm is a real control (docs/CPP.md §7.2:
-a second closure over one module is not).
+module-level state, and a duplicate arm is a real control (a second closure over
+one module is not: it shares every cache the timing depends on).
 
 * ``current(name)``: this checkout's glue and builds (the build under test).
-* ``tagged(name, tag, libs)``: the glue from a git tag with the given builds,
-  e.g. the Mojo oracle at ``mojo-oracle-v1`` with its saved ``_C.so``.
+* ``snapshot(name, directory)``: a saved package directory (a previous build).
 
-``Arm.env`` is applied around each timed sample, outside the timer: the C++
-backend reads ``CPU_ATTENTION_ISA`` on every call, which is how one process
-times each C++ ISA path.
+``Arm.env`` (e.g. a forced ``CPU_ATTENTION_ISA``) is applied around each timed
+sample, outside the timer.
 """
 
 import glob
@@ -36,8 +34,8 @@ def clear_env():
 
 
 class Arm:
-    def __init__(self, name, pkg, backend, env, origin):
-        self.name, self.pkg, self.backend = name, pkg, backend
+    def __init__(self, name, pkg, env, origin):
+        self.name, self.pkg = name, pkg
         self.env, self.origin = dict(env), origin
 
     def enter(self):
@@ -49,7 +47,7 @@ class Arm:
 
     def describe(self):
         mod = self.module()
-        info = {"backend": self.backend, "env": self.env, "origin": self.origin,
+        info = {"env": self.env, "origin": self.origin,
                  "lib": getattr(mod, "__file__", None)}
         root = os.path.dirname(self.pkg.__file__)
         info["sha256"] = {}
@@ -59,7 +57,7 @@ class Arm:
                 info["sha256"][os.path.basename(path)] = hashlib.sha256(
                     f.read()).hexdigest()
         self.enter()
-        for probe in ("isa", "tier", "backend"):
+        for probe in ("isa", "tier"):
             fn = getattr(mod, probe, None)
             if callable(fn):
                 try:
@@ -69,20 +67,18 @@ class Arm:
         return info
 
 
-def _import(name, src_py_dir, libs, backend, env):
+def _import(name, src_py_dir, libs, env):
     dst = os.path.join(_TMP, name, "ca_" + name)
     os.makedirs(dst)
     for f in glob.glob(os.path.join(src_py_dir, "*.py")):
         shutil.copy(f, dst)
     for base, src in libs.items():
         shutil.copy(src, os.path.join(dst, base))
-    saved = {k: os.environ.get(k) for k in _ENV_KEYS + ("CPU_ATTENTION_BACKEND",
-                                                        "CPU_ATTENTION_LIB")}
+    saved = {k: os.environ.get(k) for k in _ENV_KEYS + ("CPU_ATTENTION_LIB",)}
     try:
         for k in saved:
             os.environ.pop(k, None)
         os.environ.update(env)
-        os.environ["CPU_ATTENTION_BACKEND"] = backend
         modname = "ca_" + name
         spec = importlib.util.spec_from_file_location(
             modname, os.path.join(dst, "__init__.py"),
@@ -96,65 +92,26 @@ def _import(name, src_py_dir, libs, backend, env):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
-    pkg._kernel.set_backend(backend)
     if pkg._kernel.module() is None:
-        raise RuntimeError(f"arm {name}: {backend} build did not load from {dst}")
+        raise RuntimeError(f"arm {name}: the build did not load from {dst}")
     return pkg
 
 
-def current(name, backend, env=None):
+def current(name, env=None):
     libs = {os.path.basename(p): p for p in glob.glob(os.path.join(PKG, "_C*.so"))}
-    pkg = _import(name, PKG, libs, backend, env or {})
+    pkg = _import(name, PKG, libs, env or {})
     rev = subprocess.run(["git", "-C", ROOT, "rev-parse", "--short", "HEAD"],
                          capture_output=True, text=True).stdout.strip()
     dirty = subprocess.run(["git", "-C", ROOT, "status", "--porcelain",
                             "cpu_attention"], capture_output=True,
                            text=True).stdout.strip()
-    return Arm(name, pkg, backend, env or {}, f"{rev}{'+dirty' if dirty else ''}")
+    return Arm(name, pkg, env or {}, f"{rev}{'+dirty' if dirty else ''}")
 
 
-def snapshot(name, directory, backend="mojo", env=None):
+def snapshot(name, directory, env=None):
     directory = os.path.abspath(directory)
     libs = {os.path.basename(p): p for p in glob.glob(
         os.path.join(directory, "_C*.so"))}
-    pkg = _import(name, directory, libs, backend, env or {})
-    return Arm(name, pkg, backend, env or {}, directory)
+    pkg = _import(name, directory, libs, env or {})
+    return Arm(name, pkg, env or {}, directory)
 
-
-def tagged(name, tag, backend, libs, env=None):
-    """Glue from git ``tag`` with the shared objects in ``libs``."""
-    src = os.path.join(_TMP, f"src_{name}")
-    os.makedirs(src)
-    archive = subprocess.run(["git", "-C", ROOT, "archive", tag, "cpu_attention"],
-                             capture_output=True, check=True).stdout
-    subprocess.run(["tar", "-x", "-C", src, "--strip-components=1",
-                    "--wildcards", "cpu_attention/*.py"], input=archive,
-                   check=True)
-    pkg = _import(name, src, libs, backend, env or {})
-    return Arm(name, pkg, backend, env or {}, tag)
-
-
-def cpu_flags():
-    try:
-        with open("/proc/cpuinfo") as f:
-            for line in f:
-                if line.startswith(("flags", "Features")):
-                    return set(line.split(":", 1)[1].split())
-    except OSError:
-        pass
-    return set()
-
-
-def cpp_isas(dtype):
-    """The C++ ISA paths applicable on this CPU for ``dtype`` ('bf16'|'fp32')."""
-    flags = cpu_flags()
-    if "avx512f" in flags:
-        isas = []
-        if "amx_tile" in flags and "amx_bf16" in flags:
-            isas.append("amx")
-        if dtype == "fp32" or "avx512_bf16" in flags:
-            isas.append("vec")
-        return isas + ["scalar"]
-    if "asimd" in flags:
-        return (["neon"] if dtype == "fp32" or "bf16" in flags else []) + ["scalar"]
-    return ["scalar"]

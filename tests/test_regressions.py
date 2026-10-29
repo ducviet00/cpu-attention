@@ -1,12 +1,11 @@
-"""Regression coverage for both APIs, run against the selected backend.
+"""Regression coverage for both APIs.
 
-    CPU_ATTENTION_BACKEND=mojo uv run python tests/test_regressions.py
-    CPU_ATTENTION_BACKEND=cpp  uv run python tests/test_regressions.py [--quick]
+    uv run python tests/test_regressions.py [--quick]
 
 Gates are the repository's (README): flash_attn_func fp32 <= 2e-4 and bf16 <=
 3e-2 against the naive fp32 reference (fp64 arbitrates a reference that is
-itself out of tolerance); paged fp32 <= 1e-6; paged bf16 <= 3e-2 here (the
-2-ulp cross-backend gate is test_paged_sweep's), and on aarch64 <= 1e-3.
+itself out of tolerance); paged fp32 <= 1e-6; paged bf16 <= 1e-3 beyond the bf16
+output rounding (reference.bf16_excess).
 
 Covers: odd lengths around tile/page boundaries, unequal query/key lengths
 (bottom-right causal), fully masked rows, MHA/GQA/MQA, all head dims, causal
@@ -19,7 +18,6 @@ interpreter (memory safety) run in a subprocess.
 """
 
 import os
-import platform
 import subprocess
 import sys
 import threading
@@ -35,7 +33,6 @@ import reference as R  # noqa: E402
 import cpu_attention as A  # noqa: E402
 from cpu_attention import _kernel as K  # noqa: E402
 
-ARM64 = platform.machine() in ("aarch64", "arm64")
 QUICK = "--quick" in sys.argv
 ODD = [15, 17, 31, 33, 47, 49, 63, 65, 127, 129, 255, 257, 511, 513, 1023,
        1025, 2047, 2049, 4095, 4097]
@@ -229,11 +226,10 @@ def test_concurrent():
 
 
 def test_two_builds():
-    """Two independently loaded copies of this backend, calls interleaved."""
+    """Two independently loaded copies of the package, calls interleaved."""
     import arms
-    backend = K.backend()
-    a = arms.current("reg_a", backend)
-    b = arms.current("reg_b", backend)
+    a = arms.current("reg_a")
+    b = arms.current("reg_b")
     q = torch.randn(1, 300, 4, 64)
     k = torch.randn(1, 300, 2, 64)
     v = torch.randn(1, 300, 2, 64)
@@ -257,9 +253,8 @@ def test_two_builds():
 # flash_attn_with_kvcache / engine
 # ---------------------------------------------------------------------------
 def paged_tol(dt):
-    # bf16 on aarch64: 1e-3 above the bf16 output-rounding floor (see
-    # reference.bf16_excess); x86 bf16 parity is test_paged_sweep's 2-ulp gate.
-    return 1e-6 if dt == torch.float32 else (1e-3 if ARM64 else 3e-2)
+    # bf16: 1e-3 above the bf16 output-rounding floor (reference.bf16_excess).
+    return 1e-6 if dt == torch.float32 else 1e-3
 
 
 def paged_case(b, ctxs, h, hk, d, page, dt, seed, permute=True, poison=True,
@@ -310,7 +305,7 @@ def paged_ref(pc, dtype=torch.float32):
 
 def paged_err(pc, got):
     ref = paged_ref(pc)
-    if pc["q"].dtype == torch.bfloat16 and ARM64:
+    if pc["q"].dtype == torch.bfloat16:
         return R.bf16_excess(got, ref)
     err = (got.float() - ref).abs().max().item()
     if pc["q"].dtype == torch.float32 and err > 1e-6:
@@ -393,7 +388,7 @@ def test_paged_out_guard_and_scale():
         report(f"out= result {tag(dt)}", err <= paged_tol(dt), f"err {err:.3e}")
         # Changed scale catches a stale plan (a gross error). The scales stay in
         # the range the 1e-6 fp32 gate is defined for: at 0.9 the logits reach
-        # ~30 and the fp32 *reference* is 6.4e-6 from fp64 (both backends
+        # ~30 and the fp32 *reference* is 6.4e-6 from fp64 (the kernels
         # 1.7-2.6e-6), so no fp32 kernel can meet 1e-6 there.
         for scale in (0.05, 0.125, 0.05, 0.1):
             pc["scale"] = scale
@@ -422,7 +417,7 @@ import test_regressions as T, cpu_attention as A
 case = sys.argv[1]
 for dt in (torch.float32, torch.bfloat16):
     if case == "neg_slot":
-        # A negative slot skips that sequence's store (C++ semantics); its
+        # A negative slot skips that sequence's store (vLLM semantics); its
         # attention still runs over the existing cache.
         pc = T.paged_case(2, [40, 16], 4, 2, 64, 16, dt, seed=1)
         kc, vc = pc["kc"].clone(), pc["vc"].clone()
@@ -459,7 +454,7 @@ def test_memory_safety():
 
 def main():
     torch.manual_seed(0)
-    print(f"backend {K.backend()}{' quick' if QUICK else ''}", flush=True)
+    print(f"tier {K.module().tier()}{' quick' if QUICK else ''}", flush=True)
     for t in (test_memory_safety, test_odd_lengths, test_unequal, test_strides,
               test_scale_and_plans, test_workers, test_amx_toggle,
               test_paged_boundaries, test_paged_store_order,

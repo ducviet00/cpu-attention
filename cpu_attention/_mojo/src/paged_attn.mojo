@@ -22,7 +22,7 @@ from parallel import barrier, parallel
 
 comptime V_PAIRS_ARM = CompilationTarget.has_neon()
 """aarch64 stores bf16 V as key pairs (`[page/2][hd][2]`) so `bfdot` can contract
-two keys; x86 keeps `[page][hd]` (fp32 P@V, bit-parity class with C++)."""
+two keys; x86 keeps `[page][hd]` (fp32 P against widened V rows)."""
 
 
 struct PagedJob(ImplicitlyCopyable, Movable):
@@ -147,7 +147,7 @@ struct PageLayout[dtype: DType, hd: Int]:
         """K of LANES consecutive tokens from `t0` (one kv head, one page) through
         a LANES x LANES transpose of 32-bit K words (an fp32 dim, or a bf16 dim
         pair): one vector store per word row, where per-token stores are LANES
-        scalar stores each (store-bound: fp32 store-only ran 1.14x C++ on the C4D)."""
+        scalar stores each (store-bound: fp32 store-only ran 1.14x slower that way on the C4D)."""
         comptime W = Self.hd * (2 if Self.BF else 4) // 4
         comptime assert W % LANES == 0, "K words tile by LANES"
         comptime for w0 in range(0, W, LANES):
@@ -185,7 +185,7 @@ def _store_kv[dtype: DType, hd: Int, PAGE: Int](job: PagedJob, seq: Int, kvh: In
     var off: Int
     if job.slots != 0:
         var slot = Int(ptr[Int64](job.slots).unsafe_load(seq))
-        if slot < 0:  # padding: no token to store (C++ semantics)
+        if slot < 0:  # padding: no token to store (vLLM semantics)
             return
         var d = _div_page[PAGE](slot, page)
         pg = d[0]
@@ -242,8 +242,7 @@ def _store_block[dtype: DType, hd: Int, PAGE: Int](job: PagedJob, kvh: Int, s0: 
 # units (page % 16 == 0 is checked at dispatch, so a unit never straddles a
 # page): one key vector on AVX-512, two on AVX2, four on NEON. Per target only
 # compile-time constants (`Decode`) and the P@V operand differ:
-#   x86      fp32 P against V rows (bf16 V widened): the C++ class the 2-ulp x86
-#            bf16 gate compares against;
+#   x86      fp32 P against V rows (bf16 V widened);
 #   aarch64  bf16 P against bf16 V key pairs with `dot_bf16` (`bfdot`): widening
 #            V was 70% of the kernel on Axion (docs/Mojo.md §9).
 
@@ -251,8 +250,8 @@ def _store_block[dtype: DType, hd: Int, PAGE: Int](job: PagedJob, kvh: Int, s0: 
 def _kt(hd: Int, R: Int) -> Int:
     """Keys per softmax step. aarch64: 64 (the four unit bases of a step stay in
     registers). x86: at hd <= 64, 256 keys (1 KB) covers ctx=256 in a single
-    pass; at hd == 128 and R == 1 on 16 lanes, 512 keys (2 KB) matches C++
-    vec::Paged; larger R keeps R x KT inside L1 next to the K stream."""
+    pass; at hd == 128 and R == 1 on 16 lanes, 512 keys (2 KB); larger R keeps
+    R x KT inside L1 next to the K stream."""
     if V_PAIRS_ARM:
         return 64
     return 256 if hd <= 64 else (512 if (LANES == 16 and R == 1) else 128)
@@ -284,10 +283,10 @@ struct Decode[dtype: DType, hd: Int, R: Int]:
     comptime G_TAIL = min(Self.G, Self.GPU)
     """A masked tail call never leaves its unit, so it never reads past the step's pages."""
     comptime PAIRS = PageLayout[Self.dtype, Self.hd].V_PAIRS
-    # bf16 on x86: degree 2, inside the bf16 output rounding (the C++ class of
-    # the x86 gate). aarch64's gate is also <= 1e-3 against the fp32 reference,
-    # which degree 2 (relative 1.7e-3) misses by 4x.
-    comptime DEG = (5 if V_PAIRS_ARM else 2) if Self.BF else 6
+    # bf16: degree 5. The gate is <= 1e-3 against the fp32 reference beyond the
+    # bf16 output rounding; degree 2 (relative 1.7e-3) missed it by 4x (x86:
+    # 3.9e-3 worst, 91 of 252 sweep cases; degree 5: 7e-7) for +1.2% instructions.
+    comptime DEG = 5 if Self.BF else 6
     comptime NS = 2 if V_PAIRS_ARM else 1
     """Partial row sums in the softmax (independent adds on 4-lane NEON)."""
     comptime FULL = V_PAIRS_ARM and Self.R == 1
@@ -538,8 +537,7 @@ def _nc(dtype: DType, hd: Int, R: Int) -> Int:
 
 
 struct PVRows[dtype: DType, hd: Int, R: Int](PVKernel):
-    """fp32 P against V rows `[key][hd]` (bf16 V widened): x86, the C++ class of
-    the 2-ulp bf16 gate."""
+    """fp32 P against V rows `[key][hd]` (bf16 V widened): x86."""
 
     comptime P16 = False
     comptime NC = _nc(Self.dtype, Self.hd, Self.R)

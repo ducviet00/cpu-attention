@@ -81,9 +81,9 @@ def exp2[
     (-inf or -1e30) yields 0, never NaN (on NEON ~1e-38, see below).
 
     `degree` trades accuracy for instructions: 2 sits inside a bf16 rounding
-    (relative 2e-3; the C++ class the 2-ulp x86 bf16 decode gate compares
-    against), 4 and 5 are minimax at 2.6e-6 and 3e-6, 6 (Taylor) at 1.2e-7 -- the
-    paged fp32 gate (1e-6 absolute) needs 6.
+    (relative 2e-3; enough for flash bf16), 4 and 5 are minimax at 2.6e-6 and
+    3e-6 (paged bf16 uses 5), 6 (Taylor) at 1.2e-7 -- the paged fp32 gate (1e-6
+    absolute) needs 6.
 
     Per target, the round and the exponent:
     * AVX-512: `vrndscaleps`, then `vscalefps` applies the integer part -- no

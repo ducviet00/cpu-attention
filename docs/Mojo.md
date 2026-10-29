@@ -1,11 +1,12 @@
-# The Mojo backend
+# The Mojo kernel
 
-`cpu_attention/_mojo/` is the default backend: one unified CPU attention for
+`cpu_attention/_mojo/` is the library's kernel: one unified CPU attention for
 both public APIs, `flash_attn_func` (FlashAttention over supplied Q/K/V) and
 `flash_attn_with_kvcache` (one-token paged decode, PagedAttention), built with
-Mojo 1.2.0 (pinned in `pyproject.toml`). The C++ backend (`docs/CPP.md`) is the
-performance competitor; the previous Mojo build is kept as the oracle at tag
-`mojo-oracle-v1.1`.
+Mojo 1.2.0 (pinned in `pyproject.toml`). It is measured against torch SDPA
+(`flash_attn_func`) and vLLM's CPU attention (paged decode). A C++ backend served
+as the competitor until it was removed (Oct 2026; its design and ledger are in
+git history, `docs/CPP.md` before the removal).
 
 ```bash
 uv sync --extra build                                   # torch + mojo==1.2.0
@@ -16,23 +17,16 @@ uv run --extra build python scripts/build.py --tests    # every tier + the stand
 
 Current per-box results, the verdict rule and the caveats are in the
 [README](../README.md#performance), which is the single source of truth for
-numbers; this file does not repeat them. The objective (a clear per-row win over
-the fastest valid C++ path on all three machines) is **not met**. What limits it,
-by row family:
+numbers; this file does not repeat them. The objective is a clear per-row win
+over SDPA and vLLM on all three machines. Where rows tie, the limit is:
 
 - **Decode that streams more cache than fits in L2** (batch 8-32, context ~1024
-  and up): both backends run at the same memory roof, so a few percent either way
-  is placement and noise, and the same row moves 20-30% with allocation order.
-  Neither a compile-time page 64, extra dot chains, key-tile changes, software
-  prefetch nor wider key groups moved these rows (§9).
-- **Decode that allocates its output**, short calls: the extension now
-  allocates the output natively, as C++ does (`aoti_torch_empty_strided` +
-  `THPVariable_Wrap`, §9); `torch.empty_like` cost several microseconds inside an
-  interleaved run.
-- **fp32 `flash_attn_func`** is FMA-bound in both backends (parity single-thread
-  at every shape measured).
-- **Xeon AMX, head_dim 128, 256-512 tokens:** the K/V pack is slower than C++'s
-  (§9); the rest of the gap there is not explained.
+  and up): every kernel runs at the same memory roof, so a few percent either
+  way is placement and noise, and the same row moves 20-30% with allocation
+  order. Neither a compile-time page 64, extra dot chains, key-tile changes,
+  software prefetch nor wider key groups moved these rows (§9).
+- **fp32 `flash_attn_func`** is FMA-bound (parity with the former C++ backend
+  single-thread at every shape measured).
 
 ## 2. Layout
 
@@ -104,8 +98,7 @@ stays inside one unit, tracks the step maximum as a tree, and the softmax keeps
   `FULL`); `comptime assert` pins the tiling invariants.
 - `Decode.PV` is the one per-target kernel, a type conforming to the `PVKernel`
   trait (as `InnerMatmulKernel` in Modular's unified matmul): `PVRows` keeps
-  fp32 P against V rows, the x86 choice (C++'s numerics class, so the 2-ulp
-  cross-backend bf16 gate is meaningful; bf16 V is widened even/odd split,
+  fp32 P against V rows, the x86 choice (bf16 V is widened even/odd split,
   `w << 16` / `w & 0xffff0000`, 2 instructions per 32 values); `PVPairs` keeps
   bf16 P against bf16 V key pairs with `dot_bf16` (`bfdot`, plus P's low residual
   below 128 keys), the aarch64 choice (widening V was 70% of the kernel there).
@@ -141,26 +134,26 @@ is read correctly under another.
 | flash_attn_func fp32 vs naive fp32 reference | 2e-4 | test_dense 82/82, fuzz 80/80 (worst 0.52x tol) |
 | flash_attn_func bf16 | 3e-2 | same |
 | paged fp32 | 1e-6 (fp64 arbitrates an arm over the gate) | sweep 504/504, worst 8.9e-7 |
-| paged bf16 x86 | <= 2 bf16 ulp at the row peak vs C++ | worst 1.89 |
+| paged bf16 | <= 1e-3 above the bf16 output-rounding floor | sweep worst 7.0e-7 |
 | regressions (`tests/test_regressions.py`) | as above | 412/412 |
 | fast-encdec `tests/test_cpu_attention.py` (strided fused q/k/v) | 45 checks | 45/45 (development laptop; fast-encdec is not on the VMs) |
 
-**ARM bf16 "<= 1e-3 against the reference".** Taken literally (absolute error to
-the real-valued result) no bf16 output can meet it: at short contexts both
-backends sit 3-4e-3 from the fp32 reference while agreeing to 0.45-1.5 ulp, and
-the earlier campaign measured 77/252 Axion sweep cases where rounding the exact
-result to bf16 alone exceeds 1e-3 (worst 6.6e-3). The tests therefore check the
-error *above the bf16 output-rounding floor*, `max(|out - ref| - |ref -
-bf16(ref)|) <= 1e-3` (`tests/reference.bf16_excess`), on top of the 2-ulp
-cross-backend gate. This is a stated interpretation of an unattainable literal
-gate, not a passed literal gate. The scale used by the changed-scale regression
+**Paged bf16 "<= 1e-3 against the reference".** Taken literally (absolute error
+to the real-valued result) no bf16 output can meet it: an earlier campaign
+measured 77/252 Axion sweep cases where rounding the exact result to bf16 alone
+exceeds 1e-3 (worst 6.6e-3). The tests therefore check the error *above the bf16
+output-rounding floor*, `max(|out - ref| - |ref - bf16(ref)|) <= 1e-3`
+(`tests/reference.bf16_excess`), on every CPU. This is a stated interpretation
+of an unattainable literal gate, not a passed literal gate. (Until the C++
+backend was removed, x86 bf16 was judged instead as <= 2 bf16 ulp against it,
+which its degree-2 `exp2` met; the reference gate needs degree 5, §9.) The scale used by the changed-scale regression
 stays where the 1e-6 fp32 gate is defined: at scale 0.9 the fp32 *reference* is
 6.4e-6 from fp64.
 
 ## 6. Call path and threading
 
 - **Torch's OpenMP pool.** One `GOMP_parallel` region per call (~2.4 us warm);
-  MAX's `parallelize` and private pools were slower (`docs/CPP.md` §8). Slices
+  MAX's `parallelize` and private pools were slower. Slices
   use `omp_get_num_threads()`; workers are capped at physical cores.
 - **Native tensor reads (`pyview.mojo`).** `data_ptr()`/`.shape` cost ~50 ns each
   from Python, and a decode call needs a dozen. At import, `_kernel._calibrate_layout`
@@ -174,17 +167,17 @@ stays where the 1e-6 fp32 gate is defined: at scale 0.9 the fp32 *reference* is
   match a per-thread plan registered after a fully validated call; anything else
   returns to the checked Python path. A grown workspace, `set_num_workers` and
   `_drop_workspace` invalidate every table.
-  - b=1 ctx=256 decode with `out=`: 4.4 -> 2.75 us (C++ 3.06).
-  - flash_attn_func 17:8:64 bf16: 5.26 -> 3.05 us (C++ 5.28).
+  - b=1 ctx=256 decode with `out=`: 4.4 -> 2.75 us.
+  - flash_attn_func 17:8:64 bf16: 5.26 -> 3.05 us.
 - **Workspace** is per thread, grown on demand, never shrunk (a freed large
   tensor is an mmap that faults in again).
 
 ## 7. Measuring
 
-`benchmarks/bench.py` is the harness (docs/CPP.md §7 rules): every arm is an
-independently loaded copy of the package (`benchmarks/arms.py`) -- `mojo_new`,
-`mojo_ctrl` (a second copy: the noise floor), `mojo_old` (the oracle tag), one
-`cpp_<isa>` per applicable C++ path -- plus pinned vLLM and SDPA, interleaved
+`benchmarks/bench.py` is the harness (its docstring holds the rules): every Mojo
+arm is an independently loaded copy of the package (`benchmarks/arms.py`) --
+`mojo_new` and `mojo_ctrl` (a second copy: the noise floor) -- plus torch SDPA
+(the flash reference) and the pinned vLLM build (the paged reference), interleaved
 with rotated order, minimum as the statistic, raw samples kept, every arm's
 output validated, the environment recorded in the JSON. Each arm stages its own
 cache through its own `reshape_and_cache`; repeated appends rewrite the same
@@ -197,16 +190,14 @@ libraries, then pass `--previous /path/to/saved/package`. This loads the previou
 build twice independently (`mojo_previous`, `mojo_ctrl`); their spread defines
 the control uncertainty, not the candidate's improvement. Reports fingerprint
 the Python files, shared libraries, kernel sources, manifest, lockfile and build
-scripts. Screening uses only numerically valid C++ arms to establish its cutoff.
+scripts.
 Store-only rows start with poisoned caches, and self-attention rows stage a
 poisoned append slot, so missing writes cannot pass merely because setup already
 wrote the expected data.
 Store validation reads the logical K/V elements directly and requires exact
-copies; it does not reject a valid store because that arm's decoder reads
-unused poisoned padding incorrectly.
+copies; vLLM's store, whose layout is its own, is judged by decoding from it.
 Use `--load-seed` to repeat with different reproducible module-load and cache
-allocation orders. A bf16 C++ peer must itself pass the reference check before
-it can arbitrate the cross-backend gate; its name is recorded per row.
+allocation orders.
 
 ## 8. Defects found and fixed (each has a regression test)
 
@@ -310,6 +301,7 @@ Goal: one implementation across CPUs, then latency (AGENTS.md).
 | C4D decode "losses" (40 rows at 1.03-1.38) | isolated, cold-cache (8 cache copies, 8 threads): Mojo = C++ at ~60-65 GB/s (bf16 b=1 ctx=4096 261 vs 264 us, b=8 ctx=1024 512 vs 515); warm: Mojo = or faster (fp32 b=8 ctx=256 30 vs 63-69 us). Same layout, partition, page order and OpenMP pool (one `libgomp`); a 512-key tile changed nothing. Two arms interleaved in one process: C++'s warm call 186 us vs its own isolated 333 (more of its lines survive the other arm's stream). A first "previous call slows the next" result was an artifact (the same cache copy reused) and was redone | diagnosis: a measurement artifact |
 | bench: decode rows above LLC/4 per arm timed cold (read-only sweep of 2x LLC before every sample, every arm) | C4D 93/36/41 -> 96/73/1 (decode losses 40 -> 0); Axion 106/60/4 -> 115/54/1; Xeon (reports 260 MB L3, 8 cold rows) 87/78/5 -> 89/77/4 | kept (user decision) |
 | store-only K through a LANES x LANES word transpose for prefill-style staging (consecutive slots); scattered appends keep token order | C4D store `b=1 ctx=1024` fp32 1.14 -> 0.97 of C++, bf16 42.6 -> 20.9 us (0.21 of C++); `b=32 ctx=1` unchanged (blocks for scattered tokens had cost it 0.4 us) | kept |
+| C++ backend removed; x86 paged bf16 judged like aarch64 (<= 1e-3 above the bf16 output rounding vs the fp32 reference) instead of <= 2 ulp vs C++; `exp2` degree 5 for bf16 decode on every CPU (x86 was 2) | degree 2 failed the reference gate on 91/252 sweep cases (worst 3.9e-3); degree 5 worst 7.0e-7 on every x86 tier; +1.2% instructions on the Ryzen, cycles within noise | kept: one numerics rule and one `DEG` for every CPU |
 
 Result: decode unification at no measured cost; Axion fp32 `flash_attn_func` was ~5% slower
 than the dedicated NEON policy (wins became ties, no losses), accepted for the unification
@@ -347,12 +339,10 @@ compute-bound-efficient. Requests: none for the shared driver.
 
 Open: batch 8-32 context ~1024 and batch-1 context 4096 decode sit at 0.95-1.03 of C++ NEON
 (bandwidth-bound); fp32 `engine_out` rows at batch 8 still tie or lose by up to 9% in single
-runs. C++'s NEON bf16 paged kernel returns NaN on poisoned/padded cache pages (26 of 412
-`test_regressions` fail with `CPU_ATTENTION_BACKEND=cpp`, identically on the untouched tree;
-`CPU_ATTENTION_ISA=scalar` passes), so the scalar path is the valid peer there.
+runs.
 
-Earlier campaigns' ledgers (`docs/CPP.md` §8 and the oracle's notes at
-`mojo-oracle-v1.1`) still apply; nothing on them was re-run without a new
+Earlier campaigns' ledgers (`docs/CPP.md` §8 in git history and the oracle's notes
+at `mojo-oracle-v1.1`) still apply; nothing on them was re-run without a new
 mechanism.
 
 ## 10. Mojo 1.2.0 notes (the ones that cost time)

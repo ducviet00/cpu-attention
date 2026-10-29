@@ -1,18 +1,11 @@
-"""Loader and call plumbing for the attention kernels.
+"""Loader and call plumbing for the attention kernel.
 
-Two backends, one Python API:
-
-* ``mojo`` (default) -- built from ``cpu_attention/_mojo`` into
-  ``cpu_attention/_C.so`` by ``uv run --extra build python scripts/build.py``;
-* ``cpp`` -- built from ``cpu_attention/csrc`` into ``cpu_attention/_C_cpp.so``
-  by ``uv run --extra build python scripts/build_cpp.py``.
-
-``CPU_ATTENTION_BACKEND=cpp`` selects the second one. Both shared objects can be
-loaded in one process, which is what the A/B harnesses do. Set
-``CPU_ATTENTION_LIB`` to point at another build of the selected backend.
-Everything here is optional: without the shared library (or on an unsupported
-configuration) :func:`is_available` is False and every entry point raises
-``RuntimeError``.
+The kernel is built from ``cpu_attention/_mojo`` into one shared object per ISA
+tier by ``uv run --extra build python scripts/build.py``; the best tier this CPU
+supports is loaded (``CPU_ATTENTION_ISA`` forces a lower one). Set
+``CPU_ATTENTION_LIB`` to load another build. Everything here is optional: without
+the shared library (or on an unsupported configuration) :func:`is_available` is
+False and every entry point raises ``RuntimeError``.
 """
 
 import importlib.util
@@ -23,44 +16,11 @@ import threading
 
 import torch
 
-# Keep Mojo as the default until the full cross-ISA scorecard passes. Explicit
-# `auto` retains the earlier architecture-specific choice for existing callers.
-_CHOSEN = os.environ.get("CPU_ATTENTION_BACKEND", "mojo").lower()
-if _CHOSEN == "auto":
-    _CHOSEN = "cpp" if platform.machine() in ("x86_64", "AMD64") else "mojo"
-if _CHOSEN not in ("mojo", "cpp"):
-    raise ValueError(
-        f"CPU_ATTENTION_BACKEND must be 'auto', 'mojo' or 'cpp', not {_CHOSEN!r}"
-    )
-_BACKEND = _CHOSEN
-
 _DIR = os.path.dirname(os.path.abspath(__file__))
-_INITIAL_BACKEND = _BACKEND
-_LIB_PATH = os.path.join(_DIR, "_C_cpp.so" if _BACKEND == "cpp" else "_C.so")
-
-
-def backend() -> str:
-    """Return the selected backend name (``"mojo"`` or ``"cpp"``)."""
-    return _BACKEND
-
-
-def set_backend(name: str) -> None:
-    """Select the backend for later calls (``"mojo"`` or ``"cpp"``).
-
-    Both shared objects stay loaded: the A/B harnesses alternate them inside one
-    process, and plan/scratch caches are keyed per backend so switching never
-    hands one kernel the other's buffer.
-    """
-    global _BACKEND
-    if name not in ("mojo", "cpp"):
-        raise ValueError(f"backend must be 'mojo' or 'cpp', not {name!r}")
-    _BACKEND = name
 
 # The kernel specializes on head_dim at compile time; anything else raises.
 _HEAD_DIMS = {32, 64, 128}
 _DTYPE_CODES = {torch.float32: 0, torch.bfloat16: 1}
-
-_BUILTS = {}
 
 
 # Mojo build tiers (scripts/build.py), best first, with the CPU features each
@@ -79,7 +39,7 @@ _MOJO_TIERS = {
         ("aarch64-neon", set()),
     ],
 }
-# CPU_ATTENTION_ISA (shared with the C++ backend) -> Mojo tier.
+# CPU_ATTENTION_ISA -> tier.
 _MOJO_ISA = {"amx": "x86-avx512bf16", "vec": "x86-avx512bf16",
              "avx2": "x86-avx2", "neon": "aarch64-bf16"}
 _LOAD_ERROR = {}
@@ -112,11 +72,9 @@ def _mojo_tier():
     return ok[0], ok
 
 
-def _lib_path(name: str) -> str:
-    if name == _INITIAL_BACKEND and os.environ.get("CPU_ATTENTION_LIB"):
+def _lib_path() -> str:
+    if os.environ.get("CPU_ATTENTION_LIB"):
         return os.environ["CPU_ATTENTION_LIB"]
-    if name == "cpp":
-        return os.path.join(_DIR, "_C_cpp.so")
     _, candidates = _mojo_tier()
     for tier in candidates:
         path = os.path.join(_DIR, f"_C_{tier}.so")
@@ -125,9 +83,8 @@ def _lib_path(name: str) -> str:
     return os.path.join(_DIR, "_C.so")
 
 
-def _load(name=None):
-    name = name or _BACKEND
-    path = _lib_path(name)
+def _load():
+    path = _lib_path()
     if not os.path.exists(path):
         return None
     spec = importlib.util.spec_from_file_location("cpu_attention._C", path)
@@ -136,17 +93,18 @@ def _load(name=None):
     return mod
 
 
-def module(name=None):
-    """Return the compiled kernel module for ``name`` (default: the selected
-    backend), or None if it is unavailable."""
-    name = name or _BACKEND
-    if name not in _BUILTS:
+_MODULE = []
+
+
+def module():
+    """Return the compiled kernel module, or None if it is unavailable."""
+    if not _MODULE:
         try:
-            _BUILTS[name] = _load(name) or False
+            _MODULE.append(_load() or False)
         except Exception as e:  # noqa: BLE001
-            _LOAD_ERROR[name] = e
-            _BUILTS[name] = False
-    return _BUILTS[name] or None
+            _LOAD_ERROR["mojo"] = e
+            _MODULE.append(False)
+    return _MODULE[0] or None
 
 
 def is_available() -> bool:
@@ -158,27 +116,22 @@ _BOUND = {}
 
 
 def _entry(attr: str):
-    """Bind ``attr`` of the selected backend's module once per backend."""
-    key = (_BACKEND, attr)
-    fn = _BOUND.get(key)
+    """Bind ``attr`` of the kernel module once."""
+    fn = _BOUND.get(attr)
     if fn is None:
-        mod = require()
-        fn = getattr(mod, attr)
-        _BOUND[key] = fn
+        fn = _BOUND[attr] = getattr(require(), attr)
     return fn
 
 
 def require():
     """Return the compiled kernel module, raising RuntimeError if unavailable."""
     mod = module()
-    if mod is None and isinstance(_LOAD_ERROR.get(_BACKEND), RuntimeError):
-        raise _LOAD_ERROR[_BACKEND]
+    if mod is None and isinstance(_LOAD_ERROR.get("mojo"), RuntimeError):
+        raise _LOAD_ERROR["mojo"]
     if mod is None:
-        script = "build_cpp.py" if _BACKEND == "cpp" else "build.py"
         raise RuntimeError(
-            f"cpu_attention: the {_BACKEND} kernel is not built; run "
-            f"`uv run --extra build python scripts/{script}` (or set "
-            "CPU_ATTENTION_LIB)"
+            "cpu_attention: the kernel is not built; run "
+            "`uv run --extra build python scripts/build.py` (or set CPU_ATTENTION_LIB)"
         )
     return mod
 
@@ -191,11 +144,6 @@ def supported(dtype, block_size: int, head_dim: int) -> bool:
         and block_size % 16 == 0
         and is_available()
     )
-
-
-def _attention():
-    """Return the extension's single callable, bound once per backend."""
-    return _entry("attention")
 
 
 _PHYSICAL = None
@@ -268,10 +216,7 @@ def physical_cores() -> int:
 
 _PAGED_PLANS = threading.local()
 _get_num_threads = torch.get_num_threads
-"""Per-thread geometry -> fast call, for the Mojo paged path.
-
-(The C++ backend keeps the same per-thread cache inside the extension:
-`paged_call` / `paged_register`.)
+"""Per-thread geometry -> fast call, for the paged path.
 
 The engine calls `self_attention`/`cross_attention` 24 times a decode step with
 the same geometry, and at batch 1 / ctx 256 the whole call is 7 us: reading a
@@ -497,7 +442,7 @@ def _kv_register(fn, query, key, value, k_cache, page_table, mode):
 
 
 def _kv_store(key, value, k_cache, v_cache, slots):
-    """reshape_and_cache on the Mojo backend: one token per `key` row."""
+    """reshape_and_cache: one token per `key` row."""
     table = getattr(_KV_TABLE, "t", None)
     if table is not None and _KV_TABLE.gen == _KV_GEN[0] and _KV_TABLE.fn(
             _KV_TABLE.addr, None, key, value, k_cache, v_cache, slots,
@@ -525,20 +470,6 @@ def _paged(
     is a fifth of a batch-1 call and the reason the scorecard's batch-1 rows
     read badly against a reference whose output is preallocated.
     """
-    if _BACKEND == "cpp":
-        # The C++ entry reads the tensors and allocates `out` itself; it knows
-        # every geometry this thread registered (see `paged_call`).
-        call = _entry("paged_call")
-        res = call(query, key, value, k_cache, v_cache, slots, page_table, lens,
-                   scale, out)
-        if res is NotImplemented:
-            nseq, nheads = query.shape[:2]
-            npages = page_table.shape[1]
-            _entry("paged_register")(query, k_cache, page_table, do_store,
-                                     _workers(nseq * nheads, npages))
-            res = call(query, key, value, k_cache, v_cache, slots, page_table,
-                       lens, scale, out)
-        return res
     table = getattr(_KV_TABLE, "t", None)
     if table is not None and _KV_TABLE.gen == _KV_GEN[0]:
         res = _KV_TABLE.fn(
@@ -727,63 +658,8 @@ def amx_available() -> bool:
     return _AMX_OK and _AMX_ENV
 
 
-_CPP_PLANS = threading.local()
-"""Per-thread dense plans for the C++ backend: geometry -> (buffer, address).
-
-The C++ side keeps the workspace (packed K/V, accumulators) keyed on the same
-geometry, so the Python side only has to hand it the plan; every derived value
-(rows per work item, ISA, worker count) is computed once, on the miss path.
-"""
-
-def _cpp_entries():
-    """Bind the C++ plan/forward pair once per backend."""
-    return _entry("dense_make_plan"), _entry("dense_forward")
-
-
-def _cpp_plan(q, k, v, scale, causal, geom=None):
-    """The plan address for this geometry, building it on the first call."""
-    plans = getattr(_CPP_PLANS, "p", None)
-    if plans is None:
-        plans = _CPP_PLANS.p = {}
-    if geom is None:
-        geom = (q.shape, q.stride(), k.stride(), v.stride(), q.dtype)
-    qshape, qs, ks, vs, dtype = geom
-    batch, seq_q, heads, hd = qshape
-    kshape = k.shape
-    kv_heads = kshape[2]
-    workers = _workers(batch * heads * -(-seq_q // 64), 8)
-    # The public wrapper already read every stride. A contiguous Q says nothing
-    # about K or V: mixed contiguous/strided inputs need their own plan too.
-    key = (qshape, kshape, qs, ks, vs, dtype, causal, workers, scale)
-    cached = plans.get(key)
-    if cached is None:
-        make_plan, _ = _cpp_entries()
-        buf = torch.empty(24, dtype=torch.int64)
-        make_plan(
-            buf.data_ptr(), batch, seq_q, kshape[1], heads, kv_heads, hd,
-            _DTYPE_CODES[dtype], int(bool(causal)), float(scale),
-            qs[0], qs[1], qs[2], ks[0], ks[1], ks[2], vs[0], vs[1], vs[2],
-            seq_q * heads * hd, heads * hd, hd, workers,
-        )
-        if len(plans) > 64:
-            plans.clear()
-        addr = buf.data_ptr()
-        # The buffer has to outlive the address, so hold it next to the key.
-        plans[key] = cached = (buf, addr)
-    return cached[1]
-
-
-def _dense_cpp(q, k, v, scale: float, causal: bool, geom=None):
-    """Dense attention through the C++ backend: one call, five arguments."""
-    forward = _entry("dense_forward")
-    out = torch.empty_like(q, memory_format=torch.contiguous_format)
-    forward(_cpp_plan(q, k, v, scale, causal, geom), q.data_ptr(), k.data_ptr(),
-            v.data_ptr(), out.data_ptr())
-    return out
-
-
 _FLASH = threading.local()
-"""Per-thread flash_attn_func plans and workspace (the Mojo backend)."""
+"""Per-thread flash_attn_func plans and workspace."""
 _AMX_PLANS = _FLASH
 """AMX is a policy id in the flash plan, so its plans live in the same place."""
 
@@ -791,7 +667,7 @@ _AMX_PLANS = _FLASH
 def _flash_ws(nbytes):
     """This thread's workspace, grown on demand and never shrunk: a large
     `torch.empty` is an mmap, and freeing it means faulting the pages in again
-    on the next call (docs/CPP.md §3). `_drop_workspace` releases it."""
+    on the next call. `_drop_workspace` releases it."""
     ws = getattr(_FLASH, "ws", None)
     if ws is None or ws.numel() < nbytes:
         _FLASH.ws = ws = torch.empty(nbytes + 4096, dtype=torch.uint8)
@@ -825,7 +701,6 @@ def _flash_plan(geom, k, causal, scale):
     qshape, qs, ks, vs, dtype = geom
     batch, seq_q, heads, hd = qshape
     seq_k, kv_heads = k.shape[1], k.shape[2]
-    tasks_q = -(-seq_q // 64)
     dt = _DTYPE_CODES[dtype]
     # Policy ids: 0 vector, 1 AMX (fp32 hi/lo unless switched off), 2 ARM
     # bfmmla/lane-FMA. The toggles can change between calls, so key on the id.
@@ -867,7 +742,7 @@ def _flash_plan(geom, k, causal, scale):
         fuse = (heads == kv_heads and nbh >= workers and nbh % workers == 0 and
                 slab * workers <= llc * 3 // 5)
         # fp32 V is read in place while all of it fits half the LLC: the copy
-        # only buys a unit stride (C++ measurement, docs/CPP.md §5).
+        # only buys a unit stride.
         v_direct = (dt == 0 and not isa and
                     batch * kv_heads * seq_k * hd * 4 <= llc // 2)
         cells = workers if fuse else nbh
@@ -885,7 +760,7 @@ def _flash_plan(geom, k, causal, scale):
 
 
 def _flash_mojo(q, k, v, scale, causal, geom=None):
-    """flash_attn_func on the Mojo backend: one call, seven arguments."""
+    """flash_attn_func: one call, seven arguments."""
     if geom is None:
         geom = (q.shape, q.stride(), k.stride(), v.stride(), q.dtype)
     buf, plan, total = _flash_plan(geom, k, causal, scale)
@@ -961,6 +836,4 @@ def _dense(q, k, v, scale: float, causal: bool, geom=None):
     the caller has already read them (``flash_attn_func`` has to, for its
     argument checks); otherwise they are read here.
     """
-    if _BACKEND == "cpp":
-        return _dense_cpp(q, k, v, scale, causal, geom)
     return _flash_mojo(q, k, v, scale, causal, geom)

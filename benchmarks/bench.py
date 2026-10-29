@@ -1,37 +1,34 @@
-"""The benchmark: unified Mojo vs every applicable C++ path, one process.
+"""The benchmark: the Mojo kernel against torch SDPA and vLLM, one process.
 
     scripts/pin_governor.sh uv run python benchmarks/bench.py --manifest full \
         --json /path/outside/the/repo/<rev>.json [--vllm-bf16 X.so --vllm-fp32 Y.so]
 
-Rules (docs/CPP.md §7):
+Rules:
 
-* Every arm is an independently loaded copy of the package (benchmarks/arms.py):
-  ``mojo_new`` (this checkout), ``mojo_ctrl`` (a second, independent copy of it:
-  the noise floor), ``mojo_old`` (the oracle build at tag ``mojo-oracle-v1.1``),
-  one ``cpp_<isa>`` arm per C++ ISA path applicable on this CPU (oracle-tag glue,
-  this checkout's ``_C_cpp.so``), plus vLLM and SDPA as secondary references.
+* Every Mojo arm is an independently loaded copy of the package
+  (benchmarks/arms.py): ``mojo_new`` (this checkout) and ``mojo_ctrl`` (a second,
+  independent copy of it: the noise floor). ``--previous DIR`` adds
+  ``mojo_previous`` and makes ``mojo_ctrl`` a second copy of DIR instead.
+* The reference of a flash row is torch SDPA (``F.scaled_dot_product_attention``);
+  of a paged row it is vLLM's CPU attention (``scripts/build_vllm_ref.sh``): the
+  same append + paged decode, or the same ``reshape_and_cache`` for store rows.
 * Arms are interleaved, the order rotated every round; the minimum decides and
-  raw samples + median are kept. Per-arm env (the forced C++ ISA) is applied
-  outside the timer.
+  raw samples + median are kept. Per-arm env is applied outside the timer.
 * Decode rows whose per-arm K/V working set exceeds a quarter of the LLC are
   timed cold: before every sample, outside the timer and identically for every
   arm, a read-only sweep of twice the LLC evicts it. Interleaved warm, such rows
   were scored on whichever arm's lines the LLC replacement happened to keep (the
   C4D: 16-33 MB per arm on a 32 MB L3, verdicts 0.9-1.7 for equal kernels); a
   serving KV cache is far larger than the LLC anyway. ``cold`` is in the JSON.
-* Each arm stages its own cache through its own ``reshape_and_cache`` from the
-  same logical data; repeated append calls rewrite the same slot, so contexts
-  never grow. Allocation is charged identically: ours include the pack and the
-  output allocation (except ``engine_out`` rows); vLLM's cache is staged and
-  its output preallocated outside the timer.
-* Every timed arm's output is validated against the gates after timing; an
-  invalid arm is excluded from the baseline and reported.
-* ``baseline`` is the fastest *valid* C++ arm; ``ratio = mojo_new / baseline``.
-  A row is a ``win`` only below ``1 - band`` with ``band = max(0.03, |ctrl/new
-  - 1|, twin)``, ``twin`` being the spread between C++'s identical-code ``amx`` and ``vec`` paged arms, a ``loss`` above ``1 + band``, and ``unresolved`` in between.
-* A C++ arm more than ``--screen-x`` times slower than the fastest C++ arm in a
-  3-call screen cannot be the baseline and is not timed further (the screen
-  samples are kept in the JSON).
+* Each arm stages its own cache from the same logical data; repeated append
+  calls rewrite the same slot, so contexts never grow. Allocation is charged
+  identically: ours include the pack and the output allocation (except
+  ``engine_out`` rows); vLLM's cache is staged and its output preallocated
+  outside the timer.
+* Every timed arm's output is validated against the gates after timing.
+* ``ratio = mojo_new / reference``. A row is a ``win`` below ``1 - band`` with
+  ``band = max(0.03, |ctrl/new - 1|)``, a ``loss`` above ``1 + band``, and
+  ``unresolved`` in between; ``INVALID`` when ``mojo_new`` fails its gate.
 """
 
 import argparse
@@ -95,11 +92,10 @@ def environment(arms_, compiler):
 
 
 def source_hashes():
-    paths = ["pyproject.toml", "uv.lock", "scripts/build.py", "scripts/build_cpp.py",
+    paths = ["pyproject.toml", "uv.lock", "scripts/build.py",
              "benchmarks/bench.py", "benchmarks/arms.py", "benchmarks/manifest.py"]
-    paths += [os.path.relpath(p, _ROOT) for pattern in
-              ("cpu_attention/_mojo/src/*.mojo", "cpu_attention/csrc/*")
-              for p in glob.glob(os.path.join(_ROOT, pattern)) if os.path.isfile(p)]
+    paths += [os.path.relpath(p, _ROOT) for p in
+              glob.glob(os.path.join(_ROOT, "cpu_attention/_mojo/src/*.mojo"))]
     result = {}
     for path in sorted(paths):
         with open(os.path.join(_ROOT, path), "rb") as f:
@@ -136,12 +132,6 @@ def time_arms(fns, envs, rounds, calls, warmup=2, sweep=None):
 def stats(xs):
     s = sorted(xs)
     return {"min": s[0], "median": s[len(s) // 2], "n": len(s)}
-
-
-def screen_cpp(screen, valid, factor):
-    best = min((min(xs) for n, xs in screen.items() if valid[n][1]),
-               default=float("inf"))
-    return {n: xs for n, xs in screen.items() if min(xs) > factor * best}
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +300,7 @@ def paged_row(r, arms_, vllm, args, page):
                                                out=dst)
         fns[a.name] = f
     vl = vllm.get(r["dtype"]) if vllm else None
-    if vl is not None and entry in ("engine", "engine_out"):
+    if vl is not None:
         try:
             fns["vllm"] = vllm_paged(vl, r, x, q, kn, vn, scale, op, out)
         except Exception as e:  # noqa: BLE001
@@ -320,10 +310,7 @@ def paged_row(r, arms_, vllm, args, page):
     vref = torch.nn.utils.rnn.pad_sequence(x["vall"], batch_first=True)
     ref = R.ref_decode(q, kref.transpose(1, 2), vref.transpose(1, 2),
                        scale=scale, lens=lens)
-    peer = {}
-
     def store_check(name):
-        arm = next(a for a in arms_ if a.name == name)
         kc, vc = caches[name]
         slot = x["allslots"].view(-1, 1, 1)
         head = torch.arange(r["hkv"]).view(1, -1, 1)
@@ -332,20 +319,15 @@ def paged_row(r, arms_, vllm, args, page):
         off = slot % page
         ko = ((dim // 2 * page + off) * 2 + dim % 2
               if r["dtype"] == "bf16" else dim * page + off)
-        paired_v = (ARM64 and r["dtype"] == "bf16" and not
-                    (arm.backend == "cpp" and arm.env.get("CPU_ATTENTION_ISA") == "scalar"))
         vo = ((off // 2 * r["d"] + dim) * 2 + off % 2
-              if paired_v else off * r["d"] + dim)
+              if ARM64 and r["dtype"] == "bf16" else off * r["d"] + dim)
         ek = (kc.flatten()[base + ko].float() - kflat.float()).abs().max().item()
         ev = (vc.flatten()[base + vo].float() - vflat.float()).abs().max().item()
         error = max(ek, ev)
         return error, ek == 0 and ev == 0
 
-    def result(name):
-        return out[name].float()
-
     def check(name):
-        got = result(name)
+        got = out[name].float()
         if r["dtype"] == "fp32":
             err = (got - ref).abs().max().item()
             if err > 1e-6:
@@ -354,37 +336,26 @@ def paged_row(r, arms_, vllm, args, page):
                                      scale=scale, lens=lens)
                 # The fp32 reference is itself up to ~9e-7 from the exact
                 # answer, so a kernel 2e-7 from the truth can read 1.0e-6 from
-                # it (seen on het contexts, for C++ vec and Mojo alike): the
+                # it (seen on het contexts): the
                 # gate is judged against fp64 once it is exceeded.
                 err = (got.double() - truth).abs().max().item()
             return err, err <= 1e-6
-        # bf16: <= 2 bf16 ulps at the row peak against the C++ reference arm
-        # (the test_paged_sweep gate); on aarch64 also <= 1e-3 vs the reference.
-        # On aarch64 also 1e-3 above the bf16 output-rounding floor (the literal
-        # absolute 1e-3 is below that floor; reference.bf16_excess).
-        unit = ref.abs().max().clamp_min(1e-30).item() * 2 ** -8
-        err_ref = (got - ref).abs().max().item()
-        err = (got - peer["ref"]).abs().max().item() / unit
-        ok = err <= 2.0 and err_ref <= 3e-2 and (
-            not ARM64 or R.bf16_excess(got, ref) <= 1e-3)
-        return err, ok
+        # bf16: 1e-3 above the bf16 output-rounding floor (the literal absolute
+        # 1e-3 is below that floor; reference.bf16_excess), the tests' gate.
+        err = R.bf16_excess(got, ref)
+        return err, err <= 1e-3
 
     def check_all(names):
         if entry == "store":
-            return {n: store_check(n) for n in names}
-        if r["dtype"] == "bf16":
-            candidates = [args.ref_arm] + [a.name for a in arms_
-                                          if a.name.startswith("cpp_") and a.name != args.ref_arm]
-            peer["ref"] = ref.bfloat16().float()
-            check_all.peer = "rounded_reference_no_valid_cpp_peer"
-            for n in candidates:
-                value = result(n)
-                error = (value - ref).abs().max().item()
-                if error <= 3e-2 and (not ARM64 or R.bf16_excess(value, ref) <= 1e-3):
-                    peer["ref"] = value
-                    check_all.peer = n
-                    break
+            # vLLM's cache layout is its own: its store is judged by decoding
+            # from it, ours by reading every staged element back.
+            res = {n: store_check(n) for n in names if n != "vllm"}
+            if "vllm" in names:
+                vllm_decode()
+                res["vllm"] = check("vllm")
+            return res
         return {n: check(n) for n in names}
+    vllm_decode = getattr(fns.get("vllm"), "decode", None)
     rounds = args.paged_rounds
     ws = 2 * kflat.numel() * kflat.element_size()  # one arm's K + V bytes
     return fns, check_all, rounds, args.block_calls, ws
@@ -402,14 +373,25 @@ def vllm_paged(vl, r, x, q, kn, vn, scale, op, out):
                                       True, -1, isa, False, None, "auto")
     o = torch.empty_like(q)
     bt, lens, slots = x["bt"], x["lens"], x["slots"]
+    kflat, vflat = torch.cat(x["kall"]), torch.cat(x["vall"])
 
-    def f():
-        if op == "self":
-            mod.cpu_attn_reshape_and_cache(kn, vn, kc, vc, slots, isa)
+    def decode():
         mod.cpu_attention_with_kv_cache(q, kc, vc, o, qsl, lens, scale, True,
                                         None, -1, bt, 0.0, meta, None, None,
                                         1.0, 1.0, "auto")
         out["vllm"] = o
+
+    if r["entry"] == "store":
+        def f():
+            mod.cpu_attn_reshape_and_cache(kflat, vflat, kc, vc, x["allslots"], isa)
+        f.decode = decode
+        decode()
+        return f
+
+    def f():
+        if op == "self":
+            mod.cpu_attn_reshape_and_cache(kn, vn, kc, vc, slots, isa)
+        decode()
     f()
     return f
 
@@ -419,28 +401,16 @@ def build_arms(args):
     factories = []
     want = args.arms.split(",")
     if "mojo_new" in want:
-        factories.append(lambda: A.current("mojo_new", "mojo"))
+        factories.append(lambda: A.current("mojo_new"))
     if "mojo_vec" in want:  # Mojo with the AMX policy off: the vector policy only
-        factories.append(lambda: A.current("mojo_vec", "mojo",
-                                           {"CPU_ATTENTION_ISA": "vec"}))
+        factories.append(lambda: A.current("mojo_vec", {"CPU_ATTENTION_ISA": "vec"}))
     if "mojo_ctrl" in want:
         if args.previous:
             factories.append(lambda: A.snapshot("mojo_ctrl", args.previous))
         else:
-            factories.append(lambda: A.current("mojo_ctrl", "mojo"))
+            factories.append(lambda: A.current("mojo_ctrl"))
     if args.previous:
         factories.append(lambda: A.snapshot("mojo_previous", args.previous))
-    if "mojo_old" in want and os.path.exists(args.oracle):
-        factories.append(lambda: A.tagged("mojo_old", args.oracle_tag, "mojo",
-                                          {"_C.so": args.oracle}))
-    cpp = os.path.join(A.PKG, "_C_cpp.so")
-    if "cpp" in want:
-        isas = sorted(set(A.cpp_isas("bf16")) | set(A.cpp_isas("fp32")),
-                      key=["amx", "vec", "neon", "scalar"].index)
-        for isa in isas:
-            factories.append(lambda isa=isa: A.tagged(
-                f"cpp_{isa}", args.oracle_tag, "cpp", {"_C_cpp.so": cpp},
-                {"CPU_ATTENTION_ISA": isa}))
     random.Random(args.load_seed).shuffle(factories)
     return [factory() for factory in factories]
 
@@ -451,22 +421,18 @@ def main():
                     choices=("full", "historical", "extended"))
     ap.add_argument("--only", default="", help="substring filter on row labels")
     ap.add_argument("--dtype", choices=("bf16", "fp32", "both"), default="both")
-    ap.add_argument("--arms", default="mojo_new,mojo_ctrl,mojo_old,cpp,sdpa,vllm")
-    ap.add_argument("--oracle", default=os.path.join(
-        _ROOT, "cpu_attention", "_mojo", "oracle", "_C_oracle.so"))
-    ap.add_argument("--oracle-tag", default="mojo-oracle-v1.1")
+    ap.add_argument("--arms", default="mojo_new,mojo_ctrl,sdpa,vllm")
     ap.add_argument("--previous", default="", metavar="PACKAGE_DIR",
                     help="saved previous package (glue and libraries); load it twice "
                          "as mojo_previous and mojo_ctrl for build comparisons")
     ap.add_argument("--vllm-bf16", default=os.environ.get("VLLM_REF_BF16", ""),
                     help="vLLM build for bf16 rows (AMX build on AMX boxes)")
     ap.add_argument("--vllm-fp32", default=os.environ.get("VLLM_REF_FP32", ""))
-    ap.add_argument("--vllm-isa-bf16", default="vec")
+    ap.add_argument("--vllm-isa-bf16", default="vec", help="amx on AMX boxes")
     ap.add_argument("--vllm-isa-fp32", default="vec")
     ap.add_argument("--rounds", type=int, default=41)
     ap.add_argument("--paged-rounds", type=int, default=41)
     ap.add_argument("--block-calls", type=int, default=1)
-    ap.add_argument("--screen-x", type=float, default=2.0)
     ap.add_argument("--page", type=int, default=16 if ARM64 else 32)
     ap.add_argument("--threads", type=int, default=0)
     ap.add_argument("--load-seed", type=int, default=0,
@@ -481,10 +447,6 @@ def main():
     mojo = os.path.join(os.path.dirname(sys.executable), "mojo")
     compiler = _sh(mojo, "--version") if os.path.exists(mojo) else "?"
     arms_ = build_arms(args)
-    names = [a.name for a in arms_]
-    cpp_names = sorted((n for n in names if n.startswith("cpp_")),
-                       key=["cpp_amx", "cpp_vec", "cpp_neon", "cpp_scalar"].index)
-    args.ref_arm = cpp_names[0] if cpp_names else names[0]
     vllm = {}
     if "vllm" in args.arms:
         for tag in ("bf16", "fp32"):
@@ -526,61 +488,41 @@ def main():
                 for n in fns}
         if "sdpa" not in args.arms:
             fns.pop("sdpa", None)
-        # Screen: a C++ arm far slower than the fastest one cannot be the
-        # baseline; keep its screen samples and stop timing it.
-        screen = time_arms({n: fns[n] for n in cpp_names}, envs, 3, 1, warmup=1) \
-            if len(cpp_names) > 1 else {}
-        dropped = {}
-        if screen:
-            screen_valid = (checks(cpp_names) if checks else
-                            {n: check(n) for n in cpp_names})
-            dropped = screen_cpp(screen, screen_valid, args.screen_x)
-            for n in dropped:
-                fns.pop(n)
         samples = time_arms(fns, envs, rounds, calls,
                             sweep=(lambda: evict.sum()) if cold else None)
         st = {n: stats(s) for n, s in samples.items()}
         valid = (checks(list(fns)) if checks else
                  {n: check(n) for n in fns})
-        cpp_valid = [n for n in fns if n in cpp_names and valid[n][1]]
         row = dict(r, label=label, rounds=rounds, block_calls=calls, cold=cold,
                    min_us={n: s["min"] for n, s in st.items()},
                    median_us={n: s["median"] for n, s in st.items()},
                    samples_us=samples, err={n: v[0] for n, v in valid.items()},
                    valid={n: v[1] for n, v in valid.items()},
-                   screened_out=dropped,
-                   screen_valid={n: v[1] for n, v in screen_valid.items()} if screen else {},
-                   bf16_peer=getattr(checks, "peer", None),
                    loadavg=os.getloadavg())
         line = f"{label:48s}"
-        if cpp_valid and "mojo_new" in st:
-            base = min(cpp_valid, key=lambda n: st[n]["min"])
+        base = "sdpa" if r["kind"] == "flash" else "vllm"
+        if "mojo_new" in st:
+            line += f" new {st['mojo_new']['min']:10.1f}"
+        if base in st and "mojo_new" in st:
             ratio = st["mojo_new"]["min"] / st[base]["min"]
             control_peer = "mojo_previous" if args.previous else "mojo_new"
             spread = (abs(st["mojo_ctrl"]["min"] / st[control_peer]["min"] - 1)
                       if "mojo_ctrl" in st else 0.0)
-            # On x86 AMX CPUs the C++ paged path of the `amx` arm forwards to its
-            # `vec` arm: identical code, so their spread is a direct measure of how
-            # far one process's minimum can sit from another's. It widens the band.
-            twin = (abs(st["cpp_amx"]["min"] / st["cpp_vec"]["min"] - 1)
-                    if r["kind"] == "paged" and "cpp_amx" in cpp_valid
-                    and "cpp_vec" in cpp_valid else 0.0)
-            band = max(0.03, spread, twin)
+            band = max(0.03, spread)
             verdict = ("win" if ratio < 1 - band else
                        "loss" if ratio > 1 + band else "unresolved")
             if not valid["mojo_new"][1]:
                 verdict = "INVALID"
-            row.update(baseline=base, ratio=ratio, ctrl_spread=spread,
-                       twin_spread=twin, band=band, verdict=verdict)
-            if args.previous:
-                row["new/previous"] = st["mojo_new"]["min"] / st["mojo_previous"]["min"]
-            line += (f" new {st['mojo_new']['min']:10.1f} {base} "
-                     f"{st[base]['min']:10.1f} ratio {ratio:5.3f} "
+            row.update(baseline=base, ratio=ratio, ctrl_spread=spread, band=band,
+                       verdict=verdict)
+            line += (f" {base} {st[base]['min']:10.1f} ratio {ratio:5.3f} "
                      f"ctrl {spread:5.3f} {verdict}")
-        for n in ("mojo_old", "vllm", "sdpa"):
-            if n in st and "mojo_new" in st:
-                row[f"new/{n}"] = st["mojo_new"]["min"] / st[n]["min"]
-                line += f" /{n} {row[f'new/{n}']:5.3f}"
+        if args.previous and "mojo_new" in st:
+            row["new/previous"] = st["mojo_new"]["min"] / st["mojo_previous"]["min"]
+            line += f" /previous {row['new/previous']:5.3f}"
+        if r["kind"] == "flash" and "vllm" in st and "mojo_new" in st:
+            row["new/vllm"] = st["mojo_new"]["min"] / st["vllm"]["min"]
+            line += f" /vllm {row['new/vllm']:5.3f}"
         bad = [n for n, v in valid.items() if not v[1]]
         if bad:
             line += f"  INVALID {bad}"

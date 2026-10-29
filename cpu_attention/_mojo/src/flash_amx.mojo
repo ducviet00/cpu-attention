@@ -59,9 +59,8 @@ def _row32(a: SIMD[BF16, 16], b: SIMD[BF16, 16]) -> I16:
 
 @always_inline
 def _tp16(m: Array[I16, 16]) -> Array[I16, 16]:
-    """16x16 transpose of 32-bit units in registers, in the instruction sequence
-    the C++ pack uses (64 shuffles): unpack ps, unpack pd, then two stages of
-    128-bit-lane shuffles. The index-vector form (`vpermt2d/q`, 16 data + the
+    """16x16 transpose of 32-bit units in registers (64 shuffles): unpack ps,
+    unpack pd, then two stages of 128-bit-lane shuffles. The index-vector form (`vpermt2d/q`, 16 data + the
     index registers) spilled and was 18% slower on the pack."""
     var r = m.copy()
     comptime for i in range(0, 16, 2):
@@ -242,7 +241,7 @@ def _q_operand[
     and the physical L2 sets vary per process. 257:16:128 on 4 threads was bimodal,
     208-226 us in place against 197-200 us through the panel; 512:32:128 -10%,
     1024:16:128 -6%. Below that the copy is a net cost (129:16:128 +6%, 2048:8:64
-    +2%), and C++ reads Q in place everywhere."""
+    +2%)."""
     comptime BF = dtype == DType.bfloat16
     comptime E = 2 if BF else 4
     comptime DC32 = hd // 32

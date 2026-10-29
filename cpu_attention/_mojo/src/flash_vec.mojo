@@ -308,7 +308,7 @@ def _pv[
                     c[r * NV + i] = x if a == 1.0 else x * a
         comptime if BF:
             # Key pairs: one `dpbf16ps` folds two keys x LANES dims (2.05x the
-            # phase over fp32 FMA in the C++ measurement).
+            # phase over fp32 FMA).
             var vp = ptr[BFloat16](vsrc)
             var j = 0
             while j < nk:

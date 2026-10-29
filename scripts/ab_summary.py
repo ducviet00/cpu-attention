@@ -1,5 +1,6 @@
-"""Summarize a `benchmarks/bench.py --previous ... --json` run: verdicts by README row
-family, new/previous medians per kind x dtype, and every loss.
+"""Summarize a `benchmarks/bench.py --json` run: verdicts against the reference (SDPA for
+flash rows, vLLM for paged rows) by README row family, median ratios per kind x dtype
+(and new/previous with `--previous`), and every loss.
 
     python scripts/ab_summary.py full.json [more.json ...]
 """
@@ -23,20 +24,25 @@ def summarize(path):
     print(f"== {path} ({len(rows)} rows)")
     counts = collections.defaultdict(collections.Counter)
     for r in rows:
-        counts[family(r)][r["verdict"]] += 1
-        counts["all"][r["verdict"]] += 1
+        v = r.get("verdict", "no reference")
+        counts[family(r)][v] += 1
+        counts["all"][v] += 1
     for f in FAMILIES + ("all",):
         c = counts[f]
-        extra = f"  invalid {c['invalid']}" if c["invalid"] else ""
+        extra = f"  invalid {c['INVALID']}" if c["INVALID"] else ""
+        extra += f"  no reference {c['no reference']}" if c["no reference"] else ""
         print(f"  {f:11s} {c['win']:3d} / {c['unresolved']:3d} / {c['loss']:3d}{extra}")
     for kind in ("flash", "paged"):
         for dt in ("bf16", "fp32"):
-            np_ = [r["new/previous"] for r in rows if r["kind"] == kind and r["dtype"] == dt]
-            if np_:
-                print(f"  {kind} {dt}: median new/previous {statistics.median(np_):.3f}")
+            sel = [r for r in rows if r["kind"] == kind and r["dtype"] == dt]
+            for key in ("ratio", "new/previous"):
+                xs = [r[key] for r in sel if key in r]
+                if xs:
+                    print(f"  {kind} {dt}: median {key} {statistics.median(xs):.3f}")
     for r in rows:
-        if r["verdict"] == "loss":
-            print(f"  loss {r['label']:45s} {r['ratio']:.3f}  new/previous {r['new/previous']:.3f}")
+        if r.get("verdict") == "loss":
+            prev = f"  new/previous {r['new/previous']:.3f}" if "new/previous" in r else ""
+            print(f"  loss {r['label']:45s} {r['ratio']:.3f} vs {r['baseline']}{prev}")
 
 
 if __name__ == "__main__":

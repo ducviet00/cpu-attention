@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # box_provision.sh [REPO [REF]]: prepare a fresh benchmark VM (the GCP Ubuntu images are bare).
-#   toolchain and python3-dev (the C++ binding needs Python.h), uv, and ~/cpu-attention
+#   toolchain and python3-dev (the vLLM reference binding needs Python.h), uv, and ~/cpu-attention
 #   with its venv: scripts/build_vllm_ref.sh links the vLLM reference against that torch.
 # REPO: a git URL or a bundle path (default: origin on GitHub); REF: the branch to check
 # out (a bundle's HEAD may name no branch).

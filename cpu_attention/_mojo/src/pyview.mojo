@@ -1,7 +1,7 @@
 """Read a torch tensor's data pointer, sizes and strides without calling Python.
 
 `tensor.data_ptr()` and `.shape` cost ~50 ns each from Python, and a decode call
-needs a dozen of them: at batch 1 that is a quarter of the call. The C++ backend
+needs a dozen of them: at batch 1 that is a quarter of the call. A C++ extension
 reads `at::Tensor` fields directly; this does the same through field offsets
 that `cpu_attention._kernel._calibrate_layout` finds at import by matching the
 values torch reports (`tensor._cdata` is the TensorImpl address), and verifies

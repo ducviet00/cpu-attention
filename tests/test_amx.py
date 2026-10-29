@@ -17,7 +17,6 @@ chunks, and a NaN-filled tail after the tensors (a stray read comes back NaN).
 
 import argparse
 import os
-import statistics
 import sys
 import time
 

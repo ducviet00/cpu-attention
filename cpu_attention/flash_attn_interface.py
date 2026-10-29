@@ -29,13 +29,6 @@ def _lens_tensor(cache_seqlens, batch: int, device):
     return cache_seqlens
 
 
-def _append_slots(page_table, lengths, block_size: int):
-    """Slots writing one token at position ``lengths`` (flash's pre-append index)."""
-    block = torch.div(lengths, block_size, rounding_mode="floor")
-    page = page_table.gather(1, block.long().unsqueeze(1)).squeeze(1)
-    return (page * block_size + lengths % block_size).long()
-
-
 def flash_attn_with_kvcache(
     q,
     k_cache,
@@ -103,8 +96,7 @@ def flash_attn_with_kvcache(
       measurable end to end.
     """
     if (
-        _kernel._BACKEND == "mojo"
-        and qv is None
+        qv is None
         and rotary_cos is None
         and rotary_sin is None
         and cache_leftpad is None
@@ -245,12 +237,8 @@ def flash_attn_with_kvcache(
     if k is not None:
         if slot_mapping is None:
             before = _lens_tensor(cache_seqlens, batch, q.device)
-            if _kernel._BACKEND == "mojo":
-                slots = None
-                lens = before
-            else:
-                slots = _append_slots(page_table, before, block_size)
-                lens = before + 1
+            slots = None
+            lens = before
         else:
             slots = slot_mapping
             lens = _lens_tensor(cache_seqlens, batch, q.device)
@@ -301,7 +289,7 @@ def flash_attn_func(q, k, v, softmax_scale=None, causal=False):
     # the tensors read in the extension (no Python checks or plan lookup).
     table = _kernel._FLASH.__dict__.get("t")
     if (table is not None and _kernel._FLASH.gen == _kernel._flash_gen() and
-            type(q) is torch.Tensor and _kernel._BACKEND == "mojo"):
+            type(q) is torch.Tensor):
         res = _kernel._FLASH.fn(_kernel._FLASH.addr, q, k, v,
                                 softmax_scale, causal)
         if res is not None:
@@ -357,7 +345,7 @@ def flash_attn_func(q, k, v, softmax_scale=None, causal=False):
         v = v.contiguous()
         stv = v.stride()
     out = _dense(q, k, v, scale, causal, (qs, stq, stk, stv, q.dtype))
-    if _kernel._BACKEND == "mojo" and q is q0 and k is k0 and v is v0:
+    if q is q0 and k is k0 and v is v0:
         _kernel._flash_register(q, k, v, softmax_scale, causal)
     return out
 
