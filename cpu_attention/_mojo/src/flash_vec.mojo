@@ -13,7 +13,7 @@ from std.math import iota
 from std.memory import bitcast
 
 from flash_attn import FlashJob, FlashPolicy, NEG, V
-from isa import BCAST_FOLD, LANES, dot_bf16, exp2, exp2s, ptr, vmax
+from isa import BCAST_FOLD, LANES, dot_bf16, exp2, online_max, ptr, vmax
 
 comptime KP = 64  # keys per K^T block
 comptime KT = 256  # keys per softmax tile
@@ -260,8 +260,9 @@ def _softmax[
             continue
         var mxv = tm * c
         var mo = mp.unsafe_load(r)
-        var mn = max(mo, mxv)
-        var a = exp2s[5](mo - mn)
+        var s0 = online_max[1, 5](mo, mxv)
+        var mn = s0[0][0]
+        var a = s0[1][0]
         mp.unsafe_store(r, mn)
         ap.unsafe_store(r, a)
         var s = Array[V, NS](fill=V(0))

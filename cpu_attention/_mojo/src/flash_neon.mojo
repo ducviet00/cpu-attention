@@ -23,7 +23,7 @@ from std.memory import bitcast
 from std.sys import llvm_intrinsic
 
 from flash_attn import FlashJob, FlashPolicy, NEG
-from isa import exp2, ptr, vmax
+from isa import exp2, online_max, ptr, vmax
 
 comptime F4 = SIMD[DType.float32, 4]
 comptime F2 = SIMD[DType.float32, 2]
@@ -240,8 +240,9 @@ def _softmax[
     var mo0 = mp.unsafe_load(r0)
     var mo1 = mp.unsafe_load(r1)
     var mo = F4(mo0, mo0, mo1, mo1)
-    var mn = vmax[4](mo, mt * F4(c))
-    var a4 = exp2[4, 4](mo - mn)
+    var step = online_max[4, 4](mo, mt * F4(c))
+    var mn = step[0]
+    var a4 = step[1]
     var live = 2 * rp + 1 < sub
     mp.unsafe_store(r0, mn[0])
     ap.unsafe_store(r0, a4[0])

@@ -30,7 +30,7 @@ from std.sys import llvm_intrinsic
 
 from amx import tile_cfg_load, tile_dpbf16ps, tile_load, tile_store, tile_zero
 from flash_attn import FlashJob, FlashPolicy, NEG
-from isa import X86_BF16, bf16_lo, exp2, ptr, vmax
+from isa import X86_BF16, bf16_lo, exp2, online_max, ptr, vmax
 
 comptime RQT = 32  # query rows per register tile
 comptime KSTEP = 32  # keys per Q@K^T / P@V step
@@ -448,7 +448,7 @@ def _stats[
         var a = V16(1)
         var any = rescale.reduce_or()
         if any:
-            a = rescale.select(exp2[4, 16](mo - mxv), V16(1))
+            a = rescale.select(online_max[16, 4, SLACK](mo, mxv)[1], V16(1))
             changed = True
         _st16(m + rg * 4, take.select(mxv, mo), valid)
         _st16(alpha + rg * 4, a, valid)

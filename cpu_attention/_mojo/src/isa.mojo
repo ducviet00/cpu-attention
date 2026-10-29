@@ -153,9 +153,17 @@ def exp2[
 
 
 @always_inline
-def exp2s[degree: Int](x: Float32) -> Float32:
-    """Scalar `exp2` (the online-softmax rescale factor)."""
-    return exp2[degree, 1](SIMD[DType.float32, 1](x))[0]
+def online_max[
+    width: Int, degree: Int, slack: Float32 = 0.0
+](m_old: SIMD[DType.float32, width], m_tile: SIMD[DType.float32, width]) -> Tuple[
+    SIMD[DType.float32, width], SIMD[DType.float32, width]
+]:
+    """FlashAttention's running-max step, in scaled log2 units: the new running max
+    and the factor for the old row sum and accumulator (1 where the max holds).
+    With `slack` > 0 (FA4) the max moves only past m_old + slack, so most tiles
+    rescale nothing; the probabilities stay below 2^slack."""
+    var need = m_tile.gt(m_old + slack)
+    return (need.select(m_tile, m_old), need.select(exp2[degree, width](m_old - m_tile), 1.0))
 
 
 @always_inline
