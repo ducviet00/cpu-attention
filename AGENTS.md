@@ -26,6 +26,9 @@ benchmarks/arms.py          independently loaded copies of the package (the cont
 scripts/build.py            builds one Mojo shared object per ISA tier; the loader picks the best
 scripts/pin_governor.sh     pin the CPU governor to performance for a run on a local machine, restore it after
 scripts/build_vllm_ref.sh   builds the pinned vLLM csrc/cpu reference the benchmark compares against
+scripts/box_provision.sh    prepares a fresh benchmark VM (toolchain, python3-dev, uv, ~/cpu-attention venv)
+scripts/box_verify.sh       on a box: every gate on a branch, then the full-manifest A/B against a base
+scripts/ab_summary.py       verdicts by row family, new/previous medians and losses of a bench JSON
 ```
 
 ## Rules

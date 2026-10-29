@@ -172,6 +172,12 @@ uv run python benchmarks/bench.py --manifest full \
     --rounds 61 --paged-rounds 121 --json /path/outside/the/repo/run.json
 ```
 
+On a fresh VM, `scripts/box_provision.sh` installs what the image lacks (a toolchain,
+`python3-dev`, `uv`) and the repository venv; then `scripts/build_vllm_ref.sh`, and
+`scripts/box_verify.sh BRANCH BASE "ISAS" <vLLM args>` runs every gate on BRANCH and the
+full-manifest A/B against BASE at threads = physical cores (`scripts/ab_summary.py`
+summarizes the JSON). The tables above came from those scripts.
+
 * On an AMX box pass `vllm_cpu_attn_bench_amx.so --vllm-isa-bf16 amx` for bf16
   and `--threads <physical cores>`; on aarch64 pass `--vllm-isa-bf16 neon
   --vllm-isa-fp32 neon`. `--block-calls 40` is only for a desktop or laptop with
