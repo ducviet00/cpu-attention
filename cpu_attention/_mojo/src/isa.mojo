@@ -81,8 +81,8 @@ def exp2[
     lane (-inf) yields exactly 0 rather than NaN (on NEON ~1e-38, see below).
 
     `degree` trades accuracy for instructions: 2 sits inside a bf16 rounding
-    (relative 2e-3), 5 is a minimax at 3e-6, 6 (Taylor) at 1.2e-7 -- the paged
-    fp32 gate (1e-6 absolute) needs 6.
+    (relative 2e-3), 4 and 5 are minimax at 2.6e-6 and 3e-6, 6 (Taylor) at
+    1.2e-7 -- the paged fp32 gate (1e-6 absolute) needs 6.
     """
     # NEON takes the exponent from the bits of the magic-added value: `fcvt*`
     # issues on one pipe at 1/cycle on Neoverse (measured), so converting n cost
@@ -112,11 +112,12 @@ def exp2[
         p = r.fma(2.3473140e-1, 6.9335938e-1)
         p = p.fma(r, 1.0)
     elif degree <= 4:
-        p = SIMD[DType.float32, width](9.618129107628477e-3)
-        p = p.fma(r, 5.550410866482158e-2)
-        p = p.fma(r, 2.402265069591007e-1)
-        p = p.fma(r, 6.931471805599453e-1)
-        p = p.fma(r, 1.0)
+        # Remez minimax on [-0.5, 0.5]: relative 2.6e-6, degree 5's class.
+        p = SIMD[DType.float32, width](9.570101908e-3)
+        p = p.fma(r, 5.591786032e-2)
+        p = p.fma(r, 2.402474483e-1)
+        p = p.fma(r, 6.931218147e-1)
+        p = p.fma(r, 9.999992614e-1)
     elif degree == 5:
         p = SIMD[DType.float32, width](1.3392112e-3)
         p = p.fma(r, 9.6180963e-3)

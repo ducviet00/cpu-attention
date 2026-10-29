@@ -252,8 +252,9 @@ def _softmax[
         @always_inline
         def one(j: Int) capturing -> V:
             # bf16 probabilities are rounded to 8 bits right after this, so a
-            # degree-2 polynomial (relative 1.7e-3) is inside that rounding.
-            var e = exp2[2 if BF else 5, LANES](
+            # degree-2 polynomial (relative 1.7e-3) is inside that rounding;
+            # fp32 takes the degree-4 minimax (2.6e-6, gate 2e-4).
+            var e = exp2[2 if BF else 4, LANES](
                 row.unsafe_load[width=LANES](j).fma(V(c), V(-mn))
             )
             comptime if BF:
