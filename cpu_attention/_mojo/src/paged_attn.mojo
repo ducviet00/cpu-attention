@@ -17,7 +17,7 @@ from std.math import iota
 from std.memory import bitcast, stack_allocation
 from std.sys.info import CompilationTarget
 
-from isa import BCAST_FOLD, LANES, LOG2E, bf16_lo, dot_bf16, exp2, online_max, ptr, vmax
+from isa import BCAST_FOLD, LANES, LOG2E, bf16_lo, dot_bf16, exp2, online_max, ptr, transpose, vmax
 from parallel import barrier, parallel
 
 comptime V_PAIRS_ARM = CompilationTarget.has_neon()
@@ -100,9 +100,7 @@ struct PageLayout[dtype: DType, hd: Int]:
     def store_token(k_page: Int, v_page: Int, page: Int, t: Int, k_src: Int, v_src: Int):
         """Scatter one token's K and V (one kv head) into its page."""
         var ks = ptr[Scalar[Self.dtype]](k_src)
-        var vs = ptr[Scalar[Self.dtype]](v_src)
         var kdt = ptr[Scalar[Self.dtype]](k_page + t * 4)
-        var vd = ptr[Scalar[Self.dtype]](v_page)
         comptime if Self.BF and not V_PAIRS_ARM:
             for d0 in range(0, Self.hd // 2, 4):
                 comptime for u in range(4):
@@ -122,6 +120,14 @@ struct PageLayout[dtype: DType, hd: Int]:
                 var v4 = ks.unsafe_load[width=4](d0)
                 comptime for u in range(4):
                     kdt.unsafe_store((d0 + u) * page, v4[u])
+        Self.store_v(v_page, page, t, v_src)
+
+    @staticmethod
+    @always_inline
+    def store_v(v_page: Int, page: Int, t: Int, v_src: Int):
+        """One token's V (one kv head) into its page."""
+        var vs = ptr[Scalar[Self.dtype]](v_src)
+        var vd = ptr[Scalar[Self.dtype]](v_page)
         comptime if Self.V_PAIRS:
             var vdt = ptr[Scalar[Self.dtype]](
                 v_page + (((t >> 1) * Self.hd) * 2 + (t & 1)) * 2
@@ -134,6 +140,23 @@ struct PageLayout[dtype: DType, hd: Int]:
             vd.unsafe_store[width=Self.hd](
                 t * Self.hd, vs.unsafe_load[width=Self.hd]()
             )
+
+    @staticmethod
+    @always_inline
+    def store_k_block(k_page: Int, page: Int, t0: Int, k_src: Int, src_stride: Int):
+        """K of LANES consecutive tokens from `t0` (one kv head, one page) through
+        a LANES x LANES transpose of 32-bit K words (an fp32 dim, or a bf16 dim
+        pair): one vector store per word row, where per-token stores are LANES
+        scalar stores each (store-bound: fp32 store-only ran 1.14x C++ on the C4D)."""
+        comptime W = Self.hd * (2 if Self.BF else 4) // 4
+        comptime assert W % LANES == 0, "K words tile by LANES"
+        comptime for w0 in range(0, W, LANES):
+            var r = Array[SIMD[DType.int32, LANES], LANES](uninitialized=True)
+            comptime for i in range(LANES):
+                r[i] = ptr[Int32](k_src + i * src_stride).unsafe_load[width=LANES](w0)
+            transpose[DType.int32](r)
+            comptime for j in range(LANES):
+                ptr[Int32](k_page + ((w0 + j) * page + t0) * 4).unsafe_store[width=LANES](0, r[j])
 
 
 # ---------------------------------------------------------------------------
@@ -182,6 +205,34 @@ def _store_kv[dtype: DType, hd: Int, PAGE: Int](job: PagedJob, seq: Int, kvh: In
         job.k_cache + base, job.v_cache + base, page, off,
         job.k + src, job.v + src,
     )
+
+
+@always_inline
+def _store_block[dtype: DType, hd: Int, PAGE: Int](job: PagedJob, kvh: Int, s0: Int, n: Int):
+    """Store-only: tokens s0 .. s0+n-1 of kv head `kvh`. LANES tokens in
+    consecutive slots of one page take the transposed K store; anything else
+    (padding, a page boundary, scattered slots) stores token by token."""
+    comptime L = PageLayout[dtype, hd]
+    comptime E = 2 if dtype == DType.bfloat16 else 4
+    var page = PAGE if PAGE else job.page
+    if n == LANES and job.slots != 0:
+        var sl = ptr[Int64](job.slots)
+        var first = Int(sl.unsafe_load(s0))
+        var d = _div_page[PAGE](first, page)
+        var run = first >= 0 and d[1] + LANES <= page
+        var i = 1
+        while run and i < LANES:  # scattered slots (one token per sequence) stop at once
+            run = Int(sl.unsafe_load(s0 + i)) == first + i
+            i += 1
+        if run:
+            var base = ((d[0] * job.kv_heads + kvh) * page * hd) * E
+            var src = (s0 * job.kv_stride + kvh * hd) * E
+            L.store_k_block(job.k_cache + base, page, d[1], job.k + src, job.kv_stride * E)
+            for i in range(LANES):
+                L.store_v(job.v_cache + base, page, d[1] + i, job.v + src + i * job.kv_stride * E)
+            return
+    for i in range(n):
+        _store_kv[dtype, hd, PAGE](job, s0 + i, kvh)
 
 
 # ---------------------------------------------------------------------------
@@ -863,12 +914,27 @@ def _body[dtype: DType, hd: Int, PAGE: Int](ctx: Int, tid: Int, threads: Int):
     var pairs = job.num_seqs * kvh_n
     if not job.do_attend:
         if job.do_store:
-            var s0 = tid * pairs // threads
-            var s1 = (tid + 1) * pairs // threads
-            if s0 < s1:
+            # Prefill-style staging (the first LANES slots consecutive) runs in
+            # (kv head, LANES-token block) tasks, so a block is one thread's;
+            # scattered appends keep (token, kv head) order: their source rows are
+            # read contiguously (blocks cost b=32 ctx=1 ~0.4 us).
+            var blocks = job.slots != 0 and job.num_seqs >= LANES
+            if blocks:
+                var sl = ptr[Int64](job.slots)
+                for i in range(1, LANES):
+                    blocks = blocks and Int(sl.unsafe_load(i)) == Int(sl.unsafe_load(0)) + i
+            if blocks:
+                var nblk = (job.num_seqs + LANES - 1) // LANES
+                var tasks = kvh_n * nblk
+                for t in range(tid * tasks // threads, (tid + 1) * tasks // threads):
+                    var kvh = t // nblk
+                    var a = (t - kvh * nblk) * LANES
+                    _store_block[dtype, hd, PAGE](job, kvh, a, min(LANES, job.num_seqs - a))
+            else:
+                var s0 = tid * pairs // threads
                 var seq = s0 // kvh_n
                 var kvh = s0 - seq * kvh_n
-                for _ in range(s0, s1):
+                for _ in range(s0, (tid + 1) * pairs // threads):
                     _store_kv[dtype, hd, PAGE](job, seq, kvh)
                     kvh += 1
                     if kvh == kvh_n:

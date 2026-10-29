@@ -86,9 +86,10 @@ the C4D. Numbers below are the single source of truth; `docs/Mojo.md` explains t
 design and the experiments.
 
 **Setup** (Mojo 1.2.0 `2016d0cd`, torch 2.14.1+cpu). Three 16-vCPU GCP spot VMs,
-threads = physical cores, each measured `cf9688d` (Oct 2026: one decode driver and
-one vector flash policy for every CPU, `docs/Mojo.md` §3) in one full-manifest run
-(`scripts/box_verify.sh`) against an independent copy of `200e6e2` as the previous build.
+threads = physical cores, each measured `77889ea` (Oct 2026: one decode driver and
+one vector flash policy for every CPU, `docs/Mojo.md` §3; large decode rows timed cold,
+see Method) in one full-manifest run (`scripts/box_verify.sh`) against an independent
+copy of `44035cc` as the previous build.
 
 | box | CPU | threads | C++ paths it is compared with |
 |---|---|---:|---|
@@ -113,6 +114,13 @@ C4D, NEON on the Axion) and torch SDPA are secondary references.
   for `flash_attn_func`, 121 for decode, one call per sample. Every arm's output is validated before it can be a
   baseline. Ours includes the K/V pack and the output allocation (not on `out=`
   rows); each arm stages its own cache from the same data.
+* **Cold decode rows**: a decode row whose per-arm K/V working set exceeds a quarter
+  of the LLC is timed cold: before every sample, outside the timer and identically
+  for every arm, a read-only sweep of twice the LLC evicts it. Interleaved warm, those
+  rows were scored on whichever arm's lines the LLC replacement happened to keep: on
+  the C4D (16-33 MB per arm, 32 MB L3) equal kernels read 0.9-1.7, while measured
+  isolated, cold or warm, Mojo matched or beat C++ on every one of them. A serving KV
+  cache is far larger than the LLC. The JSON records `cold` per row.
 * **Verdict per row**: `ratio = Mojo min / fastest valid C++ min`; with
   `band = max(3%, |control / Mojo - 1|, twin)` a row is a **win** below
   `1 - band`, a **loss** above `1 + band`, and **unresolved** in between. `twin`
@@ -123,33 +131,28 @@ C4D, NEON on the Axion) and torch SDPA are secondary references.
 
 | rows | C4D | Axion | Xeon |
 |---|---|---|---|
-| `flash_attn_func` (78) | 73 / 5 / 0 | 58 / 20 / 0 | 49 / 27 / 2 |
-| decode, allocating the output (60) | 10 / 21 / 29 | 35 / 23 / 2 | 22 / 36 / 2 |
-| decode with `out=` (20) | 4 / 7 / 9 | 1 / 17 / 2 | 7 / 12 / 1 |
-| public `flash_attn_with_kvcache` decode (8) | 4 / 2 / 2 | 8 / 0 / 0 | 6 / 2 / 0 |
-| store-only (4) | 2 / 1 / 1 | 4 / 0 / 0 | 3 / 1 / 0 |
-| **all (170)** | **93 / 36 / 41** | **106 / 60 / 4** | **87 / 78 / 5** |
+| `flash_attn_func` (78) | 73 / 5 / 0 | 60 / 18 / 0 | 64 / 14 / 0 |
+| decode, allocating the output (60) | 12 / 48 / 0 | 35 / 24 / 1 | 14 / 43 / 3 |
+| decode with `out=` (20) | 2 / 18 / 0 | 8 / 12 / 0 | 2 / 17 / 1 |
+| public `flash_attn_with_kvcache` decode (8) | 7 / 1 / 0 | 8 / 0 / 0 | 7 / 1 / 0 |
+| store-only (4) | 2 / 1 / 1 | 4 / 0 / 0 | 2 / 2 / 0 |
+| **all (170)** | **96 / 73 / 1** | **115 / 54 / 1** | **89 / 77 / 4** |
 
 **Where Mojo does not clearly win.**
-* **C4D**: 41 losses, all but one decode (`flash_attn_func` 73 wins, 5 ties, 0 losses; the
-  other is store-only `b=1 ctx=1024` fp32, 1.13), the same rows as the previous build
-  (new/previous 0.998-1.004): batch 8 at context ~1024 including page 16/48/64, GQA
-  `h=16/4` and `het` (1.03-1.24), batch-1 context 4096/4097 (1.09-1.38) and batch 8 at
-  context 255-257 (1.07-1.77). On the 4-core C4D (32 MB L3) Mojo matched or beat C++ per
-  thread (0.92-0.98 on one thread) and the gap appeared only with all cores streaming a
-  working set that spills out of the L3 (~56 GB/s against C++'s ~62); a bare-metal Zen 4
-  does not reproduce it. The cause is not found: tile length, key-group width, thread
-  pinning, wake-up policy and thread skew made no difference, and no C4D size offers a
-  hardware PMU (C4 and C4A do, `docs/Mojo.md` §9).
-* **Axion**: 4 losses, all decode: `out=` batch 1 at context 256 fp32 (1.15-1.18, ~5 us
-  calls), batch 8 at context 1023 bf16 (1.04) and batch-1 context 4096 fp32 (1.03). Every
-  bf16 `flash_attn_func` row wins; fp32 ties or wins (no losses): its NEON policy was folded
-  into the shared vector policy, now 2% slower than the dedicated one it replaced at head_dim
-  64 and ~13% at head_dim 32 (`docs/Mojo.md` §9), a cost taken for one implementation across
-  CPUs.
-* **Xeon**: 5 losses at 1.03-1.19: fp32 `flash_attn_func` `512:32:128` and `129:16:128`, and
-  decode fp32 batch 8 at context 1025, bf16 batch-1 context 4097 and `out=` bf16 batch 8 at
-  context 256.
+* **C4D**: no decode or `flash_attn_func` losses. 66 of the 92 decode rows are timed cold
+  (8 wins, 58 ties at the shared ~60-65 GB/s DRAM roof, where both backends stream the
+  same bytes in the same order). The one loss here, store-only `b=1 ctx=1024` fp32
+  (1.14), is fixed at `f1f3199`: the store-only path writes K through a register
+  transpose (one vector store per K word row instead of a scalar store per dim and
+  token), now 0.97 of C++ (bf16 0.21).
+* **Axion**: 1 loss, decode bf16 batch 1 at context 4097 (1.03). Every bf16
+  `flash_attn_func` row wins; fp32 ties or wins (no losses): its NEON policy was folded
+  into the shared vector policy, now 2% slower than the dedicated one it replaced at
+  head_dim 64 and ~13% at head_dim 32 (`docs/Mojo.md` §9), a cost taken for one
+  implementation across CPUs.
+* **Xeon**: 4 losses, all warm decode at 1.04-1.11: batch 1 at context 4096/4097 and
+  fp32 `het`. This VM reports its socket's 260 MB L3, so only 8 decode rows cross the
+  cold threshold; the rest are timed warm and interleaved as before.
 
 **Caveats.**
 * Rows bound by memory placement swing 20-30% with allocation order. The Xeon

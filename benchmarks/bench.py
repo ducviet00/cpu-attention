@@ -13,6 +13,12 @@ Rules (docs/CPP.md §7):
 * Arms are interleaved, the order rotated every round; the minimum decides and
   raw samples + median are kept. Per-arm env (the forced C++ ISA) is applied
   outside the timer.
+* Decode rows whose per-arm K/V working set exceeds a quarter of the LLC are
+  timed cold: before every sample, outside the timer and identically for every
+  arm, a read-only sweep of twice the LLC evicts it. Interleaved warm, such rows
+  were scored on whichever arm's lines the LLC replacement happened to keep (the
+  C4D: 16-33 MB per arm on a 32 MB L3, verdicts 0.9-1.7 for equal kernels); a
+  serving KV cache is far larger than the LLC anyway. ``cold`` is in the JSON.
 * Each arm stages its own cache through its own ``reshape_and_cache`` from the
   same logical data; repeated append calls rewrite the same slot, so contexts
   never grow. Allocation is charged identically: ours include the pack and the
@@ -104,9 +110,9 @@ def source_hashes():
 # ---------------------------------------------------------------------------
 # timing
 # ---------------------------------------------------------------------------
-def time_arms(fns, envs, rounds, calls, warmup=2):
-    """Rotated round-robin; per-call microseconds. ``envs[name]()`` runs
-    before each sample, outside the timer."""
+def time_arms(fns, envs, rounds, calls, warmup=2, sweep=None):
+    """Rotated round-robin; per-call microseconds. ``envs[name]()`` (and
+    ``sweep()``, when given) runs before each sample, outside the timer."""
     names = list(fns)
     for n in names:
         envs[n]()
@@ -116,6 +122,8 @@ def time_arms(fns, envs, rounds, calls, warmup=2):
     for r in range(rounds):
         k = r % len(names)
         for n in names[k:] + names[:k]:
+            if sweep is not None:
+                sweep()
             envs[n]()
             fn = fns[n]
             t0 = time.perf_counter_ns()
@@ -378,7 +386,8 @@ def paged_row(r, arms_, vllm, args, page):
                     break
         return {n: check(n) for n in names}
     rounds = args.paged_rounds
-    return fns, check_all, rounds, args.block_calls
+    ws = 2 * kflat.numel() * kflat.element_size()  # one arm's K + V bytes
+    return fns, check_all, rounds, args.block_calls, ws
 
 
 def vllm_paged(vl, r, x, q, kn, vn, scale, op, out):
@@ -500,15 +509,19 @@ def main():
         print(f"resuming: {len(results)} rows kept, {len(rows)} to run", flush=True)
     R.burn()
     torch.manual_seed(0)
+    llc = arms_[0].pkg._kernel._llc_bytes()
+    evict = torch.ones((2 * llc) // 8, dtype=torch.int64)
     for r in rows:
         label = M.label(r)
+        cold = False
         if r["kind"] == "flash":
             fns, check, rounds, calls = flash_row(r, arms_, vllm, args)
             checks = None
         else:
             page = r["page"] or args.page
-            fns, check_all, rounds, calls = paged_row(r, arms_, vllm, args, page)
+            fns, check_all, rounds, calls, ws = paged_row(r, arms_, vllm, args, page)
             check, checks = None, check_all
+            cold = ws > llc // 4
         envs = {n: next((a.enter for a in arms_ if a.name == n), A.clear_env)
                 for n in fns}
         if "sdpa" not in args.arms:
@@ -524,12 +537,13 @@ def main():
             dropped = screen_cpp(screen, screen_valid, args.screen_x)
             for n in dropped:
                 fns.pop(n)
-        samples = time_arms(fns, envs, rounds, calls)
+        samples = time_arms(fns, envs, rounds, calls,
+                            sweep=(lambda: evict.sum()) if cold else None)
         st = {n: stats(s) for n, s in samples.items()}
         valid = (checks(list(fns)) if checks else
                  {n: check(n) for n in fns})
         cpp_valid = [n for n in fns if n in cpp_names and valid[n][1]]
-        row = dict(r, label=label, rounds=rounds, block_calls=calls,
+        row = dict(r, label=label, rounds=rounds, block_calls=calls, cold=cold,
                    min_us={n: s["min"] for n, s in st.items()},
                    median_us={n: s["median"] for n, s in st.items()},
                    samples_us=samples, err={n: v[0] for n, v in valid.items()},
@@ -570,6 +584,8 @@ def main():
         bad = [n for n, v in valid.items() if not v[1]]
         if bad:
             line += f"  INVALID {bad}"
+        if cold:
+            line += "  cold"
         print(line, flush=True)
         results.append(row)
         # The row's closures reference its (up to 270 MB per arm) K/V caches in
