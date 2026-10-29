@@ -278,6 +278,22 @@ tried moved it. Open: why C++'s 64-key K/V interleave streams better than the
 Mojo 256-key tile at b=32, and why MQA h=16/1 bf16 (92 us vs C++ 83, vLLM 39) is not
 compute-bound-efficient. Requests: none for the shared driver.
 
+**Axion campaign 2 (branch `axion-mojo`, vs `/tmp` copy of the previous build as control).**
+
+| idea | result | decision |
+|---|---|---|
+| allocate decode/flash outputs inside the extension (`aoti_torch_empty_strided` + `THPVariable_Wrap`, links libtorch_python) | removes the `empty_like` cost: engine rows 49 win / 35 unresolved / 8 loss on the 92 paged rows (was 23 losses) | kept |
+| ARM 16-key page unit (PT=16, PG=4, KT=64) paged decode, bfdot/ldp-shaped P@V, vectorized K/V store | b=8 ctx=1024 bf16 0.80 of the previous build | kept |
+| Q@K^T tail skip when a page group has <= 4 live keys | ctx 2^k+1 rows (257/1025/4097) turn into wins | kept |
+| `@no_inline` PV helpers taking `vbase` by pointer | `d=32` segfault: the pointer array's stores were dead-eliminated in the caller (tail call + stack slot), so the callee read garbage | rejected; helpers are `@always_inline` |
+| PV helpers `@no_inline` with `vbase: Array[Int, 4]` by value | 40/92 rows slower than the inline version (register pressure across Q@K^T/softmax) | rejected |
+
+Open: batch 8-32 context ~1024 and batch-1 context 4096 decode sit at 0.95-1.03 of C++ NEON
+(bandwidth-bound); fp32 `engine_out` rows at batch 8 still tie or lose by up to 9% in single
+runs. C++'s NEON bf16 paged kernel returns NaN on poisoned/padded cache pages (26 of 412
+`test_regressions` fail with `CPU_ATTENTION_BACKEND=cpp`, identically on the untouched tree;
+`CPU_ATTENTION_ISA=scalar` passes), so the scalar path is the valid peer there.
+
 Earlier campaigns' ledgers (`docs/CPP.md` §8 and the oracle's notes at
 `mojo-oracle-v1.1`) still apply; nothing on them was re-run without a new
 mechanism.

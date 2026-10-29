@@ -30,14 +30,31 @@ def _run(*args: str) -> None:
     subprocess.run(args, check=True)
 
 
-def _libgomp_flags() -> list[str] | None:
-    """Linker flags for libgomp, or None when only torch's runtime copy exists."""
+def _libgomp_flags(with_torch: bool = False) -> list[str] | None:
+    """Linker flags for libgomp (and torch libs for the shared object)."""
     try:
         import torch
 
         lib = os.path.join(os.path.dirname(torch.__file__), "lib")
+        flags: list[str] = []
         if os.path.exists(os.path.join(lib, "libgomp.so.1")):
-            return ["-Xlinker", "-l:libgomp.so.1", "-Xlinker", f"-L{lib}"]
+            flags += ["-Xlinker", "-l:libgomp.so.1", "-Xlinker", f"-L{lib}"]
+        elif any(
+            os.path.exists(os.path.join(d, "libgomp.so"))
+            for d in ("/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu", "/usr/lib64")
+        ):
+            flags += ["-Xlinker", "-lgomp"]
+        else:
+            return None
+        if with_torch:
+            flags += [
+                "-Xlinker", f"-L{lib}",
+                "-Xlinker", f"-rpath={lib}",
+                "-Xlinker", "-ltorch_python",
+                "-Xlinker", "-ltorch_cpu",
+                "-Xlinker", "-lc10",
+            ]
+        return flags
     except ImportError:
         pass
     dirs = ("/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu", "/usr/lib64")
@@ -84,7 +101,8 @@ def main() -> None:
     # bundled libgomp.so.1 is RTLD_LOCAL, so `import` fails with "undefined
     # symbol: omp_get_thread_num". Same soname either way, so the loader reuses
     # torch's copy when it is already in the process.
-    flags = _libgomp_flags()
+    flags = _libgomp_flags(with_torch=True)
+    test_flags = _libgomp_flags(with_torch=False) or []
     if flags is None:
         print("warning: no libgomp found; the extension may not import")
         flags = []
@@ -119,7 +137,7 @@ def main() -> None:
         print(f"{LIB} = {os.path.basename(best)}")
     if "--tests" not in sys.argv:
         return
-    if not flags:
+    if not test_flags:
         print("skip the standalone test: no libgomp to link against")
         return
     os.makedirs(BUILD, exist_ok=True)
@@ -133,7 +151,7 @@ def main() -> None:
         os.path.join(TESTS, "test_attention.mojo"),
         "-o",
         out,
-        *flags,
+        *test_flags,
     )
     _run(out)
 

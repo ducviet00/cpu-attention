@@ -16,7 +16,19 @@ from flash_attn import FlashJob
 from dispatch import flash_run, flash_sizes as _flash_sizes
 from isa import amx_permitted, ptr, tier_name
 from std.ffi import external_call
-from pyview import data_ptr, dims, dtype_code, hdr_at, impl, is_tensor, size, stride, word
+from pyview import (
+    alloc_out_3d,
+    alloc_out_4d,
+    data_ptr,
+    dims,
+    dtype_code,
+    hdr_at,
+    impl,
+    is_tensor,
+    size,
+    stride,
+    word,
+)
 
 
 def amx_available() -> PythonObject:
@@ -144,16 +156,20 @@ def kv_fast(
     the caller's checked path (which then registers a plan)."""
     var hdr = Int(py=table)
     var none = hdr_at(hdr, 10)
+    var qo = Int(q._obj_ptr)
     var kco = Int(k_cache._obj_ptr)
     var vco = Int(v_cache._obj_ptr)
     var oo = Int(dst._obj_ptr)
     var ko = Int(k._obj_ptr)
     var vo = Int(v._obj_ptr)
     var so = Int(slots._obj_ptr)
+    var bto = Int(block_table._obj_ptr)
     var threads = Int(external_call["omp_get_max_threads", Int32]())
     var n = hdr_at(hdr, 11)
 
-    if oo == none:
+    if qo == none:
+        if bto != none:
+            return PythonObject(None)
         # Store-only fast path (`reshape_and_cache`).
         if not (
             is_tensor(hdr, ko)
@@ -237,25 +253,24 @@ def kv_fast(
             return True
         return False
 
-    var qo = Int(q._obj_ptr)
-    var bto = Int(block_table._obj_ptr)
     var lo = Int(lens._obj_ptr)
     var store = ko != none
+    var has_dst = oo != none
     if not (
         is_tensor(hdr, qo)
         and is_tensor(hdr, kco)
         and is_tensor(hdr, vco)
         and is_tensor(hdr, bto)
         and is_tensor(hdr, lo)
-        and is_tensor(hdr, oo)
+        and (not has_dst or is_tensor(hdr, oo))
     ):
-        return False
+        return PythonObject(None)
     var qi = impl(qo)
     var kci = impl(kco)
     var vci = impl(vco)
     var bti = impl(bto)
     var li = impl(lo)
-    var oi = impl(oo)
+    var oi = impl(oo) if has_dst else 0
     var qd = dims(hdr, qi)
     var d4 = qd == 4
     if (
@@ -263,55 +278,51 @@ def kv_fast(
         or dims(hdr, kci) != 4
         or dims(hdr, vci) != 4
         or dims(hdr, bti) != 2
-        or dims(hdr, oi) != qd
         or dims(hdr, li) != 1
     ):
-        return False
-    if d4 and (size(hdr, qi, 1) != 1 or size(hdr, oi, 1) != 1):
-        return False
+        return PythonObject(None)
+    if d4 and size(hdr, qi, 1) != 1:
+        return PythonObject(None)
     if stride(hdr, bti, 1) != 1 or stride(hdr, li, 0) != 1:
-        return False
+        return PythonObject(None)
     var nseq = size(hdr, qi, 0)
     if size(hdr, li, 0) < nseq:
-        return False
+        return PythonObject(None)
     var code = dtype_code(hdr, qi)
     var i32 = hdr_at(hdr, 12)
-    if (
-        dtype_code(hdr, kci) != code
-        or dtype_code(hdr, vci) != code
-        or dtype_code(hdr, oi) != code
-    ):
-        return False
+    if dtype_code(hdr, kci) != code or dtype_code(hdr, vci) != code:
+        return PythonObject(None)
     if dtype_code(hdr, bti) != i32 or dtype_code(hdr, li) != i32:
-        return False
+        return PythonObject(None)
     # The kernel writes a contiguous [seqs, (1,) heads, hd] output and reads V
     # with the K cache's geometry.
     var nh = size(hdr, qi, 2 if d4 else 1)
     var hd = size(hdr, qi, 3 if d4 else 2)
-    if (
-        size(hdr, oi, 0) != nseq
-        or size(hdr, oi, 2 if d4 else 1) != nh
-        or size(hdr, oi, 3 if d4 else 2) != hd
-    ):
-        return False
-    if (
-        stride(hdr, oi, 0) != nh * hd
-        or stride(hdr, oi, 2 if d4 else 1) != hd
-        or stride(hdr, oi, 3 if d4 else 2) != 1
-    ):
-        return False
+    if has_dst:
+        if (
+            dims(hdr, oi) != qd
+            or dtype_code(hdr, oi) != code
+            or (d4 and size(hdr, oi, 1) != 1)
+            or size(hdr, oi, 0) != nseq
+            or size(hdr, oi, 2 if d4 else 1) != nh
+            or size(hdr, oi, 3 if d4 else 2) != hd
+            or stride(hdr, oi, 0) != nh * hd
+            or stride(hdr, oi, 2 if d4 else 1) != hd
+            or stride(hdr, oi, 3 if d4 else 2) != 1
+        ):
+            return PythonObject(None)
     comptime for i in range(4):
         if size(hdr, vci, i) != size(hdr, kci, i) or stride(
             hdr, vci, i
         ) != stride(hdr, kci, i):
-            return False
+            return PythonObject(None)
     var ki = 0
     var vi = 0
     var si = 0
     var mode = 0
     if store:
         if not (is_tensor(hdr, ko) and is_tensor(hdr, vo)):
-            return False
+            return PythonObject(None)
         ki = impl(ko)
         vi = impl(vo)
         if (
@@ -320,9 +331,9 @@ def kv_fast(
             or dtype_code(hdr, ki) != code
             or dtype_code(hdr, vi) != code
         ):
-            return False
+            return PythonObject(None)
         if d4 and (size(hdr, ki, 1) != 1 or size(hdr, vi, 1) != 1):
-            return False
+            return PythonObject(None)
         var kvh = size(hdr, kci, 1)
         if (
             size(hdr, ki, 0) != nseq
@@ -332,10 +343,10 @@ def kv_fast(
             or size(hdr, vi, 2 if d4 else 1) != kvh
             or size(hdr, vi, 3 if d4 else 2) != hd
         ):
-            return False
+            return PythonObject(None)
         if so != none:
             if not is_tensor(hdr, so):
-                return False
+                return PythonObject(None)
             si = impl(so)
             if (
                 dtype_code(hdr, si) != hdr_at(hdr, 13)
@@ -343,23 +354,23 @@ def kv_fast(
                 or stride(hdr, si, 0) != 1
                 or size(hdr, si, 0) < nseq
             ):
-                return False
+                return PythonObject(None)
             mode = 1
         else:
             if size(hdr, li, 0) != nseq:
-                return False
+                return PythonObject(None)
             mode = 2
     else:
         if vo != none or so != none:
-            return False
+            return PythonObject(None)
         if d4 and size(hdr, li, 0) != nseq:
-            return False
+            return PythonObject(None)
     var sc_obj = Int(scale._obj_ptr)
     var default_scale = sc_obj == none
     var sval = Float32(0)
     if not default_scale:
         if word(sc_obj + 8) != hdr_at(hdr, 16):
-            return False
+            return PythonObject(None)
         sval = Float32(Float64(py=scale))
     for e_i in range(n - 1, -1, -1):
         var e = hdr + 8 * (KV_ENTRY0 + KV_ENTRY_W * e_i)
@@ -403,7 +414,6 @@ def kv_fast(
         job.q = data_ptr(hdr, qi, item)
         job.k_cache = data_ptr(hdr, kci, item)
         job.v_cache = data_ptr(hdr, vci, item)
-        job.out = data_ptr(hdr, oi, item)
         job.block_table = data_ptr(hdr, bti, 4)
         job.lens = data_ptr(hdr, li, 4)
         job.q_stride = word(e + 8 * 22)
@@ -417,9 +427,19 @@ def kv_fast(
             if default_scale
             else sval
         )
+        if has_dst:
+            job.out = data_ptr(hdr, oi, item)
+            paged_run(job)
+            return dst
+        var py_out = (
+            alloc_out_4d(nseq, 1, nh, hd, job.dtype)
+            if d4
+            else alloc_out_3d(nseq, nh, hd, job.dtype)
+        )
+        job.out = data_ptr(hdr, impl(Int(py_out)), item)
         paged_run(job)
-        return True
-    return False
+        return PythonObject(from_owned=py_out)
+    return PythonObject(None)
 
 
 comptime FL_ENTRY0 = 24  # first plan entry slot (after the pyview header)
@@ -442,44 +462,37 @@ def flash_fast(
     v: PythonObject,
     scale: PythonObject,
     causal: PythonObject,
-    dst: PythonObject,
 ) raises -> PythonObject:
-    """flash_attn_func with the tensors read here: True if a plan registered by
-    a validated call matches this call exactly (layout, dtype, causal, scale,
-    threads) and it ran; False for the caller's checked path."""
+    """flash_attn_func with the tensors read here: returns the output tensor if
+    a plan registered by a validated call matches this call exactly (layout,
+    dtype, causal, scale, threads); None for the caller's checked path."""
     var hdr = Int(py=table)
     var qo = Int(q._obj_ptr)
     var ko = Int(k._obj_ptr)
     var vo = Int(v._obj_ptr)
-    var oo = Int(dst._obj_ptr)
-    if not (is_tensor(hdr, qo) and is_tensor(hdr, ko) and is_tensor(hdr, vo) and is_tensor(hdr, oo)):
-        return False
+    if not (is_tensor(hdr, qo) and is_tensor(hdr, ko) and is_tensor(hdr, vo)):
+        return PythonObject(None)
     var qi = impl(qo)
     var ki = impl(ko)
     var vi = impl(vo)
-    var oi = impl(oo)
-    if dims(hdr, qi) != 4 or dims(hdr, ki) != 4 or dims(hdr, vi) != 4 or dims(hdr, oi) != 4:
-        return False
+    if dims(hdr, qi) != 4 or dims(hdr, ki) != 4 or dims(hdr, vi) != 4:
+        return PythonObject(None)
     var code = dtype_code(hdr, qi)
-    if dtype_code(hdr, ki) != code or dtype_code(hdr, vi) != code or dtype_code(hdr, oi) != code:
-        return False
-    var row = size(hdr, qi, 2) * size(hdr, qi, 3)
+    if dtype_code(hdr, ki) != code or dtype_code(hdr, vi) != code:
+        return PythonObject(None)
     comptime for i in range(4):
-        if size(hdr, oi, i) != size(hdr, qi, i) or size(hdr, vi, i) != size(hdr, ki, i):
-            return False
-    if (stride(hdr, oi, 3) != 1 or stride(hdr, oi, 2) != size(hdr, qi, 3)
-            or stride(hdr, oi, 1) != row or stride(hdr, oi, 0) != row * size(hdr, qi, 1)):
-        return False
+        if size(hdr, vi, i) != size(hdr, ki, i):
+            return PythonObject(None)
     var co = Int(causal._obj_ptr)
     var cflag = 1 if co == hdr_at(hdr, 14) else (0 if co == hdr_at(hdr, 15) else -1)
     if cflag < 0:
-        return False
+        return PythonObject(None)
     var so = Int(scale._obj_ptr)
     var default_scale = so == hdr_at(hdr, 10)
     var sval = Float64(0)
     if not default_scale:
         if word(so + 8) != hdr_at(hdr, 16):  # exactly a Python float
-            return False
+            return PythonObject(None)
         sval = Float64(py=scale)
     var threads = Int(external_call["omp_get_max_threads", Int32]())
     var n = hdr_at(hdr, 11)
@@ -498,16 +511,24 @@ def flash_fast(
             continue
         var item = word(e + 8 * 27)
         var plan = word(e + 8 * 25)
+        var p = ptr[Int64](plan)
+        var dt = Int(p.unsafe_load(18))
+        var py_out = alloc_out_4d(
+            size(hdr, qi, 0),
+            size(hdr, qi, 1),
+            size(hdr, qi, 2),
+            size(hdr, qi, 3),
+            dt,
+        )
         var job = FlashJob(
             plan, data_ptr(hdr, qi, item), data_ptr(hdr, ki, item),
-            data_ptr(hdr, vi, item), data_ptr(hdr, oi, item),
+            data_ptr(hdr, vi, item), data_ptr(hdr, impl(Int(py_out)), item),
             ptr[Float32](e + 8 * 28).unsafe_load(0),
         )
         job.ws = word(e + 8 * 26)
-        var p = ptr[Int64](plan)
-        flash_run(job, Int(p.unsafe_load(18)), Int(p.unsafe_load(5)), Int(p.unsafe_load(27)))
-        return True
-    return False
+        flash_run(job, dt, Int(p.unsafe_load(5)), Int(p.unsafe_load(27)))
+        return PythonObject(from_owned=py_out)
+    return PythonObject(None)
 
 def kv_attention(
     plan: PythonObject,

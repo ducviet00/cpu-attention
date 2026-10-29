@@ -465,6 +465,7 @@ def _kv_table():
     t[:len(_LAYOUT)] = torch.tensor(_LAYOUT, dtype=torch.int64)
     _KV_TABLE.t, _KV_TABLE.gen, _KV_TABLE.keep = t, _KV_GEN[0], []
     _KV_TABLE.addr = t.data_ptr()
+    _KV_TABLE.fn = _entry("kv_fast")
     return t
 
 
@@ -498,7 +499,7 @@ def _kv_register(fn, query, key, value, k_cache, page_table, mode):
 def _kv_store(key, value, k_cache, v_cache, slots):
     """reshape_and_cache on the Mojo backend: one token per `key` row."""
     table = getattr(_KV_TABLE, "t", None)
-    if table is not None and _KV_TABLE.gen == _KV_GEN[0] and _entry("kv_fast")(
+    if table is not None and _KV_TABLE.gen == _KV_GEN[0] and _KV_TABLE.fn(
             _KV_TABLE.addr, None, key, value, k_cache, v_cache, slots,
             None, None, None, None):
         return
@@ -538,15 +539,17 @@ def _paged(
             res = call(query, key, value, k_cache, v_cache, slots, page_table,
                        lens, scale, out)
         return res
+    table = getattr(_KV_TABLE, "t", None)
+    if table is not None and _KV_TABLE.gen == _KV_GEN[0]:
+        res = _KV_TABLE.fn(
+            _KV_TABLE.addr, query, key, value, k_cache, v_cache, slots,
+            page_table, lens, scale, out)
+        if res is not None:
+            return res
     if out is None:
         # Paged queries have contiguous heads/dims; a fused-projection token
         # gap is compacted by empty_like without a memory-format keyword.
         out = torch.empty_like(query)
-    table = getattr(_KV_TABLE, "t", None)
-    if table is not None and _KV_TABLE.gen == _KV_GEN[0] and _entry("kv_fast")(
-            _KV_TABLE.addr, query, key, value, k_cache, v_cache, slots,
-            page_table, lens, scale, out):
-        return out
     # One tuple, one lookup: the key carries the strides, so the layout checks
     # run only when a plan is built (0.75 us of Python per call before).
     plans = _kv_plans()
@@ -913,6 +916,7 @@ def _flash_table():
     t[:len(_LAYOUT)] = torch.tensor(_LAYOUT, dtype=torch.int64)
     _FLASH.t, _FLASH.gen, _FLASH.keep = t, _flash_gen(), []
     _FLASH.addr = t.data_ptr()
+    _FLASH.fn = _entry("flash_fast")
     return t
 
 

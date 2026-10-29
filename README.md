@@ -122,11 +122,11 @@ C4D, NEON on the Axion) and torch SDPA are secondary references.
 | rows | C4D | Axion | Xeon |
 |---|---|---|---|
 | `flash_attn_func` (78) | 71 / 7 / 0 | 77 / 1 / 0 | 47 / 23 / 8 |
-| decode, allocating the output (60) | 10 / 32 / 18 | 18 / 19 / 23 | 19 / 32 / 9 |
-| decode with `out=` (20) | 3 / 12 / 5 | 3 / 10 / 7 | 7 / 11 / 2 |
+| decode, allocating the output (60) | 10 / 32 / 18 | 32 / 27 / 1 | 19 / 32 / 9 |
+| decode with `out=` (20) | 3 / 12 / 5 | 8 / 12 / 0 | 7 / 11 / 2 |
 | public `flash_attn_with_kvcache` decode (8) | 4 / 3 / 1 | 7 / 1 / 0 | 4 / 3 / 1 |
-| store-only (4) | 3 / 1 / 0 | 3 / 1 / 0 | 0 / 3 / 1 |
-| **all (170)** | **91 / 55 / 24** | **108 / 32 / 30** | **77 / 72 / 21** |
+| store-only (4) | 3 / 1 / 0 | 4 / 0 / 0 | 0 / 3 / 1 |
+| **all (170)** | **91 / 55 / 24** | **128 / 41 / 1** | **77 / 72 / 21** |
 
 **Where Mojo does not clearly win.**
 * **C4D** (re-measured at `c9bf977`: one full run, plus two `--load-seed` reruns of
@@ -142,11 +142,12 @@ C4D, NEON on the Axion) and torch SDPA are secondary references.
   skew each made no difference, and this VM exposes no hardware performance counters.
   bf16 page 48 is 8% slower per core than C++ on one thread (parity without the
   compile-time page-48 body); 4 threads hide it.
-* **Axion**: 30 losses, 1.03-1.23, **all decode**. 23 are calls that allocate
-  their output: `torch.empty_like` costs 2.6 us inside the interleaved run
-  (0.6 us hot) and C++ allocates natively, so ~5 us batch-1 calls lose by
-  1.1-1.2. The `out=` rows still lose at batch 1 (up to 1.23, fp32) and at
-  batch 8-32 bf16 (1.06). Every `flash_attn_func` row wins except one tie.
+* **Axion** (branch `axion-mojo`, re-measured; the other columns are from earlier
+  commits): 1 loss, 41 unresolved, all decode except one `flash_attn_func` tie. The one loss,
+  `engine cross b=8 ctx=1025 bf16` (1.03), re-measured 0.90 / 0.97 / 0.92 under
+  `--load-seed` 1-3 (placement noise). The unresolved rows sit at 0.95-1.03 of C++ NEON,
+  mostly batch 8-32 at context ~1024 and batch-1 context 4096, which stream 16-67 MB
+  per call; the objective of a clear win on every row is **not met** there.
 * **Xeon** (re-measured Oct 2026 after the bf16 Q-panel change; the other two boxes
   are as measured before it): 21 losses. `flash_attn_func`: 8, 1.04-1.12, seven of
   them fp32 head_dim 128 at 129-1025 tokens (and `513x257:8:64` fp32), plus bf16
