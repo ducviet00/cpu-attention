@@ -906,6 +906,37 @@ def _rows_tile[dtype: DType, hd: Int, PAGE: Int](job: PagedJob, seq: Int, kvh: I
             left -= 1
 
 
+def _share(job: PagedJob, per_seq: Int, tid: Int, threads: Int) -> Tuple[Int, Int]:
+    """Worker `tid`'s tasks `[t0, t1)` in (sequence, task) order with `per_seq`
+    tasks per sequence: contiguous, and balanced on cost (a task's context plus
+    one 16-key unit of fixed work), not on count. Equal counts left a mixed-length
+    batch's critical path on whichever worker held its longest sequence (Axion,
+    8 sequences of 17-2047 keys x 16 heads on 8 threads: 3.3x the mean, 2.7x
+    slower than vLLM)."""
+    var lens = ptr[Int32](job.lens)
+    var tasks = job.num_seqs * per_seq
+    var total = 0
+    for s in range(job.num_seqs):
+        total += Int(lens.unsafe_load(s)) + 16
+    # Worker tid starts at the first task whose preceding cost reaches
+    # tid / threads of the total (everything scaled by threads: exact integers).
+    var lo = tid * total * per_seq
+    var hi = lo + total * per_seq
+    var t0 = tasks
+    var t1 = tasks
+    var cum = 0
+    for s in range(job.num_seqs):
+        var c = (Int(lens.unsafe_load(s)) + 16) * threads
+        var last = cum + c * (per_seq - 1)  # cost before this sequence's last task
+        if t0 == tasks and lo <= last:
+            t0 = s * per_seq + max(0, (lo - cum + c - 1) // c)
+        if hi <= last:
+            t1 = s * per_seq + max(0, (hi - cum + c - 1) // c)
+            break
+        cum += c * per_seq
+    return (t0, t1)
+
+
 def _body[dtype: DType, hd: Int, PAGE: Int](ctx: Int, tid: Int, threads: Int):
     var job = ptr[PagedJob](ctx)[]
     var kvh_n = job.kv_heads
@@ -941,8 +972,7 @@ def _body[dtype: DType, hd: Int, PAGE: Int](ctx: Int, tid: Int, threads: Int):
         return
     if job.num_heads == kvh_n:
         # MHA fast path: 1 query head per kv head, chunks == 1, no barrier.
-        var t0 = tid * pairs // threads
-        var t1 = (tid + 1) * pairs // threads
+        var t0, t1 = _share(job, kvh_n, tid, threads)
         if t0 < t1:
             var seq = t0 // kvh_n
             var kvh = t0 - seq * kvh_n
@@ -970,10 +1000,8 @@ def _body[dtype: DType, hd: Int, PAGE: Int](ctx: Int, tid: Int, threads: Int):
                     kvh = 0
                     seq += 1
         barrier()
-    var tasks = pairs * job.chunks
     var per = (group + job.chunks - 1) // job.chunks
-    var t0 = tid * tasks // threads
-    var t1 = (tid + 1) * tasks // threads
+    var t0, t1 = _share(job, kvh_n * job.chunks, tid, threads)
     for t in range(t0, t1):
         var pair = t // job.chunks
         var ch = t - pair * job.chunks

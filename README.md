@@ -415,7 +415,7 @@ uv run python tests/test_dense.py          # flash_attn_func vs a naive fp32 ref
 uv run python tests/test_flash_api.py      # flash-shaped API and its rejections
 uv run python tests/fuzz_dense.py --cases 80 --max-seq 900
 uv run python tests/test_paged_sweep.py    # 504 paged cases, both dtypes
-uv run python tests/test_regressions.py    # 412 checks: odd/unequal lengths, masked rows, poisoned caches, strides, scale, workers, concurrency
+uv run python tests/test_regressions.py    # 457 checks: odd/unequal lengths, masked rows, poisoned caches, strides, scale, workers, concurrency
 uv run python tests/test_amx.py --dtype both   # AMX policy (AMX CPUs; fails if AMX is present but unusable)
 ```
 
