@@ -298,6 +298,10 @@ Goal: one implementation across CPUs, then latency (AGENTS.md).
 | NEON fp32 Q through a contiguous panel (32 heads x 128 dims: rows 16 KB apart, one L1 set) | GQA rows 1.09 -> ~1.0; C++ losses 2 -> 0 | kept |
 | lane max through `isa.vmax` (one `fmaxnm` / `vmaxps` against compare + select) | round 6 (all above): Axion fp32 flash 1.050 (19 / 20 / 0 vs C++), flash elsewhere 0.99-1.00 | kept |
 | `kvcache.mojo` -> `paged_attn.mojo`; one `isa.exp2` (AVX-512: the AMX policy's `rndscale` + `scalef`, 7 uops against 9; NEON: integer exponent; one coefficient set per degree), `isa.vmax` and `isa.bf16_lo` replace the AMX and NEON policies' copies; one `_with_policy` table for running and sizing | flash Axion / C4D / Xeon 0.998 / 0.985 (C4D bf16 0.973) / 0.989, paged 0.995 / 0.999 / 1.000; `test_amx` 102/102 | kept |
+| vector flash policy: the rescale rides P@V's accumulator load and a row tile's first key tile starts from zero (`ZEROES_ACC`: no rescale pass, no clear) | Axion fp32 flash 0.992 (16 threads 0.990); x86 neutral (Zen 4 one thread 0.99-1.00) | kept |
+| decode `PVRows`: two key pairs per loop iteration (the loop's adds and compares were 11% of a cache-resident bf16 decode) | Zen 4 one thread: 6% fewer instructions, cycles 0.85-0.93; boxes paged 0.987-1.000 | kept |
+| bf16 vector P@V one dim vector per pass, so the probability broadcast folds into `vdpbf16ps` (a separate `vbroadcastss` was 16% of the call) | Zen 4: 4-6% fewer instructions, cycles ~0.98; Zen 5 (C4D-16): head_dim 64 1.17, 128 1.15 | reverted: not a gain on every AVX-512 core |
+| flash plan: at least ~8 work items per worker (halve `rq`, clamped to `seq_q`, down to one register-tile pair) | Axion-16 1024:8:32 fp32 802 -> 712 us (C++ 704), bf16 329 -> 296 (C++ 323); 8 threads unchanged. The first version halved before clamping: 17-row calls split into a 1-row block and ran 15x slower | kept (fixed) |
 
 Result: decode unification at no measured cost; Axion fp32 `flash_attn_func` is ~5% slower
 than the dedicated NEON policy (wins became ties, no losses), accepted for the unification

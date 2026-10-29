@@ -80,21 +80,21 @@ Notes on the API:
 
 **Status: the performance objective is not met.** The unified Mojo backend (the
 default) is measured against the *fastest numerically valid C++ path* on each
-row, on three machines. It wins a clear majority of the `flash_attn_func` rows
-on the C4D and the Axion (all 78 on the Axion), and 48 of 78 on the Xeon, but it loses
-or cannot resolve many decode rows on all three. Numbers below are the single
-source of truth; `docs/Mojo.md` explains the design and the experiments.
+row, on three machines. It wins most `flash_attn_func` rows on all three and loses
+none on the Axion and the C4D, but it ties or loses many decode rows, most of all on
+the C4D. Numbers below are the single source of truth; `docs/Mojo.md` explains the
+design and the experiments.
 
-**Setup** (Mojo 1.2.0 `2016d0cd`, torch 2.14.1+cpu). All three boxes measured
-`867097e` (Oct 2026: one decode driver, one vector flash policy and one set of
-shared kernels' math for every CPU, `docs/Mojo.md` §3) in one full-manifest run
-each, against an independent copy of `9a60079` as the previous build.
+**Setup** (Mojo 1.2.0 `2016d0cd`, torch 2.14.1+cpu). Three 16-vCPU GCP spot VMs,
+threads = physical cores, each measured `2da6994` (Oct 2026: one decode driver and
+one vector flash policy for every CPU, `docs/Mojo.md` §3) in one full-manifest run
+against an independent copy of `200e6e2` as the previous build.
 
 | box | CPU | threads | C++ paths it is compared with |
 |---|---|---:|---|
-| C4D | Google C4D (c4d-standard-8): AMD EPYC 9B45 (Zen 5), 4 cores / 8 threads, 32 MB L3, AVX-512 + BF16, no AMX | 4 | vec, scalar |
-| Axion | Google Axion Neoverse-V2 (GCP c4a-standard-8) | 8 | neon, scalar |
-| Xeon | Intel Xeon Platinum 8581C (GCP c4-standard-8, 4 cores / 8 threads, AMX) | 4 | amx, vec, scalar |
+| C4D | Google C4D (c4d-standard-16): AMD EPYC 9B45 (Zen 5), 8 cores / 16 threads, AVX-512 + BF16, no AMX | 8 | vec, scalar |
+| Axion | Google Axion Neoverse-V2 (c4a-standard-16), 16 cores | 16 | neon, scalar |
+| Xeon | Intel Xeon Platinum 8581C (c4-standard-16), 8 cores / 16 threads, AMX | 8 | amx, vec, scalar |
 
 vLLM `csrc/cpu` at `db3b0f0` (AMX for Xeon bf16, VEC for x86 fp32 and the
 C4D, NEON on the Axion) and torch SDPA are secondary references.
@@ -123,39 +123,30 @@ C4D, NEON on the Axion) and torch SDPA are secondary references.
 
 | rows | C4D | Axion | Xeon |
 |---|---|---|---|
-| `flash_attn_func` (78) | 73 / 5 / 0 | 59 / 19 / 0 | 49 / 22 / 7 |
-| decode, allocating the output (60) | 13 / 22 / 25 | 34 / 22 / 4 | 14 / 42 / 4 |
-| decode with `out=` (20) | 6 / 7 / 7 | 7 / 13 / 0 | 7 / 9 / 4 |
-| public `flash_attn_with_kvcache` decode (8) | 4 / 2 / 2 | 7 / 1 / 0 | 5 / 3 / 0 |
-| store-only (4) | 3 / 0 / 1 | 4 / 0 / 0 | 0 / 4 / 0 |
-| **all (170)** | **99 / 36 / 35** | **111 / 55 / 4** | **75 / 80 / 15** |
+| `flash_attn_func` (78) | 71 / 7 / 0 | 61 / 17 / 0 | 59 / 16 / 3 |
+| decode, allocating the output (60) | 11 / 22 / 27 | 37 / 21 / 2 | 16 / 41 / 3 |
+| decode with `out=` (20) | 4 / 7 / 9 | 9 / 9 / 2 | 4 / 16 / 0 |
+| public `flash_attn_with_kvcache` decode (8) | 4 / 1 / 3 | 7 / 1 / 0 | 6 / 2 / 0 |
+| store-only (4) | 2 / 2 / 0 | 4 / 0 / 0 | 3 / 1 / 0 |
+| **all (170)** | **92 / 39 / 39** | **118 / 48 / 4** | **88 / 76 / 6** |
 
 **Where Mojo does not clearly win.**
-* **C4D**: 35 losses, all but one decode (`flash_attn_func` 73 wins, 5 ties; the
-  other is store-only `b=1 ctx=1024` fp32, 1.11). The previous build loses the same
-  rows in the same process. The largest are fp32 batch 8 at context 255-257
-  (1.56-1.85), whose ~17-19 MB working set sits near this VM's 32 MB L3, so the
-  verdict depends on which arm's cache is resident (0.61-1.81 across `--load-seed`
-  reruns). The others are batch-1 context 4096/4097 (1.07-1.19) and batch-8 context
-  ~1024 (1.03-1.27). Per thread Mojo matches or beats C++ on every shape isolated
-  (0.92-0.98 on one thread). The gap appears only with 4 threads streaming a working
-  set that spills out of the L3 (about 33 MB per call): C++ sustains ~62 GB/s there
-  and Mojo ~56. The cause is not found. Tile length, key-group width, thread pinning,
-  wake-up policy and thread skew made no difference, and this VM exposes no hardware
-  performance counters.
-* **Axion**: 4 losses, all bf16 decode at batch 8, context ~1024 (1.04-1.10). Every bf16
-  `flash_attn_func` row wins; fp32 `flash_attn_func` ties (19 wins / 20 unresolved / 0
-  losses): its NEON policy was folded into the shared vector policy, about 5% slower
-  than the dedicated one it replaced (`docs/Mojo.md` §9), a cost taken for one
-  implementation across CPUs and still to be won back. Most unresolved decode rows are
-  batch 8-32 at context ~1024 and batch-1 context 4096, which stream 16-67 MB per call
-  and sit at 0.95-1.03 of C++ NEON.
-* **Xeon**: 15 losses. 7 are `flash_attn_func` at head_dim 128, 129-1024 tokens
-  (1.04-1.10; six fp32, plus bf16 `512:32:128`). On four threads the fp32 rows run
-  4-5% behind C++ while Mojo is 3% *faster* on one thread; the cause is not found (not
-  SMT placement, workspace alignment or offset). Decode has 8, all fp32: batch 8 at
-  context ~1024 and `het` (1.03-1.14, placement-bound, see the caveat) and batch-1
-  context 4096/4097 (1.07-1.13).
+* **C4D**: 39 losses, all decode, the same rows as the previous build (new/previous
+  about 1.00): batch 8 at context ~1024 including page 16/48/64 and GQA `h=16/4`
+  (1.03-1.25), batch-1 context 4096/4097 (1.06-1.22) and fp32 batch 8 at context
+  255-257 (1.04-1.23). On the 4-core C4D (32 MB L3) Mojo matched or beat C++ per
+  thread (0.92-0.98 on one thread) and the gap appeared only with all cores streaming a
+  working set that spills out of the L3 (~56 GB/s against C++'s ~62); a bare-metal Zen 4
+  does not reproduce it. The cause is not found: tile length, key-group width, thread
+  pinning, wake-up policy and thread skew made no difference, and the VMs expose no
+  hardware performance counters.
+* **Axion**: 4 losses, decode at 1.03-1.05 (fp32 batch 8 at context ~1024, bf16 `out=`
+  batch 32 / batch-1 context 4096). Every bf16 `flash_attn_func` row wins; fp32 ties or
+  wins (22 / 17 / 0): its NEON policy was folded into the shared vector policy, about 4%
+  slower than the dedicated one it replaced (`docs/Mojo.md` §9), a cost taken for one
+  implementation across CPUs.
+* **Xeon**: 6 losses at 1.04-1.12: `flash_attn_func` fp32 `512:32:128` and `129:16:128`
+  and bf16 `513:8:64`, and bf16 decode at batch 1, context 4096/4097.
 
 **Caveats.**
 * Rows bound by memory placement swing 20-30% with allocation order. The Xeon
@@ -166,12 +157,9 @@ C4D, NEON on the Axion) and torch SDPA are secondary references.
 * Two Xeon runs of identical code differed by 5-10% on a few fp32 AMX
   `flash_attn_func` rows (the control arm moved with it, C++ did not); the
   cause is not found.
-* Single-run counts move by 6-10 rows. Across runs, the Xeon gave 64 / 76 / 30,
-  70 / 80 / 20, 67 / 79 / 24, 75 / 75 / 20 and 71-83 wins over seven runs of the
-  unified kernels. The C4D gave 84 / 50 / 36, 91 / 55 / 24, 94 / 46 / 30,
-  92 / 43 / 35 and 91-99 wins over seven runs. Read a row's verdict from repeated `--load-seed` runs, not
-  from one table.
-* The Axion runs at 8 threads (its physical cores).
+* Single-run counts move by 6-10 rows; read a row's verdict from repeated
+  `--load-seed` runs, not from one table. Earlier 4-thread measurements on the
+  8-vCPU boxes are in this file's history (`9a60079` and before).
 * The `mojo-oracle-v1.1` tag is not on `origin`. These runs fetched it from a local
   clone; the C++ arms are built from it.
 
