@@ -1,5 +1,6 @@
 """The vector policy of flash_attn_func: AVX-512 (AVX-512-BF16 dot products),
-AVX2, and NEON fp32 from one LANES-generic source.
+AVX2, and NEON fp32 from one LANES-generic source; the per-target differences are
+compile-time constants (KV32, NS, KU32 from LANES and BCAST_FOLD).
 
 Layouts: K^T blocked every KP keys, `[tile][hd][KP]` (bf16 `[tile][hd/2][KP][2]`,
 the dim pair a dot instruction contracts); V row-major (fp32, read in place
@@ -12,12 +13,20 @@ from std.math import iota
 from std.memory import bitcast
 
 from flash_attn import FlashJob, FlashPolicy, NEG, V
-from isa import LANES, dot_bf16, exp2, exp2s, ptr
+from isa import BCAST_FOLD, LANES, dot_bf16, exp2, exp2s, ptr
 
 comptime KP = 64  # keys per K^T block
 comptime KT = 256  # keys per softmax tile
 comptime RQT = 8  # query rows per register tile
 comptime PV_VECS = 2  # dim vectors per P@V pass: 1 was 1.28x slower at hd=128 fp32 (V re-read)
+comptime KV32 = max(1, 8 // LANES)
+"""fp32 key vectors per Q@K^T pass: at least 8 keys, so 4-lane NEON keeps
+RQT x 2 = 16 independent FMA chains (4 pipes x 4 cycles on Neoverse-V2)."""
+comptime NS = max(1, 8 // LANES)
+"""Partial row sums in the softmax (independent adds on 4 lanes)."""
+comptime KU32 = 1 if BCAST_FOLD else 4
+"""fp32 P@V keys per step: 4 probabilities as one vector, a lane each, where a
+broadcast does not fold into the FMA."""
 
 
 @always_inline
@@ -134,9 +143,10 @@ def _qk[
     var lim = min(kend, limit0 + 1)
     var lg = ptr[Float32](logits)
     var j = 0
+    comptime KV = 1 if DOT else KV32
     while j < nkeys:
         var jj = k0 + j
-        var c = Array[V, ROWS](fill=V(0))
+        var c = Array[V, ROWS * KV](fill=V(0))
         comptime if DOT:
             var kp = ptr[BFloat16](kd)
             # Runtime loop over dim pairs: fully unrolled, LLVM hoists the
@@ -159,31 +169,43 @@ def _qk[
         else:
             var kp = ptr[Scalar[dtype]](kd)
             for d in range(0, hd, 4):
-                comptime for u in range(4):
-                    var kv = kp.unsafe_load[width=LANES](
-                        _k_off[dtype, hd](jj, d + u)
-                    ).cast[DType.float32]()
+                var qv = Array[SIMD[DType.float32, 4], ROWS](uninitialized=True)
+                comptime if not BCAST_FOLD:
                     comptime for r in range(ROWS):
                         var rr = min(r, nrows - 1)
-                        var qs = Float32(
-                            ptr[Scalar[dtype]](q0 + rr * job.qt * 4).unsafe_load(d + u)
-                        )
-                        c[r] = V(qs).fma(kv, c[r])
-        if jj + LANES <= lim:
-            comptime for r in range(ROWS):
-                if r < nrows:
-                    lg.unsafe_store[width=LANES](r * KT + j, c[r])
-                    mx[r] = max(mx[r], c[r])
-        else:
-            var idx = iota[DType.int32, LANES](Int32(jj))
-            var past = idx.ge(SIMD[DType.int32, LANES](Int32(kend)))
-            comptime for r in range(ROWS):
-                if r < nrows:
-                    var bad = past | idx.gt(SIMD[DType.int32, LANES](Int32(limit0 + r)))
-                    var x = bad.select(V(NEG), c[r])
-                    lg.unsafe_store[width=LANES](r * KT + j, x)
-                    mx[r] = max(mx[r], x)
-        j += LANES
+                        qv[r] = ptr[Scalar[dtype]](q0 + rr * job.qt * 4).unsafe_load[width=4](d).cast[DType.float32]()
+                comptime for u in range(4):
+                    var kv = Array[V, KV](uninitialized=True)
+                    comptime for i in range(KV):
+                        kv[i] = kp.unsafe_load[width=LANES](
+                            _k_off[dtype, hd](jj + i * LANES, d + u)
+                        ).cast[DType.float32]()
+                    comptime for r in range(ROWS):
+                        var qs: Float32
+                        comptime if BCAST_FOLD:
+                            var rr = min(r, nrows - 1)
+                            qs = Float32(ptr[Scalar[dtype]](q0 + rr * job.qt * 4).unsafe_load(d + u))
+                        else:
+                            qs = qv[r][u]
+                        comptime for i in range(KV):
+                            c[r * KV + i] = V(qs).fma(kv[i], c[r * KV + i])
+        comptime for i in range(KV):
+            var ji = jj + i * LANES
+            if ji + LANES <= lim:
+                comptime for r in range(ROWS):
+                    if r < nrows:
+                        lg.unsafe_store[width=LANES](r * KT + j + i * LANES, c[r * KV + i])
+                        mx[r] = max(mx[r], c[r * KV + i])
+            else:
+                var idx = iota[DType.int32, LANES](Int32(ji))
+                var past = idx.ge(SIMD[DType.int32, LANES](Int32(kend)))
+                comptime for r in range(ROWS):
+                    if r < nrows:
+                        var bad = past | idx.gt(SIMD[DType.int32, LANES](Int32(limit0 + r)))
+                        var x = bad.select(V(NEG), c[r * KV + i])
+                        lg.unsafe_store[width=LANES](r * KT + j + i * LANES, x)
+                        mx[r] = max(mx[r], x)
+        j += KV * LANES
     comptime for r in range(ROWS):
         if r < nrows:
             ptr[Float32](tmax).unsafe_store(r, mx[r].reduce_max())
@@ -225,8 +247,10 @@ def _softmax[
         var a = exp2s[5](mo - mn)
         mp.unsafe_store(r, mn)
         ap.unsafe_store(r, a)
-        var sum = V(0)
-        while j < nkeys:
+        var s = Array[V, NS](fill=V(0))
+
+        @always_inline
+        def one(j: Int) capturing -> V:
             # bf16 probabilities are rounded to 8 bits right after this, so a
             # degree-2 polynomial (relative 1.7e-3) is inside that rounding.
             var e = exp2[2 if BF else 5, LANES](
@@ -236,8 +260,18 @@ def _softmax[
                 (pp + r * KT).unsafe_store[width=LANES](j, e.cast[DType.bfloat16]())
             else:
                 row.unsafe_store[width=LANES](j, e)
-            sum += e
+            return e
+
+        while j + NS * LANES <= nkeys:
+            comptime for u in range(NS):
+                s[u] += one(j + u * LANES)
+            j += NS * LANES
+        while j < nkeys:
+            s[0] += one(j)
             j += LANES
+        var sum = s[0]
+        comptime for u in range(1, NS):
+            sum += s[u]
         lp.unsafe_store(r, lp.unsafe_load(r) * a + sum.reduce_add())
 
 
@@ -278,7 +312,22 @@ def _pv[
                 j += 2
         else:
             var vp = ptr[Scalar[dtype]](vsrc)
-            for j in range(nk):
+            var j0 = 0
+            comptime if KU32 > 1:
+                while j0 + KU32 <= nk:
+                    var vv = Array[V, KU32 * NV](uninitialized=True)
+                    comptime for k in range(KU32):
+                        comptime for i in range(NV):
+                            vv[k * NV + i] = vp.unsafe_load[width=LANES](
+                                (k0 + j0 + k) * vstride + dc + i * LANES
+                            ).cast[DType.float32]()
+                    comptime for r in range(ROWS):
+                        var pk = lg.unsafe_load[width=KU32](r * KT + j0)
+                        comptime for k in range(KU32):
+                            comptime for i in range(NV):
+                                c[r * NV + i] = vv[k * NV + i].fma(V(pk[k]), c[r * NV + i])
+                    j0 += KU32
+            for j in range(j0, nk):
                 var row = (k0 + j) * vstride + dc
                 var vv = Array[V, NV](uninitialized=True)
                 comptime for i in range(NV):

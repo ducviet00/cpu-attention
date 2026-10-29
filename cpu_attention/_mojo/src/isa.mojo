@@ -28,6 +28,11 @@ comptime NEON_BF16 = CompilationTarget.has_neon() and CompilationTarget._has_fea
 
 comptime BF16_DOT = X86_BF16 or NEON_BF16
 
+comptime BCAST_FOLD = CompilationTarget.is_x86()
+"""A scalar broadcast folds into the FMA's memory operand (`{1to16}`), so a
+broadcast per query dim / probability is free; NEON instead loads 4 values as a
+vector and multiplies by a lane (`fmla v, v, v.s[i]`)."""
+
 comptime AMX_TIER = X86_BF16
 """The AVX-512-BF16 tier also carries the AMX kernels (inline asm assembles for
 any x86 target); they run only after `amx_permitted()`."""
