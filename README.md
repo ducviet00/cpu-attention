@@ -81,12 +81,13 @@ Notes on the API:
 **Status: the performance objective is not met.** The unified Mojo backend (the
 default) is measured against the *fastest numerically valid C++ path* on each
 row, on three machines. It wins a clear majority of the `flash_attn_func` rows
-on the C4D and the Axion, and about half of them on the Xeon, but it loses
+on the C4D and the Axion (all 78 on the Axion), and 48 of 78 on the Xeon, but it loses
 or cannot resolve many decode rows on all three. Numbers below are the single
 source of truth; `docs/Mojo.md` explains the design and the experiments.
 
-**Setup** (Mojo 1.2.0 `2016d0cd`, torch 2.14.1+cpu; the kernel sources are identical at the
-measured commits, `bbe8c1b` for Axion and Xeon and `c9bf977` for the C4D).
+**Setup** (Mojo 1.2.0 `2016d0cd`, torch 2.14.1+cpu). All three boxes measured
+`23b5bbc` (Oct 2026: `c9bf977` plus PRs #2-#4) in one full-manifest run each,
+against an independent copy of `c9bf977` as the previous build.
 
 | box | CPU | threads | C++ paths it is compared with |
 |---|---|---:|---|
@@ -121,41 +122,43 @@ C4D, NEON on the Axion) and torch SDPA are secondary references.
 
 | rows | C4D | Axion | Xeon |
 |---|---|---|---|
-| `flash_attn_func` (78) | 71 / 7 / 0 | 77 / 1 / 0 | 47 / 23 / 8 |
-| decode, allocating the output (60) | 10 / 32 / 18 | 32 / 27 / 1 | 19 / 32 / 9 |
-| decode with `out=` (20) | 3 / 12 / 5 | 8 / 12 / 0 | 7 / 11 / 2 |
-| public `flash_attn_with_kvcache` decode (8) | 4 / 3 / 1 | 7 / 1 / 0 | 4 / 3 / 1 |
-| store-only (4) | 3 / 1 / 0 | 4 / 0 / 0 | 0 / 3 / 1 |
-| **all (170)** | **91 / 55 / 24** | **128 / 41 / 1** | **77 / 72 / 21** |
+| `flash_attn_func` (78) | 71 / 7 / 0 | 78 / 0 / 0 | 48 / 18 / 12 |
+| decode, allocating the output (60) | 11 / 22 / 27 | 35 / 22 / 3 | 15 / 39 / 6 |
+| decode with `out=` (20) | 3 / 9 / 8 | 11 / 8 / 1 | 6 / 12 / 2 |
+| public `flash_attn_with_kvcache` decode (8) | 4 / 4 / 0 | 8 / 0 / 0 | 5 / 3 / 0 |
+| store-only (4) | 3 / 1 / 0 | 4 / 0 / 0 | 1 / 3 / 0 |
+| **all (170)** | **92 / 43 / 35** | **136 / 30 / 4** | **75 / 75 / 20** |
 
 **Where Mojo does not clearly win.**
-* **C4D** (re-measured at `c9bf977`: one full run, plus two `--load-seed` reruns of
-  every loss row): 24 losses, none in `flash_attn_func` (71 wins, 7 ties). 14 of the
-  24 stop being losses under another allocation order (some become wins), so they are
-  placement noise. 8 lose in all three runs: fp32 batch-1 decode at context 4096/4097
-  (1.04-1.20), fp32 batch-8 context-1024 `self` (1.04-1.06), fp32 batch-1 context-256
-  `self` (1.03-1.05) and bf16 batch-8 context-1024 page 48 `self` (1.05-1.07). Per
-  thread Mojo matches or beats C++ on every shape isolated (0.92-0.98 on one thread);
-  the gap appears only with 4 threads streaming a working set that spills out of the
-  32 MB L3 (about 33 MB per call), where C++ sustains ~62 GB/s and Mojo ~56. The cause
-  was not found: tile length, key-group width, thread pinning, wake-up policy and thread
-  skew each made no difference, and this VM exposes no hardware performance counters.
-  bf16 page 48 is 8% slower per core than C++ on one thread (parity without the
-  compile-time page-48 body); 4 threads hide it.
-* **Axion** (branch `axion-mojo`, re-measured; the other columns are from earlier
-  commits): 1 loss, 41 unresolved, all decode except one `flash_attn_func` tie. The one loss,
-  `engine cross b=8 ctx=1025 bf16` (1.03), re-measured 0.90 / 0.97 / 0.92 under
-  `--load-seed` 1-3 (placement noise). The unresolved rows sit at 0.95-1.03 of C++ NEON,
-  mostly batch 8-32 at context ~1024 and batch-1 context 4096, which stream 16-67 MB
-  per call; the objective of a clear win on every row is **not met** there.
-* **Xeon** (re-measured Oct 2026 after the bf16 Q-panel change; the other two boxes
-  are as measured before it): 21 losses. `flash_attn_func`: 8, 1.04-1.12, seven of
-  them fp32 head_dim 128 at 129-1025 tokens (and `513x257:8:64` fp32), plus bf16
-  `129:16:128`. On four threads the fp32 head_dim-128 rows run 4-5% behind C++
-  while Mojo is 3% *faster* on one thread; the cause is not found (not SMT
-  placement, workspace alignment or offset). Decode: 13, most of them fp32 at
-  batch 8, context ~1024, which move 0.82-1.02 with the allocation order (see the
-  caveat). Store-only `b=32 ctx=1` fp32 lost once (1.07 against `cpp_scalar`).
+* **C4D**: 35 losses, all decode (`flash_attn_func` 71 wins, 7 ties). The previous
+  build loses the same rows in the same process (new/previous 0.95-1.11). The largest
+  are fp32 batch 8 at context 255-257 (1.35-2.03), whose ~17-19 MB working set sits
+  near this VM's 32 MB L3, so the verdict depends on which arm's cache is resident.
+  The others are batch-1 context 4096/4097 (1.05-1.23) and batch-8 context ~1024
+  (1.03-1.24). Rows where `23b5bbc` read slower than `c9bf977` (bf16 batch-1 context
+  4096/4097, batch-8 context 257, `d=32`) gave 0.83-1.36 of the previous build under
+  `--load-seed` 1-3, with control spreads up to 29%. That is placement, not a
+  regression; `engine_out cross b=1 ctx=4096 bf16` read 1.05-1.09 in 4 of 5 runs.
+  Per thread Mojo matches or beats C++ on every shape isolated (0.92-0.98 on one
+  thread). The gap appears only with 4 threads streaming a working set that spills
+  out of the L3 (about 33 MB per call): C++ sustains ~62 GB/s there and Mojo ~56. The
+  cause is not found. Tile length, key-group width, thread pinning, wake-up policy and
+  thread skew made no difference, and this VM exposes no hardware performance counters.
+* **Axion**: 4 losses, all decode, 1.03-1.29, and every `flash_attn_func` row wins.
+  The 1.29 (`engine cross b=1 ctx=256 fp32`, a 10 us call) gave 0.83 / 1.05 / 0.83
+  under `--load-seed` 1-3. The other three are bf16 batch 8, context ~1024
+  (1.03-1.05). The 30 unresolved rows are mostly batch 8-32 at context ~1024 and
+  batch-1 context 4096. They stream 16-67 MB per call and sit at 0.95-1.03 of C++ NEON.
+* **Xeon**: 20 losses. 12 are `flash_attn_func` at 1.03-1.09: head_dim 128 at
+  256-1025 tokens (mostly fp32; bf16 `256:16:128`, `257:16:128`, `512:32:128` at
+  1.04-1.05 and fused `257:16:128` at 1.075), plus `513:8:64` fp32. On four threads
+  the fp32 head_dim-128 rows run 4-5% behind C++, while Mojo is 3% *faster* on one
+  thread; the cause is not found (not SMT placement, workspace alignment or offset).
+  The bf16 Q panel is 4-5% faster than the previous build at head_dim 128 from 1024
+  tokens. At 256-512 tokens it is within 1% in this run (0.90-0.97 in alternating
+  processes, `docs/Mojo.md` §9). Decode has 8 losses: fp32 batch 8 at context ~1024
+  (1.20-1.23, placement-bound, see the caveat), batch-1 context 4096/4097 fp32
+  (1.13-1.16), `het` fp32 (1.13) and `engine_out cross b=8 ctx=1024 bf16` (1.10).
 
 **Caveats.**
 * Rows bound by memory placement swing 20-30% with allocation order. The Xeon
@@ -166,15 +169,14 @@ C4D, NEON on the Axion) and torch SDPA are secondary references.
 * Two Xeon runs of identical code differed by 5-10% on a few fp32 AMX
   `flash_attn_func` rows (the control arm moved with it, C++ did not); the
   cause is not found.
-* Run-to-run: two Xeon runs of the same decode code gave 64 / 76 / 30 (earlier table) and 70 / 80 / 20 (Oct 2026, no oracle arm: the `mojo-oracle-v1.1` tag is absent from this clone), so single-run counts on this box move by about 6 rows, and the non-`flash_attn_func` Xeon rows above are within that noise of the earlier run. The consistent Xeon losses in both runs are the fp32 decode rows at batch 8, context ~1024 (1.06-1.31) and `flash_attn_func` head_dim 128 at 257-512 tokens (1.03-1.10).
-* The Axion box was measured once. On the C4D the 32 MB L3 makes the verdict of
-  decode rows with a 15-30 MB working set depend on which arm's cache happened
-  to be resident; repeat them with `--load-seed` before believing a gap.
-* The C4D run has no old-Mojo (`mojo-oracle-v1.1`) arm: that tag is not in this
-  repository or on `origin`, so the harness's Python glue came from commit `290b0a7`
-  (the commit that introduced the oracle setting). The Mojo and C++ arms are
-  unaffected. The fast-encdec engine test (`tests/test_cpu_attention.py`) was not run
-  on the C4D: that repository is not on the machine.
+* Single-run counts move by 6-10 rows. Across runs, the Xeon gave 64 / 76 / 30,
+  70 / 80 / 20, 67 / 79 / 24 (PR #4 branch) and 75 / 75 / 20. The C4D gave
+  84 / 50 / 36, 91 / 55 / 24, 94 / 46 / 30 (PR #2 branch) and 92 / 43 / 35. Read a
+  row's verdict from repeated `--load-seed` runs, not from one table.
+* The Axion runs at 8 threads (its physical cores). At 4 threads the same build gave
+  127 / 42 / 1.
+* The `mojo-oracle-v1.1` tag is not on `origin`. These runs fetched it from a local
+  clone; the C++ arms are built from it.
 
 ## Benchmark it yourself
 

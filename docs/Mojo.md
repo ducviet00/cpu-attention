@@ -25,11 +25,10 @@ by row family:
   is placement and noise, and the same row moves 20-30% with allocation order.
   Neither a compile-time page 64, extra dot chains, key-tile changes, software
   prefetch nor wider key groups moved these rows (§9).
-- **Decode that allocates its output**, short calls: C++ allocates natively;
-  `torch.empty_like` is the cheapest constructor available from Python and still
-  costs several microseconds inside an interleaved run. A recycled-output ring
-  removed most of the gap but needs c10 reference counts read from raw memory,
-  which was rejected as unsafe (§9).
+- **Decode that allocates its output**, short calls: the extension now
+  allocates the output natively, as C++ does (`aoti_torch_empty_strided` +
+  `THPVariable_Wrap`, §9); `torch.empty_like` cost several microseconds inside an
+  interleaved run.
 - **fp32 `flash_attn_func`** is FMA-bound in both backends (parity single-thread
   at every shape measured).
 - **Xeon AMX, head_dim 128, 256-512 tokens:** the K/V pack is slower than C++'s
@@ -122,7 +121,7 @@ is read correctly under another.
 |---|---|---|
 | flash_attn_func fp32 vs naive fp32 reference | 2e-4 | test_dense 82/82, fuzz 80/80 (worst 0.52x tol) |
 | flash_attn_func bf16 | 3e-2 | same |
-| paged fp32 | 1e-6 (fp64 arbitrates an out-of-gate fp32 reference) | sweep 504/504, worst 8.9e-7 |
+| paged fp32 | 1e-6 (fp64 arbitrates an arm over the gate) | sweep 504/504, worst 8.9e-7 |
 | paged bf16 x86 | <= 2 bf16 ulp at the row peak vs C++ | worst 1.89 |
 | regressions (`tests/test_regressions.py`) | as above | 412/412 |
 | fast-encdec `tests/test_cpu_attention.py` (strided fused q/k/v) | 45 checks | 45/45 (development laptop; fast-encdec is not on the VMs) |
