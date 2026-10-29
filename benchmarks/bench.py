@@ -29,6 +29,7 @@ Rules (docs/CPP.md §7):
 """
 
 import argparse
+import gc
 import glob
 import hashlib
 import json
@@ -459,6 +460,8 @@ def main():
     ap.add_argument("--load-seed", type=int, default=0,
                     help="shuffle module load and cache allocation order reproducibly")
     ap.add_argument("--json", default="")
+    ap.add_argument("--resume", action="store_true",
+                    help="continue --json: skip the rows it already holds and keep them")
     args = ap.parse_args()
     if args.threads:
         torch.set_num_threads(args.threads)
@@ -486,6 +489,12 @@ def main():
     rows = [r for r in M.rows(args.manifest)
             if args.dtype in ("both", r["dtype"]) and args.only in M.label(r)]
     results = []
+    if args.resume and args.json and os.path.exists(args.json):
+        with open(args.json) as f:
+            results = json.load(f)["rows"]
+        done = {x["label"] for x in results}
+        rows = [r for r in rows if M.label(r) not in done]
+        print(f"resuming: {len(results)} rows kept, {len(rows)} to run", flush=True)
     R.burn()
     torch.manual_seed(0)
     for r in rows:
@@ -560,6 +569,10 @@ def main():
             line += f"  INVALID {bad}"
         print(line, flush=True)
         results.append(row)
+        # The row's closures reference its (up to 270 MB per arm) K/V caches in
+        # reference cycles; without this the process reached 8 GB by row 156.
+        del fns, check, checks, samples, valid
+        gc.collect()
         if args.json:  # rewritten every row: a spot preemption keeps the rest
             os.makedirs(os.path.dirname(os.path.abspath(args.json)), exist_ok=True)
             pending = args.json + ".tmp"

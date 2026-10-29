@@ -14,69 +14,26 @@ uv run --extra build python scripts/build.py --tests    # every tier + the stand
 
 ## 1. Status
 
-**Integration checkpoint (2026-10-28).** The primary tree at `c7f1c28` already
-contains the AMX policy merge (`6d2cf34`) and the fast-plan AMX-toggle fix. The
-in-progress Axion merge (`afbea06`) has been resolved retaining both policy IDs
-(AMX 1, ARM 2); only AMX uses the AMX-specific 64-row work-item rule. All three
-x86 tiers build with Mojo 1.2.0. On Ryzen, both backends pass `test_dense`,
-`test_flash_api`, 80-case fuzz, the 504-case paged sweep, 412 regressions, and
-fast-encdec's engine test. AMX tests skip on this non-AMX CPU. The engine test uses fast-encdec's own
-environment (torch 2.14.1+cpu, transformers 5.19.0). This is a correctness
-checkpoint, not a claim that the performance objective is met.
+Current per-box results, the verdict rule and the caveats are in the
+[README](../README.md#performance), which is the single source of truth for
+numbers; this file does not repeat them. The objective (a clear per-row win over
+the fastest valid C++ path on all three machines) is **not met**. What limits it,
+by row family:
 
-The integration baseline (raw JSON kept outside the repo),
-41 rounds / 41 x 40-call paged blocks, measured all 170 rows with valid outputs:
-
-| rows | win | unresolved | loss |
-|---|---:|---:|---:|
-| flash_attn_func bf16 (39) | 36 | 3 | 0 |
-| flash_attn_func fp32 (39) | 13 | 25 | 1 |
-| decode / store / public API (92) | 39 | 37 | 16 |
-| **all (170)** | **88** | **65** | **17** |
-
-These are observations from that run, not an across-process speedup claim over
-the older checkpoint below. A fresh C++ build reproduced
-the baseline library's SHA256 exactly. The baseline's in-process Mojo-version
-subprocess failed after loading the extensions; `compiler.txt` records the
-compiler separately. The harness now probes it before loading any extension.
-
-Ryzen 7 7840H, full 170-row manifest (`benchmarks/manifest.py`), against the
-fastest numerically valid C++ path per row (`cpp_vec` or `cpp_scalar`), one
-process, independently loaded arms, 41 rounds (paged: 41 x 40-call blocks),
-governor pinned:
-
-| rows | win | unresolved | loss |
-|---|---:|---:|---:|
-| flash_attn_func bf16 (39) | 38 | 1 | 0 |
-| flash_attn_func fp32 (39) | 12 | 27 | 0 |
-| decode / store / public API (92) | 33 | 47 | 12 |
-| **all (170)** | **83** | **75** | **12** |
-
-A win is below `1 - max(0.03, control spread)`, a loss above `1 + band`;
-anything else is unresolved, not a win. The starting point (the oracle build,
- was 7 / 21 / 142.
-
-**Where it does not win on the Ryzen.**
-- The 12 losses (1.03-1.12) are decode rows that stream 16-32 MB of cache per
-  call (b=8 ctx~1024, b=1 ctx~4096, page 64): both backends run at the box's
-  DRAM bandwidth there (b=8 ctx=1024 bf16 is ~360 us for 32 MB). They are at a
-  shared roof rather than behind a missing technique; neither a page-64
-  specialization nor extra dot chains moved them (§9).
-- fp32 flash_attn_func is FMA-roof bound in both backends (~80% of one zmm FMA
-  per cycle, single-thread parity at every shape measured); 27 of 39 rows are
-  unresolved.
-
-**Axion.** The ARM hi/lo-probability `bfdot` P@V policy (`8b6521a`) improved all
-44 bf16 decode/API rows by 8-41% beyond their saved-build controls, but the full
-92-row paged/store run still had 12 wins / 27 unresolved / 53 losses against
-valid C++.  A globally larger work item regressed short calls; a guarded long-square
-causal fp32 D=128 rule is under integration validation. Default C++ NEON still
-fails poisoned-tail regressions; the scalar path passes. Invalid C++ arms are
-excluded per row, not silently accepted as references.
-
-**Xeon.** The AMX policy is integrated, but full primary-tree validation and
-the missing paged/store measurements remain pending. No cross-machine
-dominance claim is made.
+- **Decode that streams more cache than fits in L2** (batch 8-32, context ~1024
+  and up): both backends run at the same memory roof, so a few percent either way
+  is placement and noise, and the same row moves 20-30% with allocation order.
+  Neither a compile-time page 64, extra dot chains, key-tile changes, software
+  prefetch nor wider key groups moved these rows (§9).
+- **Decode that allocates its output**, short calls: C++ allocates natively;
+  `torch.empty_like` is the cheapest constructor available from Python and still
+  costs several microseconds inside an interleaved run. A recycled-output ring
+  removed most of the gap but needs c10 reference counts read from raw memory,
+  which was rejected as unsafe (§9).
+- **fp32 `flash_attn_func`** is FMA-bound in both backends (parity single-thread
+  at every shape measured).
+- **Xeon AMX, head_dim 128, 256-512 tokens:** the K/V pack is slower than C++'s
+  (§9); the rest of the gap there is not explained.
 
 ## 2. Layout
 
@@ -86,6 +43,8 @@ _mojo/src/parallel.mojo   one GOMP_parallel region on torch's OpenMP pool, barri
 _mojo/src/kvcache.mojo    flash_attn_with_kvcache decode + reshape_and_cache (store)
 _mojo/src/flash_attn.mojo flash_attn_func: FlashJob, FlashPolicy trait, the generic driver
 _mojo/src/flash_vec.mojo  the vector policy (AVX-512 / AVX2 / NEON-fp32, LANES-generic)
+_mojo/src/flash_amx.mojo  the AMX policy (bf16, fp32 as bf16 hi/lo), x86 only
+_mojo/src/flash_neon.mojo the aarch64 bfmmla (bf16) and lane-FMA (fp32) policies
 _mojo/src/dispatch.mojo   runtime dtype x head_dim x ISA-policy selection
 _mojo/src/pyview.mojo     reads torch tensors natively (the fast call paths, §6)
 _mojo/src/amx.mojo        AMX tile primitives (inline asm, x86 only)
@@ -276,6 +235,13 @@ the control by more than 3-5%.
 | page 64 as a compile-time constant | 0.972 bf16 / 0.999 fp32 vs the previous build | reverted |
 | fp32 scratch without the bf16 probability buffer | no change (104.6 vs 104.6 us) | kept for sizing only |
 | fp32 flash multi-thread gap on short shapes (before the fast path) | single-thread parity at every shape; 3-8% multi-thread, more L1/LLC misses, cause not found | open |
+| per-call choice of the vector or the AMX flash policy (Xeon, 4 threads) | fp32 one query 19.3 -> 7.1 us (8:64) and 74 -> 26 us (16:128); 129.5 -> 53.4 us at 1025 keys; bf16 one query 10.2 -> 8.3 us; AMX stays 2.7-8.1x ahead (bf16) elsewhere. Rule: fp32 up to 65 rows at hd 64, 24 at hd 128, or <= 64 keys; bf16 1-2 rows | kept |
+| fp32 AMX with a large softmax scale (`scale*sqrt(hd) > 6`) | hi/lo products reach 2.03e-4 vs the 2e-4 gate at scale 1.7; the exact-fp32 vector policy has no such limit | kept (routes to vector) |
+| AMX K/V pack vs C++ (Xeon, bf16 hd 128, S=129, one thread) | pack 9.6% of samples vs 7.4% (attention loops equal, 35.7% vs 36.4%); the K block reloads 16 row pointers from the stack, 27% of the function's samples are stack moves, shuffles 40%, `vpermw` 20% | open |
+| cheaper tensor constructor than `empty_like` for the decode output | cold 2.6 us; `empty(shape, dtype)` 5.7, `new_empty` 4.7, `empty_strided` 3.0 | none; `empty_like` is already the cheapest |
+| Xeon fp32 decode b=8 ctx~1024 "losses" | Mojo == C++ single-thread (17.2 vs 17.1 us/head), 4 threads (562 vs 562 us), cold cache (~600 us both) and 7-cache rotation (977 vs 930); `--load-seed` 1-4 gave 0.82-1.04 with control spreads of 17-31% | placement noise, not code |
+| harness verdict band includes the spread of C++'s identical-code `amx` and `vec` paged arms | Xeon 67/61/42 -> 64/76/30 (win/unresolved/loss); no other box has such twins | kept |
+| `bench.py` memory growth | closures kept every arm's K/V cache alive until a GC pass: 8.1 GB RSS and an OOM kill at row 156 of 170 on an 11.6 GB machine; `gc.collect()` per row and `--resume` | fixed |
 
 **Axion decode ledger (c4a-standard-8, one process, independent control, vs `2fc4652`).**
 

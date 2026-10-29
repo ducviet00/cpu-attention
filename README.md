@@ -27,12 +27,16 @@ and works as a standalone library.
 
 ```bash
 uv sync --extra build                                    # torch + the mojo wheel
-uv run --extra build python scripts/build.py --tests     # Mojo backend -> cpu_attention/_C.so
+uv run --extra build python scripts/build.py --tests     # Mojo: one _C_<tier>.so per ISA tier
 uv run --extra build python scripts/build_cpp.py --test  # C++ backend  -> cpu_attention/_C_cpp.so
 ```
 
-Both builds target the machine they run on, so rebuild per box. The C++
-build links the installed torch, so rebuild it after a torch upgrade.
+The Mojo build writes one shared object per ISA tier for the host architecture
+(x86-64: AVX-512-BF16 + AMX, AVX2, baseline; aarch64: BF16, NEON), each compiled
+for an explicit target rather than the build host. The loader picks the best
+tier the CPU reports; `CPU_ATTENTION_ISA=amx|vec|avx2|scalar|neon` forces one
+and is refused if the CPU lacks it. The C++ build links the installed torch, so
+rebuild it after a torch upgrade.
 
 ## Use
 
@@ -74,181 +78,156 @@ Notes on the API:
 
 ## Performance
 
-The tables below are the **historical C++ campaign**, not results for the
-current unified Mojo build. The ongoing Mojo campaign, including losing and
-unresolved rows, is tracked in [`docs/Mojo.md`](docs/Mojo.md). Its acceptance
-criterion is a clear per-row win over the fastest valid applicable C++ path;
-that objective is **not yet met**.
+**Status: the performance objective is not met.** The unified Mojo backend (the
+default) is measured against the *fastest numerically valid C++ path* on each
+row, on three machines. It wins a clear majority of the `flash_attn_func` rows
+on the Ryzen and the Axion, and about half of them on the Xeon, but it loses
+or cannot resolve many decode rows on all three. Numbers below are the single
+source of truth; `docs/Mojo.md` explains the design and the experiments.
 
-**Setup.**
-* **Boxes:** Ryzen 7 7840H (8 cores, AVX-512 + BF16, no AMX) at 8 threads;
-  Google Axion Neoverse-V2 (GCP c4a, 8 cores) at 8 threads; Xeon Platinum 8581C
-  (GCP C4, 4 cores / 8 threads, AMX) at 4 threads.
-* **Baselines:** vLLM `csrc/cpu` at `db3b0f0`, built for the ISA the box
-  uses. That is **AMX for Xeon bf16**, VEC for x86 fp32 and for the Ryzen, and
-  NEON on the Axion.
+**Setup** (Mojo 1.2.0 `2016d0cd`, torch 2.14.1+cpu; kernels at commit `bbe8c1b`).
+
+| box | CPU | threads | C++ paths it is compared with |
+|---|---|---:|---|
+| Ryzen | AMD Ryzen 7 7840H (8 cores, AVX-512 + BF16, no AMX), governor pinned to `performance` | 8 | vec, scalar |
+| Axion | Google Axion Neoverse-V2 (GCP c4a-standard-8) | 8 | neon, scalar |
+| Xeon | Intel Xeon Platinum 8581C (GCP c4-standard-8, 4 cores / 8 threads, AMX) | 4 | amx, vec, scalar |
+
+vLLM `csrc/cpu` at `db3b0f0` (AMX for Xeon bf16, VEC for x86 fp32 and the
+Ryzen, NEON on the Axion) and torch SDPA are secondary references.
 
 **Method.**
-* One process per box (Ryzen dense: one per row), all arms interleaved with
-  rotated order, plus a duplicate C++ arm as the noise floor.
-* Rounds: 61 dense / 121 paged on the servers; 41 dense / 41 x 40-call blocks
-  paged on the Ryzen.
-* Times are the **minimum**, in µs, listed as **C++ / Mojo / vLLM**.
+* **The manifest** (`benchmarks/manifest.py`, fixed before optimizing) has 170
+  rows, each in bf16 and fp32: the 42 historical rows plus odd lengths around
+  tile and page boundaries (17 ... 4097), unequal query/key lengths, noncausal,
+  GQA/MQA, head_dim 32/64/128, fused-QKV strided inputs, page sizes 16/48/64,
+  heterogeneous contexts, store-only, a preallocated `out=` and the public
+  `flash_attn_with_kvcache` call.
+* **One process per box, independently loaded arms** (`benchmarks/arms.py`):
+  the build under test, a second independent copy of it (the noise floor), the
+  oracle build (`mojo-oracle-v1.1`), and one arm per applicable C++ ISA path;
+  interleaved, order rotated every round, the **minimum** decides. Rounds: 61
+  for `flash_attn_func`, 121 for decode on the servers; 61 / 121 x 40-call
+  blocks on the Ryzen. Every arm's output is validated before it can be a
+  baseline. Ours includes the K/V pack and the output allocation (not on `out=`
+  rows); each arm stages its own cache from the same data.
+* **Verdict per row**: `ratio = Mojo min / fastest valid C++ min`; with
+  `band = max(3%, |control / Mojo - 1|, twin)` a row is a **win** below
+  `1 - band`, a **loss** above `1 + band`, and **unresolved** in between. `twin`
+  is the spread between C++'s `amx` and `vec` decode arms, which run identical
+  code, so it measures how far one process's minimum can sit from another's.
 
-**Ratios.**
-* `c/best` is C++ divided by the faster of Mojo and vLLM; bold is a clear win
-  (< 0.97).
-* `c/SDPA` is C++ against `torch.nn.functional.scaled_dot_product_attention`
-  in the same process, from a separate 21-round dense run.
+**Results** (win / unresolved / loss):
 
-**What is charged to whom.**
-* Ours includes the K/V pack and the output allocation.
-* vLLM's cache is staged, and its output preallocated, outside the timer.
-
-Rows are `seq:heads:head_dim`, batch 1, causal. Paged rows use 16 heads,
-head_dim 64, page 32 (x86) / 16 (ARM).
-
-**Summary.**
-
-| | Ryzen 7840H | Axion Neoverse-V2 | Xeon 8581C |
+| rows | Ryzen | Axion | Xeon |
 |---|---|---|---|
-| C++ faster than vLLM | 42/42 | 42/42 | 42/42 |
-| C++ faster than Mojo | 40/42 | 40/42 | 42/42 |
-| clear wins vs the best baseline (< 0.97) | 38 | 35 | 39 |
-| noise band (0.97-1.04) / losses | 3 / 1 | 7 / 0 | 3 / 0 |
-| C++ / SDPA (dense) | 0.22-0.71 | 0.27-0.85 | 0.17-0.64 |
+| `flash_attn_func` (78) | 50 / 27 / 1 | 77 / 1 / 0 | 40 / 27 / 11 |
+| decode, allocating the output (60) | 21 / 32 / 7 | 18 / 19 / 23 | 14 / 30 / 16 |
+| decode with `out=` (20) | 9 / 10 / 1 | 3 / 10 / 7 | 3 / 14 / 3 |
+| public `flash_attn_with_kvcache` decode (8) | 5 / 3 / 0 | 7 / 1 / 0 | 4 / 4 / 0 |
+| store-only (4) | 3 / 1 / 0 | 3 / 1 / 0 | 3 / 1 / 0 |
+| **all (170)** | **88 / 73 / 9** | **108 / 32 / 30** | **64 / 76 / 30** |
 
-**Where C++ does not clearly win.**
-* The one loss is Ryzen paged self b=32 ctx=1024 bf16, at 1.16 of Mojo.
-* On the Axion, Mojo stays the faster baseline on seven dense rows, at
-  0.97-1.01.
+**Where Mojo does not clearly win.**
+* **Ryzen**: 9 losses, 1.03-1.33. Decode at batch 8, context ~1024 in bf16 and
+  the heterogeneous-length batch (up to 1.33); one `flash_attn_func` row
+  (129:16:128 fp32, 1.03).
+* **Axion**: 30 losses, 1.03-1.23, **all decode**. 23 are calls that allocate
+  their output: `torch.empty_like` costs 2.6 us inside the interleaved run
+  (0.6 us hot) and C++ allocates natively, so ~5 us batch-1 calls lose by
+  1.1-1.2. The `out=` rows still lose at batch 1 (up to 1.23, fp32) and at
+  batch 8-32 bf16 (1.06). Every `flash_attn_func` row wins except one tie.
+* **Xeon**: 30 losses. `flash_attn_func`: 11, 1.04-1.11, head_dim-128 rows at
+  256-512 tokens (256:16:128, 257:16:128, 512:32:128). At 129 tokens in bf16 the
+  AMX K/V pack was measured ~30% slower than C++'s (single thread, sampled
+  profile), worth 5-10% of such a call; the rest of that gap is unexplained.
+  Decode: 19, up to 1.43, mostly fp32 at batch 8, context ~1024 (see the
+  caveat).
 
-Details and open problems are in [`docs/CPP.md`](docs/CPP.md).
-
-### Dense, bf16
-
-| shape | Ryzen C++ / Mojo / vLLM µs | c/best | c/SDPA | Axion C++ / Mojo / vLLM µs | c/best | c/SDPA | Xeon C++ / Mojo / vLLM µs | c/best | c/SDPA |
-|---|---|---:|---:|---|---:|---:|---|---:|---:|
-| 128:8:64 | 28.2 / 42.6 / 40.2 | **0.70** | 0.25 | 23.2 / 24.7 / 24.7 | **0.94** | 0.41 | 24.7 / 28.5 / 31.2 | **0.87** | 0.43 |
-| 512:8:64 | 167 / 264 / 359 | **0.63** | 0.22 | 216 / 233 / 264 | **0.93** | 0.36 | 181 / 242 / 266 | **0.75** | 0.32 |
-| 1024:8:64 | 699 / 1,037 / 1,456 | **0.67** | 0.30 | 870 / 882 / 984 | 0.99 | 0.53 | 629 / 838 / 992 | **0.75** | 0.43 |
-| 2048:8:64 | 2,854 / 4,124 / 5,899 | **0.69** | 0.38 | 3,323 / 3,446 / 3,742 | **0.96** | 0.62 | 2,307 / 3,069 / 3,686 | **0.75** | 0.50 |
-| 4096:8:64 | 11,484 / 16,499 / 23,165 | **0.70** | 0.38 | 13,044 / 13,903 / 15,028 | **0.94** | 0.69 | 8,837 / 11,929 / 14,852 | **0.74** | 0.53 |
-| 256:16:128 | 171 / 339 / 359 | **0.51** | 0.25 | 202 / 216 / 237 | **0.93** | 0.37 | 183 / 237 / 234 | **0.78** | 0.38 |
-| 1024:16:128 | 2,652 / 5,109 / 5,697 | **0.52** | 0.29 | 2,870 / 2,936 / 3,100 | 0.98 | 0.55 | 1,916 / 2,386 / 2,574 | **0.80** | 0.52 |
-| 2048:16:128 | 10,738 / 20,130 / 22,321 | **0.53** | 0.35 | 11,063 / 11,676 / 12,188 | **0.95** | 0.63 | 6,852 / 8,808 / 9,515 | **0.78** | 0.56 |
-| 4096:16:128 | 43,430 / 85,527 / 89,784 | **0.51** | 0.37 | 43,720 / 46,636 / 48,168 | **0.94** | 0.70 | 27,684 / 34,363 / 38,023 | **0.81** | 0.64 |
-| 512:32:128 | 1,374 / 2,728 / 3,061 | **0.50** | 0.22 | 1,427 / 1,553 / 1,618 | **0.92** | 0.35 | 1,160 / 1,491 / 1,525 | **0.78** | 0.41 |
-| 1024:8:32 | 425 / 657 / 805 | **0.65** | 0.32 | 561 / 617 / 686 | **0.91** | 0.49 | 456 / 610 / 731 | **0.75** | 0.35 |
-
-### Dense, fp32
-
-| shape | Ryzen C++ / Mojo / vLLM µs | c/best | c/SDPA | Axion C++ / Mojo / vLLM µs | c/best | c/SDPA | Xeon C++ / Mojo / vLLM µs | c/best | c/SDPA |
-|---|---|---:|---:|---|---:|---:|---|---:|---:|
-| 128:8:64 | 24.9 / 30.8 / 28.6 ¹ | **0.87** | 0.36 | 43.8 / 48.6 / 51.3 | **0.90** | 0.27 | 46.4 / 53.3 / 62.5 | **0.87** | 0.34 |
-| 512:8:64 | 306 / 349 / 344 | **0.89** | 0.39 | 557 / 574 / 638 | 0.97 | 0.32 | 330 / 426 / 626 | **0.77** | 0.22 |
-| 1024:8:64 | 1,190 / 1,310 / 1,306 | **0.91** | 0.55 | 2,153 / 2,170 / 2,438 | 0.99 | 0.47 | 1,195 / 1,407 / 2,246 | **0.85** | 0.33 |
-| 2048:8:64 | 4,871 / 5,376 / 5,313 | **0.92** | 0.65 | 8,493 / 8,473 / 9,498 | 1.00 | 0.60 | 4,438 / 5,191 / 8,661 | **0.85** | 0.35 |
-| 4096:8:64 | 20,360 / 21,050 / 21,127 | **0.97** | 0.71 | 34,212 / 37,441 / 37,366 | **0.92** | 0.71 | 17,537 / 20,404 / 33,530 | **0.86** | 0.40 |
-| 256:16:128 | 310 / 380 / 382 | **0.82** | 0.40 | 544 / 581 / 729 | **0.93** | 0.41 | 375 / 509 / 685 | **0.74** | 0.25 |
-| 1024:16:128 | 5,179 / 6,495 / 5,377 | **0.96** | 0.56 | 8,202 / 8,142 / 10,314 | 1.01 | 0.66 | 3,518 / 4,570 / 8,366 | **0.77** | 0.28 |
-| 2048:16:128 | 20,307 / 22,622 / 20,700 | 0.98 | 0.65 | 32,149 / 38,069 / 40,523 | **0.84** | 0.72 | 14,961 / 17,502 / 32,305 | **0.85** | 0.34 |
-| 4096:16:128 | 78,747 / 133,861 / 83,781 | **0.94** | 0.67 | 126,285 / 159,610 / 159,846 | **0.79** | 0.85 | 77,076 / 87,543 / 123,415 | **0.88** | 0.49 |
-| 512:32:128 | 2,871 / 3,634 / 2,889 | 0.99 | 0.42 | 4,073 / 4,617 / 5,304 | **0.88** | 0.40 | 2,135 / 2,860 / 4,610 | **0.75** | 0.17 |
-| 1024:8:32 | 656 / 743 / 732 | **0.90** | 0.50 | 1,262 / 1,280 / 1,476 | 0.99 | 0.46 | 843 / 1,017 / 1,350 | **0.83** | 0.39 |
-
-### Paged, bf16
-
-| case | Ryzen C++ / Mojo / vLLM µs | c/best | Axion C++ / Mojo / vLLM µs | c/best | Xeon C++ / Mojo / vLLM µs | c/best |
-|---|---|---:|---|---:|---|---:|
-| self b=1 ctx=256 | 3.6 / 5.6 / 5.9 | **0.63** | 6.0 / 12.5 / 10.0 | **0.60** | 7.9 / 11.9 / 12.0 | **0.66** |
-| cross b=1 ctx=256 | 5.3 / 8.2 / 6.4 | **0.83** | 5.5 / 11.2 / 7.3 | **0.75** | 7.2 / 10.5 / 7.5 | **0.96** |
-| self b=8 ctx=256 | 17.1 / 22.1 / 32.0 | **0.78** | 29.9 / 51.2 / 75.2 | **0.58** | 59.5 / 86.1 / 104 | **0.69** |
-| cross b=8 ctx=256 | 17.2 / 22.3 / 26.9 | **0.77** | 28.7 / 50.3 / 71.0 | **0.57** | 57.2 / 82.5 / 92.9 | **0.69** |
-| self b=8 ctx=1024 | 356 / 381 / 427 | **0.93** | 254 / 290 / 300 | **0.87** | 311 / 368 / 385 | **0.85** |
-| cross b=8 ctx=1024 | 355 / 378 / 414 | **0.94** | 269 / 315 / 307 | **0.88** | 306 / 357 / 368 | **0.86** |
-| self b=32 ctx=1024 | 2,856 / 2,472 / 2,859 | 1.16 | 1,163 / 1,508 / 1,535 | **0.77** | 2,837 / 4,076 / 3,095 | **0.92** |
-| cross b=32 ctx=1024 | 2,371 / 2,366 / 2,750 | 1.00 | 1,249 / 1,590 / 1,606 | **0.79** | 2,676 / 4,005 / 2,947 | **0.91** |
-| self b=1 ctx=4096 | 37.8 / 77.0 / 82.9 | **0.49** | 83.5 / 112 / 119 | **0.74** | 164 / 185 / 187 | **0.89** |
-| cross b=1 ctx=4096 | 38.9 / 76.1 / 81.1 | **0.51** | 82.1 / 109 / 114 | **0.75** | 163 / 185 / 183 | **0.89** |
-
-### Paged, fp32
-
-| case | Ryzen C++ / Mojo / vLLM µs | c/best | Axion C++ / Mojo / vLLM µs | c/best | Xeon C++ / Mojo / vLLM µs | c/best |
-|---|---|---:|---|---:|---|---:|
-| self b=1 ctx=256 | 4.6 / 6.9 / 7.2 | **0.66** | 9.5 / 15.2 / 15.9 | **0.63** | 8.7 / 12.0 / 16.1 | **0.73** |
-| cross b=1 ctx=256 | 4.5 / 6.4 / 5.6 | **0.80** | 8.2 / 13.5 / 12.1 | **0.68** | 8.4 / 10.8 / 12.9 | **0.78** |
-| self b=8 ctx=256 | 32.9 / 51.2 / 53.9 | **0.64** | 64.5 / 96.2 / 123 | **0.67** | 144 / 153 / 159 | **0.94** |
-| cross b=8 ctx=256 | 31.8 / 49.4 / 49.1 | **0.65** | 63.1 / 92.1 / 121 | **0.69** | 142 / 146 / 145 | 0.98 |
-| self b=8 ctx=1024 | 1,070 / 1,132 / 1,163 | **0.95** | 440 / 626 / 606 | **0.73** | 594 / 837 / 915 | **0.71** |
-| cross b=8 ctx=1024 | 1,037 / 1,088 / 1,167 | **0.95** | 490 / 627 / 633 | **0.78** | 592 / 822 / 918 | **0.72** |
-| self b=32 ctx=1024 | 4,788 / 5,226 / 5,082 | **0.94** | 2,667 / 2,775 / 2,930 | **0.96** | 4,340 / 4,898 / 4,760 | **0.91** |
-| cross b=32 ctx=1024 | 4,637 / 4,788 / 4,922 | **0.97** | 2,670 / 2,791 / 2,997 | **0.96** | 4,419 / 4,900 / 4,685 | **0.94** |
-| self b=1 ctx=4096 | 285 / 322 / 337 | **0.89** | 222 / 251 / 256 | **0.89** | 311 / 334 / 318 | 0.98 |
-| cross b=1 ctx=4096 | 284 / 323 / 334 | **0.88** | 224 / 248 / 262 | **0.90** | 310 / 333 / 314 | 0.99 |
-
-¹ Re-run in isolation (median of 3 runs). The matrix process read 1.33 for this
-row because it ran straight after the test suites; see `docs/CPP.md` §7.
+**Caveats.**
+* Rows bound by memory placement swing 20-30% with allocation order. The Xeon
+  fp32 decode row `cross b=8 ctx=1024` measured 0.82-1.04 of C++ across four
+  `--load-seed` values, while Mojo matched C++ in single-thread, four-thread
+  and cold-cache controlled tests; treat those verdicts as unresolved until
+  repeated across processes.
+* Two Xeon runs of identical code differed by 5-10% on a few fp32 AMX
+  `flash_attn_func` rows (the control arm moved with it, C++ did not); the
+  cause is not found.
+* Axion and Xeon were each measured once at `bbe8c1b`; the Ryzen once.
 
 ## Benchmark it yourself
 
 ```bash
 scripts/build_vllm_ref.sh             # vLLM reference -> ~/vllm_cpu_build/*.so (pinned commit)
-python benchmarks/bench.py --vllm ~/vllm_cpu_build/vllm_cpu_attn_bench.so --isa vec \
-    --rounds 41 --json out.json        # add --block-calls 40 on a laptop
+scripts/pin_governor.sh uv run python benchmarks/bench.py --manifest full \
+    --vllm-bf16 ~/vllm_cpu_build/vllm_cpu_attn_bench.so --vllm-fp32 ~/vllm_cpu_build/vllm_cpu_attn_bench.so \
+    --rounds 61 --paged-rounds 121 --block-calls 40 --json /path/outside/the/repo/run.json
 ```
 
-* Pass the AMX reference (`vllm_cpu_attn_bench_amx.so --isa amx --dtype bf16`)
-  for bf16 on an AMX box, and `--isa neon` on aarch64.
-* Judge on the minimum, and only against the duplicate arm's spread. Never
-  compare two separate runs: these machines drift 5-15% between processes.
+* On an AMX box pass `vllm_cpu_attn_bench_amx.so --vllm-isa-bf16 amx` for bf16
+  and `--threads <physical cores>`; on aarch64 pass `--vllm-isa-bf16 neon
+  --vllm-isa-fp32 neon`. `--block-calls 40` is for the Ryzen only.
+* `--only "<label substring>"` runs a subset, `--resume` continues a `--json`
+  after an interruption, `--previous <saved package>` A/Bs two of your builds
+  against an independent control, and `--load-seed N` changes the module-load and
+  cache-allocation order (repeat memory-bound rows with several).
+* Judge on the minimum and only inside one process; never compare two runs
+  (these machines drift 5-15% between processes).
 
 ## Getting the best performance
 
 1. **Set torch threads to the physical core count.** The kernels run on torch's
    OpenMP pool and cap themselves at physical cores; SMT threads only
    oversubscribe it.
-2. **Use bf16.** It is up to 3x faster than fp32 on both dense and paged rows.
-   The shortest Ryzen dense row (128:8:64) is the only case where fp32 is
-   faster (24.9 vs 28.2 µs).
+2. **Use bf16** where the model allows: on the Xeon, for sequences of 129 or
+   more tokens, the AMX policy is 2.7-8.1x faster than the vector policy in
+   bf16 and 1.1-3.4x in fp32 (fp32 runs as bf16 hi/lo products).
 3. **Pass `out=`** to `self_attention` / `cross_attention` on the decode path.
    It saves the allocation, which is a sizeable share of a batch-1 call.
-4. **Page size.** Use 32 on x86 and 16 on ARM (the engine defaults); measure
-   before changing it.
-5. **Leave AMX on** (the default on AMX CPUs). It is worth 2.8-9.8x over
-   AVX-512 for dense bf16.
+4. **Page size.** Use 32 on x86 and 16 on ARM (the engine defaults); 16, 32, 48
+   and 64 are specialized at compile time.
+5. **Leave AMX on** (the default on AMX CPUs). Few-query calls (fp32 up to ~65
+   rows at head_dim 64, bf16 1-2 rows) automatically use the vector policy,
+   which is faster there; `CPU_ATTENTION_AMX=0` forces it everywhere.
 
 ## Tests
 
 ```bash
-CPU_ATTENTION_BACKEND=cpp uv run python tests/test_dense.py        # dense vs a naive fp32 reference (89 checks)
-CPU_ATTENTION_BACKEND=cpp uv run python tests/test_flash_api.py    # flash-shaped API and its rejections
-CPU_ATTENTION_BACKEND=cpp uv run python tests/fuzz_dense.py --cases 80 --max-seq 900
-CPU_ATTENTION_BACKEND=cpp uv run python tests/test_paged_sweep.py  # 504 paged cases, both dtypes
-uv run python tests/test_amx.py                                    # AMX flash policy (AMX boxes; fails if AMX is present but unusable)
+uv run python tests/test_dense.py          # flash_attn_func vs a naive fp32 reference (82 checks)
+uv run python tests/test_flash_api.py      # flash-shaped API and its rejections
+uv run python tests/fuzz_dense.py --cases 80 --max-seq 900
+uv run python tests/test_paged_sweep.py    # 504 paged cases, both dtypes
+uv run python tests/test_regressions.py    # 412 checks: odd/unequal lengths, masked rows, poisoned caches, strides, scale, workers, concurrency
+uv run python tests/test_amx.py --dtype both   # AMX policy (AMX CPUs; fails if AMX is present but unusable)
 ```
 
-Drop `CPU_ATTENTION_BACKEND=cpp` to test the Mojo backend.
+The default backend is Mojo; prefix `CPU_ATTENTION_BACKEND=cpp` to test C++, and
+`CPU_ATTENTION_ISA=<tier>` to test a lower Mojo tier. The engine-level test
+lives in fast-encdec: `PYTHONPATH=. .venv/bin/python tests/test_cpu_attention.py`
+(it passes strided chunks of a fused projection; 45 checks).
 
-The engine-level test lives in fast-encdec:
-`CPU_ATTENTION_BACKEND=cpp PYTHONPATH=. .venv/bin/python tests/test_cpu_attention.py`.
-
-Accuracy gates:
+Accuracy gates (all pass on all three boxes at `bbe8c1b`):
 
 | case | limit |
 |---|---|
-| dense fp32 | <= 2e-4 vs the naive reference |
-| dense bf16 | <= 3e-2 |
-| paged fp32 | <= 1e-6 |
-| paged bf16, x86 | 0-2 ulp between backends |
-| paged bf16, ARM | <= 1e-3 |
+| `flash_attn_func` fp32 | <= 2e-4 vs the naive fp32 reference |
+| `flash_attn_func` bf16 | <= 3e-2 |
+| paged fp32 | <= 1e-6 (fp64 arbitrates an fp32 reference that is itself out of the gate) |
+| paged bf16, x86 | <= 2 bf16 ulp at the row peak vs C++ |
+| paged bf16, ARM | the same 2 ulp, and <= 1e-3 *above the bf16 output-rounding floor* |
+
+The ARM "<= 1e-3" is not met literally: rounding the exact result to bf16 alone
+exceeds 1e-3 on 77 of 252 sweep cases, so no bf16 output can satisfy an absolute
+1e-3. The tests check the excess over that floor (`tests/reference.py`); see
+`docs/Mojo.md` §5.
 
 ## Documentation
 
 * [`docs/CPP.md`](docs/CPP.md): the C++ backend's design, per-ISA techniques,
   numerics, measurement rules, falsification ledger and open problems.
-* [`docs/Mojo.md`](docs/Mojo.md): the Mojo backend's kernels, ISA paths,
-  language notes, failure modes, and the levers already exhausted.
+* [`docs/Mojo.md`](docs/Mojo.md): the Mojo backend's design, ISA tiers,
+  numerics, call path, defects found, falsification ledger and Mojo 1.2.0
+  notes.
 * [`AGENTS.md`](AGENTS.md): working rules for anyone changing a kernel.
 
 ## License
