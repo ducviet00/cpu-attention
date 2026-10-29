@@ -14,31 +14,24 @@ CPU_ATTENTION_BACKEND=cpp python -c "import cpu_attention"  # select it (default
 
 ## 1. Status
 
-Final verification, 2026-10-28, same tree on all three boxes. The protocol is
-in §7 and the per-row numbers are in the README.
+C++ is now the *competitor* the unified Mojo backend is judged against: the
+README's Performance section holds the current per-row verdicts (Mojo against
+the fastest valid C++ ISA path on the Ryzen, Axion and Xeon) and is the single
+source of truth for numbers. This section is the record of the C++ campaign's
+own final verification (2026-10-28), when C++ was compared with the previous
+Mojo build and vLLM `csrc/cpu`; the per-row tables of that comparison were
+retired from the README because they describe a Mojo build that no longer exists.
 
 | box | vLLM baseline | clear wins / 42 | noise band (0.97-1.04) | losses | acceptance (>= 90% clear, no loss) |
 |---|---|---:|---:|---:|---|
-| Xeon Platinum 8581C (GCP C4, 4C/8T) | AMX for bf16, VEC for fp32 | **39** | 3 | 0 | **pass** |
+| Xeon Platinum 8581C (GCP C4, 4C/8T) | AMX for bf16, VEC for fp32 | 39 | 3 | 0 | pass |
 | Ryzen 7 7840H (8 cores, AVX-512, no AMX) | VEC | 38 | 3 | 1 | not met |
 | Axion Neoverse-V2 (GCP c4a, 8 cores) | NEON | 35 | 7 | 0 | not met |
 
-"Clear win" means below 0.97 of the *faster* of Mojo and vLLM on that row.
-
-- **The one loss** is Ryzen paged self b=32 ctx=1024 bf16, at 1.16 of Mojo
-  (§9).
-- **The Axion noise rows** are dense rows where Mojo is the faster baseline,
-  at 0.97-1.01.
-- **Against vLLM alone**, C++ is faster on all 126 rows. The closest is the
-  Xeon fp32 cross b=8/256 row at 0.98, which sits at the box's memory-read
-  floor.
-- **Against Mojo alone**, C++ is faster on 122 of 126. The other four are Ryzen
-  paged b=32/1024 bf16 self (1.16) and cross (1.00), and Axion dense fp32
-  2048:8:64 and 1024:16:128 (1.00 and 1.01).
-- **Against SDPA**, every dense row on every box is faster (0.17-0.85).
-
-That is why `CPU_ATTENTION_BACKEND` still defaults to `mojo`. An explicit
-`auto` selects C++ on x86-64 and Mojo on aarch64.
+"Clear win" meant below 0.97 of the *faster* of the then-Mojo and vLLM on that
+row. Against vLLM alone C++ was faster on all 126 rows; against SDPA, every dense
+row on every box. `CPU_ATTENTION_BACKEND` defaults to `mojo`; an explicit `auto`
+selects C++ on x86-64 and Mojo on aarch64.
 
 The acceptance boxes named in the original plan were Graviton 5 and Xeon
 6975P-C. They were unreachable, so the GCP machines above stand in and are
