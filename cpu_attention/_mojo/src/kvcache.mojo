@@ -147,6 +147,9 @@ def _div_page[PAGE: Int](x: Int, page: Int, out res: Tuple[Int, Int]):
         return (x >> 5, x & 31)
     elif PAGE == 64:
         return (x >> 6, x & 63)
+    elif PAGE:
+        var q = x // PAGE  # a constant divisor: multiply and shift
+        return (q, x - q * PAGE)
     else:
         var q = x // page
         return (q, x - q * page)
@@ -225,9 +228,10 @@ struct Decode[dtype: DType, hd: Int, R: Int]:
     """Key vectors per unit."""
     comptime KT = _kt(Self.hd, Self.R)
     comptime UNITS = Self.KT // Self.UNIT
+    """Units per step; a step spans at most UNITS + 1 pages (pages are >= 16 keys)."""
     comptime G = _groups(Self.BF, Self.R)
     comptime G_TAIL = min(Self.G, Self.GPU)
-    """A masked tail call never leaves its unit (only resolved units are read)."""
+    """A masked tail call never leaves its unit, so it never reads past the step's pages."""
     comptime PAIRS = PageLayout[Self.dtype, Self.hd].V_PAIRS
     # bf16 on x86: degree 2, inside the bf16 output rounding (the C++ class of
     # the x86 gate). aarch64's gate is also <= 1e-3 against the fp32 reference,
@@ -315,38 +319,40 @@ def bitcast_bf16[width: Int](x: SIMD[DType.int32, width]) -> SIMD[DType.bfloat16
 
 
 @always_inline
-def _unit_bases[E: Int, hd: Int, PAGE: Int](
+def _page_bases[E: Int, hd: Int](
     job: PagedJob,
     bt: MutPointer[Int32, _],
     kvh: Int,
     page: Int,
-    k0: Int,
-    units: Int,
-    kbase: MutPointer[Int64, _],
-    vbase: MutPointer[Int64, _],
+    p0: Int,
+    npg: Int,
+    kpg: MutPointer[Int64, _],
+    vpg: MutPointer[Int64, _],
 ):
-    """K and V addresses of the first key of each 16-key unit from `k0`: one
-    block-table lookup per page, its units at a constant stride."""
+    """K and V block addresses of a step's npg pages from page p0: one
+    block-table lookup per page (per 16-key unit cost 5-11% more instructions
+    per call, measured on Zen 4)."""
     var head_bytes = page * hd * E
-    var g = 0
-    while g < units:
-        var d = _div_page[PAGE](k0 + g * 16, page)
-        var blk = (Int(bt.unsafe_load(d[0])) * job.kv_heads + kvh) * head_bytes
-        var kb = job.k_cache + blk + d[1] * 4
-        var vb = job.v_cache + blk + d[1] * hd * E
-        var n = min(units - g, (page - d[1]) >> 4)
-        for u in range(n):
-            kbase.unsafe_store(g + u, Int64(kb + u * 64))
-            vbase.unsafe_store(g + u, Int64(vb + u * 16 * hd * E))
-        g += n
+    for i in range(npg):
+        var blk = (Int(bt.unsafe_load(p0 + i)) * job.kv_heads + kvh) * head_bytes
+        kpg.unsafe_store(i, Int64(job.k_cache + blk))
+        vpg.unsafe_store(i, Int64(job.v_cache + blk))
+
+
+@always_inline
+def _key_addr[PAGE: Int, BYTES: Int](pg: MutPointer[Int64, _], page: Int, x: Int) -> Int:
+    """Address of key x of a step, counted from its first page's start."""
+    var d = _div_page[PAGE](x, page)
+    return Int(pg.unsafe_load(d[0])) + d[1] * BYTES
 
 
 @always_inline
 def _qk[
-    dtype: DType, hd: Int, R: Int, G: Int, KT: Int, MASK: Bool
+    dtype: DType, hd: Int, R: Int, G: Int, KT: Int, PAGE: Int, MASK: Bool
 ](
-    kbase: MutPointer[Int64, _],
+    kpg: MutPointer[Int64, _],
     page: Int,
+    o0: Int,
     q: Int,
     j: Int,
     nk: Int,
@@ -367,9 +373,9 @@ def _qk[
     var kb = Array[Int, UC](uninitialized=True)
     comptime if G >= GPU:
         comptime for u in range(UC):
-            kb[u] = Int(kbase.unsafe_load((j >> 4) + u))
+            kb[u] = _key_addr[PAGE, 4](kpg, page, o0 + j + 16 * u)
     else:
-        kb[0] = Int(kbase.unsafe_load(j >> 4)) + (j & 15) * 4
+        kb[0] = _key_addr[PAGE, 4](kpg, page, o0 + j)
     var cv = Array[V, R * G](fill=V(0))
     comptime if dtype == DType.bfloat16:
         # bf16 K and Q are dim pairs. A runtime loop over them (unrolled by U):
@@ -396,19 +402,24 @@ def _qk[
         var part = Array[V, R * G * CH](fill=V(0))
         comptime U = max(CH, 4)
         for d0 in range(0, hd, U):
-            # U query dims as one vector, then a lane each: NEON's by-element
-            # FMA (a scalar broadcast load per dim costs a load each there);
-            # x86 folds it into an embedded broadcast either way.
+            # Where a broadcast does not fold into the FMA (NEON), U query dims
+            # as one vector, then a lane each (by-element FMA).
             var qv = Array[SIMD[DType.float32, U], R](uninitialized=True)
-            comptime for r in range(R):
-                qv[r] = qf.unsafe_load[width=U](r * hd + d0)
+            comptime if not BCAST_FOLD:
+                comptime for r in range(R):
+                    qv[r] = qf.unsafe_load[width=U](r * hd + d0)
             comptime for u in range(U):
                 var d = d0 + u
                 comptime for g in range(G):
                     var k = ptr[Float32](kb[g // GU] + (g % GU) * LANES * 4).unsafe_load[width=LANES](d * page)
                     comptime for r in range(R):
                         comptime i = (r * G + g) * CH + u % CH
-                        part[i] = V(qv[r][u]).fma(k, part[i])
+                        var qs: Float32
+                        comptime if BCAST_FOLD:
+                            qs = qf.unsafe_load(r * hd + d)
+                        else:
+                            qs = qv[r][u]
+                        part[i] = V(qs).fma(k, part[i])
         comptime for rg in range(R * G):
             comptime if CH == 4:
                 cv[rg] = (part[rg * 4] + part[rg * 4 + 1]) + (part[rg * 4 + 2] + part[rg * 4 + 3])
@@ -687,15 +698,14 @@ def _exp_row[
 
 @always_inline
 def _pv[
-    dtype: DType, hd: Int, R: Int, FULL: Bool
+    dtype: DType, hd: Int, R: Int, PAGE: Int, FULL: Bool
 ](
-    k0: Int, nk: Int, len: Int, units: Int, alpha: SIMD[DType.float32, R], vbase: MutPointer[Int64, _],
-    pbuf: Int, pbuf_lo: Int, p: Int, acc: MutPointer[Float32, _],
+    k0: Int, nk: Int, len: Int, o0: Int, npg: Int, page: Int, alpha: SIMD[DType.float32, R],
+    vpg: MutPointer[Int64, _], pbuf: Int, pbuf_lo: Int, p: Int, acc: MutPointer[Float32, _],
 ):
     """acc[r] = acc[r]*alpha[r] + sum_j P[r][j] * V[k0+j] over exactly nk keys
-    (never past `len`: 0 * a padded NaN is NaN), NC dim vectors at a time, in
-    runs of units contiguous in memory (all of a page past 16 keys, so the key
-    loops are not cut every 16 keys; FULL: every unit of a step, 16 keys each)."""
+    (never past `len`: 0 * a padded NaN is NaN), NC dim vectors at a time, page
+    by page (FULL: 16-key unit by unit, a constant length)."""
     comptime D = Decode[dtype, hd, R]
     comptime V = SIMD[DType.float32, LANES]
     comptime NC = D.NC
@@ -703,17 +713,17 @@ def _pv[
     comptime for dc in range(0, hd, NC * LANES):
         var a = Array[V, LN * R * NC](fill=V(0))
         _acc_load[hd, R, NC, LANES, LN * R * NC](a, acc, dc, k0, alpha)
-        var g = 0
-        var gend = D.UNITS if FULL else units
-        while g < gend:
-            var g1 = g + 1
-            comptime if not FULL:
-                comptime RUN = D.UNIT * hd * D.E
-                while g1 < gend and Int(vbase.unsafe_load(g1)) == Int(vbase.unsafe_load(g1 - 1)) + RUN:
-                    g1 += 1
-            var kv = D.UNIT if FULL else min(g1 * D.UNIT, nk) - g * D.UNIT
-            D.PV.keys[LN * R * NC, FULL](a, Int(vbase.unsafe_load(g)), dc, p, pbuf, pbuf_lo, g * D.UNIT, kv, len)
-            g = g1
+        comptime if FULL:
+            for g in range(D.UNITS):
+                var vb = _key_addr[PAGE, hd * D.E](vpg, page, o0 + g * D.UNIT)
+                D.PV.keys[LN * R * NC, True](a, vb, dc, p, pbuf, pbuf_lo, g * D.UNIT, D.UNIT, len)
+        else:
+            var pgs = PAGE if PAGE else page
+            for i in range(npg):
+                var ks = max(0, i * pgs - o0)
+                var ke = min(nk, (i + 1) * pgs - o0)
+                var vb = Int(vpg.unsafe_load(i)) + (ks + o0 - i * pgs) * hd * D.E
+                D.PV.keys[LN * R * NC, False](a, vb, dc, p, pbuf, pbuf_lo, ks, ke - ks, len)
         comptime for r in range(R):
             comptime for i in range(NC):
                 var s = a[r * NC + i]
@@ -750,8 +760,8 @@ def _attend_rows[
             comptime for w in range(0, QW, 4):
                 qbuf.unsafe_store[width=4](r * QW + w, s.unsafe_load[width=4](w))
 
-    var kbase = stack_allocation[D.UNITS, DType.int64, alignment=64]()
-    var vbase = stack_allocation[D.UNITS, DType.int64, alignment=64]()
+    var kpg = stack_allocation[D.UNITS + 1, DType.int64, alignment=64]()
+    var vpg = stack_allocation[D.UNITS + 1, DType.int64, alignment=64]()
     var logits = stack_allocation[R * KT, DType.float32, alignment=64]()
     var pbuf = stack_allocation[(R * KT) if D.PV.P16 else 1, DType.bfloat16, alignment=64]()
     var pbuf_lo = stack_allocation[(R * KT) if D.PV.P16 else 1, DType.bfloat16, alignment=64]()
@@ -762,21 +772,24 @@ def _attend_rows[
     var k0 = 0
     while k0 < len:
         var nk = min(KT, len - k0)
-        var units = (nk + D.UNIT - 1) // D.UNIT
-        _unit_bases[D.E, hd, PAGE](job, bt, kvh, page, k0, units, kbase, vbase)
+        # The step's pages: it starts o0 keys into page p0 (o0 % 16 == 0).
+        var d0 = _div_page[PAGE](k0, page)
+        var o0 = d0[1]
+        var npg = _div_page[PAGE](o0 + nk - 1, page)[0] + 1
+        _page_bases[D.E, hd](job, bt, kvh, page, d0[0], npg, kpg, vpg)
 
         # ---- Q@K^T: G key vectors per call; the tail in masked calls of at
         # most one unit, and a single vector when that is all that is left.
         var mx = Array[V, R](fill=V(-Float32.MAX))
         var j = 0
         while j + D.G * LANES <= nk:
-            _qk[dtype, hd, R, D.G, KT, False](kbase, page, q, j, nk, logits, mx)
+            _qk[dtype, hd, R, D.G, KT, PAGE, False](kpg, page, o0, q, j, nk, logits, mx)
             j += D.G * LANES
         while j < nk:
             if nk - j <= LANES:
-                _qk[dtype, hd, R, 1, KT, True](kbase, page, q, j, nk, logits, mx)
+                _qk[dtype, hd, R, 1, KT, PAGE, True](kpg, page, o0, q, j, nk, logits, mx)
                 break
-            _qk[dtype, hd, R, D.G_TAIL, KT, True](kbase, page, q, j, nk, logits, mx)
+            _qk[dtype, hd, R, D.G_TAIL, KT, PAGE, True](kpg, page, o0, q, j, nk, logits, mx)
             j += D.G_TAIL * LANES
 
         # ---- online softmax per row; p = 2^(logit*c - m), m in scaled log2 units
@@ -795,10 +808,10 @@ def _attend_rows[
         # ---- P@V
         comptime if D.FULL:
             if nk == KT:
-                _pv[dtype, hd, R, True](k0, nk, len, units, alpha, vbase, Int(pbuf), Int(pbuf_lo), Int(logits), acc)
+                _pv[dtype, hd, R, PAGE, True](k0, nk, len, o0, npg, page, alpha, vpg, Int(pbuf), Int(pbuf_lo), Int(logits), acc)
                 k0 += nk
                 continue
-        _pv[dtype, hd, R, False](k0, nk, len, units, alpha, vbase, Int(pbuf), Int(pbuf_lo), Int(logits), acc)
+        _pv[dtype, hd, R, PAGE, False](k0, nk, len, o0, npg, page, alpha, vpg, Int(pbuf), Int(pbuf_lo), Int(logits), acc)
         k0 += nk
 
     _store_rows[dtype, hd, R](job, seq, h0, nrows, l, acc)
