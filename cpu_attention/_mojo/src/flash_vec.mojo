@@ -13,7 +13,7 @@ from std.math import iota
 from std.memory import bitcast
 
 from flash_attn import FlashJob, FlashPolicy, NEG, V
-from isa import BCAST_FOLD, LANES, dot_bf16, exp2, exp2s, ptr, vmax
+from isa import BCAST_FOLD, LANES, dot_bf16, exp2, online_max, ptr, vmax
 
 comptime KP = 64  # keys per K^T block
 comptime KT = 256  # keys per softmax tile
@@ -147,18 +147,21 @@ def _qk[
     var lg = ptr[Float32](logits)
     var j = 0
     comptime KV = 1 if DOT else KV32
+    comptime assert KP % (KV * LANES) == 0, "a Q@K^T pass stays inside one K^T block"
     while j < nkeys:
         var jj = k0 + j
         var c = Array[V, ROWS * KV](fill=V(0))
+        # The pass's keys share one K^T block (KP is a multiple of the pass), so
+        # one base and constant key/dim offsets: per-load block arithmetic kept
+        # NEON from pairing the loads (`ldp`) and cost ~10% more instructions.
+        var kb = ptr[Scalar[dtype]](kd) + _k_off[dtype, hd](jj, 0)
         comptime if DOT:
-            var kp = ptr[BFloat16](kd)
+            var kp = ptr[BFloat16](Int(kb))
             # Runtime loop over dim pairs: fully unrolled, LLVM hoists the
             # query broadcasts out of the key loop and spills them.
             for d2 in range(0, hd // 2, 4):
                 comptime for u in range(4):
-                    var kv = kp.unsafe_load[width = 2 * LANES](
-                        _k_off[dtype, hd](jj, 2 * (d2 + u))
-                    )
+                    var kv = kp.unsafe_load[width = 2 * LANES]((d2 + u) * 2 * KP)
                     comptime for r in range(ROWS):
                         var rr = min(r, nrows - 1)
                         var qv = SIMD[DType.int32, LANES](
@@ -170,14 +173,14 @@ def _qk[
                             c[r], kv, bitcast[DType.bfloat16, 2 * LANES](qv)
                         )
         else:
-            var kp = ptr[Scalar[dtype]](kd)
+            var kp = kb
             for d in range(0, hd, 4):
                 comptime if BCAST_FOLD:
                     comptime for u in range(4):
                         var kv = Array[V, KV](uninitialized=True)
                         comptime for i in range(KV):
                             kv[i] = kp.unsafe_load[width=LANES](
-                                _k_off[dtype, hd](jj + i * LANES, d + u)
+                                (d + u) * KP + i * LANES
                             ).cast[DType.float32]()
                         comptime for r in range(ROWS):
                             var rr = min(r, nrows - 1)
@@ -191,7 +194,7 @@ def _qk[
                     comptime for u in range(4):
                         comptime for i in range(KV):
                             kv[u * KV + i] = kp.unsafe_load[width=LANES](
-                                _k_off[dtype, hd](jj + i * LANES, d + u)
+                                (d + u) * KP + i * LANES
                             ).cast[DType.float32]()
                     comptime for r in range(ROWS):
                         var rr = min(r, nrows - 1)
@@ -209,9 +212,13 @@ def _qk[
             else:
                 var idx = iota[DType.int32, LANES](Int32(ji))
                 var past = idx.ge(SIMD[DType.int32, LANES](Int32(kend)))
+                # Row r sees key k iff k - limit0 <= r: one subtraction, then a
+                # compile-time constant per row (8 runtime per-row limits spilled
+                # and were reloaded on every masked pass on NEON).
+                var rel = idx - Int32(limit0)
                 comptime for r in range(ROWS):
                     if r < nrows:
-                        var bad = past | idx.gt(SIMD[DType.int32, LANES](Int32(limit0 + r)))
+                        var bad = past | rel.gt(SIMD[DType.int32, LANES](Int32(r)))
                         var x = bad.select(V(NEG), c[r * KV + i])
                         lg.unsafe_store[width=LANES](r * KT + j + i * LANES, x)
                         mx[r] = vmax[LANES](mx[r], x)
@@ -253,8 +260,9 @@ def _softmax[
             continue
         var mxv = tm * c
         var mo = mp.unsafe_load(r)
-        var mn = max(mo, mxv)
-        var a = exp2s[5](mo - mn)
+        var s0 = online_max[1, 5](mo, mxv)
+        var mn = s0[0][0]
+        var a = s0[1][0]
         mp.unsafe_store(r, mn)
         ap.unsafe_store(r, a)
         var s = Array[V, NS](fill=V(0))
@@ -292,8 +300,10 @@ def _softmax[
 @always_inline
 def _pv[
     dtype: DType, hd: Int, ROWS: Int
-](vsrc: Int, vstride: Int, k0: Int, nk: Int, logits: Int, acc: Int):
-    """acc[r] += p[r] @ V over `nk` keys, in passes of NV dim vectors."""
+](vsrc: Int, vstride: Int, k0: Int, nk: Int, logits: Int, acc: Int, alpha: Int, sub: Int):
+    """acc[r] = acc[r] * alpha[r] + p[r] @ V over `nk` keys, in passes of NV dim
+    vectors. The rescale rides the accumulator load, and a row tile's first key
+    tile (always k0 == 0) starts from zero: no separate rescale pass, no clear."""
     comptime BF = dtype == DType.bfloat16
     comptime NV = PV_VECS
     comptime DC = NV * LANES
@@ -303,10 +313,13 @@ def _pv[
 
     @always_inline
     def chunk(dc: Int) capturing:
-        var c = Array[V, ROWS * NV](uninitialized=True)
-        comptime for r in range(ROWS):
-            comptime for i in range(NV):
-                c[r * NV + i] = ap.unsafe_load[width=LANES](r * hd + dc + i * LANES)
+        var c = Array[V, ROWS * NV](fill=V(0))
+        if k0 > 0:
+            comptime for r in range(ROWS):
+                var a = ptr[Float32](alpha).unsafe_load(min(r, sub - 1))
+                comptime for i in range(NV):
+                    var x = ap.unsafe_load[width=LANES](r * hd + dc + i * LANES)
+                    c[r * NV + i] = x if a == 1.0 else x * a
         comptime if BF:
             # Key pairs: one `dpbf16ps` folds two keys x LANES dims (2.05x the
             # phase over fp32 FMA in the C++ measurement).
@@ -398,18 +411,7 @@ def _tile[
     else:
         _qk[dtype, hd, ROWS](job, kd, q0, job.qt, sub, k0, nk, limit0, aux, alpha)
     _softmax[dtype](aux, sub, nk, c, m, l, alpha)
-    var ap = ptr[Float32](alpha)
-    var acp = ptr[Float32](acc)
-    for r in range(sub):
-        var a = ap.unsafe_load(r)
-        # a == 1: no-op; a == 0: the row's first contributing tile, where the
-        # accumulator is still exactly 0.
-        if a != 1.0 and a != 0.0:
-            comptime for d in range(0, hd, LANES):
-                acp.unsafe_store[width=LANES](
-                    r * hd + d, acp.unsafe_load[width=LANES](r * hd + d) * a
-                )
-    _pv[dtype, hd, ROWS](vsrc, vstride, k0, nk, aux, acc)
+    _pv[dtype, hd, ROWS](vsrc, vstride, k0, nk, aux, acc, alpha, sub)
 
 
 struct VecPolicy[dtype: DType, hd: Int](FlashPolicy):
@@ -417,6 +419,7 @@ struct VecPolicy[dtype: DType, hd: Int](FlashPolicy):
     comptime HD = Self.hd
     comptime RQT = RQT
     comptime KT = KT
+    comptime ZEROES_ACC = True
 
     @staticmethod
     def slab_bytes(seq_k: Int) -> Int:

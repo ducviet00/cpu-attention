@@ -298,11 +298,22 @@ Goal: one implementation across CPUs, then latency (AGENTS.md).
 | NEON fp32 Q through a contiguous panel (32 heads x 128 dims: rows 16 KB apart, one L1 set) | GQA rows 1.09 -> ~1.0; C++ losses 2 -> 0 | kept |
 | lane max through `isa.vmax` (one `fmaxnm` / `vmaxps` against compare + select) | round 6 (all above): Axion fp32 flash 1.050 (19 / 20 / 0 vs C++), flash elsewhere 0.99-1.00 | kept |
 | `kvcache.mojo` -> `paged_attn.mojo`; one `isa.exp2` (AVX-512: the AMX policy's `rndscale` + `scalef`, 7 uops against 9; NEON: integer exponent; one coefficient set per degree), `isa.vmax` and `isa.bf16_lo` replace the AMX and NEON policies' copies; one `_with_policy` table for running and sizing | flash Axion / C4D / Xeon 0.998 / 0.985 (C4D bf16 0.973) / 0.989, paged 0.995 / 0.999 / 1.000; `test_amx` 102/102 | kept |
+| vector flash policy: the rescale rides P@V's accumulator load and a row tile's first key tile starts from zero (`ZEROES_ACC`: no rescale pass, no clear) | Axion fp32 flash 0.992 (16 threads 0.990); x86 neutral (Zen 4 one thread 0.99-1.00) | kept |
+| decode `PVRows`: two key pairs per loop iteration (the loop's adds and compares were 11% of a cache-resident bf16 decode) | Zen 4 one thread: 6% fewer instructions, cycles 0.85-0.93; boxes paged 0.987-1.000 | kept |
+| bf16 vector P@V one dim vector per pass, so the probability broadcast folds into `vdpbf16ps` (a separate `vbroadcastss` was 16% of the call) | Zen 4: 4-6% fewer instructions, cycles ~0.98; Zen 5 (C4D-16): head_dim 64 1.17, 128 1.15 | reverted: not a gain on every AVX-512 core |
+| flash plan: at least ~8 work items per worker (halve `rq`, clamped to `seq_q`, down to one register-tile pair) | Axion-16 1024:8:32 fp32 802 -> 712 us (C++ 704), bf16 329 -> 296 (C++ 323); 8 threads unchanged. The first version halved before clamping: 17-row calls split into a 1-row block and ran 15x slower | kept (fixed) |
+| Axion fp32 flash vs the old dedicated NEON policy, with hardware counters (c4a-standard-16, `PMU=standard`; C4D offers no PMU on any size): the FMA phases already ran fewer instructions; all of the +7-16% was outside them | 1024:8:32: 123.6M -> 136.7M instructions, FMA phases 94.2 -> 91.8M, other 7.6 -> 19.7M | diagnosis |
+| causal mask from one `rel = key - limit0` vector and per-row constants (8 runtime per-row limits spilled and were reloaded on every masked pass) | Axion hd 32 cycles 1.126 -> 1.049 of the old policy (one run) | kept |
+| one K^T base per Q@K^T pass, constant key/dim offsets (per-load block arithmetic kept NEON from pairing loads: `ldp` 10.9% of samples in the old policy, 1.2% here) | instructions vs the old policy hd 64 1.109 -> 1.072, 512:32:128 1.074 -> 1.038; cycles 1.06 -> 1.02 | kept |
+| key tile `max(256, 16384 / hd)` (512 at hd 32) | -1.3% instructions, cycles within the VM's +-5% run-to-run spread | reverted |
+| `isa.online_max`: the one running-max step (vector, NEON and AMX flash, decode; AMX keeps its slack and skip) | final round (`cf9688d`, vs `200e6e2`): flash new/previous Axion-16 0.992-0.997, Xeon-16 0.995, C4D-16 0.991-0.999; paged 0.978-1.004; `test_amx` 102/102 | kept |
 
-Result: decode unification at no measured cost; Axion fp32 `flash_attn_func` is ~5% slower
+Result: decode unification at no measured cost; Axion fp32 `flash_attn_func` was ~5% slower
 than the dedicated NEON policy (wins became ties, no losses), accepted for the unification
-(2026-10-29) and open: the separate accumulator-rescale pass (the old policy fused alpha into
-P@V's accumulator load) and the first-tile write (`ZEROES_ACC`) are the remaining differences.
+(2026-10-29). The fused rescale and first-tile write (`ZEROES_ACC`), the mask constants and the
+per-pass K base since brought it to +2% cycles / +7% instructions at hd 64; hd 32 stays ~13%
+behind. Open: the Q@K^T loop holds 33 live vectors (16 accumulators, 8 K, 8 running max, the
+query) on a 32-register machine and spills a little more than the old policy did.
 
 **Axion decode ledger (c4a-standard-8, one process, independent control, vs `2fc4652`).**
 

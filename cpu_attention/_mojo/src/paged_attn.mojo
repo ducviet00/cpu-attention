@@ -17,7 +17,7 @@ from std.math import iota
 from std.memory import bitcast, stack_allocation
 from std.sys.info import CompilationTarget
 
-from isa import BCAST_FOLD, LANES, LOG2E, bf16_lo, dot_bf16, exp2, exp2s, ptr, vmax
+from isa import BCAST_FOLD, LANES, LOG2E, bf16_lo, dot_bf16, exp2, online_max, ptr, vmax
 from parallel import barrier, parallel
 
 comptime V_PAIRS_ARM = CompilationTarget.has_neon()
@@ -252,9 +252,8 @@ def _rescale[DEG: Int](k0: Int, mx: Float32, m: Float32) -> Tuple[Float32, Float
     and accumulator (0 on the first step, which also discards their garbage)."""
     if k0 == 0:
         return (mx, Float32(0))
-    if mx > m:
-        return (mx, exp2s[DEG](m - mx))
-    return (m, Float32(1))
+    var s = online_max[1, DEG](m, mx)
+    return (s[0][0], s[1][0])
 
 
 @always_inline
@@ -546,7 +545,9 @@ struct PVRows[dtype: DType, hd: Int, R: Int](PVKernel):
                             a[s] = V(pv[r][k]).fma(v0, a[s])
                 t += 4
         comptime if Self.LN == 2:
-            while t + 1 < kv:
+
+            @always_inline
+            def pair(t: Int) capturing:
                 var p0 = Array[V, Self.R](uninitialized=True)
                 var p1 = Array[V, Self.R](uninitialized=True)
                 comptime for r in range(Self.R):
@@ -558,6 +559,15 @@ struct PVRows[dtype: DType, hd: Int, R: Int](PVKernel):
                     comptime for r in range(Self.R):
                         a[r * NC + i] = p0[r].fma(v0, a[r * NC + i])
                         a[(Self.R + r) * NC + i] = p1[r].fma(v1, a[(Self.R + r) * NC + i])
+
+            # Two pairs per iteration: the loop's own adds and compares were 11%
+            # of a cache-resident bf16 decode (Zen 4 profile).
+            while t + 3 < kv:
+                pair(t)
+                pair(t + 2)
+                t += 4
+            if t + 1 < kv:
+                pair(t)
                 t += 2
         while t < kv:
             var p0 = Array[V, Self.R](uninitialized=True)
