@@ -147,18 +147,21 @@ def _qk[
     var lg = ptr[Float32](logits)
     var j = 0
     comptime KV = 1 if DOT else KV32
+    comptime assert KP % (KV * LANES) == 0, "a Q@K^T pass stays inside one K^T block"
     while j < nkeys:
         var jj = k0 + j
         var c = Array[V, ROWS * KV](fill=V(0))
+        # The pass's keys share one K^T block (KP is a multiple of the pass), so
+        # one base and constant key/dim offsets: per-load block arithmetic kept
+        # NEON from pairing the loads (`ldp`) and cost ~10% more instructions.
+        var kb = ptr[Scalar[dtype]](kd) + _k_off[dtype, hd](jj, 0)
         comptime if DOT:
-            var kp = ptr[BFloat16](kd)
+            var kp = ptr[BFloat16](Int(kb))
             # Runtime loop over dim pairs: fully unrolled, LLVM hoists the
             # query broadcasts out of the key loop and spills them.
             for d2 in range(0, hd // 2, 4):
                 comptime for u in range(4):
-                    var kv = kp.unsafe_load[width = 2 * LANES](
-                        _k_off[dtype, hd](jj, 2 * (d2 + u))
-                    )
+                    var kv = kp.unsafe_load[width = 2 * LANES]((d2 + u) * 2 * KP)
                     comptime for r in range(ROWS):
                         var rr = min(r, nrows - 1)
                         var qv = SIMD[DType.int32, LANES](
@@ -170,14 +173,14 @@ def _qk[
                             c[r], kv, bitcast[DType.bfloat16, 2 * LANES](qv)
                         )
         else:
-            var kp = ptr[Scalar[dtype]](kd)
+            var kp = kb
             for d in range(0, hd, 4):
                 comptime if BCAST_FOLD:
                     comptime for u in range(4):
                         var kv = Array[V, KV](uninitialized=True)
                         comptime for i in range(KV):
                             kv[i] = kp.unsafe_load[width=LANES](
-                                _k_off[dtype, hd](jj + i * LANES, d + u)
+                                (d + u) * KP + i * LANES
                             ).cast[DType.float32]()
                         comptime for r in range(ROWS):
                             var rr = min(r, nrows - 1)
@@ -191,7 +194,7 @@ def _qk[
                     comptime for u in range(4):
                         comptime for i in range(KV):
                             kv[u * KV + i] = kp.unsafe_load[width=LANES](
-                                _k_off[dtype, hd](jj + i * LANES, d + u)
+                                (d + u) * KP + i * LANES
                             ).cast[DType.float32]()
                     comptime for r in range(ROWS):
                         var rr = min(r, nrows - 1)
