@@ -16,7 +16,7 @@ CPU_ATTENTION_BACKEND=cpp python -c "import cpu_attention"  # select it (default
 
 C++ is now the *competitor* the unified Mojo backend is judged against: the
 README's Performance section holds the current per-row verdicts (Mojo against
-the fastest valid C++ ISA path on the Ryzen, Axion and Xeon) and is the single
+the fastest valid C++ ISA path on the C4D, Axion and Xeon) and is the single
 source of truth for numbers. This section is the record of the C++ campaign's
 own final verification (2026-10-28), when C++ was compared with the previous
 Mojo build and vLLM `csrc/cpu`; the per-row tables of that comparison were
@@ -25,7 +25,7 @@ retired from the README because they describe a Mojo build that no longer exists
 | box | vLLM baseline | clear wins / 42 | noise band (0.97-1.04) | losses | acceptance (>= 90% clear, no loss) |
 |---|---|---:|---:|---:|---|
 | Xeon Platinum 8581C (GCP C4, 4C/8T) | AMX for bf16, VEC for fp32 | 39 | 3 | 0 | pass |
-| Ryzen 7 7840H (8 cores, AVX-512, no AMX) | VEC | 38 | 3 | 1 | not met |
+| Ryzen 7 7840H laptop (8 cores, AVX-512, no AMX), the campaign's box then | VEC | 38 | 3 | 1 | not met |
 | Axion Neoverse-V2 (GCP c4a, 8 cores) | NEON | 35 | 7 | 0 | not met |
 
 "Clear win" meant below 0.97 of the *faster* of the then-Mojo and vLLM on that
@@ -226,7 +226,7 @@ fp32: hi/lo needs three products.
 | paged fp32 | 1e-6 | `test_paged_sweep.py` 504/504; worst 7.75e-7 to 8.34e-7 |
 | paged bf16 (x86 vs the other backend) | 0-2 ulp | worst 1.92-1.96 ulp |
 | paged bf16 (ARM) | 1e-3 | within |
-| engine (`fast-encdec/tests/test_cpu_attention.py`) | 45 checks | 45/45 (Ryzen) |
+| engine (`fast-encdec/tests/test_cpu_attention.py`) | 45 checks | 45/45 (development laptop) |
 
 The sweep covers head_dim 32/64/128, pages 16/32/48/64, GQA 1/2/4, seven
 shapes, both dtypes, strided q/k/v and permuted block tables.
@@ -252,7 +252,7 @@ Bugs it found, fixed in both backends:
 3. **Allocation order can move a DRAM-bound row by 3-12%.** Paged b1/4096 and
    b32/1024 depend on which cache tensor was allocated first. Rotate it, or use
    several processes.
-4. **Pin the Ryzen governor to `performance`** for a run and restore it after;
+4. **Pin the governor to `performance`** on a laptop or desktop for a run and restore it after;
    use 40-call blocks for short paged calls (`--block-calls 40`).
    - The first row after a heavy test suite can be 1.7x off: one such row read
      1.33, and three isolated re-runs read 0.87.
@@ -297,7 +297,7 @@ Every row was measured in-process and the change was reverted.
 
 ## 9. Open problems and what is worth trying
 
-1. **Ryzen paged self b=32 ctx=1024 bf16 (1.16 of Mojo).**
+1. **Ryzen laptop (historical campaign) paged self b=32 ctx=1024 bf16 (1.16 of the then-Mojo).**
    - Store alone costs the same in both backends (54 us), but store followed by
      attend costs ~300 us more than attend alone for C++, against ~100 us for
      Mojo. Cross on the same row is at parity.
@@ -313,7 +313,7 @@ Every row was measured in-process and the change was reverted.
      polynomial's constant accumulators.
 3. **The dense entry in the `paged_call` style.** It should read tensors in C++
    and allocate the output there, worth 1-2 us on the 20-60 us short rows.
-4. **fp32 D=128 K pack when DRAM-bound** (Ryzen 2048:16:128 at 0.98). Options:
+4. **fp32 D=128 K pack when DRAM-bound** (Ryzen laptop 2048:16:128 at 0.98, historical). Options:
    - a lazy per-tile pack done by the first query block that needs it, so the
      slab stays in L2;
    - 2 MB-aligned workspaces with `MADV_HUGEPAGE`.

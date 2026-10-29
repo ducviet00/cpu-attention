@@ -24,7 +24,7 @@ benchmarks/manifest.py      the fixed 170-row performance manifest (do not edit 
 benchmarks/bench.py         the benchmark: unified Mojo vs every C++ ISA path vs vLLM vs SDPA, one process
 benchmarks/arms.py          independently loaded copies of the package (the controls)
 scripts/build.py            builds one Mojo shared object per ISA tier; the loader picks the best
-scripts/pin_governor.sh     pin the Ryzen governor to performance for a run, restore it after
+scripts/pin_governor.sh     pin the CPU governor to performance for a run on a local machine, restore it after
 scripts/build_vllm_ref.sh   builds the pinned vLLM csrc/cpu reference the benchmark compares against
 ```
 
@@ -64,7 +64,8 @@ scripts/build_vllm_ref.sh   builds the pinned vLLM csrc/cpu reference the benchm
   - One process, interleaved rotated arms, the minimum, and a duplicate control.
   - When comparing two builds, the control is a *third module* (a copy of the
     old build).
-  - Pin the Ryzen governor to `performance` for a run and restore it after.
+  - On a machine with frequency scaling (a laptop or desktop) pin the governor
+    to `performance` for a run and restore it after; the GCP VMs have none.
   - Compare against the right vLLM ISA: AMX for x86 bf16 on AMX boxes, VEC for
     other x86 rows, NEON on aarch64.
   - A change that does not beat the control spread by 3-5% is reverted and

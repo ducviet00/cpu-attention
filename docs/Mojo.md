@@ -112,20 +112,20 @@ except for `amx`); a tier the CPU lacks is refused with an error. AMX code sits 
 the AVX-512-BF16 tier (inline asm assembles for any x86 target) and runs only
 when the CPU reports `amx_tile`/`amx_bf16` and `arch_prctl` grants tile state.
 `_C.so` is a copy of the host's best tier for older callers. Every tier the CPU
-supports passes the gates (Ryzen: avx512bf16, avx2, x86-64; Xeon: vec, avx2,
+supports passes the gates (C4D: avx512bf16, avx2, x86-64; Xeon: vec, avx2,
 scalar). bf16 K is dim pairs on every tier, so a cache written under one tier
 is read correctly under another.
 
 ## 5. Numerics and gates
 
-| gate | limit | Ryzen result |
+| gate | limit | C4D result |
 |---|---|---|
 | flash_attn_func fp32 vs naive fp32 reference | 2e-4 | test_dense 82/82, fuzz 80/80 (worst 0.52x tol) |
 | flash_attn_func bf16 | 3e-2 | same |
 | paged fp32 | 1e-6 (fp64 arbitrates an out-of-gate fp32 reference) | sweep 504/504, worst 8.9e-7 |
 | paged bf16 x86 | <= 2 bf16 ulp at the row peak vs C++ | worst 1.89 |
 | regressions (`tests/test_regressions.py`) | as above | 412/412 |
-| fast-encdec `tests/test_cpu_attention.py` (strided fused q/k/v) | 45 checks | 45/45 |
+| fast-encdec `tests/test_cpu_attention.py` (strided fused q/k/v) | 45 checks | 45/45 (development laptop; fast-encdec is not on the VMs) |
 
 **ARM bf16 "<= 1e-3 against the reference".** Taken literally (absolute error to
 the real-valued result) no bf16 output can meet it: at short contexts both
@@ -171,9 +171,8 @@ with rotated order, minimum as the statistic, raw samples kept, every arm's
 output validated, the environment recorded in the JSON. Each arm stages its own
 cache through its own `reshape_and_cache`; repeated appends rewrite the same
 slot. `scripts/pin_governor.sh` pins `performance` and restores each CPU's
-original setting. Paged rows on the Ryzen use 40-call blocks, which keep a
-16 MB working set warm; that is the documented protocol, not a cold-cache
-number.
+original setting. Paged rows on a laptop or desktop can use 40-call blocks (`--block-calls 40`), which keep a
+single power state; the reported runs are on GCP VMs and use one call per sample.
 
 For an optimization A/B, save the previous package's Python files and shared
 libraries, then pass `--previous /path/to/saved/package`. This loads the previous
@@ -215,7 +214,9 @@ it can arbitrate the cross-backend gate; its name is recorded per row.
 ## 9. Falsification ledger (this campaign)
 
 Measured in one process against an independent control; reverted unless it beat
-the control by more than 3-5%.
+the control by more than 3-5%. Per-head and per-call timings in this table were
+taken on the development laptop (AMD Ryzen 7 7840H) or on the Xeon/Axion VMs as
+noted; the results that count are the three GCP VMs in the README.
 
 | idea | result | decision |
 |---|---|---|

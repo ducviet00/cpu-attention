@@ -81,20 +81,21 @@ Notes on the API:
 **Status: the performance objective is not met.** The unified Mojo backend (the
 default) is measured against the *fastest numerically valid C++ path* on each
 row, on three machines. It wins a clear majority of the `flash_attn_func` rows
-on the Ryzen and the Axion, and about half of them on the Xeon, but it loses
+on the C4D and the Axion, and about half of them on the Xeon, but it loses
 or cannot resolve many decode rows on all three. Numbers below are the single
 source of truth; `docs/Mojo.md` explains the design and the experiments.
 
-**Setup** (Mojo 1.2.0 `2016d0cd`, torch 2.14.1+cpu; kernels at commit `bbe8c1b`).
+**Setup** (Mojo 1.2.0 `2016d0cd`, torch 2.14.1+cpu; the kernel sources are identical at the
+two measured commits, `bbe8c1b` for Axion and Xeon and `bd1361a` for the C4D).
 
 | box | CPU | threads | C++ paths it is compared with |
 |---|---|---:|---|
-| Ryzen | AMD Ryzen 7 7840H (8 cores, AVX-512 + BF16, no AMX), governor pinned to `performance` | 8 | vec, scalar |
+| C4D | Google C4D (c4d-standard-8): AMD EPYC 9B45 (Zen 5), 4 cores / 8 threads, 32 MB L3, AVX-512 + BF16, no AMX | 4 | vec, scalar |
 | Axion | Google Axion Neoverse-V2 (GCP c4a-standard-8) | 8 | neon, scalar |
 | Xeon | Intel Xeon Platinum 8581C (GCP c4-standard-8, 4 cores / 8 threads, AMX) | 4 | amx, vec, scalar |
 
 vLLM `csrc/cpu` at `db3b0f0` (AMX for Xeon bf16, VEC for x86 fp32 and the
-Ryzen, NEON on the Axion) and torch SDPA are secondary references.
+C4D, NEON on the Axion) and torch SDPA are secondary references.
 
 **Method.**
 * **The manifest** (`benchmarks/manifest.py`, fixed before optimizing) has 170
@@ -107,8 +108,7 @@ Ryzen, NEON on the Axion) and torch SDPA are secondary references.
   the build under test, a second independent copy of it (the noise floor), the
   oracle build (`mojo-oracle-v1.1`), and one arm per applicable C++ ISA path;
   interleaved, order rotated every round, the **minimum** decides. Rounds: 61
-  for `flash_attn_func`, 121 for decode on the servers; 61 / 121 x 40-call
-  blocks on the Ryzen. Every arm's output is validated before it can be a
+  for `flash_attn_func`, 121 for decode, one call per sample. Every arm's output is validated before it can be a
   baseline. Ours includes the K/V pack and the output allocation (not on `out=`
   rows); each arm stages its own cache from the same data.
 * **Verdict per row**: `ratio = Mojo min / fastest valid C++ min`; with
@@ -119,19 +119,23 @@ Ryzen, NEON on the Axion) and torch SDPA are secondary references.
 
 **Results** (win / unresolved / loss):
 
-| rows | Ryzen | Axion | Xeon |
+| rows | C4D | Axion | Xeon |
 |---|---|---|---|
-| `flash_attn_func` (78) | 50 / 27 / 1 | 77 / 1 / 0 | 40 / 27 / 11 |
-| decode, allocating the output (60) | 21 / 32 / 7 | 18 / 19 / 23 | 14 / 30 / 16 |
-| decode with `out=` (20) | 9 / 10 / 1 | 3 / 10 / 7 | 3 / 14 / 3 |
-| public `flash_attn_with_kvcache` decode (8) | 5 / 3 / 0 | 7 / 1 / 0 | 4 / 4 / 0 |
-| store-only (4) | 3 / 1 / 0 | 3 / 1 / 0 | 3 / 1 / 0 |
-| **all (170)** | **88 / 73 / 9** | **108 / 32 / 30** | **64 / 76 / 30** |
+| `flash_attn_func` (78) | 68 / 10 / 0 | 77 / 1 / 0 | 40 / 27 / 11 |
+| decode, allocating the output (60) | 7 / 26 / 27 | 18 / 19 / 23 | 14 / 30 / 16 |
+| decode with `out=` (20) | 3 / 10 / 7 | 3 / 10 / 7 | 3 / 14 / 3 |
+| public `flash_attn_with_kvcache` decode (8) | 4 / 2 / 2 | 7 / 1 / 0 | 4 / 4 / 0 |
+| store-only (4) | 2 / 2 / 0 | 3 / 1 / 0 | 3 / 1 / 0 |
+| **all (170)** | **84 / 50 / 36** | **108 / 32 / 30** | **64 / 76 / 30** |
 
 **Where Mojo does not clearly win.**
-* **Ryzen**: 9 losses, 1.03-1.33. Decode at batch 8, context ~1024 in bf16 and
-  the heterogeneous-length batch (up to 1.33); one `flash_attn_func` row
-  (129:16:128 fp32, 1.03).
+* **C4D**: 36 losses, none in `flash_attn_func` (68 wins, 10 ties); the rest
+  are decode. 8 are the fp32 rows at batch 8, context 255-257, whose ~17-19 MB
+  working set sits near this VM's 32 MB L3: C++'s arm measured 112-182 us there
+  depending on which arm's cache was resident, and four reruns with different
+  allocation orders gave ratios 0.77-1.30, so the 2.1x worst case is placement
+  (see the caveats). The others are batch-1 context-4096 `out=` decode
+  (1.12-1.28), and batch-8 context-1024 bf16 through the public API (1.06-1.16).
 * **Axion**: 30 losses, 1.03-1.23, **all decode**. 23 are calls that allocate
   their output: `torch.empty_like` costs 2.6 us inside the interleaved run
   (0.6 us hot) and C++ allocates natively, so ~5 us batch-1 calls lose by
@@ -153,20 +157,23 @@ Ryzen, NEON on the Axion) and torch SDPA are secondary references.
 * Two Xeon runs of identical code differed by 5-10% on a few fp32 AMX
   `flash_attn_func` rows (the control arm moved with it, C++ did not); the
   cause is not found.
-* Axion and Xeon were each measured once at `bbe8c1b`; the Ryzen once.
+* Each box was measured once. On the C4D the 32 MB L3 makes the verdict of
+  decode rows with a 15-30 MB working set depend on which arm's cache happened
+  to be resident; repeat them with `--load-seed` before believing a gap.
 
 ## Benchmark it yourself
 
 ```bash
 scripts/build_vllm_ref.sh             # vLLM reference -> ~/vllm_cpu_build/*.so (pinned commit)
-scripts/pin_governor.sh uv run python benchmarks/bench.py --manifest full \
+uv run python benchmarks/bench.py --manifest full \
     --vllm-bf16 ~/vllm_cpu_build/vllm_cpu_attn_bench.so --vllm-fp32 ~/vllm_cpu_build/vllm_cpu_attn_bench.so \
-    --rounds 61 --paged-rounds 121 --block-calls 40 --json /path/outside/the/repo/run.json
+    --rounds 61 --paged-rounds 121 --json /path/outside/the/repo/run.json
 ```
 
 * On an AMX box pass `vllm_cpu_attn_bench_amx.so --vllm-isa-bf16 amx` for bf16
   and `--threads <physical cores>`; on aarch64 pass `--vllm-isa-bf16 neon
-  --vllm-isa-fp32 neon`. `--block-calls 40` is for the Ryzen only.
+  --vllm-isa-fp32 neon`. `--block-calls 40` is only for a desktop or laptop with
+  frequency scaling; the GCP VMs above use one call per sample.
 * `--only "<label substring>"` runs a subset, `--resume` continues a `--json`
   after an interruption, `--previous <saved package>` A/Bs two of your builds
   against an independent control, and `--load-seed N` changes the module-load and
@@ -206,7 +213,7 @@ The default backend is Mojo; prefix `CPU_ATTENTION_BACKEND=cpp` to test C++, and
 lives in fast-encdec: `PYTHONPATH=. .venv/bin/python tests/test_cpu_attention.py`
 (it passes strided chunks of a fused projection; 45 checks).
 
-Accuracy gates (all pass on all three boxes at `bbe8c1b`):
+Accuracy gates (all pass on all three boxes):
 
 | case | limit |
 |---|---|
