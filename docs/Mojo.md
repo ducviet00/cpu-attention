@@ -211,6 +211,12 @@ it can arbitrate the cross-backend gate; its name is recorded per row.
    when unused cache slots/padding hold NaN, and a non-finite row for a
    zero-length context (`test_regressions.py` on the cpp backend).
 
+9. **Harness (fixed, not a kernel defect):** the paged fp32 gate measured arms only against the
+   fp32 reference and consulted fp64 only when the reference was itself over 1e-6 from it. On
+   heterogeneous contexts the reference is 6-9e-7 from fp64 while Mojo and C++ vec are 2-5e-7 from
+   it, yet 1.0e-6 / 1.07e-6 from the reference, so valid arms (both backends) read INVALID on some
+   data draws. Any arm over 1e-6 is now judged against fp64.
+
 ## 9. Falsification ledger (this campaign)
 
 Measured in one process against an independent control; reverted unless it beat
@@ -251,6 +257,9 @@ noted; the results that count are the three GCP VMs in the README.
 | Xeon AMX pack upper bounds (wrong output, timing only): V interleave replaced by a plain join; then also the K 16x16 transpose removed | 257:16:128 bf16 single thread 826 -> 818 us (V shuffles gone), 819 (K transpose gone too); 129:16:128 282 -> 280. Removing every pack shuffle buys < 1%, so the dimension-permuted V layout (unpack lo/hi, un-permute in the driver epilogue, which runs per query row) cannot pay for itself, and the pack's remaining cost is load/store traffic, not shuffles. Slab, workspace and scratch are 64-byte aligned | not implemented; the Xeon head_dim-128 gap (3-6%) stays unexplained |
 | Xeon AMX bf16: Q through a contiguous panel when rows are >= 2 KB apart (heads * hd * 2) and seq_k >= 256 (C++ reads Q in place) | 257:16:128 bf16, 4 threads, 6 processes: in place 208-226 us (bimodal, per process), panel 197-200 (C++ 200-205); against an independent previous build in alternating processes: 1024:16:128 0.92, 512:32:128 0.90, 257:16:128 0.97, 1024:16:64 0.99; the panel for every block cost 129:16:128 +6%, 2048:8:64 +2%, 1025:8:32 +2%, hence the threshold. Full manifest 70/80/20 -> 77/72/21, `flash_attn_func` 43/26/9 -> 47/23/8 | kept |
 | Xeon fp32 head_dim 128, 4 threads, 257:16:128 | Mojo 1552 us on one thread against C++ 1604, but 414-422 us on four against 399-403 (C++ scales perfectly, Mojo 8% below linear); not bimodal, unchanged by pinning one thread per CPU, `taskset 0-3`, workspace alignment 4 KB, workspace offsets 0-512 B | open |
+| x86 decode key tile 256/512 -> 2048 keys (R=1), C4D | single-process cache-rotation A/B: bf16 b=1 ctx=4096 0.96 of the previous build, others within 2%; full-manifest harness with an independent previous-build control: median 0.994 over 92 paged rows, b=1 ctx=4096 bf16 1.06-1.09 (control spread up to 1.07-1.28 on memory-bound rows) | reverted: not reproducible beyond control spread |
+| x86 fp32 decode Q@K^T with 4 key groups per step (`G=4`, R=1), C4D | per core 0.90-0.95 of the previous build on one thread (b=1 ctx 4096, b=8 ctx 256-1024), 0.96 on two, 0.98-1.00 on four in a single-process A/B; but the full 170-row harness with an independent previous-build control (4 threads): fp32 paged median 0.995, and 7 fp32 rows 4-7% slower, among them b=8 ctx 255-257, the rows it was meant to help (the control itself moved 1-5% there) | reverted: per-core gain does not carry to the 4-thread manifest condition |
+| compile-time `PAGE=48` decode body removed (runtime page), C4D | bf16 b=8 ctx=1008 page 48 1 thread: 0.949 of the specialized build and 0.99 of C++ (the specialized body is 8% slower than C++ per core, while pages 16/32/64 are 2-6% faster than C++); 4 threads 1.010 (DRAM-bound, the manifest condition); fp32 1.01; b=1 ctx=240 bf16 4 threads 1.03 slower | reverted: no gain at the 4-thread manifest condition. Open: why the 48-key body loses 7% per core in bf16 only |
 
 **Axion decode ledger (c4a-standard-8, one process, independent control, vs `2fc4652`).**
 
