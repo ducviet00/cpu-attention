@@ -22,7 +22,7 @@ Rules (docs/CPP.md §7):
   invalid arm is excluded from the baseline and reported.
 * ``baseline`` is the fastest *valid* C++ arm; ``ratio = mojo_new / baseline``.
   A row is a ``win`` only below ``1 - band`` with ``band = max(0.03, |ctrl/new
-  - 1|)``, a ``loss`` above ``1 + band``, and ``unresolved`` in between.
+  - 1|, twin)``, ``twin`` being the spread between C++'s identical-code ``amx`` and ``vec`` paged arms, a ``loss`` above ``1 + band``, and ``unresolved`` in between.
 * A C++ arm more than ``--screen-x`` times slower than the fastest C++ arm in a
   3-call screen cannot be the baseline and is not timed further (the screen
   samples are kept in the JSON).
@@ -533,13 +533,19 @@ def main():
             control_peer = "mojo_previous" if args.previous else "mojo_new"
             spread = (abs(st["mojo_ctrl"]["min"] / st[control_peer]["min"] - 1)
                       if "mojo_ctrl" in st else 0.0)
-            band = max(0.03, spread)
+            # On x86 AMX CPUs the C++ paged path of the `amx` arm forwards to its
+            # `vec` arm: identical code, so their spread is a direct measure of how
+            # far one process's minimum can sit from another's. It widens the band.
+            twin = (abs(st["cpp_amx"]["min"] / st["cpp_vec"]["min"] - 1)
+                    if r["kind"] == "paged" and "cpp_amx" in cpp_valid
+                    and "cpp_vec" in cpp_valid else 0.0)
+            band = max(0.03, spread, twin)
             verdict = ("win" if ratio < 1 - band else
                        "loss" if ratio > 1 + band else "unresolved")
             if not valid["mojo_new"][1]:
                 verdict = "INVALID"
             row.update(baseline=base, ratio=ratio, ctrl_spread=spread,
-                       band=band, verdict=verdict)
+                       twin_spread=twin, band=band, verdict=verdict)
             if args.previous:
                 row["new/previous"] = st["mojo_new"]["min"] / st["mojo_previous"]["min"]
             line += (f" new {st['mojo_new']['min']:10.1f} {base} "
