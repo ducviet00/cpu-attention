@@ -297,6 +297,7 @@ Goal: one implementation across CPUs, then latency (AGENTS.md).
 | NEON fp32 Q@K^T: K for 4 dims first, one query vector per row; P@V chunk loop at runtime on NEON | 1.051 / 1.049 (no change) | kept (the old policy's shape, smaller code) |
 | NEON fp32 Q through a contiguous panel (32 heads x 128 dims: rows 16 KB apart, one L1 set) | GQA rows 1.09 -> ~1.0; C++ losses 2 -> 0 | kept |
 | lane max through `isa.vmax` (one `fmaxnm` / `vmaxps` against compare + select) | round 6 (all above): Axion fp32 flash 1.050 (19 / 20 / 0 vs C++), flash elsewhere 0.99-1.00 | kept |
+| `kvcache.mojo` -> `paged_attn.mojo`; one `isa.exp2` (AVX-512: the AMX policy's `rndscale` + `scalef`, 7 uops against 9; NEON: integer exponent; one coefficient set per degree), `isa.vmax` and `isa.bf16_lo` replace the AMX and NEON policies' copies; one `_with_policy` table for running and sizing | flash Axion / C4D / Xeon 0.998 / 0.985 (C4D bf16 0.973) / 0.989, paged 0.995 / 0.999 / 1.000; `test_amx` 102/102 | kept |
 
 Result: decode unification at no measured cost; Axion fp32 `flash_attn_func` is ~5% slower
 than the dedicated NEON policy (wins became ties, no losses), accepted for the unification
