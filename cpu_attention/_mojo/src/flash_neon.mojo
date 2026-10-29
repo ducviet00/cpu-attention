@@ -436,6 +436,7 @@ struct NeonMmlaPolicy[hd: Int](FlashPolicy):
     comptime HD = Self.hd
     comptime RQT = RQT
     comptime KT = KT
+    comptime ZEROES_ACC = True
 
     @staticmethod
     def slab_bytes(seq_k: Int) -> Int:
@@ -668,6 +669,7 @@ struct NeonF32Policy[hd: Int](FlashPolicy):
     comptime HD = Self.hd
     comptime RQT = ROWS32
     comptime KT = KT32
+    comptime ZEROES_ACC = True
 
     @staticmethod
     def slab_bytes(seq_k: Int) -> Int:

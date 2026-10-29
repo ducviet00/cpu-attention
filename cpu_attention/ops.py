@@ -33,6 +33,24 @@ def self_attention(
     6.8 us call, so an engine that keeps a scratch buffer per layer step should
     pass it.
     """
+    if _kernel._BACKEND == "mojo":
+        table = getattr(_kernel._KV_TABLE, "t", None)
+        if table is not None and _kernel._KV_TABLE.gen == _kernel._KV_GEN[0]:
+            res = _kernel._KV_TABLE.fn(
+                _kernel._KV_TABLE.addr,
+                query,
+                key,
+                value,
+                k_cache,
+                v_cache,
+                slot_mapping,
+                block_table,
+                context_lens,
+                scale,
+                out,
+            )
+            if res is not None:
+                return res
     return _paged(
         query,
         key,
@@ -54,6 +72,24 @@ def cross_attention(query, k_cache, v_cache, block_table, cache_seqlens, scale,
 
     ``out`` as in :func:`self_attention`.
     """
+    if _kernel._BACKEND == "mojo":
+        table = getattr(_kernel._KV_TABLE, "t", None)
+        if table is not None and _kernel._KV_TABLE.gen == _kernel._KV_GEN[0]:
+            res = _kernel._KV_TABLE.fn(
+                _kernel._KV_TABLE.addr,
+                query,
+                None,
+                None,
+                k_cache,
+                v_cache,
+                None,
+                block_table,
+                cache_seqlens,
+                scale,
+                out,
+            )
+            if res is not None:
+                return res
     return _paged(
         query,
         None,

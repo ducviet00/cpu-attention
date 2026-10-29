@@ -122,11 +122,11 @@ C4D, NEON on the Axion) and torch SDPA are secondary references.
 | rows | C4D | Axion | Xeon |
 |---|---|---|---|
 | `flash_attn_func` (78) | 68 / 10 / 0 | 77 / 1 / 0 | 40 / 27 / 11 |
-| decode, allocating the output (60) | 7 / 26 / 27 | 18 / 19 / 23 | 14 / 30 / 16 |
-| decode with `out=` (20) | 3 / 10 / 7 | 3 / 10 / 7 | 3 / 14 / 3 |
+| decode, allocating the output (60) | 7 / 26 / 27 | 32 / 27 / 1 | 14 / 30 / 16 |
+| decode with `out=` (20) | 3 / 10 / 7 | 8 / 12 / 0 | 3 / 14 / 3 |
 | public `flash_attn_with_kvcache` decode (8) | 4 / 2 / 2 | 7 / 1 / 0 | 4 / 4 / 0 |
-| store-only (4) | 2 / 2 / 0 | 3 / 1 / 0 | 3 / 1 / 0 |
-| **all (170)** | **84 / 50 / 36** | **108 / 32 / 30** | **64 / 76 / 30** |
+| store-only (4) | 2 / 2 / 0 | 4 / 0 / 0 | 3 / 1 / 0 |
+| **all (170)** | **84 / 50 / 36** | **128 / 41 / 1** | **64 / 76 / 30** |
 
 **Where Mojo does not clearly win.**
 * **C4D**: 36 losses, none in `flash_attn_func` (68 wins, 10 ties); the rest
@@ -136,11 +136,12 @@ C4D, NEON on the Axion) and torch SDPA are secondary references.
   allocation orders gave ratios 0.77-1.30, so the 2.1x worst case is placement
   (see the caveats). The others are batch-1 context-4096 `out=` decode
   (1.12-1.28), and batch-8 context-1024 bf16 through the public API (1.06-1.16).
-* **Axion**: 30 losses, 1.03-1.23, **all decode**. 23 are calls that allocate
-  their output: `torch.empty_like` costs 2.6 us inside the interleaved run
-  (0.6 us hot) and C++ allocates natively, so ~5 us batch-1 calls lose by
-  1.1-1.2. The `out=` rows still lose at batch 1 (up to 1.23, fp32) and at
-  batch 8-32 bf16 (1.06). Every `flash_attn_func` row wins except one tie.
+* **Axion** (branch `axion-mojo`, re-measured; the other columns are from earlier
+  commits): 1 loss, 41 unresolved, all decode except one `flash_attn_func` tie. The one loss,
+  `engine cross b=8 ctx=1025 bf16` (1.03), re-measured 0.90 / 0.97 / 0.92 under
+  `--load-seed` 1-3 (placement noise). The unresolved rows sit at 0.95-1.03 of C++ NEON,
+  mostly batch 8-32 at context ~1024 and batch-1 context 4096, which stream 16-67 MB
+  per call; the objective of a clear win on every row is **not met** there.
 * **Xeon**: 30 losses. `flash_attn_func`: 11, 1.04-1.11, head_dim-128 rows at
   256-512 tokens (256:16:128, 257:16:128, 512:32:128). At 129 tokens in bf16 the
   AMX K/V pack was measured ~30% slower than C++'s (single thread, sampled

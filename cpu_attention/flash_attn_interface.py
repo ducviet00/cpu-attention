@@ -125,8 +125,7 @@ def flash_attn_with_kvcache(
         table = getattr(_kernel._KV_TABLE, "t", None)
         if table is not None and _kernel._KV_TABLE.gen == _kernel._KV_GEN[0]:
             pt = page_table if page_table is not None else block_table
-            out = torch.empty_like(q)
-            if _kernel._entry("kv_fast")(
+            res = _kernel._KV_TABLE.fn(
                 _kernel._KV_TABLE.addr,
                 q,
                 k,
@@ -137,9 +136,10 @@ def flash_attn_with_kvcache(
                 pt,
                 cache_seqlens,
                 softmax_scale,
-                out,
-            ):
-                return out
+                None,
+            )
+            if res is not None:
+                return res
     if check_inputs:
         if (
             qv is not None
@@ -302,10 +302,10 @@ def flash_attn_func(q, k, v, softmax_scale=None, causal=False):
     table = _kernel._FLASH.__dict__.get("t")
     if (table is not None and _kernel._FLASH.gen == _kernel._flash_gen() and
             type(q) is torch.Tensor and _kernel._BACKEND == "mojo"):
-        out = torch.empty_like(q, memory_format=torch.contiguous_format)
-        if _kernel._entry("flash_fast")(_kernel._FLASH.addr, q, k, v,
-                                        softmax_scale, causal, out):
-            return out
+        res = _kernel._FLASH.fn(_kernel._FLASH.addr, q, k, v,
+                                softmax_scale, causal)
+        if res is not None:
+            return res
     q0, k0, v0 = q, k, v
     if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
         raise ValueError(

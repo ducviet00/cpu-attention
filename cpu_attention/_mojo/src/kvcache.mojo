@@ -126,21 +126,25 @@ struct PageLayout[dtype: DType, hd: Int]:
                         d2 * page * 2, ks.unsafe_load[width=2](2 * d2)
                     )
         elif Self.BF:
-            comptime for d2 in range(Self.hd // 2):
-                kdt.unsafe_store[width=2](
-                    d2 * page * 2, ks.unsafe_load[width=2](2 * d2)
-                )
-        else:
-            for d0 in range(0, Self.hd, 4):
+            var ksi = ptr[Int32](k_src)
+            var kdti = ptr[Int32](k_page + t * 4)
+            comptime for d0 in range(0, Self.hd // 2, 4):
+                var v4 = ksi.unsafe_load[width=4](d0)
                 comptime for u in range(4):
-                    var d = d0 + u
-                    kdt.unsafe_store(d * page, ks.unsafe_load(d))
+                    kdti.unsafe_store((d0 + u) * page, v4[u])
+        else:
+            comptime for d0 in range(0, Self.hd, 4):
+                var v4 = ks.unsafe_load[width=4](d0)
+                comptime for u in range(4):
+                    kdt.unsafe_store((d0 + u) * page, v4[u])
         comptime if Self.V_PAIRS:
             var vdt = ptr[Scalar[Self.dtype]](
                 v_page + (((t >> 1) * Self.hd) * 2 + (t & 1)) * 2
             )
-            comptime for d in range(Self.hd):
-                vdt.unsafe_store(d * 2, vs.unsafe_load(d))
+            comptime for d0 in range(0, Self.hd, 8):
+                var v8 = vs.unsafe_load[width=8](d0)
+                comptime for u in range(8):
+                    vdt.unsafe_store((d0 + u) * 2, v8[u])
         else:
             vd.unsafe_store[width=Self.hd](
                 t * Self.hd, vs.unsafe_load[width=Self.hd]()
@@ -207,6 +211,12 @@ def _attend_rows[
     dtype: DType, hd: Int, R: Int, PAGE: Int
 ](job: PagedJob, seq: Int, kvh: Int, h0: Int, nrows: Int):
     """Query heads `h0 .. h0+nrows-1` (nrows <= R, all of kv head `kvh`)."""
+    comptime if dtype == DType.bfloat16 and NEON_BF16:
+        _attend_rows_arm_bf16[hd, R, PAGE](job, seq, kvh, h0, nrows)
+        return
+    elif dtype == DType.float32 and V_PAIRS_ARM:
+        _attend_rows_arm_f32[hd, R, PAGE](job, seq, kvh, h0, nrows)
+        return
     comptime L = PageLayout[dtype, hd]
     comptime E = 2 if dtype == DType.bfloat16 else 4
     comptime KT = _kt[hd, R]()
@@ -692,6 +702,1009 @@ def _pv_arm[hd: Int, R: Int, KT: Int, PAGE: Int](
         comptime for r in range(R):
             comptime for i in range(NC):
                 acc.unsafe_store[width=4](r * hd + dc + i * 4, a[r * NC + i])
+
+
+@always_inline
+def _pv_arm_bf16_full[
+    hd: Int, DC: Int, NC: Int
+](
+    k0: Int,
+    len: Int,
+    ar: Float32,
+    vbase: MutPointer[Int64, _],
+    pbuf: MutPointer[BFloat16, _],
+    pbuf_lo: MutPointer[BFloat16, _],
+    acc: MutPointer[Float32, _],
+):
+    comptime V = SIMD[DType.float32, 4]
+    var pbuf_i32 = ptr[Int32](Int(pbuf))
+    comptime for dc in range(0, hd, DC):
+        var a = Array[V, NC](fill=V(0))
+        if k0 > 0:
+            if ar == 1.0:
+                comptime for i in range(NC):
+                    a[i] = acc.unsafe_load[width=4](dc + i * 4)
+            elif ar != 0.0:
+                var va = V(ar)
+                comptime for i in range(NC):
+                    a[i] = acc.unsafe_load[width=4](dc + i * 4) * va
+        if len >= 128:
+            for g in range(4):
+                var vbg = Int(vbase.unsafe_load(g)) + dc * 4
+                var g_off = g * 8
+                for kp in range(0, 8, 2):
+                    var probs0 = bitcast_bf16[4](
+                        SIMD[DType.int32, 4](pbuf_i32.unsafe_load(g_off + kp))
+                    )
+                    var probs1 = bitcast_bf16[4](
+                        SIMD[DType.int32, 4](
+                            pbuf_i32.unsafe_load(g_off + kp + 1)
+                        )
+                    )
+                    var vp0 = ptr[BFloat16](vbg + kp * (hd * 4))
+                    var vp1 = ptr[BFloat16](vbg + (kp + 1) * (hd * 4))
+                    comptime for i in range(NC):
+                        a[i] = dot_bf16[4](
+                            a[i], vp0.unsafe_load[width=8](i * 8), probs0
+                        )
+                    comptime for i in range(NC):
+                        a[i] = dot_bf16[4](
+                            a[i], vp1.unsafe_load[width=8](i * 8), probs1
+                        )
+        else:
+            var plo_i32 = ptr[Int32](Int(pbuf_lo))
+            for g in range(4):
+                var vbg = Int(vbase.unsafe_load(g)) + dc * 4
+                var g_off = g * 8
+                for kp in range(8):
+                    var probs = bitcast_bf16[4](
+                        SIMD[DType.int32, 4](pbuf_i32.unsafe_load(g_off + kp))
+                    )
+                    var res = bitcast_bf16[4](
+                        SIMD[DType.int32, 4](plo_i32.unsafe_load(g_off + kp))
+                    )
+                    var vp = ptr[BFloat16](vbg + kp * (hd * 4))
+                    comptime for i in range(NC):
+                        var v = vp.unsafe_load[width=8](i * 8)
+                        a[i] = dot_bf16[4](a[i], v, probs)
+                        a[i] = dot_bf16[4](a[i], v, res)
+        comptime for i in range(NC):
+            acc.unsafe_store[width=4](dc + i * 4, a[i])
+
+
+@always_inline
+def _pv_arm_bf16_tail[
+    hd: Int, R: Int, KT: Int, DC: Int, NC: Int
+](
+    k0: Int,
+    nk: Int,
+    len: Int,
+    tiles: Int,
+    alpha: SIMD[DType.float32, R],
+    vbase: MutPointer[Int64, _],
+    pbuf: MutPointer[BFloat16, _],
+    pbuf_lo: MutPointer[BFloat16, _],
+    logits: MutPointer[Float32, _],
+    acc: MutPointer[Float32, _],
+):
+    comptime V = SIMD[DType.float32, 4]
+    var pbuf_i32 = ptr[Int32](Int(pbuf))
+    var plo_i32 = ptr[Int32](Int(pbuf_lo))
+    comptime for dc in range(0, hd, DC):
+        var a = Array[V, R * NC](fill=V(0))
+        if k0 > 0:
+            comptime for r in range(R):
+                var ar = alpha[r]
+                if ar == 1.0:
+                    comptime for i in range(NC):
+                        a[r * NC + i] = acc.unsafe_load[width=4](
+                            r * hd + dc + i * 4
+                        )
+                elif ar != 0.0:
+                    var va = V(ar)
+                    comptime for i in range(NC):
+                        a[r * NC + i] = (
+                            acc.unsafe_load[width=4](r * hd + dc + i * 4) * va
+                        )
+        for g in range(tiles):
+            var kv = min(16, nk - g * 16)
+            var vbg = Int(vbase.unsafe_load(g)) + dc * 4
+            var kp = 0
+            if len >= 128:
+                comptime if R == 1:
+                    var np = kv >> 1
+                    while kp + 1 < np:
+                        var probs0 = bitcast_bf16[4](
+                            SIMD[DType.int32, 4](
+                                pbuf_i32.unsafe_load(g * 8 + kp)
+                            )
+                        )
+                        var probs1 = bitcast_bf16[4](
+                            SIMD[DType.int32, 4](
+                                pbuf_i32.unsafe_load(g * 8 + kp + 1)
+                            )
+                        )
+                        var vp0 = ptr[BFloat16](vbg + kp * (hd * 4))
+                        var vp1 = ptr[BFloat16](vbg + (kp + 1) * (hd * 4))
+                        comptime for i in range(NC):
+                            a[i] = dot_bf16[4](
+                                a[i], vp0.unsafe_load[width=8](i * 8), probs0
+                            )
+                        comptime for i in range(NC):
+                            a[i] = dot_bf16[4](
+                                a[i], vp1.unsafe_load[width=8](i * 8), probs1
+                            )
+                        kp += 2
+                while kp * 2 + 1 < kv:
+                    var probs = Array[SIMD[DType.bfloat16, 8], R](
+                        uninitialized=True
+                    )
+                    comptime for r in range(R):
+                        probs[r] = bitcast_bf16[4](
+                            SIMD[DType.int32, 4](
+                                pbuf_i32.unsafe_load(
+                                    r * (KT // 2) + g * 8 + kp
+                                )
+                            )
+                        )
+                    var vp = ptr[BFloat16](vbg + kp * (hd * 4))
+                    comptime for i in range(NC):
+                        var v = vp.unsafe_load[width=8](i * 8)
+                        comptime for r in range(R):
+                            a[r * NC + i] = dot_bf16[4](
+                                a[r * NC + i], v, probs[r]
+                            )
+                    kp += 1
+            else:
+                while kp * 2 + 1 < kv:
+                    var probs = Array[SIMD[DType.bfloat16, 8], R](
+                        uninitialized=True
+                    )
+                    var res = Array[SIMD[DType.bfloat16, 8], R](
+                        uninitialized=True
+                    )
+                    comptime for r in range(R):
+                        var idx = r * (KT // 2) + g * 8 + kp
+                        probs[r] = bitcast_bf16[4](
+                            SIMD[DType.int32, 4](pbuf_i32.unsafe_load(idx))
+                        )
+                        res[r] = bitcast_bf16[4](
+                            SIMD[DType.int32, 4](plo_i32.unsafe_load(idx))
+                        )
+                    var vp = ptr[BFloat16](vbg + kp * (hd * 4))
+                    comptime for i in range(NC):
+                        var v = vp.unsafe_load[width=8](i * 8)
+                        comptime for r in range(R):
+                            a[r * NC + i] = dot_bf16[4](
+                                a[r * NC + i], v, probs[r]
+                            )
+                            a[r * NC + i] = dot_bf16[4](
+                                a[r * NC + i], v, res[r]
+                            )
+                    kp += 1
+            if kp * 2 < kv:
+                var vp = ptr[BFloat16](vbg + kp * (hd * 4))
+                var t_idx = g * 16 + kp * 2
+                comptime for i in range(NC):
+                    var pair = vp.unsafe_load[width=8](i * 8)
+                    var v = (
+                        pair.shuffle[0, 2, 4, 6, 0, 2, 4, 6]()
+                        .slice[4]()
+                        .cast[DType.float32]()
+                    )
+                    comptime for r in range(R):
+                        var prob = logits.unsafe_load(r * KT + t_idx)
+                        a[r * NC + i] = V(prob).fma(v, a[r * NC + i])
+        comptime for r in range(R):
+            comptime for i in range(NC):
+                acc.unsafe_store[width=4](r * hd + dc + i * 4, a[r * NC + i])
+
+
+def _attend_rows_arm_bf16[
+    hd: Int, R: Int, PAGE: Int
+](job: PagedJob, seq: Int, kvh: Int, h0: Int, nrows: Int):
+    """ARM64 NEON-BF16 paged decode using 16-key page units (PT=16, PG=4, KT=64)."""
+    comptime KT = 64
+    comptime DEG = 5
+    comptime V = SIMD[DType.float32, 4]
+    comptime DC = min(hd, max(4, 64 // R))
+    comptime NC = DC // 4
+    var page = PAGE if PAGE else job.page
+    var len = Int(ptr[Int32](job.lens).unsafe_load(seq)) + (
+        1 if (job.do_store and job.slots == 0) else 0
+    )
+    if len <= 0:
+        for r in range(nrows):
+            var o = ptr[BFloat16](
+                job.out + (seq * job.out_stride + (h0 + r) * hd) * 2
+            )
+            comptime for d in range(0, hd, 4):
+                o.unsafe_store[width=4](d, SIMD[DType.bfloat16, 4](0))
+        return
+    var bt = ptr[Int32](job.block_table + seq * job.bt_stride * 4)
+    var head_bytes = page * hd * 2
+    var c = job.scale * Float32(LOG2E)
+    var vc = V(c)
+
+    var qp_buf = stack_allocation[
+        (R * hd // 2) if R > 1 else 1, DType.int32, alignment=64
+    ]()
+    var q0_addr = job.q + (seq * job.q_stride + h0 * hd) * 2
+    var qp = ptr[Int32](q0_addr) if R == 1 else qp_buf
+    comptime if R > 1:
+        for r in range(R):
+            var rr = min(r, nrows - 1)
+            var s = ptr[Int32](job.q + (seq * job.q_stride + (h0 + rr) * hd) * 2)
+            comptime for d2 in range(hd // 2):
+                qp_buf.unsafe_store(r * (hd // 2) + d2, s.unsafe_load(d2))
+
+    var kbase = stack_allocation[4, DType.int64, alignment=32]()
+    var vbase = stack_allocation[4, DType.int64, alignment=32]()
+    var logits = stack_allocation[R * KT, DType.float32, alignment=64]()
+    var pbuf = stack_allocation[R * KT, DType.bfloat16, alignment=64]()
+    var pbuf_lo = stack_allocation[R * KT, DType.bfloat16, alignment=64]()
+    var acc = stack_allocation[R * hd, DType.float32, alignment=64]()
+    var m = SIMD[DType.float32, R](-Float32.MAX)
+    var l = SIMD[DType.float32, R](0)
+
+    var k0 = 0
+    while k0 < len:
+        var nk = min(KT, len - k0)
+        comptime if R == 1:
+            if nk == 64:
+                comptime for g in range(4):
+                    var d = _div_page[PAGE](k0 + g * 16, page)
+                    var blk = (
+                        Int(bt.unsafe_load(d[0])) * job.kv_heads + kvh
+                    ) * head_bytes
+                    var boff = d[1]
+                    kbase.unsafe_store(g, Int64(job.k_cache + blk + boff * 4))
+                    vbase.unsafe_store(
+                        g, Int64(job.v_cache + blk + boff * hd * 2)
+                    )
+                var lg = Array[V, 16](fill=V(0))
+                for dp in range(0, hd // 2, 2):
+                    var qa0 = bitcast_bf16[4](
+                        SIMD[DType.int32, 4](qp.unsafe_load(dp))
+                    )
+                    var qa1 = bitcast_bf16[4](
+                        SIMD[DType.int32, 4](qp.unsafe_load(dp + 1))
+                    )
+                    comptime for g in range(4):
+                        var kbg = Int(kbase.unsafe_load(g))
+                        var kb0 = ptr[BFloat16](kbg + dp * page * 4)
+                        var kb1 = ptr[BFloat16](kbg + (dp + 1) * page * 4)
+                        comptime for h in range(4):
+                            lg[4 * g + h] = dot_bf16[4](
+                                lg[4 * g + h],
+                                kb0.unsafe_load[width=8](h * 8),
+                                qa0,
+                            )
+                        comptime for h in range(4):
+                            lg[4 * g + h] = dot_bf16[4](
+                                lg[4 * g + h],
+                                kb1.unsafe_load[width=8](h * 8),
+                                qa1,
+                            )
+                var mx0 = vmax[4](vmax[4](lg[0], lg[1]), vmax[4](lg[2], lg[3]))
+                var mx1 = vmax[4](vmax[4](lg[4], lg[5]), vmax[4](lg[6], lg[7]))
+                var mx2 = vmax[4](vmax[4](lg[8], lg[9]), vmax[4](lg[10], lg[11]))
+                var mx3 = vmax[4](vmax[4](lg[12], lg[13]), vmax[4](lg[14], lg[15]))
+                comptime for i in range(16):
+                    logits.unsafe_store[width=4](4 * i, lg[i])
+                var mx_r = vmax[4](vmax[4](mx0, mx1), vmax[4](mx2, mx3)).reduce_max() * c
+                var mn: Float32
+                var ar: Float32
+                if k0 == 0:
+                    mn = mx_r
+                    ar = 0.0
+                    m[0] = mn
+                elif mx_r > m[0]:
+                    mn = mx_r
+                    ar = exp2s[DEG](m[0] - mn)
+                    m[0] = mn
+                else:
+                    mn = m[0]
+                    ar = 1.0
+                var vmn = V(-mn)
+                var s0 = V(0)
+                var s1 = V(0)
+                if len >= 128:
+                    for i in range(0, 16, 4):
+                        var e0 = exp2[DEG, 4](
+                            logits.unsafe_load[width=4](4 * i).fma(vc, vmn)
+                        )
+                        var e1 = exp2[DEG, 4](
+                            logits.unsafe_load[width=4](4 * (i + 1)).fma(vc, vmn)
+                        )
+                        var e2 = exp2[DEG, 4](
+                            logits.unsafe_load[width=4](4 * (i + 2)).fma(vc, vmn)
+                        )
+                        var e3 = exp2[DEG, 4](
+                            logits.unsafe_load[width=4](4 * (i + 3)).fma(vc, vmn)
+                        )
+                        pbuf.unsafe_store[width=8](
+                            4 * i,
+                            e0.cast[DType.bfloat16]().join(
+                                e1.cast[DType.bfloat16]()
+                            ),
+                        )
+                        pbuf.unsafe_store[width=8](
+                            4 * (i + 2),
+                            e2.cast[DType.bfloat16]().join(
+                                e3.cast[DType.bfloat16]()
+                            ),
+                        )
+                        s0 = (s0 + e0) + e2
+                        s1 = (s1 + e1) + e3
+                else:
+                    for i in range(0, 16, 2):
+                        var e0 = exp2[DEG, 4](
+                            logits.unsafe_load[width=4](4 * i).fma(vc, vmn)
+                        )
+                        var e1 = exp2[DEG, 4](
+                            logits.unsafe_load[width=4](4 * (i + 1)).fma(vc, vmn)
+                        )
+                        var hi0 = e0.cast[DType.bfloat16]()
+                        var lo0 = (e0 - hi0.cast[DType.float32]()).cast[
+                            DType.bfloat16
+                        ]()
+                        var hi1 = e1.cast[DType.bfloat16]()
+                        var lo1 = (e1 - hi1.cast[DType.float32]()).cast[
+                            DType.bfloat16
+                        ]()
+                        pbuf.unsafe_store[width=8](4 * i, hi0.join(hi1))
+                        pbuf_lo.unsafe_store[width=8](4 * i, lo0.join(lo1))
+                        s0 += e0
+                        s1 += e1
+                l[0] = (
+                    (l[0] * ar if k0 > 0 else Float32(0))
+                    + (s0 + s1).reduce_add()
+                )
+                _pv_arm_bf16_full[hd, DC, NC](
+                    k0, len, ar, vbase, pbuf, pbuf_lo, acc
+                )
+            else:
+                var tiles = (nk + 15) >> 4
+                for g in range(tiles):
+                    var d = _div_page[PAGE](k0 + g * 16, page)
+                    var blk = (
+                        Int(bt.unsafe_load(d[0])) * job.kv_heads + kvh
+                    ) * head_bytes
+                    var boff = d[1]
+                    kbase.unsafe_store(g, Int64(job.k_cache + blk + boff * 4))
+                    vbase.unsafe_store(
+                        g, Int64(job.v_cache + blk + boff * hd * 2)
+                    )
+                var mx = V(-Float32.MAX)
+                var vnk = SIMD[DType.int32, 4](Int32(nk))
+                var lane = iota[DType.int32, 4]()
+                for g in range(tiles):
+                    var kbg = Int(kbase.unsafe_load(g))
+                    if nk - g * 16 <= 4:
+                        var cg0 = V(0)
+                        for dp in range(0, hd // 2, 2):
+                            var qa0 = bitcast_bf16[4](
+                                SIMD[DType.int32, 4](qp.unsafe_load(dp))
+                            )
+                            var qa1 = bitcast_bf16[4](
+                                SIMD[DType.int32, 4](qp.unsafe_load(dp + 1))
+                            )
+                            var kb0 = ptr[BFloat16](kbg + dp * page * 4)
+                            var kb1 = ptr[BFloat16](kbg + (dp + 1) * page * 4)
+                            cg0 = dot_bf16[4](
+                                cg0, kb0.unsafe_load[width=8](0), qa0
+                            )
+                            cg0 = dot_bf16[4](
+                                cg0, kb1.unsafe_load[width=8](0), qa1
+                            )
+                        var base_i = g * 16
+                        var v = cg0
+                        if base_i + 4 > nk:
+                            var idx = (
+                                SIMD[DType.int32, 4](Int32(base_i)) + lane
+                            )
+                            v = idx.lt(vnk).select(v, V(-Float32.MAX))
+                        mx = vmax[4](mx, v)
+                        logits.unsafe_store[width=4](base_i, v)
+                    else:
+                        var cg = Array[V, 4](fill=V(0))
+                        for dp in range(0, hd // 2, 2):
+                            var qa0 = bitcast_bf16[4](
+                                SIMD[DType.int32, 4](qp.unsafe_load(dp))
+                            )
+                            var qa1 = bitcast_bf16[4](
+                                SIMD[DType.int32, 4](qp.unsafe_load(dp + 1))
+                            )
+                            var kb0 = ptr[BFloat16](kbg + dp * page * 4)
+                            var kb1 = ptr[BFloat16](kbg + (dp + 1) * page * 4)
+                            comptime for h in range(4):
+                                cg[h] = dot_bf16[4](
+                                    cg[h], kb0.unsafe_load[width=8](h * 8), qa0
+                                )
+                            comptime for h in range(4):
+                                cg[h] = dot_bf16[4](
+                                    cg[h], kb1.unsafe_load[width=8](h * 8), qa1
+                                )
+                        comptime for h in range(4):
+                            var base_i = g * 16 + h * 4
+                            if base_i < nk:
+                                var v = cg[h]
+                                if base_i + 4 > nk:
+                                    var idx = (
+                                        SIMD[DType.int32, 4](Int32(base_i))
+                                        + lane
+                                    )
+                                    v = idx.lt(vnk).select(v, V(-Float32.MAX))
+                                mx = vmax[4](mx, v)
+                                logits.unsafe_store[width=4](base_i, v)
+                var mx_r = mx.reduce_max() * c
+                var mn: Float32
+                var ar: Float32
+                if k0 == 0:
+                    mn = mx_r
+                    ar = 0.0
+                    m[0] = mn
+                elif mx_r > m[0]:
+                    mn = mx_r
+                    ar = exp2s[DEG](m[0] - mn)
+                    m[0] = mn
+                else:
+                    mn = m[0]
+                    ar = 1.0
+                var vmn = V(-mn)
+                var sum = V(0)
+                var t = 0
+                if len >= 128:
+                    while t < nk:
+                        var e = exp2[DEG, 4](
+                            logits.unsafe_load[width=4](t).fma(vc, vmn)
+                        )
+                        pbuf.unsafe_store[width=4](
+                            t, e.cast[DType.bfloat16]()
+                        )
+                        logits.unsafe_store[width=4](t, e)
+                        sum += e
+                        t += 4
+                else:
+                    while t < nk:
+                        var e = exp2[DEG, 4](
+                            logits.unsafe_load[width=4](t).fma(vc, vmn)
+                        )
+                        var hi = e.cast[DType.bfloat16]()
+                        var lo = (e - hi.cast[DType.float32]()).cast[
+                            DType.bfloat16
+                        ]()
+                        pbuf.unsafe_store[width=4](t, hi)
+                        pbuf_lo.unsafe_store[width=4](t, lo)
+                        logits.unsafe_store[width=4](t, e)
+                        sum += e
+                        t += 4
+                l[0] = (
+                    (l[0] * ar if k0 > 0 else Float32(0)) + sum.reduce_add()
+                )
+                _pv_arm_bf16_tail[hd, 1, KT, DC, NC](
+                    k0,
+                    nk,
+                    len,
+                    tiles,
+                    SIMD[DType.float32, 1](ar),
+                    vbase,
+                    pbuf,
+                    pbuf_lo,
+                    logits,
+                    acc,
+                )
+        else:
+            var tiles = (nk + 15) >> 4
+            for g in range(tiles):
+                var d = _div_page[PAGE](k0 + g * 16, page)
+                var blk = (
+                    Int(bt.unsafe_load(d[0])) * job.kv_heads + kvh
+                ) * head_bytes
+                var boff = d[1]
+                kbase.unsafe_store(g, Int64(job.k_cache + blk + boff * 4))
+                vbase.unsafe_store(g, Int64(job.v_cache + blk + boff * hd * 2))
+            var mx = Array[V, R](fill=V(-Float32.MAX))
+            var vnk = SIMD[DType.int32, 4](Int32(nk))
+            var lane = iota[DType.int32, 4]()
+            comptime G_SUB = 4 if R == 2 else 2
+            for g in range(tiles):
+                var kbg = Int(kbase.unsafe_load(g))
+                comptime for s in range(0, 4, G_SUB):
+                    if g * 16 + s * 4 < nk:
+                        var cv = Array[V, R * G_SUB](fill=V(0))
+                        for dp in range(0, hd // 2, 2):
+                            var kb0 = ptr[BFloat16](
+                                kbg + dp * page * 4 + s * 16
+                            )
+                            var kb1 = ptr[BFloat16](
+                                kbg + (dp + 1) * page * 4 + s * 16
+                            )
+                            comptime for h in range(G_SUB):
+                                var kv0 = kb0.unsafe_load[width=8](h * 8)
+                                var kv1 = kb1.unsafe_load[width=8](h * 8)
+                                comptime for r in range(R):
+                                    var qa0 = bitcast_bf16[4](
+                                        SIMD[DType.int32, 4](
+                                            qp.unsafe_load(
+                                                r * (hd // 2) + dp
+                                            )
+                                        )
+                                    )
+                                    var qa1 = bitcast_bf16[4](
+                                        SIMD[DType.int32, 4](
+                                            qp.unsafe_load(
+                                                r * (hd // 2) + dp + 1
+                                            )
+                                        )
+                                    )
+                                    var c = dot_bf16[4](
+                                        cv[r * G_SUB + h], kv0, qa0
+                                    )
+                                    cv[r * G_SUB + h] = dot_bf16[4](
+                                        c, kv1, qa1
+                                    )
+                        comptime for h in range(G_SUB):
+                            var base_i = g * 16 + (s + h) * 4
+                            if base_i < nk:
+                                comptime for r in range(R):
+                                    var v = cv[r * G_SUB + h]
+                                    if base_i + 4 > nk:
+                                        var idx = (
+                                            SIMD[DType.int32, 4](Int32(base_i))
+                                            + lane
+                                        )
+                                        v = idx.lt(vnk).select(
+                                            v, V(-Float32.MAX)
+                                        )
+                                    mx[r] = vmax[4](mx[r], v)
+                                    logits.unsafe_store[width=4](
+                                        r * KT + base_i, v
+                                    )
+            var alpha = SIMD[DType.float32, R](1)
+            comptime for r in range(R):
+                var mx_r = mx[r].reduce_max() * c
+                var mn: Float32
+                if k0 == 0:
+                    mn = mx_r
+                    alpha[r] = 0.0
+                    m[r] = mn
+                elif mx_r > m[r]:
+                    mn = mx_r
+                    alpha[r] = exp2s[DEG](m[r] - mn)
+                    m[r] = mn
+                else:
+                    mn = m[r]
+                    alpha[r] = 1.0
+                var vmn = V(-mn)
+                var sum = V(0)
+                var t = 0
+                if len >= 128:
+                    while t < nk:
+                        var e = exp2[DEG, 4](
+                            logits.unsafe_load[width=4](r * KT + t).fma(
+                                vc, vmn
+                            )
+                        )
+                        pbuf.unsafe_store[width=4](
+                            r * KT + t, e.cast[DType.bfloat16]()
+                        )
+                        if (nk & 1) == 1:
+                            logits.unsafe_store[width=4](r * KT + t, e)
+                        sum += e
+                        t += 4
+                else:
+                    while t < nk:
+                        var e = exp2[DEG, 4](
+                            logits.unsafe_load[width=4](r * KT + t).fma(
+                                vc, vmn
+                            )
+                        )
+                        var hi = e.cast[DType.bfloat16]()
+                        var lo = (e - hi.cast[DType.float32]()).cast[
+                            DType.bfloat16
+                        ]()
+                        pbuf.unsafe_store[width=4](r * KT + t, hi)
+                        pbuf_lo.unsafe_store[width=4](r * KT + t, lo)
+                        if (nk & 1) == 1:
+                            logits.unsafe_store[width=4](r * KT + t, e)
+                        sum += e
+                        t += 4
+                l[r] = (
+                    (l[r] * alpha[r] if k0 > 0 else Float32(0))
+                    + sum.reduce_add()
+                )
+            _pv_arm_bf16_tail[hd, R, KT, DC, NC](
+                k0, nk, len, tiles, alpha, vbase, pbuf, pbuf_lo, logits, acc
+            )
+        k0 += nk
+
+    for r in range(nrows):
+        var o = ptr[BFloat16](
+            job.out + (seq * job.out_stride + (h0 + r) * hd) * 2
+        )
+        if l[r] <= 0:
+            comptime for d in range(0, hd, 4):
+                o.unsafe_store[width=4](d, SIMD[DType.bfloat16, 4](0))
+            continue
+        var inv = V(Float32(1) / l[r])
+        comptime for d in range(0, hd, 4):
+            o.unsafe_store[width=4](
+                d,
+                (acc.unsafe_load[width=4](r * hd + d) * inv).cast[
+                    DType.bfloat16
+                ](),
+            )
+
+
+@always_inline
+def _pv_arm_f32_step[
+    hd: Int, R: Int, KT: Int, DC: Int, NC: Int
+](
+    k0: Int,
+    nk: Int,
+    tiles: Int,
+    alpha: SIMD[DType.float32, R],
+    vbase: MutPointer[Int64, _],
+    p: MutPointer[Float32, _],
+    acc: MutPointer[Float32, _],
+):
+    comptime V = SIMD[DType.float32, 4]
+    comptime for dc in range(0, hd, DC):
+        var a = Array[V, R * NC](fill=V(0))
+        if k0 > 0:
+            comptime for r in range(R):
+                var ar = alpha[r]
+                if ar == 1.0:
+                    comptime for i in range(NC):
+                        a[r * NC + i] = acc.unsafe_load[width=4](
+                            r * hd + dc + i * 4
+                        )
+                elif ar != 0.0:
+                    var va = V(ar)
+                    comptime for i in range(NC):
+                        a[r * NC + i] = (
+                            acc.unsafe_load[width=4](r * hd + dc + i * 4) * va
+                        )
+        comptime if R == 1:
+            if nk == 64:
+                for g in range(4):
+                    var vbg = Int(vbase.unsafe_load(g)) + dc * 4
+                    var g_off = g * 16
+                    for t in range(0, 16, 2):
+                        var p01 = p.unsafe_load[width=2](g_off + t)
+                        var p0 = V(p01[0])
+                        var p1 = V(p01[1])
+                        var vr0 = ptr[Float32](vbg + t * hd * 4)
+                        var vr1 = ptr[Float32](vbg + (t + 1) * hd * 4)
+                        comptime for i in range(NC):
+                            a[i] = p0.fma(vr0.unsafe_load[width=4](i * 4), a[i])
+                        comptime for i in range(NC):
+                            a[i] = p1.fma(vr1.unsafe_load[width=4](i * 4), a[i])
+            else:
+                for g in range(tiles):
+                    var kv = min(16, nk - g * 16)
+                    var vbg = Int(vbase.unsafe_load(g)) + dc * 4
+                    var g_off = g * 16
+                    var t = 0
+                    while t + 1 < kv:
+                        var p01 = p.unsafe_load[width=2](g_off + t)
+                        var p0 = V(p01[0])
+                        var p1 = V(p01[1])
+                        var vr0 = ptr[Float32](vbg + t * hd * 4)
+                        var vr1 = ptr[Float32](vbg + (t + 1) * hd * 4)
+                        comptime for i in range(NC):
+                            a[i] = p0.fma(vr0.unsafe_load[width=4](i * 4), a[i])
+                        comptime for i in range(NC):
+                            a[i] = p1.fma(vr1.unsafe_load[width=4](i * 4), a[i])
+                        t += 2
+                    if t < kv:
+                        var p0 = V(p.unsafe_load(g_off + t))
+                        var vr0 = ptr[Float32](vbg + t * hd * 4)
+                        comptime for i in range(NC):
+                            a[i] = p0.fma(vr0.unsafe_load[width=4](i * 4), a[i])
+        else:
+            for g in range(tiles):
+                var kv = min(16, nk - g * 16)
+                var vbg = Int(vbase.unsafe_load(g)) + dc * 4
+                var t = 0
+                while t < kv:
+                    var p0 = Array[V, R](uninitialized=True)
+                    comptime for r in range(R):
+                        p0[r] = V(p.unsafe_load(r * KT + g * 16 + t))
+                    var vr0 = ptr[Float32](vbg + t * hd * 4)
+                    comptime for i in range(NC):
+                        var v0 = vr0.unsafe_load[width=4](i * 4)
+                        comptime for r in range(R):
+                            a[r * NC + i] = p0[r].fma(v0, a[r * NC + i])
+                    t += 1
+        comptime for r in range(R):
+            comptime for i in range(NC):
+                acc.unsafe_store[width=4](r * hd + dc + i * 4, a[r * NC + i])
+
+
+def _attend_rows_arm_f32[
+    hd: Int, R: Int, PAGE: Int
+](job: PagedJob, seq: Int, kvh: Int, h0: Int, nrows: Int):
+    """ARM64 NEON FP32 paged decode using 16-key page units (PT=16, PG=4, KT=64)."""
+    comptime KT = 64
+    comptime DEG = 6
+    comptime V = SIMD[DType.float32, 4]
+    comptime DC = min(hd, max(4, 64 // R))
+    comptime NC = DC // 4
+    var page = PAGE if PAGE else job.page
+    var len = Int(ptr[Int32](job.lens).unsafe_load(seq)) + (
+        1 if (job.do_store and job.slots == 0) else 0
+    )
+    if len <= 0:
+        for r in range(nrows):
+            var o = ptr[Float32](
+                job.out + (seq * job.out_stride + (h0 + r) * hd) * 4
+            )
+            comptime for d in range(0, hd, 4):
+                o.unsafe_store[width=4](d, V(0))
+        return
+    var bt = ptr[Int32](job.block_table + seq * job.bt_stride * 4)
+    var head_bytes = page * hd * 4
+    var c = job.scale * Float32(LOG2E)
+    var vc = V(c)
+
+    var qf_buf = stack_allocation[
+        (R * hd) if R > 1 else 1, DType.float32, alignment=64
+    ]()
+    var q0_addr = job.q + (seq * job.q_stride + h0 * hd) * 4
+    var qf = ptr[Float32](q0_addr) if R == 1 else qf_buf
+    comptime if R > 1:
+        for r in range(R):
+            var rr = min(r, nrows - 1)
+            var s = ptr[Float32](
+                job.q + (seq * job.q_stride + (h0 + rr) * hd) * 4
+            )
+            comptime for d in range(0, hd, 4):
+                qf_buf.unsafe_store[width=4](r * hd + d, s.unsafe_load[width=4](d))
+
+    var kbase = stack_allocation[4, DType.int64, alignment=32]()
+    var vbase = stack_allocation[4, DType.int64, alignment=32]()
+    var logits = stack_allocation[R * KT, DType.float32, alignment=64]()
+    var acc = stack_allocation[R * hd, DType.float32, alignment=64]()
+    var m = SIMD[DType.float32, R](-Float32.MAX)
+    var l = SIMD[DType.float32, R](0)
+
+    var k0 = 0
+    while k0 < len:
+        var nk = min(KT, len - k0)
+        var tiles = (nk + 15) >> 4
+        for g in range(tiles):
+            var d = _div_page[PAGE](k0 + g * 16, page)
+            var blk = (
+                Int(bt.unsafe_load(d[0])) * job.kv_heads + kvh
+            ) * head_bytes
+            var boff = d[1]
+            kbase.unsafe_store(g, Int64(job.k_cache + blk + boff * 4))
+            vbase.unsafe_store(g, Int64(job.v_cache + blk + boff * hd * 4))
+
+        comptime if R == 1:
+            var mx = V(-Float32.MAX)
+            if nk == 64:
+                for g in range(4):
+                    var kbg = Int(kbase.unsafe_load(g))
+                    var cg = Array[V, 16](fill=V(0))
+                    for d0 in range(0, hd, 4):
+                        var qv = qf.unsafe_load[width=4](d0)
+                        comptime for u in range(4):
+                            var kd = ptr[Float32](
+                                kbg + (d0 + u) * page * 4
+                            )
+                            comptime for h in range(4):
+                                cg[h * 4 + u] = kd.unsafe_load[width=4](
+                                    h * 4
+                                ).fma(V(qv[u]), cg[h * 4 + u])
+                    comptime for h in range(4):
+                        var v = (cg[h * 4 + 0] + cg[h * 4 + 1]) + (
+                            cg[h * 4 + 2] + cg[h * 4 + 3]
+                        )
+                        mx = vmax[4](mx, v)
+                        logits.unsafe_store[width=4](g * 16 + h * 4, v)
+            else:
+                var vnk = SIMD[DType.int32, 4](Int32(nk))
+                var lane = iota[DType.int32, 4]()
+                for g in range(tiles):
+                    var kbg = Int(kbase.unsafe_load(g))
+                    if nk - g * 16 <= 4:
+                        var cg = Array[V, 4](fill=V(0))
+                        for d0 in range(0, hd, 4):
+                            var qv = qf.unsafe_load[width=4](d0)
+                            comptime for u in range(4):
+                                var kd = ptr[Float32](
+                                    kbg + (d0 + u) * page * 4
+                                )
+                                cg[u] = kd.unsafe_load[width=4](0).fma(
+                                    V(qv[u]), cg[u]
+                                )
+                        var base_i = g * 16
+                        var v = (cg[0] + cg[1]) + (cg[2] + cg[3])
+                        if base_i + 4 > nk:
+                            var idx = (
+                                SIMD[DType.int32, 4](Int32(base_i)) + lane
+                            )
+                            v = idx.lt(vnk).select(v, V(-Float32.MAX))
+                        mx = vmax[4](mx, v)
+                        logits.unsafe_store[width=4](base_i, v)
+                    else:
+                        var cg = Array[V, 16](fill=V(0))
+                        for d0 in range(0, hd, 4):
+                            var qv = qf.unsafe_load[width=4](d0)
+                            comptime for u in range(4):
+                                var kd = ptr[Float32](
+                                    kbg + (d0 + u) * page * 4
+                                )
+                                comptime for h in range(4):
+                                    cg[h * 4 + u] = kd.unsafe_load[width=4](
+                                        h * 4
+                                    ).fma(V(qv[u]), cg[h * 4 + u])
+                        comptime for h in range(4):
+                            var base_i = g * 16 + h * 4
+                            if base_i < nk:
+                                var v = (cg[h * 4 + 0] + cg[h * 4 + 1]) + (
+                                    cg[h * 4 + 2] + cg[h * 4 + 3]
+                                )
+                                if base_i + 4 > nk:
+                                    var idx = (
+                                        SIMD[DType.int32, 4](Int32(base_i))
+                                        + lane
+                                    )
+                                    v = idx.lt(vnk).select(v, V(-Float32.MAX))
+                                mx = vmax[4](mx, v)
+                                logits.unsafe_store[width=4](base_i, v)
+            var mx_r = mx.reduce_max() * c
+            var mn: Float32
+            var ar: Float32
+            if k0 == 0:
+                mn = mx_r
+                ar = 0.0
+                m[0] = mn
+            elif mx_r > m[0]:
+                mn = mx_r
+                ar = exp2s[DEG](m[0] - mn)
+                m[0] = mn
+            else:
+                mn = m[0]
+                ar = 1.0
+            var vmn = V(-mn)
+            if nk == 64:
+                var s0 = V(0)
+                var s1 = V(0)
+                for i in range(0, 16, 4):
+                    var e0 = exp2[DEG, 4](
+                        logits.unsafe_load[width=4](4 * i).fma(vc, vmn)
+                    )
+                    var e1 = exp2[DEG, 4](
+                        logits.unsafe_load[width=4](4 * (i + 1)).fma(vc, vmn)
+                    )
+                    var e2 = exp2[DEG, 4](
+                        logits.unsafe_load[width=4](4 * (i + 2)).fma(vc, vmn)
+                    )
+                    var e3 = exp2[DEG, 4](
+                        logits.unsafe_load[width=4](4 * (i + 3)).fma(vc, vmn)
+                    )
+                    logits.unsafe_store[width=4](4 * i, e0)
+                    logits.unsafe_store[width=4](4 * (i + 1), e1)
+                    logits.unsafe_store[width=4](4 * (i + 2), e2)
+                    logits.unsafe_store[width=4](4 * (i + 3), e3)
+                    s0 = (s0 + e0) + e2
+                    s1 = (s1 + e1) + e3
+                l[0] = (
+                    (l[0] * ar if k0 > 0 else Float32(0))
+                    + (s0 + s1).reduce_add()
+                )
+            else:
+                var sum = V(0)
+                var t = 0
+                while t < nk:
+                    var e = exp2[DEG, 4](
+                        logits.unsafe_load[width=4](t).fma(vc, vmn)
+                    )
+                    logits.unsafe_store[width=4](t, e)
+                    sum += e
+                    t += 4
+                l[0] = (
+                    (l[0] * ar if k0 > 0 else Float32(0)) + sum.reduce_add()
+                )
+            _pv_arm_f32_step[hd, 1, KT, DC, NC](
+                k0,
+                nk,
+                tiles,
+                SIMD[DType.float32, 1](ar),
+                vbase,
+                logits,
+                acc,
+            )
+        else:
+            var mx = Array[V, R](fill=V(-Float32.MAX))
+            var vnk = SIMD[DType.int32, 4](Int32(nk))
+            var lane = iota[DType.int32, 4]()
+            comptime CH = 4 if R <= 4 else 2
+            for g in range(tiles):
+                var kbg = Int(kbase.unsafe_load(g))
+                for h in range(4):
+                    var base_i = g * 16 + h * 4
+                    if base_i < nk:
+                        var part = Array[V, R * CH](fill=V(0))
+                        var kb = ptr[Float32](kbg + h * 16)
+                        for d0 in range(0, hd, 4):
+                            comptime for u in range(4):
+                                var kv = kb.unsafe_load[width=4](
+                                    (d0 + u) * page
+                                )
+                                comptime for r in range(R):
+                                    var qv = qf.unsafe_load[width=4](
+                                        r * hd + d0
+                                    )
+                                    comptime idx_p = r * CH + (u % CH)
+                                    part[idx_p] = V(qv[u]).fma(kv, part[idx_p])
+                        comptime for r in range(R):
+                            var v: V
+                            comptime if CH == 4:
+                                v = (part[r * 4] + part[r * 4 + 1]) + (
+                                    part[r * 4 + 2] + part[r * 4 + 3]
+                                )
+                            else:
+                                v = part[r * 2] + part[r * 2 + 1]
+                            if base_i + 4 > nk:
+                                var idx = (
+                                    SIMD[DType.int32, 4](Int32(base_i)) + lane
+                                )
+                                v = idx.lt(vnk).select(v, V(-Float32.MAX))
+                            mx[r] = vmax[4](mx[r], v)
+                            logits.unsafe_store[width=4](r * KT + base_i, v)
+            var alpha = SIMD[DType.float32, R](1)
+            comptime for r in range(R):
+                var mx_r = mx[r].reduce_max() * c
+                var mn: Float32
+                if k0 == 0:
+                    mn = mx_r
+                    alpha[r] = 0.0
+                    m[r] = mn
+                elif mx_r > m[r]:
+                    mn = mx_r
+                    alpha[r] = exp2s[DEG](m[r] - mn)
+                    m[r] = mn
+                else:
+                    mn = m[r]
+                    alpha[r] = 1.0
+                var vmn = V(-mn)
+                var sum = V(0)
+                var t = 0
+                while t < nk:
+                    var e = exp2[DEG, 4](
+                        logits.unsafe_load[width=4](r * KT + t).fma(vc, vmn)
+                    )
+                    logits.unsafe_store[width=4](r * KT + t, e)
+                    sum += e
+                    t += 4
+                l[r] = (
+                    (l[r] * alpha[r] if k0 > 0 else Float32(0))
+                    + sum.reduce_add()
+                )
+            _pv_arm_f32_step[hd, R, KT, DC, NC](
+                k0, nk, tiles, alpha, vbase, logits, acc
+            )
+        k0 += nk
+
+    for r in range(nrows):
+        var o = ptr[Float32](
+            job.out + (seq * job.out_stride + (h0 + r) * hd) * 4
+        )
+        if l[r] <= 0:
+            comptime for d in range(0, hd, 4):
+                o.unsafe_store[width=4](d, V(0))
+            continue
+        var inv = V(Float32(1) / l[r])
+        comptime for d in range(0, hd, 4):
+            o.unsafe_store[width=4](
+                d, acc.unsafe_load[width=4](r * hd + d) * inv
+            )
 
 
 # ---------------------------------------------------------------------------
