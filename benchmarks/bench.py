@@ -344,8 +344,11 @@ def paged_row(r, arms_, vllm, args, page):
                 truth = R.ref_decode(q, kref.transpose(1, 2),
                                      vref.transpose(1, 2), dtype=torch.float64,
                                      scale=scale, lens=lens)
-                if (ref.double() - truth).abs().max().item() > 1e-6:
-                    err = (got.double() - truth).abs().max().item()
+                # The fp32 reference is itself up to ~9e-7 from the exact
+                # answer, so a kernel 2e-7 from the truth can read 1.0e-6 from
+                # it (seen on het contexts, for C++ vec and Mojo alike): the
+                # gate is judged against fp64 once it is exceeded.
+                err = (got.double() - truth).abs().max().item()
             return err, err <= 1e-6
         # bf16: <= 2 bf16 ulps at the row peak against the C++ reference arm
         # (the test_paged_sweep gate); on aarch64 also <= 1e-3 vs the reference.

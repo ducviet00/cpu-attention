@@ -211,6 +211,12 @@ it can arbitrate the cross-backend gate; its name is recorded per row.
    when unused cache slots/padding hold NaN, and a non-finite row for a
    zero-length context (`test_regressions.py` on the cpp backend).
 
+9. **Harness (fixed, not a kernel defect):** the paged fp32 gate measured arms only against the
+   fp32 reference and consulted fp64 only when the reference was itself over 1e-6 from it. On
+   heterogeneous contexts the reference is 6-9e-7 from fp64 while Mojo and C++ vec are 2-5e-7 from
+   it, yet 1.0e-6 / 1.07e-6 from the reference, so valid arms (both backends) read INVALID on some
+   data draws. Any arm over 1e-6 is now judged against fp64.
+
 ## 9. Falsification ledger (this campaign)
 
 Measured in one process against an independent control; reverted unless it beat
