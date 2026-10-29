@@ -17,7 +17,7 @@ from std.math import iota
 from std.memory import bitcast, stack_allocation
 from std.sys.info import CompilationTarget
 
-from isa import LANES, LOG2E, dot_bf16, exp2, exp2s, ptr, vmax
+from isa import BCAST_FOLD, LANES, LOG2E, dot_bf16, exp2, exp2s, ptr, vmax
 from parallel import barrier, parallel
 
 comptime V_PAIRS_ARM = CompilationTarget.has_neon()
@@ -453,9 +453,9 @@ trait PVKernel:
     """Key-parity accumulator sets per dim vector."""
 
     @staticmethod
-    def store_p[LO: Bool](e: SIMD[DType.float32, LANES], logits: Int, pbuf: Int, pbuf_lo: Int, i: Int, odd: Bool):
-        """Keep the probabilities `e` of keys i .. i+LANES-1 (`odd`: the step has
-        an odd number of keys)."""
+    def store_p[LO: Bool, W: Int](e: SIMD[DType.float32, W], logits: Int, pbuf: Int, pbuf_lo: Int, i: Int, odd: Bool):
+        """Keep the probabilities `e` of keys i .. i+W-1 (`odd`: the step has an
+        odd number of keys)."""
         ...
 
     @staticmethod
@@ -488,8 +488,8 @@ struct PVRows[dtype: DType, hd: Int, R: Int](PVKernel):
 
     @staticmethod
     @always_inline
-    def store_p[LO: Bool](e: SIMD[DType.float32, LANES], logits: Int, pbuf: Int, pbuf_lo: Int, i: Int, odd: Bool):
-        ptr[Float32](logits).unsafe_store[width=LANES](i, e)
+    def store_p[LO: Bool, W: Int](e: SIMD[DType.float32, W], logits: Int, pbuf: Int, pbuf_lo: Int, i: Int, odd: Bool):
+        ptr[Float32](logits).unsafe_store[width=W](i, e)
 
     @staticmethod
     @always_inline
@@ -520,6 +520,20 @@ struct PVRows[dtype: DType, hd: Int, R: Int](PVKernel):
                 return (vp + t * Self.hd).unsafe_load[width=LANES](i * LANES).cast[DType.float32]()
 
         var t = 0
+        comptime if not BCAST_FOLD:
+            # 4 probabilities per row as one vector, a lane each (NEON's
+            # by-element FMA; a broadcast load per key costs a load there).
+            while t + 3 < kv:
+                var pv = Array[SIMD[DType.float32, 4], Self.R](uninitialized=True)
+                comptime for r in range(Self.R):
+                    pv[r] = pk.unsafe_load[width=4](r * KT + t)
+                comptime for k in range(4):
+                    comptime for i in range(NC):
+                        var v0 = vrow(t + k, i)
+                        comptime for r in range(Self.R):
+                            comptime s = ((k % Self.LN) * Self.R + r) * NC + i
+                            a[s] = V(pv[r][k]).fma(v0, a[s])
+                t += 4
         comptime if Self.LN == 2:
             while t + 1 < kv:
                 var p0 = Array[V, Self.R](uninitialized=True)
@@ -556,13 +570,13 @@ struct PVPairs[hd: Int, R: Int](PVKernel):
 
     @staticmethod
     @always_inline
-    def store_p[LO: Bool](e: SIMD[DType.float32, LANES], logits: Int, pbuf: Int, pbuf_lo: Int, i: Int, odd: Bool):
+    def store_p[LO: Bool, W: Int](e: SIMD[DType.float32, W], logits: Int, pbuf: Int, pbuf_lo: Int, i: Int, odd: Bool):
         var hi = e.cast[DType.bfloat16]()
-        ptr[BFloat16](pbuf).unsafe_store[width=LANES](i, hi)
+        ptr[BFloat16](pbuf).unsafe_store[width=W](i, hi)
         comptime if LO:
-            ptr[BFloat16](pbuf_lo).unsafe_store[width=LANES](i, (e - hi.cast[DType.float32]()).cast[DType.bfloat16]())
+            ptr[BFloat16](pbuf_lo).unsafe_store[width=W](i, (e - hi.cast[DType.float32]()).cast[DType.bfloat16]())
         if odd:  # the unpaired last key is an fp32 FMA
-            ptr[Float32](logits).unsafe_store[width=LANES](i, e)
+            ptr[Float32](logits).unsafe_store[width=W](i, e)
 
     @staticmethod
     @always_inline
@@ -647,18 +661,23 @@ def _exp_row[
     var s = Array[V, D.NS](fill=V(0))
 
     @always_inline
-    def one(t: Int) capturing -> V:
-        var e = exp2[D.DEG, LANES](lg.unsafe_load[width=LANES](row + t).fma(V(c), V(-mn)))
-        D.PV.store_p[LO](e, logits, pbuf, pbuf_lo, row + t, odd)
-        return e
+    def ex(t: Int) capturing -> V:
+        return exp2[D.DEG, LANES](lg.unsafe_load[width=LANES](row + t).fma(V(c), V(-mn)))
 
     var t = 0
-    while t + D.NS * LANES <= nk:
-        comptime for u in range(D.NS):
-            s[u] += one(t + u * LANES)
-        t += D.NS * LANES
+    comptime if D.NS == 2:
+        # Two vectors per step, kept with one store (16-byte bf16 stores on NEON).
+        while t + 2 * LANES <= nk:
+            var e0 = ex(t)
+            var e1 = ex(t + LANES)
+            D.PV.store_p[LO, 2 * LANES](e0.join(e1), logits, pbuf, pbuf_lo, row + t, odd)
+            s[0] += e0
+            s[1] += e1
+            t += 2 * LANES
     while t < nk:
-        s[0] += one(t)
+        var e = ex(t)
+        D.PV.store_p[LO, LANES](e, logits, pbuf, pbuf_lo, row + t, odd)
+        s[0] += e
         t += LANES
     var sum = s[0]
     comptime for u in range(1, D.NS):
@@ -710,6 +729,7 @@ def _attend_rows[
     comptime D = Decode[dtype, hd, R]
     comptime KT = D.KT
     comptime assert D.UNIT % LANES == 0 and KT % D.UNIT == 0, "a step is whole units of whole vectors"
+    comptime assert D.NS == 1 or D.NS == 2, "the softmax keeps one or two partial sums"
     comptime assert hd % (D.NC * LANES) == 0, "P@V chunks tile head_dim"
     comptime V = SIMD[DType.float32, LANES]
     var page = PAGE if PAGE else job.page

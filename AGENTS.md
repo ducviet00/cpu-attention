@@ -35,6 +35,15 @@ scripts/build_vllm_ref.sh   builds the pinned vLLM csrc/cpu reference the benchm
   acceptance bar is a clear per-row win of Mojo over the *fastest numerically
   valid* C++ path (every ISA the CPU supports), judged as in `docs/Mojo.md` §7.
   The previous Mojo build is kept as the oracle at git tag `mojo-oracle-v1.1`.
+- **One implementation across CPUs is the highest objective**, then latency
+  (the model is Modular's unified matmul). Each op has one driver; a target
+  differs only by compile-time constants (`Decode`, `FlashPolicy` members derived
+  from `simd_width_of` / `CompilationTarget`) or a trait-plugged kernel
+  (`PVKernel`, `FlashPolicy`) where the hardware or the numerics really differ.
+  A refactor that removes a per-target path may cost at most about 1% of
+  latency, and must keep Mojo competitive with the C++ backend (no row family
+  that wins against the fastest valid C++ path may fall behind it): measure on
+  all three boxes, record the cost in the ledger, and win it back next.
 - **File ownership in the C++ backend.**
   - The shared core is `cpu_attn_impl.hpp`, the entry points
     (`cpu_attn.cpp/.hpp`) and `binding.cpp`.
