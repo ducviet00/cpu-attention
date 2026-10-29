@@ -914,13 +914,32 @@ def _body[dtype: DType, hd: Int, PAGE: Int](ctx: Int, tid: Int, threads: Int):
     var pairs = job.num_seqs * kvh_n
     if not job.do_attend:
         if job.do_store:
-            # (kv head, block of LANES tokens) tasks, so a block is one thread's.
-            var nblk = (job.num_seqs + LANES - 1) // LANES
-            var tasks = kvh_n * nblk
-            for t in range(tid * tasks // threads, (tid + 1) * tasks // threads):
-                var kvh = t // nblk
-                var a = (t - kvh * nblk) * LANES
-                _store_block[dtype, hd, PAGE](job, kvh, a, min(LANES, job.num_seqs - a))
+            # Prefill-style staging (the first LANES slots consecutive) runs in
+            # (kv head, LANES-token block) tasks, so a block is one thread's;
+            # scattered appends keep (token, kv head) order: their source rows are
+            # read contiguously (blocks cost b=32 ctx=1 ~0.4 us).
+            var blocks = job.slots != 0 and job.num_seqs >= LANES
+            if blocks:
+                var sl = ptr[Int64](job.slots)
+                for i in range(1, LANES):
+                    blocks = blocks and Int(sl.unsafe_load(i)) == Int(sl.unsafe_load(0)) + i
+            if blocks:
+                var nblk = (job.num_seqs + LANES - 1) // LANES
+                var tasks = kvh_n * nblk
+                for t in range(tid * tasks // threads, (tid + 1) * tasks // threads):
+                    var kvh = t // nblk
+                    var a = (t - kvh * nblk) * LANES
+                    _store_block[dtype, hd, PAGE](job, kvh, a, min(LANES, job.num_seqs - a))
+            else:
+                var s0 = tid * pairs // threads
+                var seq = s0 // kvh_n
+                var kvh = s0 - seq * kvh_n
+                for _ in range(s0, (tid + 1) * pairs // threads):
+                    _store_kv[dtype, hd, PAGE](job, seq, kvh)
+                    kvh += 1
+                    if kvh == kvh_n:
+                        kvh = 0
+                        seq += 1
         return
     if job.num_heads == kvh_n:
         # MHA fast path: 1 query head per kv head, chunks == 1, no barrier.
