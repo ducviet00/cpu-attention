@@ -86,9 +86,9 @@ the C4D. Numbers below are the single source of truth; `docs/Mojo.md` explains t
 design and the experiments.
 
 **Setup** (Mojo 1.2.0 `2016d0cd`, torch 2.14.1+cpu). Three 16-vCPU GCP spot VMs,
-threads = physical cores, each measured `2da6994` (Oct 2026: one decode driver and
+threads = physical cores, each measured `cf9688d` (Oct 2026: one decode driver and
 one vector flash policy for every CPU, `docs/Mojo.md` §3) in one full-manifest run
-against an independent copy of `200e6e2` as the previous build.
+(`scripts/box_verify.sh`) against an independent copy of `200e6e2` as the previous build.
 
 | box | CPU | threads | C++ paths it is compared with |
 |---|---|---:|---|
@@ -123,30 +123,33 @@ C4D, NEON on the Axion) and torch SDPA are secondary references.
 
 | rows | C4D | Axion | Xeon |
 |---|---|---|---|
-| `flash_attn_func` (78) | 71 / 7 / 0 | 61 / 17 / 0 | 59 / 16 / 3 |
-| decode, allocating the output (60) | 11 / 22 / 27 | 37 / 21 / 2 | 16 / 41 / 3 |
-| decode with `out=` (20) | 4 / 7 / 9 | 9 / 9 / 2 | 4 / 16 / 0 |
-| public `flash_attn_with_kvcache` decode (8) | 4 / 1 / 3 | 7 / 1 / 0 | 6 / 2 / 0 |
-| store-only (4) | 2 / 2 / 0 | 4 / 0 / 0 | 3 / 1 / 0 |
-| **all (170)** | **92 / 39 / 39** | **118 / 48 / 4** | **88 / 76 / 6** |
+| `flash_attn_func` (78) | 73 / 5 / 0 | 58 / 20 / 0 | 49 / 27 / 2 |
+| decode, allocating the output (60) | 10 / 21 / 29 | 35 / 23 / 2 | 22 / 36 / 2 |
+| decode with `out=` (20) | 4 / 7 / 9 | 1 / 17 / 2 | 7 / 12 / 1 |
+| public `flash_attn_with_kvcache` decode (8) | 4 / 2 / 2 | 8 / 0 / 0 | 6 / 2 / 0 |
+| store-only (4) | 2 / 1 / 1 | 4 / 0 / 0 | 3 / 1 / 0 |
+| **all (170)** | **93 / 36 / 41** | **106 / 60 / 4** | **87 / 78 / 5** |
 
 **Where Mojo does not clearly win.**
-* **C4D**: 39 losses, all decode, the same rows as the previous build (new/previous
-  about 1.00): batch 8 at context ~1024 including page 16/48/64 and GQA `h=16/4`
-  (1.03-1.25), batch-1 context 4096/4097 (1.06-1.22) and fp32 batch 8 at context
-  255-257 (1.04-1.23). On the 4-core C4D (32 MB L3) Mojo matched or beat C++ per
+* **C4D**: 41 losses, all but one decode (`flash_attn_func` 73 wins, 5 ties, 0 losses; the
+  other is store-only `b=1 ctx=1024` fp32, 1.13), the same rows as the previous build
+  (new/previous 0.998-1.004): batch 8 at context ~1024 including page 16/48/64, GQA
+  `h=16/4` and `het` (1.03-1.24), batch-1 context 4096/4097 (1.09-1.38) and batch 8 at
+  context 255-257 (1.07-1.77). On the 4-core C4D (32 MB L3) Mojo matched or beat C++ per
   thread (0.92-0.98 on one thread) and the gap appeared only with all cores streaming a
   working set that spills out of the L3 (~56 GB/s against C++'s ~62); a bare-metal Zen 4
   does not reproduce it. The cause is not found: tile length, key-group width, thread
-  pinning, wake-up policy and thread skew made no difference, and the VMs expose no
-  hardware performance counters.
-* **Axion**: 4 losses, decode at 1.03-1.05 (fp32 batch 8 at context ~1024, bf16 `out=`
-  batch 32 / batch-1 context 4096). Every bf16 `flash_attn_func` row wins; fp32 ties or
-  wins (22 / 17 / 0): its NEON policy was folded into the shared vector policy, about 4%
-  slower than the dedicated one it replaced (`docs/Mojo.md` §9), a cost taken for one
-  implementation across CPUs.
-* **Xeon**: 6 losses at 1.04-1.12: `flash_attn_func` fp32 `512:32:128` and `129:16:128`
-  and bf16 `513:8:64`, and bf16 decode at batch 1, context 4096/4097.
+  pinning, wake-up policy and thread skew made no difference, and no C4D size offers a
+  hardware PMU (C4 and C4A do, `docs/Mojo.md` §9).
+* **Axion**: 4 losses, all decode: `out=` batch 1 at context 256 fp32 (1.15-1.18, ~5 us
+  calls), batch 8 at context 1023 bf16 (1.04) and batch-1 context 4096 fp32 (1.03). Every
+  bf16 `flash_attn_func` row wins; fp32 ties or wins (no losses): its NEON policy was folded
+  into the shared vector policy, now 2% slower than the dedicated one it replaced at head_dim
+  64 and ~13% at head_dim 32 (`docs/Mojo.md` §9), a cost taken for one implementation across
+  CPUs.
+* **Xeon**: 5 losses at 1.03-1.19: fp32 `flash_attn_func` `512:32:128` and `129:16:128`, and
+  decode fp32 batch 8 at context 1025, bf16 batch-1 context 4097 and `out=` bf16 batch 8 at
+  context 256.
 
 **Caveats.**
 * Rows bound by memory placement swing 20-30% with allocation order. The Xeon
