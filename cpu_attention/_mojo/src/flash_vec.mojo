@@ -292,8 +292,10 @@ def _softmax[
 @always_inline
 def _pv[
     dtype: DType, hd: Int, ROWS: Int
-](vsrc: Int, vstride: Int, k0: Int, nk: Int, logits: Int, acc: Int):
-    """acc[r] += p[r] @ V over `nk` keys, in passes of NV dim vectors."""
+](vsrc: Int, vstride: Int, k0: Int, nk: Int, logits: Int, acc: Int, alpha: Int, sub: Int):
+    """acc[r] = acc[r] * alpha[r] + p[r] @ V over `nk` keys, in passes of NV dim
+    vectors. The rescale rides the accumulator load, and a row tile's first key
+    tile (always k0 == 0) starts from zero: no separate rescale pass, no clear."""
     comptime BF = dtype == DType.bfloat16
     comptime NV = PV_VECS
     comptime DC = NV * LANES
@@ -303,10 +305,13 @@ def _pv[
 
     @always_inline
     def chunk(dc: Int) capturing:
-        var c = Array[V, ROWS * NV](uninitialized=True)
-        comptime for r in range(ROWS):
-            comptime for i in range(NV):
-                c[r * NV + i] = ap.unsafe_load[width=LANES](r * hd + dc + i * LANES)
+        var c = Array[V, ROWS * NV](fill=V(0))
+        if k0 > 0:
+            comptime for r in range(ROWS):
+                var a = ptr[Float32](alpha).unsafe_load(min(r, sub - 1))
+                comptime for i in range(NV):
+                    var x = ap.unsafe_load[width=LANES](r * hd + dc + i * LANES)
+                    c[r * NV + i] = x if a == 1.0 else x * a
         comptime if BF:
             # Key pairs: one `dpbf16ps` folds two keys x LANES dims (2.05x the
             # phase over fp32 FMA in the C++ measurement).
@@ -398,18 +403,7 @@ def _tile[
     else:
         _qk[dtype, hd, ROWS](job, kd, q0, job.qt, sub, k0, nk, limit0, aux, alpha)
     _softmax[dtype](aux, sub, nk, c, m, l, alpha)
-    var ap = ptr[Float32](alpha)
-    var acp = ptr[Float32](acc)
-    for r in range(sub):
-        var a = ap.unsafe_load(r)
-        # a == 1: no-op; a == 0: the row's first contributing tile, where the
-        # accumulator is still exactly 0.
-        if a != 1.0 and a != 0.0:
-            comptime for d in range(0, hd, LANES):
-                acp.unsafe_store[width=LANES](
-                    r * hd + d, acp.unsafe_load[width=LANES](r * hd + d) * a
-                )
-    _pv[dtype, hd, ROWS](vsrc, vstride, k0, nk, aux, acc)
+    _pv[dtype, hd, ROWS](vsrc, vstride, k0, nk, aux, acc, alpha, sub)
 
 
 struct VecPolicy[dtype: DType, hd: Int](FlashPolicy):
@@ -417,6 +411,7 @@ struct VecPolicy[dtype: DType, hd: Int](FlashPolicy):
     comptime HD = Self.hd
     comptime RQT = RQT
     comptime KT = KT
+    comptime ZEROES_ACC = True
 
     @staticmethod
     def slab_bytes(seq_k: Int) -> Int:
