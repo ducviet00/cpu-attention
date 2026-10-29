@@ -153,6 +153,20 @@ def exp2[
 
 
 @always_inline
+def transpose[dt: DType](mut r: Array[SIMD[dt, LANES], LANES]):
+    """LANES x LANES in registers (any 32-bit lane type): log2(LANES) rounds of
+    interleaving row i with row i + LANES/2."""
+    comptime ROUNDS = 4 if LANES == 16 else (3 if LANES == 8 else 2)
+    comptime for _s in range(ROUNDS):
+        var t = Array[SIMD[dt, LANES], LANES](uninitialized=True)
+        comptime for i in range(LANES // 2):
+            var w = r[i].interleave(r[i + LANES // 2])
+            t[2 * i] = w.slice[LANES, offset=0]()
+            t[2 * i + 1] = w.slice[LANES, offset=LANES]()
+        r = t^
+
+
+@always_inline
 def online_max[
     width: Int, degree: Int, slack: Float32 = 0.0
 ](m_old: SIMD[DType.float32, width], m_tile: SIMD[DType.float32, width]) -> Tuple[

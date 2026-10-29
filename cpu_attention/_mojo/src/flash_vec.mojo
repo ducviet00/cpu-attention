@@ -13,7 +13,7 @@ from std.math import iota
 from std.memory import bitcast
 
 from flash_attn import FlashJob, FlashPolicy, NEG, V
-from isa import BCAST_FOLD, LANES, dot_bf16, exp2, online_max, ptr, vmax
+from isa import BCAST_FOLD, LANES, dot_bf16, exp2, online_max, ptr, transpose, vmax
 
 comptime KP = 64  # keys per K^T block
 comptime KT = 256  # keys per softmax tile
@@ -48,20 +48,6 @@ def _k_off[dtype: DType, hd: Int](j: Int, d: Int) -> Int:
 # ---------------------------------------------------------------------------
 # pack
 # ---------------------------------------------------------------------------
-@always_inline
-def _transpose(mut r: Array[V, LANES]):
-    """LANES x LANES in registers: log2(LANES) rounds of interleaving row i
-    with row i + LANES/2."""
-    comptime ROUNDS = 4 if LANES == 16 else (3 if LANES == 8 else 2)
-    comptime for _s in range(ROUNDS):
-        var t = Array[V, LANES](uninitialized=True)
-        comptime for i in range(LANES // 2):
-            var w = r[i].interleave(r[i + LANES // 2])
-            t[2 * i] = w.slice[LANES, offset=0]()
-            t[2 * i + 1] = w.slice[LANES, offset=LANES]()
-        r = t^
-
-
 def _pack[dtype: DType, hd: Int](job: FlashJob, b: Int, kvh: Int, slab: Int):
     comptime E = 2 if dtype == DType.bfloat16 else 4
     comptime BF = dtype == DType.bfloat16
@@ -78,7 +64,7 @@ def _pack[dtype: DType, hd: Int](job: FlashJob, b: Int, kvh: Int, slab: Int):
                 r[i] = ks.unsafe_load[width=LANES]((t0 + i) * job.kt + d0).cast[
                     DType.float32
                 ]()
-            _transpose(r)
+            transpose[DType.float32](r)
             comptime if BF:
                 comptime for d in range(0, LANES, 2):
                     kd.unsafe_store[width = 2 * LANES](
