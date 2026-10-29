@@ -384,13 +384,19 @@ def _qk[
         var part = Array[V, R * G * CH](fill=V(0))
         comptime U = max(CH, 4)
         for d0 in range(0, hd, U):
+            # U query dims as one vector, then a lane each: NEON's by-element
+            # FMA (a scalar broadcast load per dim costs a load each there);
+            # x86 folds it into an embedded broadcast either way.
+            var qv = Array[SIMD[DType.float32, U], R](uninitialized=True)
+            comptime for r in range(R):
+                qv[r] = qf.unsafe_load[width=U](r * hd + d0)
             comptime for u in range(U):
                 var d = d0 + u
                 comptime for g in range(G):
                     var k = ptr[Float32](kb[g]).unsafe_load[width=LANES](d * page)
                     comptime for r in range(R):
                         comptime i = (r * G + g) * CH + u % CH
-                        part[i] = V(qf.unsafe_load(r * hd + d)).fma(k, part[i])
+                        part[i] = V(qv[r][u]).fma(k, part[i])
         comptime for rg in range(R * G):
             comptime if CH == 4:
                 cv[rg] = (part[rg * 4] + part[rg * 4 + 1]) + (part[rg * 4 + 2] + part[rg * 4 + 3])
@@ -399,19 +405,29 @@ def _qk[
                 comptime for c in range(1, CH):
                     sum += part[rg * CH + c]
                 cv[rg] = sum
-    comptime for g in range(G):
-        var key = j + g * LANES
-        comptime if MASK:
-            if key >= nk:
-                continue
-        comptime for r in range(R):
+    comptime assert G & (G - 1) == 0 and G <= 32, "G is a power of two"
+    comptime for r in range(R):
+        var t = Array[V, G](uninitialized=True)
+        comptime for g in range(G):
+            var key = j + g * LANES
             var v = cv[r * G + g]
             comptime if MASK:
                 if key + LANES > nk:
                     var lane = iota[DType.int32, LANES]() + Int32(key)
                     v = lane.lt(SIMD[DType.int32, LANES](Int32(nk))).select(v, V(-Float32.MAX))
-            mx[r] = vmax[LANES](mx[r], v)
-            logits.unsafe_store[width=LANES](r * KT + key, v)
+                if key < nk:
+                    logits.unsafe_store[width=LANES](r * KT + key, v)
+            else:
+                logits.unsafe_store[width=LANES](r * KT + key, v)
+            t[g] = v
+        # The call's max as a tree: a chain of G `vmax` after a 16-vector sweep
+        # sits on the softmax's critical path.
+        comptime for lvl in range(5):
+            comptime s = 16 >> lvl
+            comptime if s < G:
+                comptime for i in range(s):
+                    t[i] = vmax[LANES](t[i], t[i + s])
+        mx[r] = vmax[LANES](mx[r], t[0])
 
 
 @always_inline
@@ -491,9 +507,18 @@ def _pv[
     comptime for dc in range(0, hd, NC * LANES):
         var a = Array[V, LN * R * NC](fill=V(0))
         _acc_load[hd, R, NC, LANES, LN * R * NC](a, acc, dc, k0, alpha)
-        for g in range(D.UNITS if FULL else units):
-            var kv = D.UNIT if FULL else min(D.UNIT, nk - g * D.UNIT)
-            var t = 0  # keys done in this unit
+        # Units in a row of memory (all of a page past 16 keys) are one run, so
+        # the key loops are not cut every 16 keys (x86 pages are 32).
+        var g = 0
+        var gend = D.UNITS if FULL else units
+        while g < gend:
+            var g1 = g + 1
+            comptime if not FULL:
+                comptime RUN = D.UNIT * hd * D.E
+                while g1 < gend and Int(vbase.unsafe_load(g1)) == Int(vbase.unsafe_load(g1 - 1)) + RUN:
+                    g1 += 1
+            var kv = D.UNIT if FULL else min(g1 * D.UNIT, nk) - g * D.UNIT
+            var t = 0  # keys done in this run
             comptime if D.PAIRS:
                 # bf16 V key pairs `[key/2][hd][2]`: one load is LANES dims of a
                 # key pair, contracted against the pair's two probabilities.
@@ -599,6 +624,7 @@ def _pv[
                         comptime for r in range(R):
                             a[r * NC + i] = p0[r].fma(v0, a[r * NC + i])
                     t += 1
+            g = g1
         comptime for r in range(R):
             comptime for i in range(NC):
                 var s = a[r * NC + i]
