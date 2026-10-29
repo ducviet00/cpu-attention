@@ -78,14 +78,21 @@ def exp2[
     """`2^x` for `x <= 0`: round to nearest, a polynomial on the fraction, the
     integer part inserted into the exponent. About 9-10 instructions against
     `std.math.exp`'s ~22 (docs/Mojo.md §7). Inputs below -127 clamp, so a masked
-    lane (-inf) yields exactly 0 rather than NaN.
+    lane (-inf) yields exactly 0 rather than NaN (on NEON ~1e-38, see below).
 
     `degree` trades accuracy for instructions: 2 sits inside a bf16 rounding
     (relative 2e-3), 5 is a minimax at 3e-6, 6 (Taylor) at 1.2e-7 -- the paged
     fp32 gate (1e-6 absolute) needs 6.
     """
-    var xc = vmax(x, SIMD[DType.float32, width](-127.0))
+    # NEON takes the exponent from the bits of the magic-added value: `fcvt*`
+    # issues on one pipe at 1/cycle on Neoverse (measured), so converting n cost
+    # the fp32 flash softmax ~8%. The integer exponent add needs x >= -126 (a
+    # masked lane is then ~1e-38, not 0; fully masked rows are zeroed by the
+    # callers).
+    comptime NEON_EXP = CompilationTarget.has_neon()
+    var xc = vmax(x, SIMD[DType.float32, width](-126.0 if NEON_EXP else -127.0))
     var n: SIMD[DType.float32, width]
+    var y = SIMD[DType.float32, width](0)
     comptime if X86_BF16 and width == 16:
         var x16 = rebind[SIMD[DType.float32, 16]](xc)
         n = rebind[SIMD[DType.float32, width]](
@@ -97,7 +104,8 @@ def exp2[
         )
     else:
         comptime MAGIC = 12582912.0  # 1.5 * 2^23: adding it rounds to nearest
-        n = (xc + MAGIC) - MAGIC
+        y = xc + MAGIC
+        n = y - MAGIC
     var r = xc - n
     var p: SIMD[DType.float32, width]
     comptime if degree <= 2:
@@ -124,6 +132,10 @@ def exp2[
         p = p.fma(r, 2.4022651e-1)
         p = p.fma(r, 6.9314718e-1)
         p = p.fma(r, 1.0)
+    comptime if NEON_EXP:
+        return bitcast[DType.float32, width](
+            bitcast[DType.int32, width](p) + (bitcast[DType.int32, width](y) << 23)
+        )
     var e = (n.cast[DType.int32]() + 127) << 23
     return p * bitcast[DType.float32, width](e)
 
