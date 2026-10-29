@@ -25,7 +25,11 @@ Rules:
   identically: ours include the pack and the output allocation (except
   ``engine_out`` rows); vLLM's cache is staged and its output preallocated
   outside the timer.
-* Every timed arm's output is validated against the gates after timing.
+* Every timed arm's output is validated after timing: ours against the test
+  gates, a reference against the ``flash_attn_func`` gates (fp32 2e-4, bf16
+  3e-2; vLLM's bf16 decode is 1.8-2.3e-3 above the bf16 rounding on the Axion's
+  heterogeneous contexts, outside our 1e-3). vLLM on x86 takes no page size
+  that is not a multiple of 32; those rows have no reference.
 * ``ratio = mojo_new / reference``. A row is a ``win`` below ``1 - band`` with
   ``band = max(0.03, |ctrl/new - 1|)``, a ``loss`` above ``1 + band``, and
   ``unresolved`` in between; ``INVALID`` when ``mojo_new`` fails its gate.
@@ -328,6 +332,9 @@ def paged_row(r, arms_, vllm, args, page):
 
     def check(name):
         got = out[name].float()
+        if name == "vllm":  # a reference must be sane, not meet our gate
+            err = (got - ref).abs().max().item()
+            return err, err <= (2e-4 if r["dtype"] == "fp32" else 3e-2)
         if r["dtype"] == "fp32":
             err = (got - ref).abs().max().item()
             if err > 1e-6:
