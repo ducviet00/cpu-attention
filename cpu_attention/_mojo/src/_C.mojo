@@ -11,7 +11,7 @@ from std.os import abort
 from std.memory import bitcast
 from std.python import Python, PythonObject
 from std.python.bindings import PythonModuleBuilder
-from kvcache import PagedJob, paged_run
+from paged_attn import PagedJob, paged_run
 from flash_attn import FlashJob
 from dispatch import flash_run, flash_sizes as _flash_sizes
 from isa import amx_permitted, ptr, tier_name

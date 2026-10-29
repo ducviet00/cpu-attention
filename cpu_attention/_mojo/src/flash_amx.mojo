@@ -30,7 +30,7 @@ from std.sys import llvm_intrinsic
 
 from amx import tile_cfg_load, tile_dpbf16ps, tile_load, tile_store, tile_zero
 from flash_attn import FlashJob, FlashPolicy, NEG
-from isa import X86_BF16, exp2, ptr
+from isa import X86_BF16, bf16_lo, exp2, ptr, vmax
 
 comptime RQT = 32  # query rows per register tile
 comptime KSTEP = 32  # keys per Q@K^T / P@V step
@@ -52,16 +52,6 @@ def _pad(n: Int) -> Int:
 # ---------------------------------------------------------------------------
 # pack
 # ---------------------------------------------------------------------------
-@always_inline
-def _hi(x: V16) -> SIMD[BF16, 16]:
-    return x.cast[BF16]()
-
-
-@always_inline
-def _lo(x: V16, hi: SIMD[BF16, 16]) -> SIMD[BF16, 16]:
-    return (x - hi.cast[F]()).cast[BF16]()
-
-
 @always_inline
 def _row32(a: SIMD[BF16, 16], b: SIMD[BF16, 16]) -> I16:
     return bitcast[DType.int32, 16](a.join(b))
@@ -133,10 +123,10 @@ def _pack_k_block[
             else:
                 var f0 = ptr[Float32](s).unsafe_load[width=16](0)
                 var f1 = ptr[Float32](s).unsafe_load[width=16](16)
-                var h0 = _hi(f0)
-                var h1 = _hi(f1)
+                var h0 = f0.cast[BF16]()
+                var h1 = f1.cast[BF16]()
                 rows[i] = _row32(h0, h1)
-                rlo[i] = _row32(_lo(f0, h0), _lo(f1, h1))
+                rlo[i] = _row32(bf16_lo[16](f0, h0), bf16_lo[16](f1, h1))
         else:
             rows[i] = I16(0)
             rlo[i] = I16(0)
@@ -147,10 +137,10 @@ def _pack_k_block[
                 else:
                     var f0 = ptr[Float32](s).unsafe_load[width=16](0)
                     var f1 = ptr[Float32](s).unsafe_load[width=16](16)
-                    var h0 = _hi(f0)
-                    var h1 = _hi(f1)
+                    var h0 = f0.cast[BF16]()
+                    var h1 = f1.cast[BF16]()
                     rows[i] = _row32(h0, h1)
-                    rlo[i] = _row32(_lo(f0, h0), _lo(f1, h1))
+                    rlo[i] = _row32(bf16_lo[16](f0, h0), bf16_lo[16](f1, h1))
     var cols = _tp16(rows)
     comptime for i in range(16):
         dst.unsafe_store[width=16](i * 16, cols[i])
@@ -211,10 +201,10 @@ def _pack_v_block[
                     fa = ptr[Float32](vs + ka * vts + dc * 16 * E).unsafe_load[width=16](0)
                 if ka + 1 < job.seq_k:
                     fc = ptr[Float32](vs + (ka + 1) * vts + dc * 16 * E).unsafe_load[width=16](0)
-            var h0 = _hi(fa)
-            var h1 = _hi(fc)
+            var h0 = fa.cast[BF16]()
+            var h1 = fc.cast[BF16]()
             dst.unsafe_store[width=32](r * 32, h0.interleave(h1))
-            dst.unsafe_store[width=32](512 + r * 32, _lo(fa, h0).interleave(_lo(fc, h1)))
+            dst.unsafe_store[width=32](512 + r * 32, bf16_lo[16](fa, h0).interleave(bf16_lo[16](fc, h1)))
 
 
 @always_inline
@@ -235,44 +225,6 @@ def _pack_v[dtype: DType, hd: Int](job: FlashJob, b: Int, kvh: Int, slab: Int):
 # ---------------------------------------------------------------------------
 # exp2 and the bf16 probability store
 # ---------------------------------------------------------------------------
-@always_inline
-def _vmax[w: Int](a: SIMD[F, w], b: SIMD[F, w]) -> SIMD[F, w]:
-    """Lane max as one `vmaxps`. `max()` on SIMD floats is NaN-propagating and
-    compiles to compare + masked max + move (3 uops per vector, in the hottest
-    loop of the softmax); the logits are never NaN."""
-    return a.gt(b).select(a, b)
-
-
-@always_inline
-def _exp2v[fast: Bool](x: V16) -> V16:
-    """2^x for finite x <= ~16 (a masked lane is -1e30 and comes out exactly +0).
-    n = round(x) in one `vrndscaleps`, a polynomial on the fraction, and the
-    integer part applied by one `vscalefps` -- no clamp, no exponent shift/multiply
-    (7 uops against 9 for clamp + magic-number rounding + bit insert; 4-9% on the
-    whole call). `fast` is the bf16 form, a degree-2 polynomial (2.3e-3, under the
-    bf16 rounding that follows); fp32 keeps the degree-4 minimax (2.8e-6)."""
-    comptime if X86_BF16:
-        var n = llvm_intrinsic["llvm.x86.avx512.mask.rndscale.ps.512", V16, has_side_effect=False](
-            x, Int32(8), x, Int16(-1), Int32(4)
-        )
-        var r = x - n
-        var p: V16
-        comptime if fast:
-            p = r.fma(2.3473140e-1, 6.9335938e-1)
-            p = p.fma(r, 1.0)
-        else:
-            p = V16(9.582830106e-3)
-            p = p.fma(r, 5.590639966e-2)
-            p = p.fma(r, 2.402409885e-1)
-            p = p.fma(r, 6.931241964e-1)
-            p = p.fma(r, 1.0)
-        return llvm_intrinsic["llvm.x86.avx512.mask.scalef.ps.512", V16, has_side_effect=False](
-            p, n, V16(0), Int16(-1), Int32(4)
-        )
-    else:
-        return exp2[5, 16](x)  # this tier never runs the AMX policy
-
-
 # ---------------------------------------------------------------------------
 # Q@K^T
 # ---------------------------------------------------------------------------
@@ -307,10 +259,10 @@ def _q_operand[
                 else:
                     var f0 = ptr[Float32](s).unsafe_load[width=16](0)
                     var f1 = ptr[Float32](s).unsafe_load[width=16](16)
-                    var h0 = _hi(f0)
-                    var h1 = _hi(f1)
+                    var h0 = f0.cast[BF16]()
+                    var h1 = f1.cast[BF16]()
                     ph.unsafe_store[width=32](r * hd + dc * 32, h0.join(h1))
-                    pl.unsafe_store[width=32](r * hd + dc * 32, _lo(f0, h0).join(_lo(f1, h1)))
+                    pl.unsafe_store[width=32](r * hd + dc * 32, bf16_lo[16](f0, h0).join(bf16_lo[16](f1, h1)))
             else:
                 ph.unsafe_store[width=32](r * hd + dc * 32, SIMD[BF16, 32](0))
                 comptime if not BF:
@@ -401,7 +353,7 @@ def _qk[
 @always_inline
 def _op[is_max: Bool](a: V16, b: V16) -> V16:
     comptime if is_max:
-        return _vmax[16](a, b)
+        return vmax[16](a, b)
     else:
         return a + b
 
@@ -481,7 +433,7 @@ def _stats[
             var j = 0
             while j < n:
                 comptime for rr in range(4):
-                    mx[rr] = _vmax[16](mx[rr], ptr[Float32](lg + (rg + r4 + rr) * LS + j * 4).unsafe_load[width=16](0))
+                    mx[rr] = vmax[16](mx[rr], ptr[Float32](lg + (rg + r4 + rr) * LS + j * 4).unsafe_load[width=16](0))
                 j += 16
             comptime for rr in range(4):
                 rmax[r4 + rr] = mx[rr]
@@ -496,7 +448,7 @@ def _stats[
         var a = V16(1)
         var any = rescale.reduce_or()
         if any:
-            a = rescale.select(_exp2v[False](mo - mxv), V16(1))
+            a = rescale.select(exp2[4, 16](mo - mxv), V16(1))
             changed = True
         _st16(m + rg * 4, take.select(mxv, mo), valid)
         _st16(alpha + rg * 4, a, valid)
@@ -525,8 +477,8 @@ def _emit32[
     """P for 32 keys of one row (and its lo half for fp32); returns their sum."""
     comptime BF = dtype == DType.bfloat16
     var l = ptr[Float32](lp)
-    var e0 = _exp2v[BF](l.unsafe_load[width=16](0).fma(vc, nbase))
-    var e1 = _exp2v[BF](l.unsafe_load[width=16](16).fma(vc, nbase))
+    var e0 = exp2[2 if BF else 4, 16](l.unsafe_load[width=16](0).fma(vc, nbase))
+    var e1 = exp2[2 if BF else 4, 16](l.unsafe_load[width=16](16).fma(vc, nbase))
     var hh = _cvt2(e0, e1)
     ptr[BFloat16](pp).unsafe_store[width=32](0, hh)
     comptime if not BF:

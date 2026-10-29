@@ -9,7 +9,7 @@ from std.math import exp
 from std.memory import stack_allocation
 
 from isa import ptr
-from kvcache import PagedJob, paged_run
+from paged_attn import PagedJob, paged_run
 
 
 def _fill[dtype: DType](p: Int, n: Int, seed: Int) -> Int:

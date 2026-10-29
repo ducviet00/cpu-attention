@@ -76,69 +76,80 @@ def exp2[
     degree: Int, width: Int
 ](x: SIMD[DType.float32, width]) -> SIMD[DType.float32, width]:
     """`2^x` for `x <= 0`: round to nearest, a polynomial on the fraction, the
-    integer part inserted into the exponent. About 9-10 instructions against
-    `std.math.exp`'s ~22 (docs/Mojo.md §7). Inputs below -127 clamp, so a masked
-    lane (-inf) yields exactly 0 rather than NaN (on NEON ~1e-38, see below).
+    integer part applied to the exponent; the one exp of every kernel. About 7-10
+    instructions against `std.math.exp`'s ~22 (docs/Mojo.md §7). A masked lane
+    (-inf or -1e30) yields 0, never NaN (on NEON ~1e-38, see below).
 
     `degree` trades accuracy for instructions: 2 sits inside a bf16 rounding
-    (relative 2e-3), 4 and 5 are minimax at 2.6e-6 and 3e-6, 6 (Taylor) at
-    1.2e-7 -- the paged fp32 gate (1e-6 absolute) needs 6.
+    (relative 2e-3; the C++ class the 2-ulp x86 bf16 decode gate compares
+    against), 4 and 5 are minimax at 2.6e-6 and 3e-6, 6 (Taylor) at 1.2e-7 -- the
+    paged fp32 gate (1e-6 absolute) needs 6.
+
+    Per target, the round and the exponent:
+    * AVX-512: `vrndscaleps`, then `vscalefps` applies the integer part -- no
+      clamp, no exponent shift or multiply (7 uops against 9; 4-9% of an AMX
+      flash call).
+    * NEON: a magic-constant add rounds, and the exponent comes from that sum's
+      bits (`fcvt*` issues on one pipe at 1/cycle on Neoverse: ~8% of the fp32
+      flash softmax). The integer exponent add needs x >= -126, so a masked lane
+      is ~1e-38, not 0; fully masked rows are zeroed by the callers.
+    * otherwise: magic-constant round, x clamped at -127, exponent bits built from
+      the converted integer part.
     """
-    # NEON takes the exponent from the bits of the magic-added value: `fcvt*`
-    # issues on one pipe at 1/cycle on Neoverse (measured), so converting n cost
-    # the fp32 flash softmax ~8%. The integer exponent add needs x >= -126 (a
-    # masked lane is then ~1e-38, not 0; fully masked rows are zeroed by the
-    # callers).
+    comptime W = SIMD[DType.float32, width]
+    comptime SCALEF = X86_BF16 and width == 16
     comptime NEON_EXP = CompilationTarget.has_neon()
-    var xc = vmax(x, SIMD[DType.float32, width](-126.0 if NEON_EXP else -127.0))
-    var n: SIMD[DType.float32, width]
-    var y = SIMD[DType.float32, width](0)
-    comptime if X86_BF16 and width == 16:
-        var x16 = rebind[SIMD[DType.float32, 16]](xc)
-        n = rebind[SIMD[DType.float32, width]](
-            llvm_intrinsic[
-                "llvm.x86.avx512.mask.rndscale.ps.512",
-                SIMD[DType.float32, 16],
-                has_side_effect=False,
-            ](x16, Int32(8), x16, Int16(-1), Int32(4))
+
+    @always_inline
+    def poly(r: W) -> W:
+        var p: W
+        comptime if degree <= 2:
+            p = r.fma(2.3473140e-1, 6.9335938e-1)
+            p = p.fma(r, 1.0)
+        elif degree <= 4:
+            # Remez minimax on [-0.5, 0.5]: relative 2.6e-6, degree 5's class.
+            p = W(9.570101908e-3)
+            p = p.fma(r, 5.591786032e-2)
+            p = p.fma(r, 2.402474483e-1)
+            p = p.fma(r, 6.931218147e-1)
+            p = p.fma(r, 9.999992614e-1)
+        elif degree == 5:
+            p = W(1.3392112e-3)
+            p = p.fma(r, 9.6180963e-3)
+            p = p.fma(r, 5.5503282e-2)
+            p = p.fma(r, 2.4022652e-1)
+            p = p.fma(r, 6.9314718e-1)
+            p = p.fma(r, 1.0)
+        else:
+            p = W(1.5403530e-4)
+            p = p.fma(r, 1.3333558e-3)
+            p = p.fma(r, 9.6181291e-3)
+            p = p.fma(r, 5.5504109e-2)
+            p = p.fma(r, 2.4022651e-1)
+            p = p.fma(r, 6.9314718e-1)
+            p = p.fma(r, 1.0)
+        return p
+
+    comptime if SCALEF:
+        comptime V16 = SIMD[DType.float32, 16]
+        var x16 = rebind[V16](x)
+        var n16 = llvm_intrinsic["llvm.x86.avx512.mask.rndscale.ps.512", V16, has_side_effect=False](
+            x16, Int32(8), x16, Int16(-1), Int32(4)
         )
-    else:
-        comptime MAGIC = 12582912.0  # 1.5 * 2^23: adding it rounds to nearest
-        y = xc + MAGIC
-        n = y - MAGIC
-    var r = xc - n
-    var p: SIMD[DType.float32, width]
-    comptime if degree <= 2:
-        p = r.fma(2.3473140e-1, 6.9335938e-1)
-        p = p.fma(r, 1.0)
-    elif degree <= 4:
-        # Remez minimax on [-0.5, 0.5]: relative 2.6e-6, degree 5's class.
-        p = SIMD[DType.float32, width](9.570101908e-3)
-        p = p.fma(r, 5.591786032e-2)
-        p = p.fma(r, 2.402474483e-1)
-        p = p.fma(r, 6.931218147e-1)
-        p = p.fma(r, 9.999992614e-1)
-    elif degree == 5:
-        p = SIMD[DType.float32, width](1.3392112e-3)
-        p = p.fma(r, 9.6180963e-3)
-        p = p.fma(r, 5.5503282e-2)
-        p = p.fma(r, 2.4022652e-1)
-        p = p.fma(r, 6.9314718e-1)
-        p = p.fma(r, 1.0)
-    else:
-        p = SIMD[DType.float32, width](1.5403530e-4)
-        p = p.fma(r, 1.3333558e-3)
-        p = p.fma(r, 9.6181291e-3)
-        p = p.fma(r, 5.5504109e-2)
-        p = p.fma(r, 2.4022651e-1)
-        p = p.fma(r, 6.9314718e-1)
-        p = p.fma(r, 1.0)
+        var p16 = rebind[V16](poly(rebind[W](x16 - n16)))
+        return rebind[W](
+            llvm_intrinsic["llvm.x86.avx512.mask.scalef.ps.512", V16, has_side_effect=False](
+                p16, n16, V16(0), Int16(-1), Int32(4)
+            )
+        )
+    comptime MAGIC = 12582912.0  # 1.5 * 2^23: adding it rounds to nearest
+    var xc = vmax(x, W(-126.0 if NEON_EXP else -127.0))
+    var y = xc + MAGIC
+    var n = y - MAGIC
+    var p = poly(xc - n)
     comptime if NEON_EXP:
-        return bitcast[DType.float32, width](
-            bitcast[DType.int32, width](p) + (bitcast[DType.int32, width](y) << 23)
-        )
-    var e = (n.cast[DType.int32]() + 127) << 23
-    return p * bitcast[DType.float32, width](e)
+        return bitcast[DType.float32, width](bitcast[DType.int32, width](p) + (bitcast[DType.int32, width](y) << 23))
+    return p * bitcast[DType.float32, width]((n.cast[DType.int32]() + 127) << 23)
 
 
 @always_inline
@@ -180,6 +191,13 @@ def dot_bf16[
         return rebind[H](ea[0]).fma(
             rebind[H](eb[0]), rebind[H](ea[1]).fma(rebind[H](eb[1]), acc)
         )
+
+
+@always_inline
+def bf16_lo[width: Int](x: SIMD[DType.float32, width], hi: SIMD[DType.bfloat16, width]) -> SIMD[DType.bfloat16, width]:
+    """The low half of the bf16 split x ~ hi + lo (hi = x rounded to bf16): with
+    it, bf16 products (hi*hi + hi*lo + lo*hi) keep fp32 accuracy."""
+    return (x - hi.cast[DType.float32]()).cast[DType.bfloat16]()
 
 
 @always_inline

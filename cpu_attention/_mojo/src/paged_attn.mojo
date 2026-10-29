@@ -17,7 +17,7 @@ from std.math import iota
 from std.memory import bitcast, stack_allocation
 from std.sys.info import CompilationTarget
 
-from isa import BCAST_FOLD, LANES, LOG2E, dot_bf16, exp2, exp2s, ptr, vmax
+from isa import BCAST_FOLD, LANES, LOG2E, bf16_lo, dot_bf16, exp2, exp2s, ptr, vmax
 from parallel import barrier, parallel
 
 comptime V_PAIRS_ARM = CompilationTarget.has_neon()
@@ -585,7 +585,7 @@ struct PVPairs[hd: Int, R: Int](PVKernel):
         var hi = e.cast[DType.bfloat16]()
         ptr[BFloat16](pbuf).unsafe_store[width=W](i, hi)
         comptime if LO:
-            ptr[BFloat16](pbuf_lo).unsafe_store[width=W](i, (e - hi.cast[DType.float32]()).cast[DType.bfloat16]())
+            ptr[BFloat16](pbuf_lo).unsafe_store[width=W](i, bf16_lo(e, hi))
         if odd:  # the unpaired last key is an fp32 FMA
             ptr[Float32](logits).unsafe_store[width=W](i, e)
 

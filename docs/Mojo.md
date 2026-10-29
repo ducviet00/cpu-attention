@@ -39,7 +39,7 @@ by row family:
 ```
 _mojo/src/isa.mojo        tier flags, LANES, ptr, one exp2[degree], dot_bf16, AMX permission
 _mojo/src/parallel.mojo   one GOMP_parallel region on torch's OpenMP pool, barrier
-_mojo/src/kvcache.mojo    flash_attn_with_kvcache decode (one driver, `Decode` + `PVKernel`) + reshape_and_cache
+_mojo/src/paged_attn.mojo flash_attn_with_kvcache decode (one driver, `Decode` + `PVKernel`) + reshape_and_cache
 _mojo/src/flash_attn.mojo flash_attn_func: FlashJob, FlashPolicy trait, the generic driver
 _mojo/src/flash_vec.mojo  the vector policy (AVX-512 / AVX2 / NEON fp32, LANES-generic; target constants)
 _mojo/src/flash_amx.mojo  the AMX policy (bf16, fp32 as bf16 hi/lo), x86 only
@@ -93,7 +93,7 @@ rescans per query head). Groups are split into chunks only when there are fewer
 reads past `lens`, a negative slot skips its store, a zero-length context returns
 0. The page size is a compile-time constant for 16/32/48/64.
 
-**One decode driver for every tier** (`kvcache._attend_rows`). A softmax step of
+**One decode driver for every tier** (`paged_attn._attend_rows`). A softmax step of
 `KT` keys is resolved into 16-key units (page % 16 == 0, so a unit never
 straddles a page): one key vector on AVX-512, two on AVX2, four on NEON. Q@K^T
 scores `G` key vectors per call (independent dot chains) with a masked tail that
