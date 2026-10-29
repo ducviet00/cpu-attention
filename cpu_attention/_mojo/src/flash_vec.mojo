@@ -169,26 +169,33 @@ def _qk[
         else:
             var kp = ptr[Scalar[dtype]](kd)
             for d in range(0, hd, 4):
-                var qv = Array[SIMD[DType.float32, 4], ROWS](uninitialized=True)
-                comptime if not BCAST_FOLD:
+                comptime if BCAST_FOLD:
+                    comptime for u in range(4):
+                        var kv = Array[V, KV](uninitialized=True)
+                        comptime for i in range(KV):
+                            kv[i] = kp.unsafe_load[width=LANES](
+                                _k_off[dtype, hd](jj + i * LANES, d + u)
+                            ).cast[DType.float32]()
+                        comptime for r in range(ROWS):
+                            var rr = min(r, nrows - 1)
+                            var qs = Float32(ptr[Scalar[dtype]](q0 + rr * job.qt * 4).unsafe_load(d + u))
+                            comptime for i in range(KV):
+                                c[r * KV + i] = V(qs).fma(kv[i], c[r * KV + i])
+                else:
+                    # K for 4 dims first, then per row one 4-dim query vector
+                    # used by lane (one live query register).
+                    var kv = Array[V, 4 * KV](uninitialized=True)
+                    comptime for u in range(4):
+                        comptime for i in range(KV):
+                            kv[u * KV + i] = kp.unsafe_load[width=LANES](
+                                _k_off[dtype, hd](jj + i * LANES, d + u)
+                            ).cast[DType.float32]()
                     comptime for r in range(ROWS):
                         var rr = min(r, nrows - 1)
-                        qv[r] = ptr[Scalar[dtype]](q0 + rr * job.qt * 4).unsafe_load[width=4](d).cast[DType.float32]()
-                comptime for u in range(4):
-                    var kv = Array[V, KV](uninitialized=True)
-                    comptime for i in range(KV):
-                        kv[i] = kp.unsafe_load[width=LANES](
-                            _k_off[dtype, hd](jj + i * LANES, d + u)
-                        ).cast[DType.float32]()
-                    comptime for r in range(ROWS):
-                        var qs: Float32
-                        comptime if BCAST_FOLD:
-                            var rr = min(r, nrows - 1)
-                            qs = Float32(ptr[Scalar[dtype]](q0 + rr * job.qt * 4).unsafe_load(d + u))
-                        else:
-                            qs = qv[r][u]
-                        comptime for i in range(KV):
-                            c[r * KV + i] = V(qs).fma(kv[i], c[r * KV + i])
+                        var qv = ptr[Scalar[dtype]](q0 + rr * job.qt * 4).unsafe_load[width=4](d).cast[DType.float32]()
+                        comptime for u in range(4):
+                            comptime for i in range(KV):
+                                c[r * KV + i] = V(qv[u]).fma(kv[u * KV + i], c[r * KV + i])
         comptime for i in range(KV):
             var ji = jj + i * LANES
             if ji + LANES <= lim:
