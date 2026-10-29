@@ -277,6 +277,23 @@ the control by more than 3-5%.
 | fp32 scratch without the bf16 probability buffer | no change (104.6 vs 104.6 us) | kept for sizing only |
 | fp32 flash multi-thread gap on short shapes (before the fast path) | single-thread parity at every shape; 3-8% multi-thread, more L1/LLC misses, cause not found | open |
 
+**Axion decode ledger (c4a-standard-8, one process, independent control, vs `2fc4652`).**
+
+| idea | result | decision |
+|---|---|---|
+| NEON decode key tile `KT` 256 -> 64 (hd 64), 128 -> 64 (hd 128) | b=8 ctx=1024 bf16 0.986; d=128 cross 0.992 (within control) | reverted |
+| software prefetch of the next-but-one K and V page at each page crossing | b=8 ctx=1024 1.02, b=1 ctx=4096 bf16 1.06 / fp32 1.08 (slower) | reverted |
+| bf16 Q@K^T key groups per step G 8 -> 16 (ARM, R=1) | b=32 ctx=1024 1.001, b=8 ctx=256 1.047 | reverted |
+| recycle allocated decode outputs (ring checked by raw refcounts) | `engine` rows b=1 ctx=256 bf16 8.0 -> 6.5 us (C++ 8.1) | rejected: reads c10 refcounts from raw memory, unsafe |
+
+Findings. Plain `engine` rows lose to `engine_out` rows by the cost of `torch.empty_like`
+(0.7 us hot, 2-3 us in the interleaved harness; C++ allocates inside its extension, about
+1.4 us). Large-batch bf16 decode (b=8..32, ctx~1024, d=128, page 64, MQA h=16/1) streams
+16-67 MB per call at 60-150 GB/s and sits at 1.04-1.17 of C++ NEON; no loop-shape change
+tried moved it. Open: why C++'s 64-key K/V interleave streams better than the
+Mojo 256-key tile at b=32, and why MQA h=16/1 bf16 (92 us vs C++ 83, vLLM 39) is not
+compute-bound-efficient. Requests: none for the shared driver.
+
 Earlier campaigns' ledgers (`docs/CPP.md` §8 and the oracle's notes at
 `mojo-oracle-v1.1`) still apply; nothing on them was re-run without a new
 mechanism.
