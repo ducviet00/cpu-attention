@@ -11,13 +11,9 @@ and works as a standalone library.
   aligned) or not.
 * fp32 and bf16, MHA / MQA / GQA, head_dim 32/64/128, page size a multiple of
   16.
-* Two interchangeable backends behind one API:
-  * **C++** (`cpu_attention/csrc/`, [`docs/CPP.md`](docs/CPP.md));
-  * **Mojo** (`cpu_attention/_mojo/`, [`docs/Mojo.md`](docs/Mojo.md)).
-
-  `CPU_ATTENTION_BACKEND=mojo|cpp|auto` selects one. The default is `mojo`;
-  `auto` picks `cpp` on x86-64 and `mojo` on aarch64. Both load in one
-  process, so they can be A/B'd.
+* One kernel, written in Mojo (`cpu_attention/_mojo/`,
+  [`docs/Mojo.md`](docs/Mojo.md)): one driver per op for every CPU, a target
+  differing only by compile-time constants and a trait-plugged inner kernel.
 * Linux, PyTorch, Python >= 3.10.
 * Not supported, and rejected with `NotImplementedError` rather than silently
   ignored: rotary, ALiBi, softcap, sliding windows, varlen/packed QKV,
@@ -27,16 +23,14 @@ and works as a standalone library.
 
 ```bash
 uv sync --extra build                                    # torch + the mojo wheel
-uv run --extra build python scripts/build.py --tests     # Mojo: one _C_<tier>.so per ISA tier
-uv run --extra build python scripts/build_cpp.py --test  # C++ backend  -> cpu_attention/_C_cpp.so
+uv run --extra build python scripts/build.py --tests     # one _C_<tier>.so per ISA tier
 ```
 
-The Mojo build writes one shared object per ISA tier for the host architecture
+The build writes one shared object per ISA tier for the host architecture
 (x86-64: AVX-512-BF16 + AMX, AVX2, baseline; aarch64: BF16, NEON), each compiled
 for an explicit target rather than the build host. The loader picks the best
 tier the CPU reports; `CPU_ATTENTION_ISA=amx|vec|avx2|scalar|neon` forces one
-and is refused if the CPU lacks it. The C++ build links the installed torch, so
-rebuild it after a torch upgrade.
+and is refused if the CPU lacks it.
 
 ## Use
 
@@ -68,9 +62,8 @@ reshape_and_cache(k, v, k_cache, v_cache, slot_mapping)   # stage a cache
 
 Notes on the API:
 * **Cache layout.** The cache is this library's head-major layout (K is stored
-  transposed inside the page), and each backend defines its own. Stage a cache
-  through the *active* backend's `reshape_and_cache`; a cache written by one
-  backend is garbage to the other.
+  transposed inside the page). Stage a cache through `reshape_and_cache`; a
+  cache in another library's layout (vLLM's included) is not readable.
 * **Strides.** q/k/v may be strided chunks of a fused projection: any token
   stride, with heads and dims contiguous.
 * **`causal` on the paged path** is accepted and has no effect, because one
@@ -222,8 +215,7 @@ uv run python tests/test_regressions.py    # 412 checks: odd/unequal lengths, ma
 uv run python tests/test_amx.py --dtype both   # AMX policy (AMX CPUs; fails if AMX is present but unusable)
 ```
 
-The default backend is Mojo; prefix `CPU_ATTENTION_BACKEND=cpp` to test C++, and
-`CPU_ATTENTION_ISA=<tier>` to test a lower Mojo tier. The engine-level test
+Prefix `CPU_ATTENTION_ISA=<tier>` to test a lower tier. The engine-level test
 lives in fast-encdec: `PYTHONPATH=. .venv/bin/python tests/test_cpu_attention.py`
 (it passes strided chunks of a fused projection; 45 checks).
 
@@ -234,25 +226,22 @@ Accuracy gates (all pass on all three boxes):
 | `flash_attn_func` fp32 | <= 2e-4 vs the naive fp32 reference |
 | `flash_attn_func` bf16 | <= 3e-2 |
 | paged fp32 | <= 1e-6 (fp64 arbitrates an fp32 reference that is itself out of the gate) |
-| paged bf16, x86 | <= 2 bf16 ulp at the row peak vs C++ |
-| paged bf16, ARM | the same 2 ulp, and <= 1e-3 *above the bf16 output-rounding floor* |
+| paged bf16 | <= 1e-3 *above the bf16 output-rounding floor* |
 
-The ARM "<= 1e-3" is not met literally: rounding the exact result to bf16 alone
+The paged bf16 "<= 1e-3" is not met literally: rounding the exact result to bf16 alone
 exceeds 1e-3 on 77 of 252 sweep cases, so no bf16 output can satisfy an absolute
 1e-3. The tests check the excess over that floor (`tests/reference.py`); see
 `docs/Mojo.md` §5.
 
 ## Documentation
 
-* [`docs/CPP.md`](docs/CPP.md): the C++ backend's design, per-ISA techniques,
-  numerics, measurement rules, falsification ledger and open problems.
-* [`docs/Mojo.md`](docs/Mojo.md): the Mojo backend's design, ISA tiers,
+* [`docs/Mojo.md`](docs/Mojo.md): the kernel's design, ISA tiers,
   numerics, call path, defects found, falsification ledger and Mojo 1.2.0
   notes.
 * [`AGENTS.md`](AGENTS.md): working rules for anyone changing a kernel.
 
 ## License
 
-Apache-2.0. Both backends follow vLLM's `csrc/cpu` attention (Apache-2.0); the
+Apache-2.0. The kernel follows vLLM's `csrc/cpu` attention (Apache-2.0); the
 Python API mirrors [flash-attention](https://github.com/Dao-AILab/flash-attention)
 (BSD-3).
