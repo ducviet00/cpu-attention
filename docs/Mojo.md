@@ -242,6 +242,7 @@ the control by more than 3-5%.
 | Xeon fp32 decode b=8 ctx~1024 "losses" | Mojo == C++ single-thread (17.2 vs 17.1 us/head), 4 threads (562 vs 562 us), cold cache (~600 us both) and 7-cache rotation (977 vs 930); `--load-seed` 1-4 gave 0.82-1.04 with control spreads of 17-31% | placement noise, not code |
 | harness verdict band includes the spread of C++'s identical-code `amx` and `vec` paged arms | Xeon 67/61/42 -> 64/76/30 (win/unresolved/loss); no other box has such twins | kept |
 | `bench.py` memory growth | closures kept every arm's K/V cache alive until a GC pass: 8.1 GB RSS and an OOM kill at row 156 of 170 on an 11.6 GB machine; `gc.collect()` per row and `--resume` | fixed |
+| AMX partial query tile: configure only the live A/C rows (Xeon) | the hardware is cheaper with fewer rows (isolated tile-dot microbenchmark: 1-4 rows 3.0 ns, 8 rows 3.2, 16 rows 5.2 ns), but building the configuration from runtime row counts changed the full-row code: fp32 1024:8:32 1.125, 1025:8:32 1.080, fused 1024:8:64 1.104 against an independent previous build; one win (fp32 17x301, 0.94, where the vector policy is faster anyway) | rejected; next try would keep the constant full-tile configuration and patch only the row bytes on a tail |
 
 **Axion decode ledger (c4a-standard-8, one process, independent control, vs `2fc4652`).**
 

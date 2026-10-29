@@ -8,3 +8,4 @@ dist/
 .venv
 reports/
 research_notes/
+.claude/

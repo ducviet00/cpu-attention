@@ -18,7 +18,8 @@ cpu_attention/csrc/         C++ backend  -> _C_cpp.so  (scripts/build_cpp.py)
 cpu_attention/_mojo/        Mojo backend -> _C.so      (scripts/build.py)
 tests/                      correctness: test_dense, test_flash_api, fuzz_dense, test_paged_sweep,
                             test_regressions (odd/unequal lengths, poisoned caches, strides, scale,
-                            workers, concurrency, ...), test_amx; reference.py = naive references
+                            workers, concurrency, ...), test_amx, test_benchmark_protocol (harness
+                            validation and controls); reference.py = naive references
 benchmarks/manifest.py      the fixed 170-row performance manifest (do not edit it to change a score)
 benchmarks/bench.py         the benchmark: unified Mojo vs every C++ ISA path vs vLLM vs SDPA, one process
 benchmarks/arms.py          independently loaded copies of the package (the controls)
