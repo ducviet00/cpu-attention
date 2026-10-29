@@ -18,7 +18,11 @@ from isa import BCAST_FOLD, LANES, dot_bf16, exp2, exp2s, ptr, vmax
 comptime KP = 64  # keys per K^T block
 comptime KT = 256  # keys per softmax tile
 comptime RQT = 8  # query rows per register tile
-comptime PV_VECS = 2  # dim vectors per P@V pass: 1 was 1.28x slower at hd=128 fp32 (V re-read)
+comptime PV_VECS = 2  # fp32 dim vectors per P@V pass: 1 was 1.28x slower at hd=128 fp32 (V re-read)
+comptime PV_VECS_BF = 1
+"""bf16 P@V covers one dim vector per pass, so each probability-pair broadcast
+feeds one `dot_bf16` and folds into it (`vdpbf16ps ... {1to16}`); at 2 it was a
+separate `vbroadcastss` per row and key pair, ~16% of a bf16 flash call."""
 comptime KV32 = max(1, 8 // LANES)
 """fp32 key vectors per Q@K^T pass: at least 8 keys, so 4-lane NEON keeps
 RQT x 2 = 16 independent FMA chains (4 pipes x 4 cycles on Neoverse-V2)."""
@@ -297,7 +301,7 @@ def _pv[
     vectors. The rescale rides the accumulator load, and a row tile's first key
     tile (always k0 == 0) starts from zero: no separate rescale pass, no clear."""
     comptime BF = dtype == DType.bfloat16
-    comptime NV = PV_VECS
+    comptime NV = PV_VECS_BF if BF else PV_VECS
     comptime DC = NV * LANES
     var ap = ptr[Float32](acc)
     var lg = ptr[Float32](logits)
