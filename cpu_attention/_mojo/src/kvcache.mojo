@@ -267,7 +267,7 @@ def _attend_rows[
             (4 if R == 1 else (2 if R == 2 else 1))
             if (dtype == DType.float32 and V_PAIRS_ARM)
             else (
-                (4 if R == 1 else 1)
+                1
                 if dtype == DType.float32
                 else (
                     (8 if V_PAIRS_ARM else 4)
