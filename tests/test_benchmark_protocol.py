@@ -45,7 +45,7 @@ class ProtocolTests(unittest.TestCase):
         arm = SimpleNamespace(name="cpp_fake", pkg=NoopPackage(), enter=lambda: None, env={})
         row = dict(b=1, h=1, hkv=1, d=32, ctx=1, entry="store", op="store", dtype="fp32")
         args = SimpleNamespace(ref_arm=arm.name, paged_rounds=1, block_calls=1)
-        fns, check, _, _ = bench.paged_row(row, [arm], {}, args, 16)
+        fns, check, _, _, _ = bench.paged_row(row, [arm], {}, args, 16)
         fns[arm.name]()
         self.assertFalse(check([arm.name])[arm.name][1])
 
@@ -54,13 +54,24 @@ class ProtocolTests(unittest.TestCase):
         good = SimpleNamespace(name="cpp_scalar", pkg=OneTokenPackage(), enter=lambda: None)
         row = dict(b=1, h=1, hkv=1, d=32, ctx=1, entry="engine", op="cross", dtype="bf16")
         args = SimpleNamespace(ref_arm=bad.name, paged_rounds=1, block_calls=1)
-        fns, check, _, _ = bench.paged_row(row, [bad, good], {}, args, 16)
+        fns, check, _, _, ws = bench.paged_row(row, [bad, good], {}, args, 16)
         for fn in fns.values():
             fn()
         valid = check(list(fns))
         self.assertFalse(valid[bad.name][1])
         self.assertTrue(valid[good.name][1])
         self.assertEqual(check.peer, good.name)
+        self.assertEqual(ws, 2 * 1 * 1 * 32 * 2)  # one arm's K + V bytes: ctx x hkv x d x bf16
+
+    def test_cold_sweep_runs_before_every_sample(self):
+        events = []
+        fns = {n: (lambda n=n: events.append(n)) for n in ("a", "b")}
+        envs = {n: (lambda: None) for n in fns}
+        samples = bench.time_arms(fns, envs, rounds=3, calls=1, warmup=0,
+                                  sweep=lambda: events.append("sweep"))
+        self.assertEqual({n: len(x) for n, x in samples.items()}, {"a": 3, "b": 3})
+        self.assertEqual(events, ["sweep", "a", "sweep", "b", "sweep", "b", "sweep", "a",
+                                  "sweep", "a", "sweep", "b"])
 
     def test_previous_has_independent_duplicate(self):
         args = SimpleNamespace(arms="mojo_new,mojo_ctrl", previous="/saved/package", load_seed=0)
