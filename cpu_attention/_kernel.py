@@ -853,10 +853,10 @@ def _flash_plan(geom, k, causal, scale):
         # At least ~8 work items per worker: causal blocks differ in cost, and at
         # 4 per worker the tail cost 1024:8:32 10-11% at 16 threads (Axion, both
         # dtypes). Halve rq, down to one register-tile pair.
-        floor, cap = (64 if isa == 1 else 16), _workers(1 << 30)
-        while rq > floor and batch * heads * -(-seq_q // rq) < 8 * cap:
-            rq //= 2
         rq = min(rq, max(seq_q, 1))
+        floor, cap = (64 if isa == 1 else 16), _workers(1 << 30)
+        while rq // 2 >= floor and batch * heads * -(-seq_q // rq) < 8 * cap:
+            rq //= 2
         nqb = -(-seq_q // rq)
         workers = _workers(batch * heads * nqb, 8)
         slab, aux = _entry("flash_sizes")(seq_k, rq, hd, dt, isa)
