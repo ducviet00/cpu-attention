@@ -237,13 +237,9 @@ struct Decode[dtype: DType, hd: Int, R: Int]:
     """Partial row sums in the softmax (independent adds on 4-lane NEON)."""
     comptime FULL = V_PAIRS_ARM and Self.R == 1
     """A full R == 1 step gets its own P@V body with constant unit lengths."""
-    comptime NC = (Self.hd // LANES) if Self.R * Self.hd // LANES <= 16 else max(
-        2 if PageLayout[Self.dtype, Self.hd].SPLIT else 1, 16 // Self.R
-    )
-    """P@V dim vectors per register chunk: R x NC accumulators stay in registers."""
-    comptime LN = 2 if (not Self.PAIRS and Self.R * Self.NC <= 8) else 1
-    """Key-parity accumulators while the tile is small: even and odd keys feed
-    independent FMA chains (one chain per dim vector is latency bound at R=1)."""
+    comptime NC = _nc(Self.dtype, Self.hd, Self.R)
+    comptime PV: PVKernel = PVPairs[Self.hd, Self.R] if Self.PAIRS else PVRows[Self.dtype, Self.hd, Self.R]
+    """The P@V kernel: the only per-target code in the driver."""
 
 
 @always_inline
@@ -430,50 +426,226 @@ def _qk[
         mx[r] = vmax[LANES](mx[r], t[0])
 
 
+trait PVKernel:
+    """How a step keeps its probabilities and contracts them with V: the one
+    per-target piece of the decode driver (`Decode.PV`), as `InnerMatmulKernel`
+    is for Modular's matmul."""
+
+    comptime P16: Bool
+    """Probabilities are also kept as bf16 (`pbuf`, and `pbuf_lo` when LO)."""
+    comptime LN: Int
+    """Key-parity accumulator sets per dim vector."""
+
+    @staticmethod
+    def store_p[LO: Bool](e: SIMD[DType.float32, LANES], logits: Int, pbuf: Int, pbuf_lo: Int, i: Int, odd: Bool):
+        """Keep the probabilities `e` of keys i .. i+LANES-1 (`odd`: the step has
+        an odd number of keys)."""
+        ...
+
+    @staticmethod
+    def keys[N: Int, FULL: Bool](
+        mut a: Array[SIMD[DType.float32, LANES], N], vb: Int, dc: Int, p: Int, pbuf: Int, pbuf_lo: Int,
+        kf: Int, kv: Int, len: Int,
+    ):
+        """a += P[:, kf : kf+kv] @ V for the dims from `dc`, over a run of kv keys
+        contiguous from address `vb` (FULL: one 16-key unit)."""
+        ...
+
+
+def _nc(dtype: DType, hd: Int, R: Int) -> Int:
+    """P@V dim vectors per register chunk: R x NC accumulators stay in registers."""
+    if R * hd // LANES <= 16:
+        return hd // LANES
+    var split = dtype == DType.bfloat16 and not V_PAIRS_ARM and hd % (2 * LANES) == 0
+    return max(2 if split else 1, 16 // R)
+
+
+struct PVRows[dtype: DType, hd: Int, R: Int](PVKernel):
+    """fp32 P against V rows `[key][hd]` (bf16 V widened): x86, the C++ class of
+    the 2-ulp bf16 gate."""
+
+    comptime P16 = False
+    comptime NC = _nc(Self.dtype, Self.hd, Self.R)
+    comptime LN = 2 if Self.R * Self.NC <= 8 else 1
+    """Even and odd keys feed independent FMA chains while the tile is small
+    (one chain per dim vector is latency bound at R=1)."""
+
+    @staticmethod
+    @always_inline
+    def store_p[LO: Bool](e: SIMD[DType.float32, LANES], logits: Int, pbuf: Int, pbuf_lo: Int, i: Int, odd: Bool):
+        ptr[Float32](logits).unsafe_store[width=LANES](i, e)
+
+    @staticmethod
+    @always_inline
+    def keys[N: Int, FULL: Bool](
+        mut a: Array[SIMD[DType.float32, LANES], N], vb: Int, dc: Int, p: Int, pbuf: Int, pbuf_lo: Int,
+        kf: Int, kv: Int, len: Int,
+    ):
+        comptime V = SIMD[DType.float32, LANES]
+        comptime KT = _kt(Self.hd, Self.R)
+        comptime NC = Self.NC
+        comptime SPLIT = PageLayout[Self.dtype, Self.hd].SPLIT
+        var vp = ptr[Scalar[Self.dtype]](vb + dc * (2 if Self.dtype == DType.bfloat16 else 4))
+        var pk = ptr[Float32](p) + kf
+
+        @always_inline
+        def vrow(t: Int, i: Int) capturing -> V:
+            comptime if SPLIT:
+                # Dims are kept even/odd-split per 2*LANES block: one 64-byte
+                # load is LANES words; `<< 16` is the even dims and
+                # `& 0xffff0000` the odd ones, 2 instructions per 32 values
+                # against 4 for zero-extend + shift (the widen was 28% of a bf16
+                # decode). Each dim's fp32 math is unchanged.
+                var w = bitcast[DType.int32, LANES]((vp + t * Self.hd).unsafe_load[width = 2 * LANES]((i // 2) * 2 * LANES))
+                if i % 2 == 0:
+                    return bitcast[DType.float32, LANES](w << 16)
+                return bitcast[DType.float32, LANES](w & Int32(-65536))
+            else:
+                return (vp + t * Self.hd).unsafe_load[width=LANES](i * LANES).cast[DType.float32]()
+
+        var t = 0
+        comptime if Self.LN == 2:
+            while t + 1 < kv:
+                var p0 = Array[V, Self.R](uninitialized=True)
+                var p1 = Array[V, Self.R](uninitialized=True)
+                comptime for r in range(Self.R):
+                    p0[r] = V(pk.unsafe_load(r * KT + t))
+                    p1[r] = V(pk.unsafe_load(r * KT + t + 1))
+                comptime for i in range(NC):
+                    var v0 = vrow(t, i)
+                    var v1 = vrow(t + 1, i)
+                    comptime for r in range(Self.R):
+                        a[r * NC + i] = p0[r].fma(v0, a[r * NC + i])
+                        a[(Self.R + r) * NC + i] = p1[r].fma(v1, a[(Self.R + r) * NC + i])
+                t += 2
+        while t < kv:
+            var p0 = Array[V, Self.R](uninitialized=True)
+            comptime for r in range(Self.R):
+                p0[r] = V(pk.unsafe_load(r * KT + t))
+            comptime for i in range(NC):
+                var v0 = vrow(t, i)
+                comptime for r in range(Self.R):
+                    a[r * NC + i] = p0[r].fma(v0, a[r * NC + i])
+            t += 1
+
+
+struct PVPairs[hd: Int, R: Int](PVKernel):
+    """bf16 P against bf16 V key pairs `[key/2][hd][2]` with `dot_bf16`
+    (`bfdot`): one load is LANES dims of a key pair, contracted against the
+    pair's two probabilities. aarch64, where widening V was 70% of the kernel."""
+
+    comptime P16 = True
+    comptime NC = _nc(DType.bfloat16, Self.hd, Self.R)
+    comptime LN = 1
+
+    @staticmethod
+    @always_inline
+    def store_p[LO: Bool](e: SIMD[DType.float32, LANES], logits: Int, pbuf: Int, pbuf_lo: Int, i: Int, odd: Bool):
+        var hi = e.cast[DType.bfloat16]()
+        ptr[BFloat16](pbuf).unsafe_store[width=LANES](i, hi)
+        comptime if LO:
+            ptr[BFloat16](pbuf_lo).unsafe_store[width=LANES](i, (e - hi.cast[DType.float32]()).cast[DType.bfloat16]())
+        if odd:  # the unpaired last key is an fp32 FMA
+            ptr[Float32](logits).unsafe_store[width=LANES](i, e)
+
+    @staticmethod
+    @always_inline
+    def keys[N: Int, FULL: Bool](
+        mut a: Array[SIMD[DType.float32, LANES], N], vb: Int, dc: Int, p: Int, pbuf: Int, pbuf_lo: Int,
+        kf: Int, kv: Int, len: Int,
+    ):
+        comptime V = SIMD[DType.float32, LANES]
+        comptime B = SIMD[DType.bfloat16, 2 * LANES]
+        comptime KT = _kt(Self.hd, Self.R)
+        comptime NC = Self.NC
+        var vbg = vb + dc * 4
+        var w0 = kf >> 1
+        var pw = ptr[Int32](pbuf)  # one bf16 key pair per word
+        var plw = ptr[Int32](pbuf_lo)
+
+        @always_inline
+        def prob(w: MutPointer[Int32, _], r: Int, t: Int) capturing -> B:
+            return bitcast_bf16[LANES](SIMD[DType.int32, LANES](w.unsafe_load(r * (KT // 2) + w0 + (t >> 1))))
+
+        var t = 0
+        if len >= 128:
+            comptime if Self.R == 1:
+                # Two key pairs per step.
+                while t + 3 < kv:
+                    var p0 = prob(pw, 0, t)
+                    var p1 = prob(pw, 0, t + 2)
+                    var vp0 = ptr[BFloat16](vbg + t * Self.hd * 2)
+                    var vp1 = ptr[BFloat16](vbg + (t + 2) * Self.hd * 2)
+                    comptime for i in range(NC):
+                        a[i] = dot_bf16[LANES](a[i], vp0.unsafe_load[width = 2 * LANES](i * 2 * LANES), p0)
+                    comptime for i in range(NC):
+                        a[i] = dot_bf16[LANES](a[i], vp1.unsafe_load[width = 2 * LANES](i * 2 * LANES), p1)
+                    t += 4
+            while t + 1 < kv:
+                var pr = Array[B, Self.R](uninitialized=True)
+                comptime for r in range(Self.R):
+                    pr[r] = prob(pw, r, t)
+                var vp = ptr[BFloat16](vbg + t * Self.hd * 2)
+                comptime for i in range(NC):
+                    var v = vp.unsafe_load[width = 2 * LANES](i * 2 * LANES)
+                    comptime for r in range(Self.R):
+                        a[r * NC + i] = dot_bf16[LANES](a[r * NC + i], v, pr[r])
+                t += 2
+        else:
+            # Short contexts can have one dominant key, where single-bf16 P
+            # misses the 1e-3 gate: add P's low bf16 residual.
+            while t + 1 < kv:
+                var pr = Array[B, Self.R](uninitialized=True)
+                var lo = Array[B, Self.R](uninitialized=True)
+                comptime for r in range(Self.R):
+                    pr[r] = prob(pw, r, t)
+                    lo[r] = prob(plw, r, t)
+                var vp = ptr[BFloat16](vbg + t * Self.hd * 2)
+                comptime for i in range(NC):
+                    var v = vp.unsafe_load[width = 2 * LANES](i * 2 * LANES)
+                    comptime for r in range(Self.R):
+                        a[r * NC + i] = dot_bf16[LANES](a[r * NC + i], v, pr[r])
+                        a[r * NC + i] = dot_bf16[LANES](a[r * NC + i], v, lo[r])
+                t += 2
+        comptime if not FULL:
+            if t < kv:
+                # The unpaired last key: only its half of the pair (0 * a padded
+                # NaN is still NaN).
+                var vp = ptr[BFloat16](vbg + t * Self.hd * 2)
+                comptime for i in range(NC):
+                    var v = rebind[V](vp.unsafe_load[width = 2 * LANES](i * 2 * LANES).cast[DType.float32]().deinterleave()[0])
+                    comptime for r in range(Self.R):
+                        a[r * NC + i] = V(ptr[Float32](p).unsafe_load(r * KT + kf + t)).fma(v, a[r * NC + i])
+
+
 @always_inline
 def _exp_row[
-    NS: Int, DEG: Int, PAIRS: Bool, LO: Bool
-](
-    logits: MutPointer[Float32, _],
-    pbuf: MutPointer[BFloat16, _],
-    pbuf_lo: MutPointer[BFloat16, _],
-    row: Int,
-    nk: Int,
-    c: Float32,
-    mn: Float32,
-) -> Float32:
-    """p = 2^(logit*c - mn) for one row of a step; returns the row sum. PAIRS:
-    bf16 P (+ its low residual when LO) for `dot_bf16`, and fp32 P only for an
-    odd step, whose unpaired last key is an fp32 FMA. Otherwise fp32 P in place."""
+    dtype: DType, hd: Int, R: Int, LO: Bool
+](logits: Int, pbuf: Int, pbuf_lo: Int, row: Int, nk: Int, c: Float32, mn: Float32) -> Float32:
+    """p = 2^(logit*c - mn) for one row of a step, kept by `Decode.PV`; returns
+    the row sum (NS partial sums)."""
+    comptime D = Decode[dtype, hd, R]
     comptime V = SIMD[DType.float32, LANES]
-    var s = Array[V, NS](fill=V(0))
+    var lg = ptr[Float32](logits)
+    var odd = (nk & 1) == 1
+    var s = Array[V, D.NS](fill=V(0))
 
     @always_inline
     def one(t: Int) capturing -> V:
-        var e = exp2[DEG, LANES](logits.unsafe_load[width=LANES](row + t).fma(V(c), V(-mn)))
-        comptime if PAIRS:
-            var hi = e.cast[DType.bfloat16]()
-            pbuf.unsafe_store[width=LANES](row + t, hi)
-            comptime if LO:
-                pbuf_lo.unsafe_store[width=LANES](
-                    row + t, (e - hi.cast[DType.float32]()).cast[DType.bfloat16]()
-                )
-            if (nk & 1) == 1:
-                logits.unsafe_store[width=LANES](row + t, e)
-        else:
-            logits.unsafe_store[width=LANES](row + t, e)
+        var e = exp2[D.DEG, LANES](lg.unsafe_load[width=LANES](row + t).fma(V(c), V(-mn)))
+        D.PV.store_p[LO](e, logits, pbuf, pbuf_lo, row + t, odd)
         return e
 
     var t = 0
-    while t + NS * LANES <= nk:
-        comptime for u in range(NS):
+    while t + D.NS * LANES <= nk:
+        comptime for u in range(D.NS):
             s[u] += one(t + u * LANES)
-        t += NS * LANES
+        t += D.NS * LANES
     while t < nk:
         s[0] += one(t)
         t += LANES
     var sum = s[0]
-    comptime for u in range(1, NS):
+    comptime for u in range(1, D.NS):
         sum += s[u]
     return sum.reduce_add()
 
@@ -482,33 +654,20 @@ def _exp_row[
 def _pv[
     dtype: DType, hd: Int, R: Int, FULL: Bool
 ](
-    k0: Int,
-    nk: Int,
-    len: Int,
-    units: Int,
-    alpha: SIMD[DType.float32, R],
-    vbase: MutPointer[Int64, _],
-    pbuf: MutPointer[BFloat16, _],
-    pbuf_lo: MutPointer[BFloat16, _],
-    p: MutPointer[Float32, _],
-    acc: MutPointer[Float32, _],
+    k0: Int, nk: Int, len: Int, units: Int, alpha: SIMD[DType.float32, R], vbase: MutPointer[Int64, _],
+    pbuf: Int, pbuf_lo: Int, p: Int, acc: MutPointer[Float32, _],
 ):
     """acc[r] = acc[r]*alpha[r] + sum_j P[r][j] * V[k0+j] over exactly nk keys
-    (never past `len`: 0 * a padded NaN is NaN), unit by unit (FULL: all units
-    of a step, 16 keys each), NC dim vectors at a time."""
+    (never past `len`: 0 * a padded NaN is NaN), NC dim vectors at a time, in
+    runs of units contiguous in memory (all of a page past 16 keys, so the key
+    loops are not cut every 16 keys; FULL: every unit of a step, 16 keys each)."""
     comptime D = Decode[dtype, hd, R]
-    comptime L = PageLayout[dtype, hd]
     comptime V = SIMD[DType.float32, LANES]
-    comptime KT = D.KT
     comptime NC = D.NC
-    comptime LN = D.LN
-    var pw = ptr[Int32](Int(pbuf))  # one bf16 key pair per word
-    var plw = ptr[Int32](Int(pbuf_lo))
+    comptime LN = D.PV.LN
     comptime for dc in range(0, hd, NC * LANES):
         var a = Array[V, LN * R * NC](fill=V(0))
         _acc_load[hd, R, NC, LANES, LN * R * NC](a, acc, dc, k0, alpha)
-        # Units in a row of memory (all of a page past 16 keys) are one run, so
-        # the key loops are not cut every 16 keys (x86 pages are 32).
         var g = 0
         var gend = D.UNITS if FULL else units
         while g < gend:
@@ -518,112 +677,7 @@ def _pv[
                 while g1 < gend and Int(vbase.unsafe_load(g1)) == Int(vbase.unsafe_load(g1 - 1)) + RUN:
                     g1 += 1
             var kv = D.UNIT if FULL else min(g1 * D.UNIT, nk) - g * D.UNIT
-            var t = 0  # keys done in this run
-            comptime if D.PAIRS:
-                # bf16 V key pairs `[key/2][hd][2]`: one load is LANES dims of a
-                # key pair, contracted against the pair's two probabilities.
-                var vbg = Int(vbase.unsafe_load(g)) + dc * 4
-                var w0 = g * (D.UNIT // 2)
-
-                @always_inline
-                def prob(w: MutPointer[Int32, _], r: Int, t: Int) capturing -> SIMD[DType.bfloat16, 2 * LANES]:
-                    return bitcast_bf16[LANES](SIMD[DType.int32, LANES](w.unsafe_load(r * (KT // 2) + w0 + (t >> 1))))
-
-                if len >= 128:
-                    comptime if R == 1:
-                        # Two key pairs per step.
-                        while t + 3 < kv:
-                            var p0 = prob(pw, 0, t)
-                            var p1 = prob(pw, 0, t + 2)
-                            var vp0 = ptr[BFloat16](vbg + t * hd * 2)
-                            var vp1 = ptr[BFloat16](vbg + (t + 2) * hd * 2)
-                            comptime for i in range(NC):
-                                a[i] = dot_bf16[LANES](a[i], vp0.unsafe_load[width = 2 * LANES](i * 2 * LANES), p0)
-                            comptime for i in range(NC):
-                                a[i] = dot_bf16[LANES](a[i], vp1.unsafe_load[width = 2 * LANES](i * 2 * LANES), p1)
-                            t += 4
-                    while t + 1 < kv:
-                        var pr = Array[SIMD[DType.bfloat16, 2 * LANES], R](uninitialized=True)
-                        comptime for r in range(R):
-                            pr[r] = prob(pw, r, t)
-                        var vp = ptr[BFloat16](vbg + t * hd * 2)
-                        comptime for i in range(NC):
-                            var v = vp.unsafe_load[width = 2 * LANES](i * 2 * LANES)
-                            comptime for r in range(R):
-                                a[r * NC + i] = dot_bf16[LANES](a[r * NC + i], v, pr[r])
-                        t += 2
-                else:
-                    # Short contexts can have one dominant key, where single-bf16
-                    # P misses the 1e-3 gate: add P's low bf16 residual.
-                    while t + 1 < kv:
-                        var pr = Array[SIMD[DType.bfloat16, 2 * LANES], R](uninitialized=True)
-                        var lo = Array[SIMD[DType.bfloat16, 2 * LANES], R](uninitialized=True)
-                        comptime for r in range(R):
-                            pr[r] = prob(pw, r, t)
-                            lo[r] = prob(plw, r, t)
-                        var vp = ptr[BFloat16](vbg + t * hd * 2)
-                        comptime for i in range(NC):
-                            var v = vp.unsafe_load[width = 2 * LANES](i * 2 * LANES)
-                            comptime for r in range(R):
-                                a[r * NC + i] = dot_bf16[LANES](a[r * NC + i], v, pr[r])
-                                a[r * NC + i] = dot_bf16[LANES](a[r * NC + i], v, lo[r])
-                        t += 2
-                comptime if not FULL:
-                    if t < kv:
-                        # The unpaired last key: only its half of the pair (0 *
-                        # a padded NaN is still NaN).
-                        var vp = ptr[BFloat16](vbg + t * hd * 2)
-                        comptime for i in range(NC):
-                            var v = rebind[V](
-                                vp.unsafe_load[width = 2 * LANES](i * 2 * LANES).cast[DType.float32]().deinterleave()[0]
-                            )
-                            comptime for r in range(R):
-                                a[r * NC + i] = V(p.unsafe_load(r * KT + g * D.UNIT + t)).fma(v, a[r * NC + i])
-            else:
-                # V rows `[key][hd]`, fp32 P.
-                var vp = ptr[Scalar[dtype]](Int(vbase.unsafe_load(g)) + dc * D.E)
-
-                @always_inline
-                def vrow(t: Int, i: Int) capturing -> V:
-                    comptime if L.SPLIT:
-                        # Dims are kept even/odd-split per 2*LANES block: one
-                        # 64-byte load is LANES words; `<< 16` is the even dims
-                        # and `& 0xffff0000` the odd ones, 2 instructions per 32
-                        # values against 4 for zero-extend + shift (the widen was
-                        # 28% of a bf16 decode). Each dim's fp32 math is unchanged.
-                        var w = bitcast[DType.int32, LANES](
-                            (vp + t * hd).unsafe_load[width = 2 * LANES]((i // 2) * 2 * LANES)
-                        )
-                        if i % 2 == 0:
-                            return bitcast[DType.float32, LANES](w << 16)
-                        return bitcast[DType.float32, LANES](w & Int32(-65536))
-                    else:
-                        return (vp + t * hd).unsafe_load[width=LANES](i * LANES).cast[DType.float32]()
-
-                var pk = p + g * D.UNIT
-                comptime if LN == 2:
-                    while t + 1 < kv:
-                        var p0 = Array[V, R](uninitialized=True)
-                        var p1 = Array[V, R](uninitialized=True)
-                        comptime for r in range(R):
-                            p0[r] = V(pk.unsafe_load(r * KT + t))
-                            p1[r] = V(pk.unsafe_load(r * KT + t + 1))
-                        comptime for i in range(NC):
-                            var v0 = vrow(t, i)
-                            var v1 = vrow(t + 1, i)
-                            comptime for r in range(R):
-                                a[r * NC + i] = p0[r].fma(v0, a[r * NC + i])
-                                a[(R + r) * NC + i] = p1[r].fma(v1, a[(R + r) * NC + i])
-                        t += 2
-                while t < kv:
-                    var p0 = Array[V, R](uninitialized=True)
-                    comptime for r in range(R):
-                        p0[r] = V(pk.unsafe_load(r * KT + t))
-                    comptime for i in range(NC):
-                        var v0 = vrow(t, i)
-                        comptime for r in range(R):
-                            a[r * NC + i] = p0[r].fma(v0, a[r * NC + i])
-                    t += 1
+            D.PV.keys[LN * R * NC, FULL](a, Int(vbase.unsafe_load(g)), dc, p, pbuf, pbuf_lo, g * D.UNIT, kv, len)
             g = g1
         comptime for r in range(R):
             comptime for i in range(NC):
@@ -663,8 +717,8 @@ def _attend_rows[
     var kbase = stack_allocation[D.UNITS, DType.int64, alignment=64]()
     var vbase = stack_allocation[D.UNITS, DType.int64, alignment=64]()
     var logits = stack_allocation[R * KT, DType.float32, alignment=64]()
-    var pbuf = stack_allocation[(R * KT) if D.PAIRS else 1, DType.bfloat16, alignment=64]()
-    var pbuf_lo = stack_allocation[(R * KT) if D.PAIRS else 1, DType.bfloat16, alignment=64]()
+    var pbuf = stack_allocation[(R * KT) if D.PV.P16 else 1, DType.bfloat16, alignment=64]()
+    var pbuf_lo = stack_allocation[(R * KT) if D.PV.P16 else 1, DType.bfloat16, alignment=64]()
     var acc = stack_allocation[R * hd, DType.float32, alignment=64]()
     var m = SIMD[DType.float32, R](-Float32.MAX)
     var l = SIMD[DType.float32, R](0)
@@ -696,19 +750,19 @@ def _attend_rows[
             m[r] = s[0]
             alpha[r] = s[1]
             var sum: Float32
-            if D.PAIRS and len < 128:
-                sum = _exp_row[D.NS, D.DEG, D.PAIRS, True](logits, pbuf, pbuf_lo, r * KT, nk, c, s[0])
+            if D.PV.P16 and len < 128:
+                sum = _exp_row[dtype, hd, R, True](Int(logits), Int(pbuf), Int(pbuf_lo), r * KT, nk, c, s[0])
             else:
-                sum = _exp_row[D.NS, D.DEG, D.PAIRS, False](logits, pbuf, pbuf_lo, r * KT, nk, c, s[0])
+                sum = _exp_row[dtype, hd, R, False](Int(logits), Int(pbuf), Int(pbuf_lo), r * KT, nk, c, s[0])
             l[r] = (l[r] * alpha[r] if k0 > 0 else Float32(0)) + sum
 
         # ---- P@V
         comptime if D.FULL:
             if nk == KT:
-                _pv[dtype, hd, R, True](k0, nk, len, units, alpha, vbase, pbuf, pbuf_lo, logits, acc)
+                _pv[dtype, hd, R, True](k0, nk, len, units, alpha, vbase, Int(pbuf), Int(pbuf_lo), Int(logits), acc)
                 k0 += nk
                 continue
-        _pv[dtype, hd, R, False](k0, nk, len, units, alpha, vbase, pbuf, pbuf_lo, logits, acc)
+        _pv[dtype, hd, R, False](k0, nk, len, units, alpha, vbase, Int(pbuf), Int(pbuf_lo), Int(logits), acc)
         k0 += nk
 
     _store_rows[dtype, hd, R](job, seq, h0, nrows, l, acc)
