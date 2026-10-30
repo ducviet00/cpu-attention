@@ -33,3 +33,4 @@ cpu_attention = ["_C.so", "_C_*.so"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+filterwarnings = ["ignore:Failed to initialize NumPy"]  # torch, when numpy is absent
