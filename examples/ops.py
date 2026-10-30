@@ -1,110 +1,51 @@
 """Example: an inference engine's per-layer paged-attention calls.
 
 An engine that already holds validated tensors and its own slot mapping (as
-fast-encdec's runner does, once per decode step) can skip
-``flash_attn_with_kvcache``'s argument checks and call the kernel plumbing
-directly. These take three-dimensional q/k/v; they use ``cpu_attention._kernel``,
-which is internal and may change between releases.
+fast-encdec's runner does, once per decode step) can skip the public functions'
+checks and launch the kernel directly. q/k/v are ``[tokens, heads, head_dim]``
+(heads and dims contiguous; a token stride is fine). This uses
+``cpu_attention._kernel``, which is internal and may change between releases.
 """
 
-from cpu_attention import _kernel
-from cpu_attention._kernel import _paged
+import torch
+
+from cpu_attention import _kernel as K
+
+_PLANS = {}
 
 
-def self_attention(
-    query,
-    key,
-    value,
-    k_cache,
-    v_cache,
-    slot_mapping,
-    block_table,
-    context_lens,
-    scale,
-    out=None,
-):
-    """Write new K/V into the paged cache and attend over the cached keys.
-
-    ``query``/``key``/``value`` are ``[num_seqs, num_heads, head_dim]`` with the
-    token stride taken from the tensors (a fused q/k/v projection hands out
-    chunks of one buffer).  ``context_lens`` is the cached length *after* the
-    store, and ``slot_mapping[b]`` is where sequence ``b``'s new token goes.
-
-    ``out`` writes into a caller-owned ``[num_seqs, num_heads, head_dim]``
-    tensor instead of allocating one. At batch 1 the allocation is 1.3 us of a
-    6.8 us call, so an engine that keeps a scratch buffer per layer step should
-    pass it.
-    """
-    table = getattr(_kernel._KV_TABLE, "t", None)
-    if table is not None and _kernel._KV_TABLE.gen == _kernel._KV_GEN[0]:
-        res = _kernel._KV_TABLE.fn(
-            _kernel._KV_TABLE.addr,
-            query,
-            key,
-            value,
-            k_cache,
-            v_cache,
-            slot_mapping,
-            block_table,
-            context_lens,
-            scale,
-            out,
-        )
-        if res is not None:
-            return res
-    return _paged(
-        query,
-        key,
-        value,
-        k_cache,
-        v_cache,
-        slot_mapping,
-        block_table,
-        context_lens,
-        scale,
-        do_store=True,
-        out=out,
-    )
+def _plan(query, key, k_cache, block_table, store, attend):
+    geom = (None if query is None else (query.shape, query.stride()),
+            None if key is None else (key.shape, key.stride()), k_cache.shape,
+            k_cache.dtype, None if block_table is None else block_table.shape,
+            store, attend, torch.get_num_threads())
+    plan = _PLANS.get(geom)
+    if plan is None:
+        npages = block_table.shape[1] if block_table is not None else 0
+        plan = _PLANS[geom] = K.paged_plan(query, key, k_cache, npages, store, attend)
+    return plan
 
 
-def cross_attention(query, k_cache, v_cache, block_table, cache_seqlens, scale,
-                    out=None):
-    """Attend over a paged, pre-staged encoder K/V cache (no store).
-
-    ``out`` as in :func:`self_attention`.
-    """
-    table = getattr(_kernel._KV_TABLE, "t", None)
-    if table is not None and _kernel._KV_TABLE.gen == _kernel._KV_GEN[0]:
-        res = _kernel._KV_TABLE.fn(
-            _kernel._KV_TABLE.addr,
-            query,
-            None,
-            None,
-            k_cache,
-            v_cache,
-            None,
-            block_table,
-            cache_seqlens,
-            scale,
-            out,
-        )
-        if res is not None:
-            return res
-    return _paged(
-        query,
-        None,
-        None,
-        k_cache,
-        v_cache,
-        None,
-        block_table,
-        cache_seqlens,
-        scale,
-        do_store=False,
-        out=out,
-    )
+def self_attention(query, key, value, k_cache, v_cache, slot_mapping, block_table,
+                   context_lens, scale, out=None):
+    """Store each sequence's new K/V at ``slot_mapping`` and attend over its cache;
+    ``context_lens`` is the length after the store. ``out``, when given, is a
+    caller-owned ``[seqs, heads, head_dim]`` output (it saves the allocation)."""
+    out = torch.empty_like(query) if out is None else out
+    K.run_paged(_plan(query, key, k_cache, block_table, True, True), query, key, value,
+                k_cache, v_cache, out, slot_mapping, block_table, context_lens, scale)
+    return out
 
 
-def reshape_and_cache(key, value, k_cache, v_cache, slot_mapping) -> None:
-    """``cpu_attention.reshape_and_cache`` without its argument checks."""
-    _kernel._kv_store(key, value, k_cache, v_cache, slot_mapping)
+def cross_attention(query, k_cache, v_cache, block_table, cache_seqlens, scale, out=None):
+    """Attend over a pre-staged (encoder) K/V cache; no store."""
+    out = torch.empty_like(query) if out is None else out
+    K.run_paged(_plan(query, None, k_cache, block_table, False, True), query, None, None,
+                k_cache, v_cache, out, None, block_table, cache_seqlens, scale)
+    return out
+
+
+def reshape_and_cache(key, value, k_cache, v_cache, slot_mapping):
+    """``cpu_attention.reshape_and_cache`` without its checks."""
+    K.run_paged(_plan(None, key, k_cache, None, True, False), None, key, value,
+                k_cache, v_cache, None, slot_mapping, None, None, 1.0)
