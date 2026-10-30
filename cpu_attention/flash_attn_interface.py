@@ -11,6 +11,7 @@ import torch
 from . import _kernel
 from ._kernel import _DTYPE_CODES, _HEAD_DIMS, _dense, _paged, supported
 
+_MHA_ONLY = "cpu_attention supports MHA only (nheads == nheads_k); GQA/MQA are not supported yet"
 _SCALES = {}
 """``head_dim ** -0.5`` per head dim: a float pow is ~20 ns and the value cannot
 change, so the default scale is looked up rather than recomputed."""
@@ -73,6 +74,8 @@ def flash_attn_with_kvcache(
 
     Deliberate differences:
 
+    * MHA only: ``nheads_k`` must equal ``nheads`` (GQA/MQA raise
+      ``NotImplementedError``).
     * ``q`` must be ``[batch, 1, nheads, headdim]``: the kernel decodes one
       query token per sequence, so ``seqlen`` may only be 1.
     * The cache is head-major ``[num_blocks, nheads_k, page_block_size,
@@ -172,6 +175,8 @@ def flash_attn_with_kvcache(
         raise ValueError("cpu_attention: head_dim mismatch between q and the caches")
     if num_heads % num_kv_heads:
         raise ValueError("cpu_attention: nheads must be divisible by nheads_k")
+    if num_heads != num_kv_heads:
+        raise NotImplementedError(_MHA_ONLY)
     if not (k_cache.is_contiguous() and v_cache.is_contiguous()):
         raise ValueError("cpu_attention: the paged caches must be contiguous")
     if q.dtype != k_cache.dtype or v_cache.dtype != q.dtype:
@@ -220,8 +225,8 @@ def flash_attn_func(q, k, v, softmax_scale=None, causal=False):
     """Dense attention, flash-attn's ``flash_attn_func``.
 
     ``q`` is ``[batch, seqlen_q, nheads, headdim]`` and ``k``/``v`` are
-    ``[batch, seqlen_k, nheads_k, headdim]``; MQA/GQA is ``nheads % nheads_k ==
-    0`` with query head ``h`` reading KV head ``h // (nheads // nheads_k)``.
+    ``[batch, seqlen_k, nheads, headdim]``: MHA only, GQA/MQA (``nheads_k <
+    nheads``) raise ``NotImplementedError``.
     ``causal`` uses flash-attn's bottom-right alignment (query ``i`` sees keys
     ``j <= i + seqlen_k - seqlen_q``), so rows with no visible key come back
     zero.  ``softmax_scale`` defaults to ``1 / sqrt(headdim)``.
@@ -265,6 +270,8 @@ def flash_attn_func(q, k, v, softmax_scale=None, causal=False):
             "cpu_attention: k/v must be [batch, seqlen_k, nheads_k, headdim] and "
             "match q (nheads divisible by nheads_k)"
         )
+    if num_heads != num_kv_heads:
+        raise NotImplementedError(_MHA_ONLY)
     if head_dim not in _HEAD_DIMS:
         raise ValueError(
             f"cpu_attention cannot run head_dim={head_dim} (32, 64 or 128)"

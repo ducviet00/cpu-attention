@@ -40,31 +40,31 @@ from cpu_attention import _kernel  # noqa: E402
 DT = {"bf16": torch.bfloat16, "fp32": torch.float32}
 WARMUP, RUNS, PAGES = 3, 10, (16, 32)
 
-# Prefill: (name, batch, seq, heads, kv heads, head_dim, causal).
+# MHA shapes (GQA/MQA are not supported yet).
+# Prefill: (name, batch, seq, heads, head_dim, causal).
 FLASH = [
-    ("short prompt", 1, 128, 16, 16, 64, True),
-    ("prompt 1k", 1, 1024, 16, 16, 64, True),
-    ("prompt 2k, d128", 1, 2048, 32, 32, 128, True),
-    ("long prompt, GQA", 1, 4096, 32, 8, 128, True),
-    ("encoder batch", 8, 512, 16, 16, 64, False),
-    ("encoder 1500 (Whisper)", 1, 1500, 20, 20, 64, False),
-    ("encoder, d32", 8, 256, 16, 16, 32, False),
+    ("short prompt", 1, 128, 16, 64, True),
+    ("prompt 1k", 1, 1024, 16, 64, True),
+    ("prompt 2k, d128", 1, 2048, 32, 128, True),
+    ("long prompt 4k, d128", 1, 4096, 32, 128, True),
+    ("encoder batch", 8, 512, 16, 64, False),
+    ("encoder 1500 (Whisper)", 1, 1500, 20, 64, False),
+    ("encoder, d32", 8, 256, 16, 32, False),
 ]
-# Paged decode: (name, batch, context, heads, kv heads, head_dim, append).
+# Paged decode: (name, batch, context, heads, head_dim, append).
 # `context` is a length or a list of per-sequence lengths; `append` writes the new
 # token's K/V in the same call (self-attention), otherwise the cache is read only
 # (cross-attention over an encoder's K/V).
 PAGED = [
-    ("b1 short", 1, 256, 16, 16, 64, True),
-    ("b1 long, GQA", 1, 4096, 32, 8, 128, True),
-    ("b8 1k", 8, 1024, 16, 16, 64, True),
-    ("b8 1k, d32", 8, 1024, 16, 16, 32, True),
-    ("b8 1k, GQA 8:1", 8, 1024, 32, 4, 128, True),
-    ("b8 4k, GQA", 8, 4096, 32, 8, 128, True),
-    ("b8 mixed 17-2047", 8, [17, 255, 1023, 1025, 33, 513, 2047, 64], 16, 16, 64, True),
-    ("b8 cross 1500 (Whisper)", 8, 1500, 20, 20, 64, False),
-    ("b32 512", 32, 512, 16, 16, 64, True),
-    ("b32 2k, GQA", 32, 2048, 32, 8, 128, True),
+    ("b1 short", 1, 256, 16, 64, True),
+    ("b1 long 4k, d128", 1, 4096, 32, 128, True),
+    ("b8 1k", 8, 1024, 16, 64, True),
+    ("b8 1k, d32", 8, 1024, 16, 32, True),
+    ("b8 4k, d128", 8, 4096, 32, 128, True),
+    ("b8 mixed 17-2047", 8, [17, 255, 1023, 1025, 33, 513, 2047, 64], 16, 64, True),
+    ("b8 cross 1500 (Whisper)", 8, 1500, 20, 64, False),
+    ("b32 512", 32, 512, 16, 64, True),
+    ("b32 1k, d128", 32, 1024, 32, 128, True),
 ]
 
 
@@ -127,26 +127,25 @@ def measure(fns, flush):
 
 
 def flash_row(spec, dtype, pkgs):
-    _, b, s, h, hk, d, causal = spec
-    q = torch.randn(b, s, h, d, dtype=dtype)
-    k, v = (torch.randn(b, s, hk, d, dtype=dtype) for _ in range(2))
+    _, b, s, h, d, causal = spec
+    q, k, v = (torch.randn(b, s, h, d, dtype=dtype) for _ in range(3))
     out = {}
     fns = {name: (lambda p=p, name=name: out.__setitem__(
         name, p.flash_attn_func(q, k, v, causal=causal))) for name, p in pkgs.items()}
     qt, kt, vt = (x.transpose(1, 2) for x in (q, k, v))
     fns["sdpa"] = lambda: out.__setitem__("sdpa", F.scaled_dot_product_attention(
-        qt, kt, vt, is_causal=causal, enable_gqa=h != hk).transpose(1, 2))
+        qt, kt, vt, is_causal=causal).transpose(1, 2))
     return fns, out, "sdpa"
 
 
 def paged_row(spec, dtype, pkgs, vllm):
-    _, b, ctx, h, hk, d, append = spec
+    _, b, ctx, h, d, append = spec
     lens = ctx if isinstance(ctx, list) else [ctx] * b
     staged = [n - 1 if append else n for n in lens]  # an append call adds the last token
-    kv = [(torch.randn(n, hk, d, dtype=dtype), torch.randn(n, hk, d, dtype=dtype))
+    kv = [(torch.randn(n, h, d, dtype=dtype), torch.randn(n, h, d, dtype=dtype))
           for n in staged]
     q = torch.randn(b, 1, h, d, dtype=dtype)
-    kn, vn = (torch.randn(b, 1, hk, d, dtype=dtype) for _ in range(2))
+    kn, vn = (torch.randn(b, 1, h, d, dtype=dtype) for _ in range(2))
     before = torch.tensor(staged, dtype=torch.int32)
     out, fns = {}, {}
     for page in PAGES:
@@ -155,7 +154,7 @@ def paged_row(spec, dtype, pkgs, vllm):
         for i, n in enumerate(nb):
             bt[i, :n] = torch.arange(sum(nb[:i]), sum(nb[:i]) + n, dtype=torch.int32)
         for name, p in pkgs.items():
-            kc = torch.zeros(sum(nb), hk, page, d, dtype=dtype)
+            kc = torch.zeros(sum(nb), h, page, d, dtype=dtype)
             vc = torch.zeros_like(kc)
             for i, (k, v) in enumerate(kv):  # stage each prompt through the API
                 if len(k):
@@ -179,8 +178,8 @@ def vllm_paged(vllm, page, bt, kv, q, kn, vn, lens, append, out):
     """vLLM's two calls per decode step: store the new token, attend. The scheduler
     metadata is per batch (once per step in vLLM), so it is built outside the timer."""
     mod, isa = vllm
-    b, h, d, hk = q.shape[0], q.shape[2], q.shape[3], kn.shape[2]
-    kc = torch.zeros(int(bt.max()) + 1, hk, page, d, dtype=q.dtype)
+    b, _, h, d = q.shape
+    kc = torch.zeros(int(bt.max()) + 1, h, page, d, dtype=q.dtype)
     vc = torch.zeros_like(kc)
     slot = lambda i, t: int(bt[i, t // page]) * page + t % page  # noqa: E731
     slots = torch.tensor([slot(i, t) for i, (k, _) in enumerate(kv) for t in range(len(k))],
@@ -189,7 +188,7 @@ def vllm_paged(vllm, page, bt, kv, q, kn, vn, lens, append, out):
                                    kc, vc, slots, isa)
     seqlens = torch.tensor(lens, dtype=torch.int32)
     qsl = torch.arange(b + 1, dtype=torch.int32)
-    meta = mod.get_scheduler_metadata(b, h, hk, d, seqlens, q.dtype, qsl, True, -1, isa,
+    meta = mod.get_scheduler_metadata(b, h, h, d, seqlens, q.dtype, qsl, True, -1, isa,
                                       False, None, "auto")
     new_slots = torch.tensor([slot(i, n - 1) for i, n in enumerate(lens)], dtype=torch.int64)
     q3, kn3, vn3 = q.squeeze(1), kn.squeeze(1), vn.squeeze(1)

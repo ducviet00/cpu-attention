@@ -8,7 +8,7 @@ import cpu_attention as C
 
 def paged():
     q = torch.randn(2, 1, 4, 64)
-    kc = torch.zeros(4, 2, 16, 64)
+    kc = torch.zeros(4, 4, 16, 64)
     return q, kc, kc.clone(), torch.arange(4, dtype=torch.int32).view(2, 2)
 
 
@@ -46,6 +46,17 @@ def test_kvcache_bad_arguments(bad):
         C.flash_attn_with_kvcache(q, kc, vc, cache_seqlens=4, page_table=bt)
 
 
+@pytest.mark.parametrize("kv_heads", [2, 1])
+def test_gqa_mqa_not_supported_yet(kv_heads):
+    q, kc, vc, bt = paged()
+    kc = torch.zeros(4, kv_heads, 16, 64)
+    with pytest.raises(NotImplementedError):
+        C.flash_attn_with_kvcache(q, kc, kc.clone(), cache_seqlens=4, page_table=bt)
+    k = torch.randn(2, 8, kv_heads, 64)
+    with pytest.raises(NotImplementedError):
+        C.flash_attn_func(torch.randn(2, 8, 4, 64), k, k)
+
+
 @pytest.mark.parametrize("bad", ["dtype", "heads", "slots_dtype", "slots_len", "past_end"])
 def test_reshape_and_cache_bad_arguments(bad):
     k = torch.randn(5, 2, 64)
@@ -67,7 +78,7 @@ def test_reshape_and_cache_bad_arguments(bad):
 
 @pytest.mark.parametrize("bad", ["dtype", "head_dim", "heads", "batch"])
 def test_flash_bad_arguments(bad):
-    q, k = torch.randn(2, 8, 4, 64), torch.randn(2, 8, 2, 64)
+    q, k = torch.randn(2, 8, 4, 64), torch.randn(2, 8, 4, 64)
     if bad == "dtype":
         q, k = q.half(), k.half()
     elif bad == "head_dim":

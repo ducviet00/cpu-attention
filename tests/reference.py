@@ -1,39 +1,28 @@
-"""The slow, obviously correct reference: numpy in float64, one (batch, head) at a time."""
+"""The slow, obviously correct reference: eager attention in float64 (the shape of
+transformers' ``eager_attention_forward``: matmul, additive mask, softmax, matmul)."""
 
-import numpy as np
 import torch
 
 
-def f64(t):
-    return t.detach().double().numpy()
-
-
 def attention(q, k, v, scale, causal=False):
-    """q [b, sq, h, d], k/v [b, sk, hk, d] (numpy float64) -> [b, sq, h, d].
+    """q [b, sq, h, d], k/v [b, sk, h, d] (MHA) -> float64 [b, sq, h, d].
 
-    Query head ``i`` reads kv head ``i // (h // hk)``; ``causal`` is bottom-right
-    aligned (query ``i`` sees keys ``j <= i + sk - sq``), and a row that sees no
-    key is zero.
+    ``causal`` is bottom-right aligned (query ``i`` sees keys ``j <= i + sk - sq``),
+    and a row that sees no key is zero.
     """
-    b, sq, h, d = q.shape
-    sk, hk = k.shape[1], k.shape[2]
-    out = np.zeros((b, sq, h, d))
-    for bi in range(b):
-        for hi in range(h):
-            kh = hi // (h // hk)
-            s = q[bi, :, hi] @ k[bi, :, kh].T * scale
-            if causal:
-                s[np.arange(sk)[None, :] > np.arange(sq)[:, None] + sk - sq] = -np.inf
-            for i in range(sq):
-                if np.isinf(s[i]).all():
-                    continue
-                p = np.exp(s[i] - s[i].max())
-                out[bi, i, hi] = p @ v[bi, :, kh] / p.sum()
-    return out
+    q, k, v = (x.double().transpose(1, 2) for x in (q, k, v))  # [b, h, s, d]
+    weights = torch.matmul(q, k.transpose(2, 3)) * scale
+    if causal:
+        sq, sk = q.shape[2], k.shape[2]
+        mask = torch.zeros(sq, sk, dtype=torch.float64)
+        mask[torch.arange(sk)[None, :] > torch.arange(sq)[:, None] + sk - sq] = float("-inf")
+        weights = weights + mask
+    weights = torch.softmax(weights, dim=-1).nan_to_num(0.0)  # a fully masked row is 0/0
+    return torch.matmul(weights, v).transpose(1, 2).contiguous()
 
 
 def check(got, ref, dtype, paged=False):
-    """Max error of ``got`` (a torch tensor) against the float64 ``ref``, and its limit.
+    """Max error of ``got`` against the float64 ``ref``, and its limit.
 
     flash_attn_func: fp32 2e-4, bf16 3e-2. Paged decode: fp32 1e-6; bf16 1e-3 beyond
     the unavoidable rounding of the exact result to bf16 (rounding alone exceeds an
@@ -42,10 +31,10 @@ def check(got, ref, dtype, paged=False):
     logits (c4a-standard-8, d=128, scale 0.2 = 2.3x that: up to 2.2e-6; at the model
     scale 1.4-2.2e-7).
     """
-    err = np.abs(f64(got) - ref)
+    err = (got.double() - ref).abs()
     if dtype == torch.float32:
-        return err.max(), (1e-6 if paged else 2e-4)
+        return err.max().item(), (1e-6 if paged else 2e-4)
     if not paged:
-        return err.max(), 3e-2
-    rounding = np.abs(ref - f64(torch.from_numpy(ref).bfloat16()))
-    return (err - rounding).max(), 1e-3
+        return err.max().item(), 3e-2
+    rounding = (ref - ref.bfloat16().double()).abs()
+    return (err - rounding).max().item(), 1e-3

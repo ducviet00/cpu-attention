@@ -14,7 +14,7 @@ license = { file = "LICENSE" }
 [project.optional-dependencies]
 # The Mojo compiler, from the PyPI wheel: uv is the only tool needed.
 build = ["mojo==1.2.0"]
-test = ["pytest>=8", "numpy>=1.26"]
+test = ["pytest>=8"]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cpu" }

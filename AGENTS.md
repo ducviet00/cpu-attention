@@ -15,7 +15,7 @@ with a falsification ledger: do not re-run a dead idea without a new mechanism.
 cpu_attention/              the Python API (flash-attn's functions + reshape_and_cache), loader, worker policy
 cpu_attention/_mojo/        the Mojo kernel -> _C_<tier>.so (scripts/build.py)
 examples/ops.py             an engine's per-layer calls over the internal plumbing (fast-encdec's)
-tests/                      pytest against tests/reference.py (numpy float64, explicit loops):
+tests/                      pytest against tests/reference.py (eager attention, PyTorch float64):
                             test_flash, test_kvcache, test_api (rejections)
 benchmarks/bench.py         the benchmark: typical shapes, ours vs torch SDPA (prefill) and vLLM
                             (paged decode), at the Python API, cold caches, median of 10
@@ -30,6 +30,8 @@ scripts/box_verify.sh       on a box: the tests at every tier on a branch, then 
 
 ## Rules
 
+- **MHA only, for now.** GQA/MQA (`nheads_k < nheads`) raise
+  `NotImplementedError`; tests and benchmark shapes are MHA.
 - **The API is flash-attn's.** `cpu_attention` exports flash-attn's functions
   plus `reshape_and_cache` (vLLM's signature: the cache layout is ours, so its
   writer must be public); engine conveniences belong in `examples/`.
@@ -53,7 +55,7 @@ scripts/box_verify.sh       on a box: the tests at every tier on a branch, then 
 - **Correctness first.** Every kernel change must pass `uv run --extra test pytest`
   at the best tier and with `CPU_ATTENTION_ISA=` each lower tier the CPU supports
   (`scripts/box_verify.sh` runs them all). Tests compare against the float64
-  numpy reference only (never SDPA or vLLM); limits are in the README. Keep them
+  eager reference only (never SDPA or vLLM); limits are in the README. Keep them
   concise: a new case is a parametrize entry, not a new script.
 - **Measure the way `benchmarks/bench.py` does** (`benchmarks/BENCHMARK.md`):
   the Python API, cold caches before every call, 3 warmup + 10 samples, arms
