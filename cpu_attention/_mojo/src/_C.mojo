@@ -43,30 +43,14 @@ def kv_attention(
     heads, head_dim, page, bt_stride, out_stride, dtype, workers, do_store,
     do_attend, q token stride, k/v token stride (`_kernel.paged_plan`)."""
     var p = ptr[Int64](Int(py=plan))
-    var job = PagedJob()
-    job.num_seqs = Int(p[0])
-    job.heads = Int(p[1])
-    job.head_dim = Int(p[2])
-    job.page = Int(p[3])
-    job.bt_stride = Int(p[4])
-    job.out_stride = Int(p[5])
-    job.dtype = Int(p[6])
-    job.workers = Int(p[7])
-    job.do_store = p[8] != 0
-    job.do_attend = p[9] != 0
-    job.q_stride = Int(p[10])
-    job.kv_stride = Int(p[11])
-    job.q = Int(py=q)
-    job.k = Int(py=k)
-    job.v = Int(py=v)
-    job.k_cache = Int(py=k_cache)
-    job.v_cache = Int(py=v_cache)
-    job.out = Int(py=dst)
-    job.slots = Int(py=slots)
-    job.block_table = Int(py=block_table)
-    job.lens = Int(py=lens)
-    job.scale = Float32(Float64(py=scale))
-    paged_run(job)
+    paged_run(PagedJob(
+        q=Int(py=q), k=Int(py=k), v=Int(py=v), k_cache=Int(py=k_cache), v_cache=Int(py=v_cache),
+        out=Int(py=dst), slots=Int(py=slots), block_table=Int(py=block_table), lens=Int(py=lens),
+        num_seqs=Int(p[0]), heads=Int(p[1]), head_dim=Int(p[2]), page=Int(p[3]),
+        bt_stride=Int(p[4]), q_stride=Int(p[10]), kv_stride=Int(p[11]), out_stride=Int(p[5]),
+        scale=Float32(Float64(py=scale)), dtype=Int(p[6]), workers=Int(p[7]),
+        do_store=p[8] != 0, do_attend=p[9] != 0,
+    ))
 
 
 def flash_forward(

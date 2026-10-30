@@ -49,9 +49,3 @@ def parallel(body: Body, ctx: Int, workers: Int):
 def barrier():
     """All threads of the current region (only inside a `parallel` body)."""
     external_call["GOMP_barrier", NoneType]()
-
-
-@always_inline
-def static_range(n: Int, tid: Int, threads: Int) -> Tuple[Int, Int]:
-    """This thread's contiguous share of `n` items."""
-    return (tid * n // threads, (tid + 1) * n // threads)

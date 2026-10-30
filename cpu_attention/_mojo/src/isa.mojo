@@ -26,8 +26,6 @@ comptime NEON_BF16 = CompilationTarget.has_neon() and CompilationTarget._has_fea
 ]()
 """`bfdot` / `bfmmla` (Armv8.6 BF16)."""
 
-comptime BF16_DOT = X86_BF16 or NEON_BF16
-
 comptime BCAST_FOLD = CompilationTarget.is_x86()
 """A scalar broadcast folds into the FMA's memory operand (`{1to16}`), so a
 broadcast per query dim / probability is free; NEON instead loads 4 values as a
@@ -220,12 +218,6 @@ def bf16_lo[width: Int](x: SIMD[DType.float32, width], hi: SIMD[DType.bfloat16, 
     """The low half of the bf16 split x ~ hi + lo (hi = x rounded to bf16): with
     it, bf16 products (hi*hi + hi*lo + lo*hi) keep fp32 accuracy."""
     return (x - hi.cast[DType.float32]()).cast[DType.bfloat16]()
-
-
-@always_inline
-def to_bf16[width: Int](x: SIMD[DType.float32, width]) -> SIMD[DType.bfloat16, width]:
-    """Round-to-nearest-even fp32 -> bf16 (one `vcvtneps2bf16` on AVX-512-BF16)."""
-    return x.cast[DType.bfloat16]()
 
 
 def amx_permitted() -> Bool:

@@ -21,8 +21,10 @@ comptime V_PAIRS_ARM = CompilationTarget.has_neon()
 two keys; x86 keeps `[page][hd]` (fp32 P against widened V rows)."""
 
 
+@fieldwise_init
 struct PagedJob(ImplicitlyCopyable, Movable):
-    """One call, as raw addresses. `k`/`v`/`slots` are only read by the store."""
+    """One call, as raw addresses and the plan's geometry (`_C.kv_attention`).
+    `k`/`v`/`slots` are read only by the store; a zero `slots` appends at `lens`."""
 
     var q: Int
     var k: Int
@@ -46,30 +48,6 @@ struct PagedJob(ImplicitlyCopyable, Movable):
     var workers: Int
     var do_store: Bool
     var do_attend: Bool
-
-    def __init__(out self):
-        self.q = 0
-        self.k = 0
-        self.v = 0
-        self.k_cache = 0
-        self.v_cache = 0
-        self.out = 0
-        self.slots = 0
-        self.block_table = 0
-        self.lens = 0
-        self.num_seqs = 0
-        self.heads = 0
-        self.head_dim = 0
-        self.page = 0
-        self.bt_stride = 0
-        self.q_stride = 0
-        self.kv_stride = 0
-        self.out_stride = 0
-        self.scale = 1.0
-        self.dtype = 0
-        self.workers = 1
-        self.do_store = False
-        self.do_attend = True
 
 
 # ---------------------------------------------------------------------------
