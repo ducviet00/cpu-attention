@@ -25,6 +25,13 @@ over SDPA and vLLM on all three machines. Where rows tie, the limit is:
   way is placement and noise, and the same row moves 20-30% with allocation
   order. Neither a compile-time page 64, extra dot chains, key-tile changes,
   software prefetch nor wider key groups moved these rows (§9).
+- **GQA decode at head_dim 128** (32 query heads over 8 or 4 KV heads, the
+  Llama-style shape; not in the old 170-row manifest, whose GQA rows were
+  head_dim 64): vLLM is 1.34-1.86x faster in bf16 on c4-standard-*, where it
+  runs the group on AMX tiles, and 1.1-1.6x on c4a-standard-* in both dtypes
+  (README). Our decode keeps a group's query heads as rows of one vector
+  register tile (§3); an AMX (and a `bfmmla`) `PVKernel` for groups is the
+  candidate.
 - **fp32 `flash_attn_func`** is FMA-bound (parity with the former C++ backend
   single-thread at every shape measured).
 
