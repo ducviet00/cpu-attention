@@ -25,8 +25,8 @@ over SDPA and vLLM on all three machines. Where rows tie, the limit is:
   way is placement and noise, and the same row moves 20-30% with allocation
   order. Neither a compile-time page 64, extra dot chains, key-tile changes,
   software prefetch nor wider key groups moved these rows (§9).
-- **bf16 decode at head_dim 128** (MHA, long contexts): vLLM is 1.09-1.16x
-  faster on c4-standard-* (its AMX path) and 1.06-1.26x on c4a-standard-*
+- **bf16 decode at head_dim 128** (MHA, long contexts): vLLM is 1.06-1.13x
+  faster on c4-standard-* (its AMX path) and 1.04-1.22x on c4a-standard-*
   (README); fp32 and c4d-standard-* tie or win.
 - **GQA/MQA are out of scope for now**: the API raises `NotImplementedError`
   for `nheads_k < nheads`, and the group paths are removed from both kernels

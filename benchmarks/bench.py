@@ -36,35 +36,36 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 import cpu_attention  # noqa: E402
 from cpu_attention import _kernel  # noqa: E402
+from report import label  # noqa: E402
 
 DT = {"bf16": torch.bfloat16, "fp32": torch.float32}
 WARMUP, RUNS, PAGES = 3, 10, (16, 32)
 
-# MHA shapes (GQA/MQA are not supported yet).
-# Prefill: (name, batch, seq, heads, head_dim, causal).
+# MHA shapes (GQA/MQA are not supported yet); rows are labelled by shape
+# (`report.label`: N batch, L query length, S key/value length, H heads, E head dim).
+# Prefill: (N, L = S, H, E, causal).
 FLASH = [
-    ("short prompt", 1, 128, 16, 64, True),
-    ("prompt 1k", 1, 1024, 16, 64, True),
-    ("prompt 2k, d128", 1, 2048, 32, 128, True),
-    ("long prompt 4k, d128", 1, 4096, 32, 128, True),
-    ("encoder batch", 8, 512, 16, 64, False),
-    ("encoder 1500 (Whisper)", 1, 1500, 20, 64, False),
-    ("encoder, d32", 8, 256, 16, 32, False),
+    (1, 128, 16, 64, True),
+    (1, 1024, 16, 64, True),
+    (1, 2048, 32, 128, True),
+    (1, 4096, 32, 128, True),
+    (8, 512, 16, 64, False),
+    (1, 1500, 20, 64, False),
+    (8, 256, 16, 32, False),
 ]
-# Paged decode: (name, batch, context, heads, head_dim, append).
-# `context` is a length or a list of per-sequence lengths; `append` writes the new
-# token's K/V in the same call (self-attention), otherwise the cache is read only
-# (cross-attention over an encoder's K/V).
+# Paged decode, L = 1: (N, S, H, E, append). S is a length or a list of
+# per-sequence lengths; `append` stores the new token's K/V in the call
+# (self-attention), otherwise the cache is read only (cross-attention).
 PAGED = [
-    ("b1 short", 1, 256, 16, 64, True),
-    ("b1 long 4k, d128", 1, 4096, 32, 128, True),
-    ("b8 1k", 8, 1024, 16, 64, True),
-    ("b8 1k, d32", 8, 1024, 16, 32, True),
-    ("b8 4k, d128", 8, 4096, 32, 128, True),
-    ("b8 mixed 17-2047", 8, [17, 255, 1023, 1025, 33, 513, 2047, 64], 16, 64, True),
-    ("b8 cross 1500 (Whisper)", 8, 1500, 20, 64, False),
-    ("b32 512", 32, 512, 16, 64, True),
-    ("b32 1k, d128", 32, 1024, 32, 128, True),
+    (1, 256, 16, 64, True),
+    (1, 4096, 32, 128, True),
+    (8, 1024, 16, 64, True),
+    (8, 1024, 16, 32, True),
+    (8, 4096, 32, 128, True),
+    (8, [17, 255, 1023, 1025, 33, 513, 2047, 64], 16, 64, True),
+    (8, 1500, 20, 64, False),
+    (32, 512, 16, 64, True),
+    (32, 1024, 32, 128, True),
 ]
 
 
@@ -127,7 +128,7 @@ def measure(fns, flush):
 
 
 def flash_row(spec, dtype, pkgs):
-    _, b, s, h, d, causal = spec
+    b, s, h, d, causal = spec
     q, k, v = (torch.randn(b, s, h, d, dtype=dtype) for _ in range(3))
     out = {}
     fns = {name: (lambda p=p, name=name: out.__setitem__(
@@ -139,7 +140,7 @@ def flash_row(spec, dtype, pkgs):
 
 
 def paged_row(spec, dtype, pkgs, vllm):
-    _, b, ctx, h, d, append = spec
+    b, ctx, h, d, append = spec
     lens = ctx if isinstance(ctx, list) else [ctx] * b
     staged = [n - 1 if append else n for n in lens]  # an append call adds the last token
     kv = [(torch.randn(n, h, d, dtype=dtype), torch.randn(n, h, d, dtype=dtype))
@@ -213,7 +214,7 @@ def best(timing, prefix):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--json", default="")
-    ap.add_argument("--only", default="", help="substring filter on row names")
+    ap.add_argument("--only", default="", help="substring filter on row labels, e.g. 'N=8 '")
     ap.add_argument("--dtype", choices=("bf16", "fp32", "both"), default="both")
     ap.add_argument("--threads", type=int, default=0, help="default: physical cores")
     ap.add_argument("--compare", default="", metavar="PACKAGE_DIR",
@@ -244,7 +245,8 @@ def main():
     for kind, specs in (("flash", FLASH), ("paged", PAGED)):
         for spec in specs:
             for dt in DT:
-                if args.only not in spec[0] or args.dtype not in ("both", dt):
+                name = label(kind, spec)
+                if args.only not in name or args.dtype not in ("both", dt):
                     continue
                 torch.manual_seed(0)
                 if kind == "flash":
@@ -253,9 +255,9 @@ def main():
                     fns, out, ref = paged_row(spec, DT[dt], pkgs, vllm.get(dt))
                 timing = measure(fns, lambda: flush_buf.add_(1))
                 ours, base = best(timing, "ours"), best(timing, ref)
-                row = dict(kind=kind, name=spec[0], dtype=dt, shape=spec[1:], timing=timing,
+                row = dict(kind=kind, name=name, dtype=dt, shape=spec, timing=timing,
                            ours=ours, ref=base)
-                line = (f"{kind:5s} {spec[0]:26s} {dt}  ours {timing[ours]['median']:9.1f} us"
+                line = (f"{kind:5s} {name:34s} {dt}  ours {timing[ours]['median']:9.1f} us"
                         f" ({ours})")
                 if base:
                     row["ratio"] = timing[ours]["median"] / timing[base]["median"]
