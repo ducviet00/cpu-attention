@@ -65,7 +65,7 @@ def tier() raises -> PythonObject:
 def flash_sizes(
     seq_k: PythonObject, rq: PythonObject, hd: PythonObject, dtype: PythonObject, isa: PythonObject
 ) raises -> PythonObject:
-    """(slab bytes per (batch, kv head), scratch bytes per thread)."""
+    """(slab bytes per (batch, head), scratch bytes per thread)."""
     var s = _flash_sizes(Int(py=seq_k), Int(py=rq), Int(py=hd), Int(py=dtype), Int(py=isa))
     return Python.tuple(s[0], s[1])
 
@@ -86,7 +86,7 @@ def flash_forward(
     )
     job.ws = Int(py=ws)
     var p = ptr[Int64](Int(py=plan))
-    flash_run(job, Int(p.unsafe_load(18)), Int(p.unsafe_load(5)), Int(p.unsafe_load(27)))
+    flash_run(job, Int(p.unsafe_load(17)), Int(p.unsafe_load(4)), Int(p.unsafe_load(26)))
 
 
 comptime KV_ENTRY0 = 24  # first plan entry slot (after the pyview header)
@@ -234,15 +234,13 @@ def kv_fast(
             var p = ptr[Int64](word(e + 8 * 21))
             var job = PagedJob()
             job.num_seqs = Int(p[0])
-            job.num_heads = Int(p[1])
-            job.kv_heads = Int(p[2])
-            job.head_dim = Int(p[3])
-            job.page = Int(p[4])
-            job.dtype = Int(p[7])
-            job.workers = Int(p[8])
+            job.heads = Int(p[1])
+            job.head_dim = Int(p[2])
+            job.page = Int(p[3])
+            job.dtype = Int(p[6])
+            job.workers = Int(p[7])
             job.do_store = True
             job.do_attend = False
-            job.chunks = 1
             job.k = data_ptr(hdr, ki, item)
             job.v = data_ptr(hdr, vi, item)
             job.k_cache = data_ptr(hdr, kci, item)
@@ -400,17 +398,15 @@ def kv_fast(
         var p = ptr[Int64](word(e + 8 * 21))
         var job = PagedJob()
         job.num_seqs = Int(p[0])
-        job.num_heads = Int(p[1])
-        job.kv_heads = Int(p[2])
-        job.head_dim = Int(p[3])
-        job.page = Int(p[4])
-        job.bt_stride = Int(p[5])
-        job.out_stride = Int(p[6])
-        job.dtype = Int(p[7])
-        job.workers = Int(p[8])
-        job.do_store = p[9] != 0
-        job.do_attend = p[10] != 0
-        job.chunks = Int(p[11])
+        job.heads = Int(p[1])
+        job.head_dim = Int(p[2])
+        job.page = Int(p[3])
+        job.bt_stride = Int(p[4])
+        job.out_stride = Int(p[5])
+        job.dtype = Int(p[6])
+        job.workers = Int(p[7])
+        job.do_store = p[8] != 0
+        job.do_attend = p[9] != 0
         job.q = data_ptr(hdr, qi, item)
         job.k_cache = data_ptr(hdr, kci, item)
         job.v_cache = data_ptr(hdr, vci, item)
@@ -512,7 +508,7 @@ def flash_fast(
         var item = word(e + 8 * 27)
         var plan = word(e + 8 * 25)
         var p = ptr[Int64](plan)
-        var dt = Int(p.unsafe_load(18))
+        var dt = Int(p.unsafe_load(17))
         var py_out = alloc_out_4d(
             size(hdr, qi, 0),
             size(hdr, qi, 1),
@@ -526,7 +522,7 @@ def flash_fast(
             ptr[Float32](e + 8 * 28).unsafe_load(0),
         )
         job.ws = word(e + 8 * 26)
-        flash_run(job, dt, Int(p.unsafe_load(5)), Int(p.unsafe_load(27)))
+        flash_run(job, dt, Int(p.unsafe_load(4)), Int(p.unsafe_load(26)))
         return PythonObject(from_owned=py_out)
     return PythonObject(None)
 
@@ -546,22 +542,20 @@ def kv_attention(
     scale: PythonObject,
 ) raises:
     """KV-cache attention / store. `plan` addresses int64 geometry slots:
-    num_seqs, num_heads, kv_heads, head_dim, page, bt_stride, out_stride, dtype,
-    workers, do_store, do_attend, chunks."""
+    num_seqs, heads, head_dim, page, bt_stride, out_stride, dtype, workers,
+    do_store, do_attend."""
     var p = ptr[Int64](Int(py=plan))
     var job = PagedJob()
     job.num_seqs = Int(p[0])
-    job.num_heads = Int(p[1])
-    job.kv_heads = Int(p[2])
-    job.head_dim = Int(p[3])
-    job.page = Int(p[4])
-    job.bt_stride = Int(p[5])
-    job.out_stride = Int(p[6])
-    job.dtype = Int(p[7])
-    job.workers = Int(p[8])
-    job.do_store = p[9] != 0
-    job.do_attend = p[10] != 0
-    job.chunks = Int(p[11])
+    job.heads = Int(p[1])
+    job.head_dim = Int(p[2])
+    job.page = Int(p[3])
+    job.bt_stride = Int(p[4])
+    job.out_stride = Int(p[5])
+    job.dtype = Int(p[6])
+    job.workers = Int(p[7])
+    job.do_store = p[8] != 0
+    job.do_attend = p[9] != 0
     job.q = Int(py=q)
     job.k = Int(py=k)
     job.v = Int(py=v)

@@ -233,15 +233,13 @@ contiguous q and cache) builds no stride tuples at all.
 def _kv_build(query, key, value, k_cache, page_table, do_store, do_attend):
     """Build the Mojo fast call for one geometry + layout.
 
-    The geometry rides in a 12-slot int64 buffer the kernel reads, and the token
-    strides are constants of the plan (they are part of its key), so a call
-    marshals only the per-call pointers and the scale. Workers follow
-    `_workers`; `chunks` splits a GQA/MQA group across workers only when there
-    are fewer (sequence, kv head) pairs than workers (each chunk is a register
-    tile of the group's query heads over one scan of the cache).
+    The geometry rides in a 10-slot int64 buffer the kernel reads (MHA: the
+    cache's heads are the query's), and the token strides are constants of the
+    plan (they are part of its key), so a call marshals only the per-call
+    pointers and the scale. Workers follow `_workers`.
     """
     nseq, nheads, hd = query.shape
-    kvh, page = k_cache.shape[1:3]
+    page = k_cache.shape[2]
     npages = page_table.shape[1] if page_table is not None else 0
     # Heads and dims must be contiguous; a token stride is fine (the engine's
     # q/k/v are chunks of one fused projection). Anything else is copied.
@@ -250,16 +248,10 @@ def _kv_build(query, key, value, k_cache, page_table, do_store, do_attend):
                               value.stride() == key.stride()))
     q_stride = query.stride(0) if q_ok else nheads * hd
     kv_stride = (key.stride(0) if kv_ok else key.shape[1] * hd) if do_store else 0
-    pairs = nseq * kvh
-    group = nheads // kvh
-    workers = _workers(nseq * nheads, max(npages, 1))
-    chunks = 1
-    if do_attend and pairs < workers:
-        chunks = min(group, -(-workers // pairs))
-    workers = max(1, min(workers, pairs * chunks))
-    buf = torch.tensor([nseq, nheads, kvh, hd, page, npages, nheads * hd,
+    workers = max(1, _workers(nseq * nheads, max(npages, 1)))
+    buf = torch.tensor([nseq, nheads, hd, page, npages, nheads * hd,
                         _DTYPE_CODES[query.dtype], workers, int(do_store),
-                        int(do_attend), chunks], dtype=torch.int64)
+                        int(do_attend)], dtype=torch.int64)
     plan = buf.data_ptr()
     entry = _entry("kv_attention")
 
@@ -700,7 +692,7 @@ def _flash_plan(geom, k, causal, scale):
         plans = _FLASH.p = {}
     qshape, qs, ks, vs, dtype = geom
     batch, seq_q, heads, hd = qshape
-    seq_k, kv_heads = k.shape[1], k.shape[2]
+    seq_k = k.shape[1]
     dt = _DTYPE_CODES[dtype]
     # Policy ids: 0 vector, 1 AMX (fp32 hi/lo unless switched off), 2 ARM
     # bfmmla/lane-FMA. The toggles can change between calls, so key on the id.
@@ -735,20 +727,20 @@ def _flash_plan(geom, k, causal, scale):
         nqb = -(-seq_q // rq)
         workers = _workers(batch * heads * nqb, 8)
         slab, aux = _entry("flash_sizes")(seq_k, rq, hd, dt, isa)
-        nbh = batch * kv_heads
+        nbh = batch * heads
         llc = _llc_bytes()
         # Fused (pack own head, attend, no barrier) while every worker's slab
-        # fits 0.6 of the LLC and the heads divide evenly; MHA only.
-        fuse = (heads == kv_heads and nbh >= workers and nbh % workers == 0 and
+        # fits 0.6 of the LLC and the heads divide evenly.
+        fuse = (nbh >= workers and nbh % workers == 0 and
                 slab * workers <= llc * 3 // 5)
         # fp32 V is read in place while all of it fits half the LLC: the copy
         # only buys a unit stride.
         v_direct = (dt == 0 and not isa and
-                    batch * kv_heads * seq_k * hd * 4 <= llc // 2)
+                    batch * heads * seq_k * hd * 4 <= llc // 2)
         cells = workers if fuse else nbh
         total = cells * slab + workers * aux + 64
         buf = torch.tensor([
-            batch, seq_q, seq_k, heads, kv_heads, hd,
+            batch, seq_q, seq_k, heads, hd,
             qs[0], qs[1], qs[2], ks[0], ks[1], ks[2], vs[0], vs[1], vs[2],
             seq_q * heads * hd, heads * hd, hd,
             dt, int(bool(causal)), workers, int(fuse), rq, 0, slab, aux,

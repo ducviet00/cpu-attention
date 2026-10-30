@@ -1,7 +1,7 @@
 """`flash_attn_func`: FlashAttention over supplied Q/K/V tensors.
 
-Work item = (batch, query head, `rq` consecutive query rows). Each (batch, kv
-head) is first packed into a private slab -- K^T blocked every KP keys (the
+MHA. Work item = (batch, head, `rq` consecutive query rows). Each (batch, head)
+is first packed into a private slab -- K^T blocked every KP keys (the
 `[tile][hd][KP]` / bf16 `[tile][hd/2][KP][2]` page layout the KV cache uses),
 V row-major (fp32, or read in place while all of V fits LLC/2) or as bf16 key
 pairs for a `dpbf16ps` P@V. The key range is then walked in tiles of KT keys,
@@ -36,7 +36,6 @@ struct FlashJob(ImplicitlyCopyable, Movable):
     var seq_q: Int
     var seq_k: Int
     var heads: Int
-    var kv_heads: Int
     var qb: Int
     var qt: Int
     var qh: Int
@@ -54,7 +53,7 @@ struct FlashJob(ImplicitlyCopyable, Movable):
     var fuse: Bool
     var rq: Int
     var ws: Int
-    var slab: Int  # bytes per (batch, kv head) slab
+    var slab: Int  # bytes per (batch, head) slab
     var aux: Int  # bytes per thread
     var v_direct: Bool
     var scale: Float32
@@ -69,27 +68,26 @@ struct FlashJob(ImplicitlyCopyable, Movable):
         self.seq_q = Int(p[1])
         self.seq_k = Int(p[2])
         self.heads = Int(p[3])
-        self.kv_heads = Int(p[4])
-        self.qb = Int(p[6])
-        self.qt = Int(p[7])
-        self.qh = Int(p[8])
-        self.kb = Int(p[9])
-        self.kt = Int(p[10])
-        self.kh = Int(p[11])
-        self.vb = Int(p[12])
-        self.vt = Int(p[13])
-        self.vh = Int(p[14])
-        self.ob = Int(p[15])
-        self.ot = Int(p[16])
-        self.oh = Int(p[17])
-        self.causal = p[19] != 0
-        self.workers = Int(p[20])
-        self.fuse = p[21] != 0
-        self.rq = Int(p[22])
-        self.ws = Int(p[23])
-        self.slab = Int(p[24])
-        self.aux = Int(p[25])
-        self.v_direct = p[26] != 0
+        self.qb = Int(p[5])
+        self.qt = Int(p[6])
+        self.qh = Int(p[7])
+        self.kb = Int(p[8])
+        self.kt = Int(p[9])
+        self.kh = Int(p[10])
+        self.vb = Int(p[11])
+        self.vt = Int(p[12])
+        self.vh = Int(p[13])
+        self.ob = Int(p[14])
+        self.ot = Int(p[15])
+        self.oh = Int(p[16])
+        self.causal = p[18] != 0
+        self.workers = Int(p[19])
+        self.fuse = p[20] != 0
+        self.rq = Int(p[21])
+        self.ws = Int(p[22])
+        self.slab = Int(p[23])
+        self.aux = Int(p[24])
+        self.v_direct = p[25] != 0
         self.scale = scale
 
 
@@ -109,7 +107,7 @@ trait FlashPolicy:
 
     @staticmethod
     def slab_bytes(seq_k: Int) -> Int:
-        """Packed K/V bytes for one (batch, kv head)."""
+        """Packed K/V bytes for one (batch, head)."""
         ...
 
     @staticmethod
@@ -118,7 +116,7 @@ trait FlashPolicy:
         ...
 
     @staticmethod
-    def pack(job: FlashJob, b: Int, kvh: Int, slab: Int):
+    def pack(job: FlashJob, b: Int, h: Int, slab: Int):
         ...
 
     @staticmethod
@@ -126,7 +124,7 @@ trait FlashPolicy:
         job: FlashJob,
         slab: Int,
         b: Int,
-        kvh: Int,
+        h: Int,
         q0: Int,
         sub: Int,
         k0: Int,
@@ -162,8 +160,6 @@ def _attend[
     comptime RQT = P.RQT
     comptime KT = P.KT
     comptime E = 2 if dtype == DType.bfloat16 else 4
-    var group = job.heads // job.kv_heads
-    var kvh = h // group
     var q0 = qblk * job.rq
     var nrows = min(job.rq, job.seq_q - q0)
     var acc = aux + P.tile_bytes()
@@ -197,7 +193,7 @@ def _attend[
                     if nk > 0:
                         var qr = qbase + r0 * job.qt * E
                         var ar = acc + r0 * hd * 4
-                        P.tile(job, slab, b, kvh, qr, sub, k0, nk, lim, c, aux, ar, m + r0 * 4, l + r0 * 4, alpha + r0 * 4)
+                        P.tile(job, slab, b, h, qr, sub, k0, nk, lim, c, aux, ar, m + r0 * 4, l + r0 * 4, alpha + r0 * 4)
                 r0 += RQT
             k0 += KT
     for r in range(nrows):
@@ -221,26 +217,25 @@ def _attend[
 def _body[P: FlashPolicy](ctx: Int, tid: Int, threads: Int):
     var job = ptr[FlashJob](ctx)[]
     var nqb = (job.seq_q + job.rq - 1) // job.rq
-    var nbh = job.batch * job.kv_heads
-    var group = job.heads // job.kv_heads
+    var nbh = job.batch * job.heads
     var cells = threads if job.fuse else nbh
     var aux = job.ws + cells * job.slab + tid * job.aux
     if job.fuse:
-        # (batch, kv head) round-robin: neighbouring heads on neighbouring
-        # threads (adjacent source chunks in token-major K/V).
+        # (batch, head) round-robin: neighbouring heads on neighbouring threads
+        # (adjacent source chunks in token-major K/V).
         var slab = job.ws + tid * job.slab
         var i = tid
         while i < nbh:
-            var b = i // job.kv_heads
-            var kvh = i - b * job.kv_heads
-            P.pack(job, b, kvh, slab)
+            var b = i // job.heads
+            var h = i - b * job.heads
+            P.pack(job, b, h, slab)
             for qb in range(nqb):
-                _attend[P](job, b, kvh, qb, slab, aux)
+                _attend[P](job, b, h, qb, slab, aux)
             i += threads
         return
     var i = tid
     while i < nbh:
-        P.pack(job, i // job.kv_heads, i % job.kv_heads, job.ws + i * job.slab)
+        P.pack(job, i // job.heads, i % job.heads, job.ws + i * job.slab)
         i += threads
     barrier()
     var counter = ptr[Int64](job.ws + cells * job.slab + threads * job.aux)
@@ -256,14 +251,14 @@ def _body[P: FlashPolicy](ctx: Int, tid: Int, threads: Int):
         var qb = (nqb - 1 - (raw >> 1)) if (raw & 1) else (raw >> 1)
         var b = hp // job.heads
         var h = hp - b * job.heads
-        _attend[P](job, b, h, qb, job.ws + (b * job.kv_heads + h // group) * job.slab, aux)
+        _attend[P](job, b, h, qb, job.ws + hp * job.slab, aux)
 
 
 def flash_drive[P: FlashPolicy](job: FlashJob):
     var st = stack_allocation[1, FlashJob]()
     st[] = job
     if not job.fuse:
-        var cells = job.batch * job.kv_heads
+        var cells = job.batch * job.heads
         ptr[Int64](job.ws + cells * job.slab + job.workers * job.aux)[] = 0
     comptime body = _body[P]
     parallel(body, Int(st), job.workers)

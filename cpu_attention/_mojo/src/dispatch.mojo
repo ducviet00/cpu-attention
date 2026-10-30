@@ -58,7 +58,7 @@ def flash_run(job: FlashJob, dtype: Int, hd: Int, isa: Int) raises:
 
 
 def flash_sizes(seq_k: Int, rq: Int, hd: Int, dtype: Int, isa: Int) raises -> Tuple[Int, Int]:
-    """(slab bytes per (batch, kv head), scratch bytes per thread)."""
+    """(slab bytes per (batch, head), scratch bytes per thread)."""
     var sizes = (0, 0)
 
     def size[P: FlashPolicy]() raises capturing:

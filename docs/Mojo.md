@@ -29,8 +29,9 @@ over SDPA and vLLM on all three machines. Where rows tie, the limit is:
   faster on c4-standard-* (its AMX path) and 1.06-1.26x on c4a-standard-*
   (README); fp32 and c4d-standard-* tie or win.
 - **GQA/MQA are out of scope for now**: the API raises `NotImplementedError`
-  for `nheads_k < nheads`, though the kernel keeps its group paths (a group's
-  query heads as rows of one register tile, §3). When last measured (`0081f7c`),
+  for `nheads_k < nheads`, and the group paths are removed from both kernels
+  (in git history before the removal: a group's query heads as rows of one
+  decode register tile, `R` up to 8). When last measured (`0081f7c`),
   GQA decode at head_dim 128 (32 query heads over 8 or 4 KV heads) ran 1.34-1.86x
   behind vLLM in bf16 on c4-standard-*, where vLLM uses AMX tiles for the group,
   and 1.1-1.6x behind on c4a-standard-*; an AMX (and a `bfmmla`) `PVKernel` for
@@ -57,14 +58,14 @@ _mojo/tests/test_attention.mojo   standalone decode parity test vs a scalar fp32
 
 ## 3. One design for both APIs
 
-**The page layout is shared.** flash_attn_func packs each (batch, kv head) into a
+**The page layout is shared.** flash_attn_func packs each (batch, head) into a
 private slab whose K^T is blocked every 64 keys -- exactly a KV-cache page of 64
 tokens: `[tile][hd][64]` fp32, `[tile][hd/2][64][2]` bf16 (the dim pair a dot
 instruction contracts). The decode cache uses the same dim-pair K layout per
-page. So Q@K^T, the online softmax and P@V are the same register-tile
-algorithm over pages of keys:
-- decode: rows = the query heads of one kv group;
-- flash_attn_func: rows = consecutive query positions.
+page. So Q@K^T, the online softmax and P@V are the same algorithm over pages of
+keys: decode scores one query row per (sequence, head), flash_attn_func a
+register tile of consecutive query positions. MHA only (GQA/MQA raise in the API;
+the group paths were removed from both kernels, §9).
 
 **flash_attn_func driver / policy split.** `flash_attn.mojo` owns scheduling,
 the bottom-right causal bound (row i sees keys `j <= i + seq_k - seq_q`, exact
@@ -89,21 +90,18 @@ a broadcast does not fold into the FMA, `isa.BCAST_FOLD` false, query dims and
 probabilities as vectors used by lane, 4 keys per P@V step, and a contiguous Q
 panel). The bf16 matrix engines (AMX, `bfmmla`) keep their own policies.
 
-**Decode.** Work item = (sequence, kv head, chunk of that head's query heads):
-every query head of a GQA/MQA group is a row of one register tile, so the group
-shares one scan of the cache (0.52-0.73 of C++ on the GQA/MQA rows, where C++
-rescans per query head). Groups are split into chunks only when there are fewer
-(sequence, kv head) pairs than workers; stores then precede a barrier. P@V never
-reads past `lens`, a negative slot skips its store, a zero-length context returns
-0. The page size is a compile-time constant for 16/32/48/64.
+**Decode.** Work item = (sequence, head), one query row; workers take contiguous
+ranges balanced on context length (`_share`). P@V never reads past `lens`, a
+negative slot skips its store, a zero-length context returns 0. The page size is
+a compile-time constant for 16/32/48/64.
 
-**One decode driver for every tier** (`paged_attn._attend_rows`). A softmax step of
+**One decode driver for every tier** (`paged_attn._attend`). A softmax step of
 `KT` keys is resolved into 16-key units (page % 16 == 0, so a unit never
 straddles a page): one key vector on AVX-512, two on AVX2, four on NEON. Q@K^T
 scores `G` key vectors per call (independent dot chains) with a masked tail that
 stays inside one unit, tracks the step maximum as a tree, and the softmax keeps
 `NS` partial sums. What differs per target is compile-time only:
-- `Decode[dtype, hd, R]` holds the shape as `comptime` members computed from
+- `Decode[dtype, hd]` holds the shape as `comptime` members computed from
   `simd_width_of` and `CompilationTarget` (`KT`, `G`, `G_TAIL`, `DEG`, `NS`, `NC`,
   `FULL`); `comptime assert` pins the tiling invariants.
 - `Decode.PV` is the one per-target kernel, a type conforming to the `PVKernel`

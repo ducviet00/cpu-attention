@@ -12,7 +12,7 @@ instruction against 8 for `bfdot` (2.2-3.2x over it in the previous kernel).
   vectors in (r0, r0, r1, r1) lane order, and the bf16 probabilities leave as
   the P@V `a` operand ([r0 k0..k3][r1 k0..k3]) with one zip.
 
-Packed slab (per batch, kv head; keys padded to 16):
+Packed slab (per batch, head; keys padded to 16):
   K  `[key block of 8][hd/4][4 key pairs][8]`: four dims of two keys per 16 B,
      so Q@K^T walks one linear stream (hd * 16 B per 8 keys);
   V  `[hd/8 chunk][key group of 4][4 dim pairs][8]`: a P@V pass over 8 dims
@@ -71,12 +71,12 @@ def _bf16(e: F4) -> SIMD[DType.uint16, 4]:
 # ---------------------------------------------------------------------------
 # pack
 # ---------------------------------------------------------------------------
-def _pack[hd: Int](job: FlashJob, b: Int, kvh: Int, slab: Int):
+def _pack[hd: Int](job: FlashJob, b: Int, h: Int, slab: Int):
     comptime DG = hd // 4
     var n = job.seq_k
     var pad = _pad(n)
-    var ks = ptr[BFloat16](job.k + (b * job.kb + kvh * job.kh) * 2)
-    var vs = ptr[BFloat16](job.v + (b * job.vb + kvh * job.vh) * 2)
+    var ks = ptr[BFloat16](job.k + (b * job.kb + h * job.kh) * 2)
+    var vs = ptr[BFloat16](job.v + (b * job.vb + h * job.vh) * 2)
     var kd = ptr[BFloat16](slab)
     var vd = ptr[BFloat16](slab + pad * hd * 2)
     var zero = B8(0)
@@ -416,15 +416,15 @@ struct NeonMmlaPolicy[hd: Int](FlashPolicy):
         return LG_BYTES + P_BYTES + (RQT // 2) * (Self.hd // 4) * 16 + (RQT // 2) * 16
 
     @staticmethod
-    def pack(job: FlashJob, b: Int, kvh: Int, slab: Int):
-        _pack[Self.hd](job, b, kvh, slab)
+    def pack(job: FlashJob, b: Int, h: Int, slab: Int):
+        _pack[Self.hd](job, b, h, slab)
 
     @staticmethod
     def tile(
         job: FlashJob,
         slab: Int,
         b: Int,
-        kvh: Int,
+        h: Int,
         q0: Int,
         sub: Int,
         k0: Int,
