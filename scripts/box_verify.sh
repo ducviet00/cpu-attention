@@ -7,6 +7,9 @@
 #   NOBENCH  1 = gates only
 # Results go to ~/verify-BRANCH.out/{gates/*.log,full.json,full.log}; summarize the JSON
 # with scripts/ab_summary.py.
+# Launch it outside the ssh session (`sudo systemd-run --uid=$USER --setenv=HOME=$HOME
+# --working-directory=$HOME bash ...`): when the last session logs out, systemd stops the
+# user's processes, nohup and setsid included.
 set -uo pipefail
 export PATH=$HOME/.local/bin:$PATH
 BR=$1; BASE_REF=$2; ISAS=$3; shift 3
