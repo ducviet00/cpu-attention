@@ -318,7 +318,12 @@ def _acc_load[
 
 @always_inline
 def _store_row[dtype: DType, hd: Int](job: PagedJob, seq: Int, h: Int, l: Float32, acc: MutPointer[Float32, _]):
-    """out = acc / l; a row that saw no key is exactly 0."""
+    """out = acc / l; a row that saw no key is exactly 0.
+
+    Runtime loops on purpose: with only constant offsets into the accumulator
+    buffer, LLVM promotes it to vector registers live across the key loop and
+    spills the Q@K^T accumulators (aarch64 bf16 d=128: 155 stack accesses in that
+    loop against 47, decode 4-14% slower)."""
     comptime L = PageLayout[dtype, hd]
     comptime E = 2 if dtype == DType.bfloat16 else 4
     var o = ptr[Scalar[dtype]](job.out + (seq * job.out_stride + h * hd) * E)
@@ -328,12 +333,12 @@ def _store_row[dtype: DType, hd: Int](job: PagedJob, seq: Int, h: Int, l: Float3
         return
     var inv = Float32(1) / l
     comptime if L.SPLIT:
-        comptime for d in range(0, hd, 2 * LANES):
+        for d in range(0, hd, 2 * LANES):
             var ev = acc.unsafe_load[width=LANES](d) * inv
             var od = acc.unsafe_load[width=LANES](d + LANES) * inv
             o.unsafe_store[width = 2 * LANES](d, ev.interleave(od).cast[dtype]())
     else:
-        comptime for d in range(0, hd, LANES):
+        for d in range(0, hd, LANES):
             o.unsafe_store[width=LANES](d, (acc.unsafe_load[width=LANES](d) * inv).cast[dtype]())
 
 
