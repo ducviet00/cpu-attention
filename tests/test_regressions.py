@@ -407,6 +407,18 @@ def test_paged_workers():
         got = A.cross_attention(pc["q"], pc["kc"], pc["vc"], pc["bt"],
                                 pc["lens"], pc["scale"])
         report(f"paged workers={w}", paged_err(pc, got) <= 1e-6)
+    # Workers split tasks by context length: lopsided batches (an empty and a
+    # 2047-key sequence), MHA, GQA and chunked MQA groups, odd worker counts.
+    for w in (2, 3, 5, 8, 0):
+        A.set_num_workers(w)
+        for h, hk in ((8, 8), (8, 2), (8, 1)):
+            for ctxs in ([0, 2047, 1, 17, 64], [2047, 16], [5, 3, 1024]):
+                pc = paged_case(len(ctxs), ctxs, h, hk, 64, 16, torch.float32,
+                                seed=w + h + hk)
+                got = A.cross_attention(pc["q"], pc["kc"], pc["vc"], pc["bt"],
+                                        pc["lens"], pc["scale"])
+                report(f"paged balanced workers={w} h={h}/{hk} ctx={ctxs}",
+                       paged_err(pc, got) <= 1e-6)
     A.set_num_workers(0)
 
 
