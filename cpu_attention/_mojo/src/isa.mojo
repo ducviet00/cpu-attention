@@ -1,0 +1,248 @@
+"""What every kernel shares: the build tier, lane width, pointers, `exp2`, bf16.
+
+One source builds several tiers (`scripts/build.py`): each `.so` is compiled for
+an explicit target, and the Python loader picks the highest tier this CPU and OS
+support. So every ISA decision below is `comptime`, made from the tier's target
+features; nothing here probes the running CPU except `amx_permitted` (AMX needs
+OS permission, which only a syscall can ask for).
+"""
+
+from std.ffi import external_call
+from std.memory import MutPointer, bitcast
+from std.origin import MutUntrackedOrigin
+from std.sys import llvm_intrinsic, simd_width_of
+from std.sys.info import CompilationTarget
+
+comptime LANES = simd_width_of[DType.float32]()
+"""fp32 lanes per vector: 16 on AVX-512, 8 on AVX2, 4 on NEON/SSE."""
+
+comptime X86_BF16 = CompilationTarget.is_x86() and CompilationTarget._has_feature[
+    "avx512bf16"
+]()
+"""`vdpbf16ps`: 2 bf16 MACs per fp32 lane, exact products, fp32 accumulate."""
+
+comptime NEON_BF16 = CompilationTarget.has_neon() and CompilationTarget._has_feature[
+    "bf16"
+]()
+"""`bfdot` / `bfmmla` (Armv8.6 BF16)."""
+
+comptime BF16_DOT = X86_BF16 or NEON_BF16
+
+comptime BCAST_FOLD = CompilationTarget.is_x86()
+"""A scalar broadcast folds into the FMA's memory operand (`{1to16}`), so a
+broadcast per query dim / probability is free; NEON instead loads 4 values as a
+vector and multiplies by a lane (`fmla v, v, v.s[i]`)."""
+
+comptime AMX_TIER = X86_BF16
+"""The AVX-512-BF16 tier also carries the AMX kernels (inline asm assembles for
+any x86 target); they run only after `amx_permitted()`."""
+
+
+def tier_name() -> String:
+    comptime if X86_BF16:
+        return "x86-avx512bf16"
+    elif CompilationTarget.is_x86() and LANES == 8:
+        return "x86-avx2"
+    elif CompilationTarget.is_x86():
+        return "x86-64"
+    elif NEON_BF16:
+        return "aarch64-bf16"
+    else:
+        return "aarch64-neon" if CompilationTarget.has_neon() else "portable"
+
+
+@always_inline
+def ptr[T: AnyType](address: Int) -> MutPointer[T, MutUntrackedOrigin]:
+    return MutPointer[T, MutUntrackedOrigin](unsafe_from_address=address)
+
+
+comptime LOG2E = 1.4426950408889634
+
+
+@always_inline
+def vmax[w: Int](a: SIMD[DType.float32, w], b: SIMD[DType.float32, w]) -> SIMD[DType.float32, w]:
+    """Fast lane-wise maximum (one `vmaxps` on x86, one `fmaxnm` on aarch64);
+    `max()` on SIMD floats is NaN-propagating and emits compare + select on x86."""
+    comptime if CompilationTarget.has_neon() and w == 4:
+        return llvm_intrinsic[
+            "llvm.maxnum.v4f32", SIMD[DType.float32, w], has_side_effect=False
+        ](a, b)
+    else:
+        return a.gt(b).select(a, b)
+
+
+@always_inline
+def exp2[
+    degree: Int, width: Int
+](x: SIMD[DType.float32, width]) -> SIMD[DType.float32, width]:
+    """`2^x` for `x <= 0`: round to nearest, a polynomial on the fraction, the
+    integer part applied to the exponent; the one exp of every kernel. About 7-10
+    instructions against `std.math.exp`'s ~22 (docs/Mojo.md §7). A masked lane
+    (-inf or -1e30) yields 0, never NaN (on NEON ~1e-38, see below).
+
+    `degree` trades accuracy for instructions: 2 sits inside a bf16 rounding
+    (relative 2e-3; enough for flash bf16), 4 and 5 are minimax at 2.6e-6 and
+    3e-6 (paged bf16 uses 5), 6 (Taylor) at 1.2e-7 -- the paged fp32 gate (1e-6
+    absolute) needs 6.
+
+    Per target, the round and the exponent:
+    * AVX-512: `vrndscaleps`, then `vscalefps` applies the integer part -- no
+      clamp, no exponent shift or multiply (7 uops against 9; 4-9% of an AMX
+      flash call).
+    * NEON: a magic-constant add rounds, and the exponent comes from that sum's
+      bits (`fcvt*` issues on one pipe at 1/cycle on Neoverse: ~8% of the fp32
+      flash softmax). The integer exponent add needs x >= -126, so a masked lane
+      is ~1e-38, not 0; fully masked rows are zeroed by the callers.
+    * otherwise: magic-constant round, x clamped at -127, exponent bits built from
+      the converted integer part.
+    """
+    comptime W = SIMD[DType.float32, width]
+    comptime SCALEF = X86_BF16 and width == 16
+    comptime NEON_EXP = CompilationTarget.has_neon()
+
+    @always_inline
+    def poly(r: W) -> W:
+        var p: W
+        comptime if degree <= 2:
+            p = r.fma(2.3473140e-1, 6.9335938e-1)
+            p = p.fma(r, 1.0)
+        elif degree <= 4:
+            # Remez minimax on [-0.5, 0.5]: relative 2.6e-6, degree 5's class.
+            p = W(9.570101908e-3)
+            p = p.fma(r, 5.591786032e-2)
+            p = p.fma(r, 2.402474483e-1)
+            p = p.fma(r, 6.931218147e-1)
+            p = p.fma(r, 9.999992614e-1)
+        elif degree == 5:
+            p = W(1.3392112e-3)
+            p = p.fma(r, 9.6180963e-3)
+            p = p.fma(r, 5.5503282e-2)
+            p = p.fma(r, 2.4022652e-1)
+            p = p.fma(r, 6.9314718e-1)
+            p = p.fma(r, 1.0)
+        else:
+            p = W(1.5403530e-4)
+            p = p.fma(r, 1.3333558e-3)
+            p = p.fma(r, 9.6181291e-3)
+            p = p.fma(r, 5.5504109e-2)
+            p = p.fma(r, 2.4022651e-1)
+            p = p.fma(r, 6.9314718e-1)
+            p = p.fma(r, 1.0)
+        return p
+
+    comptime if SCALEF:
+        comptime V16 = SIMD[DType.float32, 16]
+        var x16 = rebind[V16](x)
+        var n16 = llvm_intrinsic["llvm.x86.avx512.mask.rndscale.ps.512", V16, has_side_effect=False](
+            x16, Int32(8), x16, Int16(-1), Int32(4)
+        )
+        var p16 = rebind[V16](poly(rebind[W](x16 - n16)))
+        return rebind[W](
+            llvm_intrinsic["llvm.x86.avx512.mask.scalef.ps.512", V16, has_side_effect=False](
+                p16, n16, V16(0), Int16(-1), Int32(4)
+            )
+        )
+    comptime MAGIC = 12582912.0  # 1.5 * 2^23: adding it rounds to nearest
+    var xc = vmax(x, W(-126.0 if NEON_EXP else -127.0))
+    var y = xc + MAGIC
+    var n = y - MAGIC
+    var p = poly(xc - n)
+    comptime if NEON_EXP:
+        return bitcast[DType.float32, width](bitcast[DType.int32, width](p) + (bitcast[DType.int32, width](y) << 23))
+    return p * bitcast[DType.float32, width]((n.cast[DType.int32]() + 127) << 23)
+
+
+@always_inline
+def transpose[dt: DType](mut r: Array[SIMD[dt, LANES], LANES]):
+    """LANES x LANES in registers (any 32-bit lane type): log2(LANES) rounds of
+    interleaving row i with row i + LANES/2."""
+    comptime ROUNDS = 4 if LANES == 16 else (3 if LANES == 8 else 2)
+    comptime for _s in range(ROUNDS):
+        var t = Array[SIMD[dt, LANES], LANES](uninitialized=True)
+        comptime for i in range(LANES // 2):
+            var w = r[i].interleave(r[i + LANES // 2])
+            t[2 * i] = w.slice[LANES, offset=0]()
+            t[2 * i + 1] = w.slice[LANES, offset=LANES]()
+        r = t^
+
+
+@always_inline
+def online_max[
+    width: Int, degree: Int, slack: Float32 = 0.0
+](m_old: SIMD[DType.float32, width], m_tile: SIMD[DType.float32, width]) -> Tuple[
+    SIMD[DType.float32, width], SIMD[DType.float32, width]
+]:
+    """FlashAttention's running-max step, in scaled log2 units: the new running max
+    and the factor for the old row sum and accumulator (1 where the max holds).
+    With `slack` > 0 (FA4) the max moves only past m_old + slack, so most tiles
+    rescale nothing; the probabilities stay below 2^slack."""
+    var need = m_tile.gt(m_old + slack)
+    return (need.select(m_tile, m_old), need.select(exp2[degree, width](m_old - m_tile), 1.0))
+
+
+@always_inline
+def dot_bf16[
+    width: Int
+](
+    acc: SIMD[DType.float32, width],
+    a: SIMD[DType.bfloat16, 2 * width],
+    b: SIMD[DType.bfloat16, 2 * width],
+) -> SIMD[DType.float32, width]:
+    """`acc[i] += a[2i]*b[2i] + a[2i+1]*b[2i+1]`: products of two bf16 values are
+    exact in fp32, so this is widening math with a different summation order.
+    `has_side_effect=False` matters: without it the calls stay ordered and the
+    phase is ~4x slower (docs/Mojo.md §5)."""
+    comptime if X86_BF16 and width == 16:
+        return llvm_intrinsic[
+            "llvm.x86.avx512bf16.dpbf16ps.512",
+            SIMD[DType.float32, width],
+            has_side_effect=False,
+        ](acc, a, b)
+    elif NEON_BF16 and width == 4:
+        return llvm_intrinsic[
+            "llvm.aarch64.neon.bfdot",
+            SIMD[DType.float32, width],
+            has_side_effect=False,
+        ](acc, a, b)
+    else:
+        var af = a.cast[DType.float32]()
+        var bf = b.cast[DType.float32]()
+        var ea = af.deinterleave()
+        var eb = bf.deinterleave()
+        comptime H = SIMD[DType.float32, width]
+        return rebind[H](ea[0]).fma(
+            rebind[H](eb[0]), rebind[H](ea[1]).fma(rebind[H](eb[1]), acc)
+        )
+
+
+@always_inline
+def bf16_lo[width: Int](x: SIMD[DType.float32, width], hi: SIMD[DType.bfloat16, width]) -> SIMD[DType.bfloat16, width]:
+    """The low half of the bf16 split x ~ hi + lo (hi = x rounded to bf16): with
+    it, bf16 products (hi*hi + hi*lo + lo*hi) keep fp32 accuracy."""
+    return (x - hi.cast[DType.float32]()).cast[DType.bfloat16]()
+
+
+@always_inline
+def to_bf16[width: Int](x: SIMD[DType.float32, width]) -> SIMD[DType.bfloat16, width]:
+    """Round-to-nearest-even fp32 -> bf16 (one `vcvtneps2bf16` on AVX-512-BF16)."""
+    return x.cast[DType.bfloat16]()
+
+
+def amx_permitted() -> Bool:
+    """Ask the kernel for AMX tile-data permission (`arch_prctl`), once per
+    process; False on every non-AMX tier or when the OS refuses."""
+    comptime if not AMX_TIER:
+        return False
+    comptime ARCH_REQ_XCOMP_PERM = 0x1023
+    comptime XFEATURE_XTILEDATA = 18
+    comptime SYS_ARCH_PRCTL = 158
+    return (
+        Int(
+            external_call["syscall", Int, Int64, Int64, Int64](
+                Int64(SYS_ARCH_PRCTL),
+                Int64(ARCH_REQ_XCOMP_PERM),
+                Int64(XFEATURE_XTILEDATA),
+            )
+        )
+        == 0
+    )

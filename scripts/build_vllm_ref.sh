@@ -15,10 +15,12 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYBIN="$REPO/.venv/bin/python"
 OUT="$HOME/vllm_cpu_build"
 
-if [ ! -d "$HOME/vllm/.git" ]; then
-  git clone https://github.com/vllm-project/vllm "$HOME/vllm"
+# Only the pinned commit: a full clone of vLLM stalled on the GCP boxes.
+if [ "$(git -C "$HOME/vllm" rev-parse HEAD 2>/dev/null)" != "$VLLM_COMMIT" ]; then
+  rm -rf "$HOME/vllm" && git init -q "$HOME/vllm"
+  git -C "$HOME/vllm" fetch -q --depth 1 https://github.com/vllm-project/vllm "$VLLM_COMMIT"
+  git -C "$HOME/vllm" checkout -q FETCH_HEAD
 fi
-git -C "$HOME/vllm" checkout -q "$VLLM_COMMIT"
 
 mkdir -p "$OUT" && cd "$OUT"
 ln -sfn "$HOME/vllm/csrc" csrc

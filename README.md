@@ -11,13 +11,9 @@ and works as a standalone library.
   aligned) or not.
 * fp32 and bf16, MHA / MQA / GQA, head_dim 32/64/128, page size a multiple of
   16.
-* Two interchangeable backends behind one API:
-  * **C++** (`cpu_attention/csrc/`, [`docs/CPP.md`](docs/CPP.md));
-  * **Mojo** (`cpu_attention/_mojo/`, [`docs/Mojo.md`](docs/Mojo.md)).
-
-  `CPU_ATTENTION_BACKEND=mojo|cpp|auto` selects one. The default is `mojo`;
-  `auto` picks `cpp` on x86-64 and `mojo` on aarch64. Both load in one
-  process, so they can be A/B'd.
+* One kernel, written in Mojo (`cpu_attention/_mojo/`,
+  [`docs/Mojo.md`](docs/Mojo.md)): one driver per op for every CPU, a target
+  differing only by compile-time constants and a trait-plugged inner kernel.
 * Linux, PyTorch, Python >= 3.10.
 * Not supported, and rejected with `NotImplementedError` rather than silently
   ignored: rotary, ALiBi, softcap, sliding windows, varlen/packed QKV,
@@ -27,12 +23,14 @@ and works as a standalone library.
 
 ```bash
 uv sync --extra build                                    # torch + the mojo wheel
-uv run --extra build python scripts/build.py --tests     # Mojo backend -> cpu_attention/_C.so
-uv run --extra build python scripts/build_cpp.py --test  # C++ backend  -> cpu_attention/_C_cpp.so
+uv run --extra build python scripts/build.py --tests     # one _C_<tier>.so per ISA tier
 ```
 
-Both builds target the machine they run on, so rebuild per box. The C++
-build links the installed torch, so rebuild it after a torch upgrade.
+The build writes one shared object per ISA tier for the host architecture
+(x86-64: AVX-512-BF16 + AMX, AVX2, baseline; aarch64: BF16, NEON), each compiled
+for an explicit target rather than the build host. The loader picks the best
+tier the CPU reports; `CPU_ATTENTION_ISA=amx|vec|avx2|scalar|neon` forces one
+and is refused if the CPU lacks it.
 
 ## Use
 
@@ -64,9 +62,8 @@ reshape_and_cache(k, v, k_cache, v_cache, slot_mapping)   # stage a cache
 
 Notes on the API:
 * **Cache layout.** The cache is this library's head-major layout (K is stored
-  transposed inside the page), and each backend defines its own. Stage a cache
-  through the *active* backend's `reshape_and_cache`; a cache written by one
-  backend is garbage to the other.
+  transposed inside the page). Stage a cache through `reshape_and_cache`; a
+  cache in another library's layout (vLLM's included) is not readable.
 * **Strides.** q/k/v may be strided chunks of a fused projection: any token
   stride, with heads and dims contiguous.
 * **`causal` on the paged path** is accepted and has no effect, because one
@@ -74,179 +71,630 @@ Notes on the API:
 
 ## Performance
 
-**Setup.**
-* **Boxes:** Ryzen 7 7840H (8 cores, AVX-512 + BF16, no AMX) at 8 threads;
-  Google Axion Neoverse-V2 (GCP c4a, 8 cores) at 8 threads; Xeon Platinum 8581C
-  (GCP C4, 4 cores / 8 threads, AMX) at 4 threads.
-* **Baselines:** vLLM `csrc/cpu` at `db3b0f0`, built for the ISA the box
-  uses. That is **AMX for Xeon bf16**, VEC for x86 fp32 and for the Ryzen, and
-  NEON on the Axion.
+The kernel is measured against **torch SDPA** (`F.scaled_dot_product_attention`)
+on every `flash_attn_func` row, and against **vLLM's CPU attention** (`csrc/cpu`
+at `db3b0f0`, built by `scripts/build_vllm_ref.sh`) on every paged row. Times are
+microseconds per call (the minimum over interleaved samples), and the ratio is
+**ours / reference**: below 1 means we are faster. These numbers are the single
+source of truth; `docs/Mojo.md` explains the design and the experiments.
 
-**Method.**
-* One process per box (Ryzen dense: one per row), all arms interleaved with
-  rotated order, plus a duplicate C++ arm as the noise floor.
-* Rounds: 61 dense / 121 paged on the servers; 41 dense / 41 x 40-call blocks
-  paged on the Ryzen.
-* Times are the **minimum**, in µs, listed as **C++ / Mojo / vLLM**.
+**Setup** (Mojo 1.2.0 `2016d0cd`, torch 2.14.1+cpu, Oct 2026). Three 8-vCPU GCP
+spot VMs at `453760b`, and the same three machine types at 16 vCPUs at `14f9609`
+(the same kernel; [16-vCPU results](#16-vcpu-boxes)), threads = physical cores:
 
-**Ratios.**
-* `c/best` is C++ divided by the faster of Mojo and vLLM; bold is a clear win
-  (< 0.97).
-* `c/SDPA` is C++ against `torch.nn.functional.scaled_dot_product_attention`
-  in the same process, from a separate 21-round dense run.
+| box | CPU | threads | vLLM ISA |
+|---|---|---:|---|
+| C4D | c4d-standard-8: AMD EPYC 9B45 (Zen 5), 4 cores / 8 threads, AVX-512 + BF16, no AMX | 4 | VEC |
+| Axion | c4a-standard-8: Google Axion Neoverse-V2, 8 cores | 8 | NEON |
+| Xeon | c4-standard-8: Intel Xeon Platinum 8581C, 4 cores / 8 threads, AMX | 4 | AMX for bf16, VEC for fp32 |
+| C4D-16 | c4d-standard-16: the same EPYC, 8 cores / 16 threads | 8 | VEC |
+| Axion-16 | c4a-standard-16: the same Axion, 16 cores | 16 | NEON |
+| Xeon-16 | c4-standard-16: the same Xeon, 8 cores / 16 threads | 8 | AMX for bf16, VEC for fp32 |
 
-**What is charged to whom.**
-* Ours includes the K/V pack and the output allocation.
-* vLLM's cache is staged, and its output preallocated, outside the timer.
+**Method** (`benchmarks/bench.py`; its docstring has the full rules).
+* **The manifest** (`benchmarks/manifest.py`, fixed before optimizing) has 170
+  rows, 85 shapes in both bf16 and fp32: odd lengths around tile and page
+  boundaries (17 ... 4097), unequal query/key lengths, noncausal, GQA/MQA,
+  head_dim 32/64/128, fused-QKV strided inputs, page sizes 16/48/64,
+  heterogeneous contexts, store-only, a preallocated `out=` and the public
+  `flash_attn_with_kvcache` call. Shapes are `seq_q:heads:head_dim` for flash
+  rows (`sq/sk` when they differ, `h=Q/KV` heads for GQA/MQA).
+* **One process per box**, with our build loaded twice independently (the second
+  copy is the noise floor), SDPA and vLLM: interleaved, order rotated every
+  round, and the **minimum** decides. Rounds: 61 for `flash_attn_func` and 121
+  for decode, one call per sample. Every arm's output is validated.
+* **Equal work.** Ours includes the K/V pack and the output allocation (except
+  `out=` rows). For a decode row, vLLM does the same append and paged decode on
+  its own cache, staged outside the timer, and its output is preallocated. For a
+  store row, both run their `reshape_and_cache`.
+* **Cold decode rows.** A decode row whose per-arm K/V working set exceeds a
+  quarter of the LLC is timed cold (marked ᶜ): before every sample, outside the
+  timer and identically for every arm, a read-only sweep of twice the LLC evicts
+  it. A serving KV cache is far larger than the LLC.
+* **Verdict per row.** With `band = max(3%, spread between our two copies)`, a
+  row is a **win** below `1 - band`, a **loss** above `1 + band` (marked ▲), and
+  **unresolved** in between.
 
-Rows are `seq:heads:head_dim`, batch 1, causal. Paged rows use 16 heads,
-head_dim 64, page 32 (x86) / 16 (ARM).
+**Results, 8-vCPU boxes** (win / unresolved / loss):
 
-**Summary.**
+| rows | reference | C4D | Axion | Xeon |
+|---|---|---|---|---|
+| `flash_attn_func` (78) | SDPA | 78 / 0 / 0 | 78 / 0 / 0 | 78 / 0 / 0 |
+| decode, allocating the output (60) | vLLM | 41 / 15 / 0 (4 no ref.) | 53 / 3 / 4 | 30 / 20 / 6 (4 no ref.) |
+| decode with `out=` (20) | vLLM | 14 / 6 / 0 | 18 / 2 / 0 | 10 / 7 / 3 |
+| public `flash_attn_with_kvcache` decode (8) | vLLM | 5 / 2 / 1 | 6 / 1 / 1 | 5 / 2 / 1 |
+| store-only (`reshape_and_cache`) (4) | vLLM | 3 / 0 / 1 | 3 / 1 / 0 | 4 / 0 / 0 |
+| **all (170)** | | **141 / 23 / 2 (4 no ref.)** | **158 / 7 / 5** | **127 / 29 / 10 (4 no ref.)** |
 
-| | Ryzen 7840H | Axion Neoverse-V2 | Xeon 8581C |
+Median ours / reference (bf16, fp32):
+
+| rows | C4D | Axion | Xeon |
 |---|---|---|---|
-| C++ faster than vLLM | 42/42 | 42/42 | 42/42 |
-| C++ faster than Mojo | 40/42 | 40/42 | 42/42 |
-| clear wins vs the best baseline (< 0.97) | 38 | 35 | 39 |
-| noise band (0.97-1.04) / losses | 3 / 1 | 7 / 0 | 3 / 0 |
-| C++ / SDPA (dense) | 0.22-0.71 | 0.27-0.85 | 0.17-0.64 |
+| `flash_attn_func` | 0.17, 0.30 | 0.46, 0.48 | 0.41, 0.32 |
+| decode, allocating the output | 0.84, 0.98 | 0.86, 0.88 | 0.96, 0.94 |
+| decode with `out=` | 0.84, 0.97 | 0.85, 0.88 | 0.91, 0.98 |
+| public `flash_attn_with_kvcache` decode | 0.83, 0.99 | 0.91, 0.94 | 0.92, 0.83 |
+| store-only (`reshape_and_cache`) | 0.46, 0.86 | 0.94, 0.77 | 0.61, 0.58 |
 
-**Where C++ does not clearly win.**
-* The one loss is Ryzen paged self b=32 ctx=1024 bf16, at 1.16 of Mojo.
-* On the Axion, Mojo stays the faster baseline on seven dense rows, at
-  0.97-1.01.
+<details><summary>`flash_attn_func`: µs per call, ours / SDPA (78 rows)</summary>
 
-Details and open problems are in [`docs/CPP.md`](docs/CPP.md).
+| row | C4D ours | C4D SDPA | C4D ratio | Axion ours | Axion SDPA | Axion ratio | Xeon ours | Xeon SDPA | Xeon ratio |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| `128:8:64 bf16` | 17.8 | 128.4 | 0.14 | 21.4 | 61.9 | 0.35 | 19.1 | 50.7 | 0.38 |
+| `128:8:64 fp32` | 27.0 | 125.7 | 0.21 | 44.4 | 165.4 | 0.27 | 36.9 | 118.6 | 0.31 |
+| `512:8:64 bf16` | 202.9 | 1614.5 | 0.13 | 210.7 | 608.6 | 0.35 | 147.7 | 416.3 | 0.35 |
+| `512:8:64 fp32` | 335.4 | 1535.7 | 0.22 | 568.7 | 1775.8 | 0.32 | 302.5 | 1336.2 | 0.23 |
+| `1024:8:64 bf16` | 777.9 | 4475.8 | 0.17 | 799.0 | 1645.6 | 0.49 | 474.5 | 1180.5 | 0.40 |
+| `1024:8:64 fp32` | 1318.3 | 4361.5 | 0.30 | 2195.7 | 4605.7 | 0.48 | 1019.6 | 3174.8 | 0.32 |
+| `2048:8:64 bf16` | 3059.5 | 14899.7 | 0.21 | 3101.4 | 5323.1 | 0.58 | 1617.9 | 3673.1 | 0.44 |
+| `2048:8:64 fp32` | 5463.9 | 14473.3 | 0.38 | 8608.6 | 14336.3 | 0.60 | 3717.5 | 10525.9 | 0.35 |
+| `4096:8:64 bf16` | 12166.6 | 53587.0 | 0.23 | 12177.8 | 18888.9 | 0.64 | 5909.2 | 12562.7 | 0.47 |
+| `4096:8:64 fp32` | 22617.0 | 52088.1 | 0.43 | 34520.4 | 48266.7 | 0.72 | 14028.9 | 37208.2 | 0.38 |
+| `256:16:128 bf16` | 212.2 | 1524.9 | 0.14 | 196.2 | 544.2 | 0.36 | 179.8 | 359.6 | 0.50 |
+| `256:16:128 fp32` | 365.4 | 1515.2 | 0.24 | 542.6 | 1331.9 | 0.41 | 376.2 | 1284.9 | 0.29 |
+| `1024:16:128 bf16` | 3068.4 | 16711.5 | 0.18 | 2628.4 | 5236.4 | 0.50 | 1482.3 | 3376.5 | 0.44 |
+| `1024:16:128 fp32` | 5716.1 | 16572.2 | 0.34 | 7965.6 | 13678.4 | 0.58 | 3508.6 | 10884.3 | 0.32 |
+| `2048:16:128 bf16` | 12049.0 | 56116.4 | 0.21 | 10231.4 | 17652.4 | 0.58 | 5099.7 | 10831.1 | 0.47 |
+| `2048:16:128 fp32` | 22460.4 | 54368.4 | 0.41 | 31463.2 | 43325.1 | 0.73 | 12773.4 | 35716.2 | 0.36 |
+| `4096:16:128 bf16` | 47063.3 | 205989.1 | 0.23 | 42005.8 | 62507.5 | 0.67 | 19670.9 | 38231.3 | 0.51 |
+| `4096:16:128 fp32` | 86773.7 | 198862.5 | 0.44 | 125173.3 | 149934.8 | 0.83 | 66588.7 | 137427.2 | 0.48 |
+| `512:32:128 bf16` | 1597.5 | 12164.1 | 0.13 | 1386.0 | 4075.0 | 0.34 | 948.6 | 2156.3 | 0.44 |
+| `512:32:128 fp32` | 2943.9 | 12068.5 | 0.24 | 4126.8 | 10346.7 | 0.40 | 2263.5 | 10391.3 | 0.22 |
+| `1024:8:32 bf16` | 431.2 | 2584.2 | 0.17 | 540.8 | 1182.7 | 0.46 | 359.7 | 1000.9 | 0.36 |
+| `1024:8:32 fp32` | 706.5 | 2462.7 | 0.29 | 1329.4 | 2762.2 | 0.48 | 667.2 | 1945.5 | 0.34 |
+| `17:8:64 bf16` | 2.5 | 11.0 | 0.23 | 5.2 | 17.6 | 0.30 | 5.5 | 15.3 | 0.36 |
+| `17:8:64 fp32` | 2.8 | 11.5 | 0.24 | 5.7 | 20.0 | 0.28 | 5.8 | 14.5 | 0.40 |
+| `65:8:64 bf16` | 7.2 | 55.6 | 0.13 | 11.2 | 31.1 | 0.36 | 12.4 | 36.9 | 0.34 |
+| `65:8:64 fp32` | 10.0 | 44.3 | 0.23 | 17.3 | 47.6 | 0.36 | 18.2 | 54.7 | 0.33 |
+| `129:8:64 bf16` | 18.8 | 162.3 | 0.12 | 22.0 | 66.3 | 0.33 | 24.5 | 65.4 | 0.38 |
+| `129:8:64 fp32` | 28.2 | 133.4 | 0.21 | 46.0 | 127.3 | 0.36 | 50.3 | 149.2 | 0.34 |
+| `257:8:64 bf16` | 59.0 | 489.0 | 0.12 | 62.5 | 182.1 | 0.34 | 58.4 | 183.4 | 0.32 |
+| `257:8:64 fp32` | 94.9 | 422.4 | 0.22 | 155.7 | 425.7 | 0.37 | 127.3 | 417.2 | 0.31 |
+| `513:8:64 bf16` | 206.8 | 1726.8 | 0.12 | 214.6 | 618.1 | 0.35 | 166.3 | 462.9 | 0.36 |
+| `513:8:64 fp32` | 342.8 | 1563.0 | 0.22 | 573.1 | 1591.2 | 0.36 | 356.3 | 1537.2 | 0.23 |
+| `1025:8:64 bf16` | 785.9 | 4699.1 | 0.17 | 804.0 | 1661.7 | 0.48 | 538.3 | 1322.7 | 0.41 |
+| `1025:8:64 fp32` | 1328.5 | 4370.1 | 0.30 | 2203.3 | 4100.1 | 0.54 | 1104.0 | 3603.6 | 0.31 |
+| `2049:8:64 bf16` | 3069.7 | 15346.0 | 0.20 | 3103.6 | 5347.1 | 0.58 | 1713.0 | 3720.4 | 0.46 |
+| `2049:8:64 fp32` | 5223.3 | 14458.8 | 0.36 | 8597.5 | 12682.8 | 0.68 | 3735.7 | 10652.0 | 0.35 |
+| `4097:8:64 bf16` | 12138.3 | 54627.3 | 0.22 | 12254.2 | 19455.6 | 0.63 | 6007.6 | 12538.6 | 0.48 |
+| `4097:8:64 fp32` | 20794.1 | 51904.0 | 0.40 | 34556.5 | 42608.9 | 0.81 | 14081.4 | 37515.4 | 0.38 |
+| `129:16:128 bf16` | 68.6 | 634.9 | 0.11 | 65.4 | 192.3 | 0.34 | 77.5 | 166.2 | 0.47 |
+| `129:16:128 fp32` | 111.8 | 466.6 | 0.24 | 161.4 | 403.8 | 0.40 | 176.6 | 479.2 | 0.37 |
+| `257:16:128 bf16` | 221.1 | 1913.4 | 0.12 | 201.1 | 574.3 | 0.35 | 195.5 | 563.4 | 0.35 |
+| `257:16:128 fp32` | 380.8 | 1562.4 | 0.24 | 557.4 | 1364.7 | 0.41 | 425.0 | 1444.8 | 0.29 |
+| `1025:16:128 bf16` | 3095.3 | 18158.9 | 0.17 | 2655.7 | 5298.1 | 0.50 | 1571.4 | 3521.6 | 0.45 |
+| `1025:16:128 fp32` | 5765.1 | 16574.9 | 0.35 | 8013.7 | 13704.0 | 0.58 | 3689.3 | 11162.6 | 0.33 |
+| `2049:16:128 bf16` | 12139.5 | 60387.1 | 0.20 | 10298.1 | 17583.6 | 0.59 | 5077.8 | 10770.7 | 0.47 |
+| `2049:16:128 fp32` | 20977.0 | 54803.5 | 0.38 | 31604.5 | 43268.5 | 0.73 | 13043.3 | 36610.3 | 0.36 |
+| `1025:8:32 bf16` | 435.6 | 2698.7 | 0.16 | 540.1 | 1180.3 | 0.46 | 382.6 | 1004.9 | 0.38 |
+| `1025:8:32 fp32` | 711.8 | 2482.3 | 0.29 | 1329.6 | 2759.7 | 0.48 | 669.7 | 2029.0 | 0.33 |
+| `1x129:8:64 bf16` | 3.5 | 35.1 | 0.10 | 4.8 | 21.3 | 0.23 | 6.5 | 13.6 | 0.48 |
+| `1x129:8:64 fp32` | 3.8 | 10.7 | 0.36 | 7.0 | 22.5 | 0.31 | 5.6 | 13.3 | 0.42 |
+| `17x301:8:64 bf16` | 14.6 | 58.7 | 0.25 | 13.8 | 44.3 | 0.31 | 15.0 | 38.8 | 0.39 |
+| `17x301:8:64 fp32` | 19.4 | 57.3 | 0.34 | 31.4 | 61.3 | 0.51 | 34.9 | 61.2 | 0.57 |
+| `127x129:8:64 bf16` | 18.5 | 150.1 | 0.12 | 20.4 | 88.9 | 0.23 | 22.0 | 91.8 | 0.24 |
+| `127x129:8:64 fp32` | 28.0 | 147.5 | 0.19 | 44.7 | 150.2 | 0.30 | 40.6 | 153.0 | 0.27 |
+| `129x127:8:64 bf16` | 18.8 | 196.4 | 0.10 | 19.8 | 89.5 | 0.22 | 22.1 | 96.2 | 0.23 |
+| `129x127:8:64 fp32` | 27.5 | 165.6 | 0.17 | 43.5 | 153.0 | 0.28 | 39.7 | 159.9 | 0.25 |
+| `257x513:8:64 bf16` | 153.6 | 1022.5 | 0.15 | 156.0 | 394.4 | 0.40 | 108.0 | 319.9 | 0.34 |
+| `257x513:8:64 fp32` | 252.8 | 850.5 | 0.30 | 424.4 | 799.2 | 0.53 | 243.4 | 817.0 | 0.30 |
+| `513x257:8:64 bf16` | 58.3 | 920.6 | 0.06 | 60.4 | 368.9 | 0.16 | 71.3 | 345.7 | 0.21 |
+| `513x257:8:64 fp32` | 95.4 | 872.5 | 0.11 | 153.0 | 776.5 | 0.20 | 134.6 | 787.2 | 0.17 |
+| `1025x2049:8:64 bf16` | 2298.2 | 13232.2 | 0.17 | 2321.7 | 5012.7 | 0.46 | 1265.2 | 4109.1 | 0.31 |
+| `1025x2049:8:64 fp32` | 3898.1 | 12611.6 | 0.31 | 6484.5 | 11380.9 | 0.57 | 2757.9 | 9967.0 | 0.28 |
+| `2049x1025:8:64 bf16` | 792.5 | 12652.8 | 0.06 | 803.9 | 4597.2 | 0.17 | 561.6 | 3265.3 | 0.17 |
+| `2049x1025:8:64 fp32` | 1362.2 | 12103.1 | 0.11 | 2208.3 | 10744.6 | 0.21 | 1125.5 | 9398.7 | 0.12 |
+| `1024:8:64 noncausal bf16` | 1505.0 | 5997.1 | 0.25 | 1532.1 | 2142.4 | 0.72 | 790.6 | 1488.7 | 0.53 |
+| `1024:8:64 noncausal fp32` | 2554.2 | 5744.6 | 0.44 | 4263.5 | 4437.9 | 0.96 | 1726.3 | 4210.0 | 0.41 |
+| `1025:8:64 noncausal bf16` | 1550.3 | 6323.3 | 0.25 | 1566.7 | 2196.5 | 0.71 | 852.2 | 1576.6 | 0.54 |
+| `1025:8:64 noncausal fp32` | 2602.3 | 5820.4 | 0.45 | 4310.8 | 4505.6 | 0.96 | 1768.8 | 4392.6 | 0.40 |
+| `1024:16:128 noncausal bf16` | 5829.3 | 22130.4 | 0.26 | 5027.5 | 6924.6 | 0.73 | 2436.3 | 4327.3 | 0.56 |
+| `1024:16:128 noncausal fp32` | 11253.3 | 21890.5 | 0.51 | 15481.9 | 16158.7 | 0.96 | 5715.1 | 14323.7 | 0.40 |
+| `1024:32/8:128 bf16` | 6036.5 | 33279.6 | 0.18 | 5221.4 | 10505.0 | 0.50 | 2839.1 | 6320.2 | 0.45 |
+| `1024:32/8:128 fp32` | 11068.4 | 32649.5 | 0.34 | 15936.9 | 27250.0 | 0.58 | 6908.3 | 21664.8 | 0.32 |
+| `1024:16/1:64 bf16` | 1563.7 | 8923.7 | 0.18 | 1602.9 | 3237.8 | 0.50 | 938.5 | 2269.6 | 0.41 |
+| `1024:16/1:64 fp32` | 2644.8 | 8617.2 | 0.31 | 4402.2 | 8032.6 | 0.55 | 1761.8 | 6098.0 | 0.29 |
+| `1024:8:64 fused bf16` | 784.0 | 4535.4 | 0.17 | 801.5 | 1672.7 | 0.48 | 498.3 | 1209.6 | 0.41 |
+| `1024:8:64 fused fp32` | 1323.3 | 4351.6 | 0.30 | 2194.8 | 4081.1 | 0.54 | 971.0 | 3242.9 | 0.30 |
+| `257:16:128 fused bf16` | 222.1 | 1923.4 | 0.12 | 202.1 | 576.4 | 0.35 | 217.5 | 593.4 | 0.37 |
+| `257:16:128 fused fp32` | 392.5 | 1595.9 | 0.25 | 567.5 | 1365.8 | 0.42 | 447.8 | 1570.6 | 0.29 |
 
-### Dense, bf16
+</details>
 
-| shape | Ryzen C++ / Mojo / vLLM µs | c/best | c/SDPA | Axion C++ / Mojo / vLLM µs | c/best | c/SDPA | Xeon C++ / Mojo / vLLM µs | c/best | c/SDPA |
-|---|---|---:|---:|---|---:|---:|---|---:|---:|
-| 128:8:64 | 28.2 / 42.6 / 40.2 | **0.70** | 0.25 | 23.2 / 24.7 / 24.7 | **0.94** | 0.41 | 24.7 / 28.5 / 31.2 | **0.87** | 0.43 |
-| 512:8:64 | 167 / 264 / 359 | **0.63** | 0.22 | 216 / 233 / 264 | **0.93** | 0.36 | 181 / 242 / 266 | **0.75** | 0.32 |
-| 1024:8:64 | 699 / 1,037 / 1,456 | **0.67** | 0.30 | 870 / 882 / 984 | 0.99 | 0.53 | 629 / 838 / 992 | **0.75** | 0.43 |
-| 2048:8:64 | 2,854 / 4,124 / 5,899 | **0.69** | 0.38 | 3,323 / 3,446 / 3,742 | **0.96** | 0.62 | 2,307 / 3,069 / 3,686 | **0.75** | 0.50 |
-| 4096:8:64 | 11,484 / 16,499 / 23,165 | **0.70** | 0.38 | 13,044 / 13,903 / 15,028 | **0.94** | 0.69 | 8,837 / 11,929 / 14,852 | **0.74** | 0.53 |
-| 256:16:128 | 171 / 339 / 359 | **0.51** | 0.25 | 202 / 216 / 237 | **0.93** | 0.37 | 183 / 237 / 234 | **0.78** | 0.38 |
-| 1024:16:128 | 2,652 / 5,109 / 5,697 | **0.52** | 0.29 | 2,870 / 2,936 / 3,100 | 0.98 | 0.55 | 1,916 / 2,386 / 2,574 | **0.80** | 0.52 |
-| 2048:16:128 | 10,738 / 20,130 / 22,321 | **0.53** | 0.35 | 11,063 / 11,676 / 12,188 | **0.95** | 0.63 | 6,852 / 8,808 / 9,515 | **0.78** | 0.56 |
-| 4096:16:128 | 43,430 / 85,527 / 89,784 | **0.51** | 0.37 | 43,720 / 46,636 / 48,168 | **0.94** | 0.70 | 27,684 / 34,363 / 38,023 | **0.81** | 0.64 |
-| 512:32:128 | 1,374 / 2,728 / 3,061 | **0.50** | 0.22 | 1,427 / 1,553 / 1,618 | **0.92** | 0.35 | 1,160 / 1,491 / 1,525 | **0.78** | 0.41 |
-| 1024:8:32 | 425 / 657 / 805 | **0.65** | 0.32 | 561 / 617 / 686 | **0.91** | 0.49 | 456 / 610 / 731 | **0.75** | 0.35 |
+<details><summary>decode, allocating the output: µs per call, ours / vLLM (60 rows)</summary>
 
-### Dense, fp32
+| row | C4D ours | C4D vLLM | C4D ratio | Axion ours | Axion vLLM | Axion ratio | Xeon ours | Xeon vLLM | Xeon ratio |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| `engine self b=1 ctx=256 bf16` | 3.9 | 7.4 | 0.52 | 6.4 | 10.9 | 0.59 | 5.8 | 11.9 | 0.49 |
+| `engine self b=1 ctx=256 fp32` | 7.2 | 9.3 | 0.77 | 9.4 | 16.4 | 0.57 | 10.7 | 21.2 | 0.51 |
+| `engine cross b=1 ctx=256 bf16` | 3.8 | 5.9 | 0.64 | 6.1 | 7.9 | 0.77 | 6.4 | 8.2 | 0.78 |
+| `engine cross b=1 ctx=256 fp32` | 7.1 | 7.9 | 0.90 | 9.3 | 12.6 | 0.74 | 9.7 | 17.0 | 0.57 |
+| `engine self b=8 ctx=256 bf16` | 46.3 | 67.5 | 0.69 | 36.0 | 86.0 | 0.42 | 90.7 | 113.2 | 0.80 |
+| `engine self b=8 ctx=256 fp32` | 313.6ᶜ | 325.8 | 0.96 | 97.0 | 147.1 | 0.66 | 166.3 | 176.7 | 0.94 |
+| `engine cross b=8 ctx=256 bf16` | 43.8 | 64.9 | 0.67 | 33.9 | 83.5 | 0.41 | 90.7 | 103.5 | 0.88 |
+| `engine cross b=8 ctx=256 fp32` | 313.2ᶜ | 314.4 | 1.00 | 89.6 | 139.1 | 0.64 | 165.9 | 165.0 | 1.01 |
+| `engine self b=8 ctx=1024 bf16` | 634.3ᶜ | 741.0 | 0.86 | 396.8ᶜ | 422.2 | 0.94 | 411.0 | 420.3 | 0.98 |
+| `engine self b=8 ctx=1024 fp32` | 1235.7ᶜ | 1257.1 | 0.98 | 723.0ᶜ | 780.3 | 0.93 | 886.2 | 985.5 | 0.90 |
+| `engine cross b=8 ctx=1024 bf16` | 632.5ᶜ | 735.8 | 0.86 | 385.0ᶜ | 404.5 | 0.95 | 402.2 | 411.8 | 0.98 |
+| `engine cross b=8 ctx=1024 fp32` | 1233.6ᶜ | 1245.4 | 0.99 | 700.3ᶜ | 771.8 | 0.91 | 860.4 | 943.4 | 0.91 |
+| `engine self b=32 ctx=1024 bf16` | 2521.0ᶜ | 3028.9 | 0.83 | 1525.7ᶜ | 1817.4 | 0.84 | 2959.2ᶜ | 2848.8 | 1.04 ▲ |
+| `engine self b=32 ctx=1024 fp32` | 4946.1ᶜ | 5076.9 | 0.97 | 3012.5ᶜ | 3249.9 | 0.93 | 5222.0ᶜ | 5133.2 | 1.02 |
+| `engine cross b=32 ctx=1024 bf16` | 2512.1ᶜ | 2992.6 | 0.84 | 1587.0ᶜ | 1855.8 | 0.86 | 2953.0ᶜ | 2744.3 | 1.08 ▲ |
+| `engine cross b=32 ctx=1024 fp32` | 4920.5ᶜ | 5030.7 | 0.98 | 2875.7ᶜ | 3275.3 | 0.88 | 5191.5ᶜ | 4967.1 | 1.05 ▲ |
+| `engine self b=1 ctx=4096 bf16` | 316.7ᶜ | 347.7 | 0.91 | 137.3 | 156.9 | 0.88 | 224.6 | 234.8 | 0.96 |
+| `engine self b=1 ctx=4096 fp32` | 630.5ᶜ | 624.5 | 1.01 | 337.3ᶜ | 348.9 | 0.97 | 384.9 | 367.0 | 1.05 |
+| `engine cross b=1 ctx=4096 bf16` | 317.7ᶜ | 358.3 | 0.89 | 140.3 | 151.3 | 0.93 | 227.6 | 246.1 | 0.92 |
+| `engine cross b=1 ctx=4096 fp32` | 633.1ᶜ | 625.0 | 1.01 | 342.0ᶜ | 356.0 | 0.96 | 381.6 | 385.4 | 0.99 |
+| `engine self b=8 ctx=255 bf16` | 45.7 | 61.4 | 0.74 | 36.9 | 75.3 | 0.49 | 93.4 | 119.3 | 0.78 |
+| `engine self b=8 ctx=255 fp32` | 314.3ᶜ | 330.3 | 0.95 | 88.9 | 147.2 | 0.60 | 171.0 | 178.7 | 0.96 |
+| `engine cross b=8 ctx=255 bf16` | 44.0 | 65.3 | 0.67 | 35.9 | 74.7 | 0.48 | 91.0 | 107.9 | 0.84 |
+| `engine cross b=8 ctx=255 fp32` | 313.2ᶜ | 318.5 | 0.98 | 84.8 | 136.4 | 0.62 | 169.6 | 166.7 | 1.02 |
+| `engine self b=8 ctx=257 bf16` | 174.6ᶜ | 220.1 | 0.79 | 38.8 | 81.8 | 0.47 | 96.2 | 132.2 | 0.73 |
+| `engine self b=8 ctx=257 fp32` | 326.3ᶜ | 367.4 | 0.89 | 101.6 | 144.3 | 0.70 | 179.8 | 209.3 | 0.86 |
+| `engine cross b=8 ctx=257 bf16` | 173.7ᶜ | 212.9 | 0.82 | 38.3 | 70.0 | 0.55 | 98.8 | 120.9 | 0.82 |
+| `engine cross b=8 ctx=257 fp32` | 326.0ᶜ | 357.0 | 0.91 | 93.3 | 133.0 | 0.70 | 177.0 | 187.2 | 0.95 |
+| `engine self b=8 ctx=1023 bf16` | 629.4ᶜ | 730.8 | 0.86 | 388.5ᶜ | 415.7 | 0.93 | 444.6 | 449.3 | 0.99 |
+| `engine self b=8 ctx=1023 fp32` | 1234.0ᶜ | 1257.5 | 0.98 | 707.5ᶜ | 743.5 | 0.95 | 1026.8 | 1071.8 | 0.96 |
+| `engine cross b=8 ctx=1023 bf16` | 631.8ᶜ | 720.9 | 0.88 | 373.1ᶜ | 412.7 | 0.90 | 442.2 | 455.7 | 0.97 |
+| `engine cross b=8 ctx=1023 fp32` | 1231.0ᶜ | 1251.9 | 0.98 | 706.4ᶜ | 792.8 | 0.89 | 995.9 | 1057.1 | 0.94 |
+| `engine self b=8 ctx=1025 bf16` | 640.4ᶜ | 759.2 | 0.84 | 346.2ᶜ | 421.6 | 0.82 | 471.0 | 477.3 | 0.99 |
+| `engine self b=8 ctx=1025 fp32` | 1244.6ᶜ | 1299.4 | 0.96 | 689.1ᶜ | 769.7 | 0.90 | 1137.6 | 1136.2 | 1.00 |
+| `engine cross b=8 ctx=1025 bf16` | 638.0ᶜ | 750.8 | 0.85 | 362.5ᶜ | 411.8 | 0.88 | 463.4 | 507.9 | 0.91 |
+| `engine cross b=8 ctx=1025 fp32` | 1245.1ᶜ | 1289.8 | 0.97 | 691.9ᶜ | 763.1 | 0.91 | 1127.7 | 1099.8 | 1.03 |
+| `engine self b=1 ctx=4097 bf16` | 318.7ᶜ | 369.1 | 0.86 | 138.2 | 159.3 | 0.87 | 224.5 | 247.1 | 0.91 |
+| `engine self b=1 ctx=4097 fp32` | 633.1ᶜ | 633.2 | 1.00 | 344.7ᶜ | 349.2 | 0.99 | 373.1 | 393.3 | 0.95 |
+| `engine cross b=1 ctx=4097 bf16` | 319.5ᶜ | 371.6 | 0.86 | 140.3 | 153.7 | 0.91 | 236.8 | 235.4 | 1.01 |
+| `engine cross b=1 ctx=4097 fp32` | 633.2ᶜ | 631.9 | 1.00 | 348.5ᶜ | 350.3 | 1.00 | 378.0 | 386.1 | 0.98 |
+| `engine self b=8 ctx=1024 page=16 bf16` | 631.3ᶜ | - | - | 369.7ᶜ | 425.2 | 0.87 | 524.2 | - | - |
+| `engine self b=8 ctx=1024 page=16 fp32` | 1230.1ᶜ | - | - | 678.2ᶜ | 769.8 | 0.88 | 816.8 | - | - |
+| `engine self b=8 ctx=1024 page=48 bf16` | 634.6ᶜ | - | - | 279.4ᶜ | 317.0 | 0.88 | 372.8 | - | - |
+| `engine self b=8 ctx=1024 page=48 fp32` | 1228.4ᶜ | - | - | 517.2ᶜ | 627.4 | 0.82 | 778.0 | - | - |
+| `engine self b=8 ctx=1024 page=64 bf16` | 632.1ᶜ | 721.2 | 0.88 | 282.2ᶜ | 328.2 | 0.86 | 383.1 | 385.5 | 0.99 |
+| `engine self b=8 ctx=1024 page=64 fp32` | 1230.0ᶜ | 1256.6 | 0.98 | 518.3ᶜ | 638.6 | 0.81 | 901.2 | 1012.7 | 0.89 |
+| `engine self b=8 ctx=1024 h=16/4 bf16` | 72.7 | 92.5 | 0.79 | 79.8 | 74.4 | 1.07 ▲ | 122.8 | 116.0 | 1.06 ▲ |
+| `engine self b=8 ctx=1024 h=16/4 fp32` | 329.6ᶜ | 359.2 | 0.92 | 117.6 | 149.2 | 0.79 | 210.3 | 238.8 | 0.88 |
+| `engine cross b=8 ctx=1024 h=16/4 bf16` | 74.4 | 102.5 | 0.73 | 80.2 | 68.9 | 1.16 ▲ | 122.1 | 108.6 | 1.12 ▲ |
+| `engine cross b=8 ctx=1024 h=16/4 fp32` | 331.3ᶜ | 350.8 | 0.94 | 124.5 | 158.6 | 0.79 | 207.1 | 222.1 | 0.93 |
+| `engine cross b=8 ctx=1024 h=16/1 bf16` | 34.6 | 107.8 | 0.32 | 66.5 | 37.7 | 1.77 ▲ | 75.0 | 35.4 | 2.12 ▲ |
+| `engine cross b=8 ctx=1024 h=16/1 fp32` | 44.5 | 138.8 | 0.32 | 87.2 | 83.4 | 1.05 ▲ | 89.6 | 207.5 | 0.43 |
+| `engine self b=8 ctx=het bf16` | 391.4ᶜ | 475.6 | 0.82 | 154.1 | 215.7 | 0.71 | 256.1 | 275.2 | 0.93 |
+| `engine self b=8 ctx=het fp32` | 761.8ᶜ | 799.2 | 0.95 | 430.1ᶜ | 490.1 | 0.88 | 451.8 | 507.8 | 0.89 |
+| `engine cross b=8 ctx=het bf16` | 391.0ᶜ | 467.7 | 0.84 | 148.0 | 209.9 | 0.71 | 257.4 | 267.4 | 0.96 |
+| `engine cross b=8 ctx=het fp32` | 759.8ᶜ | 787.0 | 0.97 | 424.0ᶜ | 477.9 | 0.89 | 459.2 | 505.8 | 0.91 |
+| `engine cross b=8 ctx=1024 d=32 bf16` | 325.2ᶜ | 379.7 | 0.86 | 89.0 | 118.5 | 0.75 | 205.4 | 231.4 | 0.89 |
+| `engine cross b=8 ctx=1024 d=32 fp32` | 626.6ᶜ | 636.2 | 0.98 | 408.0ᶜ | 430.3 | 0.95 | 373.5 | 364.5 | 1.02 |
+| `engine cross b=8 ctx=1024 d=128 bf16` | 623.9ᶜ | 721.0 | 0.87 | 269.2ᶜ | 360.2 | 0.75 | 409.2 | 413.1 | 0.99 |
+| `engine cross b=8 ctx=1024 d=128 fp32` | 1232.5ᶜ | 1247.0 | 0.99 | 567.9ᶜ | 623.1 | 0.91 | 857.9 | 955.0 | 0.90 |
 
-| shape | Ryzen C++ / Mojo / vLLM µs | c/best | c/SDPA | Axion C++ / Mojo / vLLM µs | c/best | c/SDPA | Xeon C++ / Mojo / vLLM µs | c/best | c/SDPA |
-|---|---|---:|---:|---|---:|---:|---|---:|---:|
-| 128:8:64 | 24.9 / 30.8 / 28.6 ¹ | **0.87** | 0.36 | 43.8 / 48.6 / 51.3 | **0.90** | 0.27 | 46.4 / 53.3 / 62.5 | **0.87** | 0.34 |
-| 512:8:64 | 306 / 349 / 344 | **0.89** | 0.39 | 557 / 574 / 638 | 0.97 | 0.32 | 330 / 426 / 626 | **0.77** | 0.22 |
-| 1024:8:64 | 1,190 / 1,310 / 1,306 | **0.91** | 0.55 | 2,153 / 2,170 / 2,438 | 0.99 | 0.47 | 1,195 / 1,407 / 2,246 | **0.85** | 0.33 |
-| 2048:8:64 | 4,871 / 5,376 / 5,313 | **0.92** | 0.65 | 8,493 / 8,473 / 9,498 | 1.00 | 0.60 | 4,438 / 5,191 / 8,661 | **0.85** | 0.35 |
-| 4096:8:64 | 20,360 / 21,050 / 21,127 | **0.97** | 0.71 | 34,212 / 37,441 / 37,366 | **0.92** | 0.71 | 17,537 / 20,404 / 33,530 | **0.86** | 0.40 |
-| 256:16:128 | 310 / 380 / 382 | **0.82** | 0.40 | 544 / 581 / 729 | **0.93** | 0.41 | 375 / 509 / 685 | **0.74** | 0.25 |
-| 1024:16:128 | 5,179 / 6,495 / 5,377 | **0.96** | 0.56 | 8,202 / 8,142 / 10,314 | 1.01 | 0.66 | 3,518 / 4,570 / 8,366 | **0.77** | 0.28 |
-| 2048:16:128 | 20,307 / 22,622 / 20,700 | 0.98 | 0.65 | 32,149 / 38,069 / 40,523 | **0.84** | 0.72 | 14,961 / 17,502 / 32,305 | **0.85** | 0.34 |
-| 4096:16:128 | 78,747 / 133,861 / 83,781 | **0.94** | 0.67 | 126,285 / 159,610 / 159,846 | **0.79** | 0.85 | 77,076 / 87,543 / 123,415 | **0.88** | 0.49 |
-| 512:32:128 | 2,871 / 3,634 / 2,889 | 0.99 | 0.42 | 4,073 / 4,617 / 5,304 | **0.88** | 0.40 | 2,135 / 2,860 / 4,610 | **0.75** | 0.17 |
-| 1024:8:32 | 656 / 743 / 732 | **0.90** | 0.50 | 1,262 / 1,280 / 1,476 | 0.99 | 0.46 | 843 / 1,017 / 1,350 | **0.83** | 0.39 |
+</details>
 
-### Paged, bf16
+<details><summary>decode with `out=`: µs per call, ours / vLLM (20 rows)</summary>
 
-| case | Ryzen C++ / Mojo / vLLM µs | c/best | Axion C++ / Mojo / vLLM µs | c/best | Xeon C++ / Mojo / vLLM µs | c/best |
-|---|---|---:|---|---:|---|---:|
-| self b=1 ctx=256 | 3.6 / 5.6 / 5.9 | **0.63** | 6.0 / 12.5 / 10.0 | **0.60** | 7.9 / 11.9 / 12.0 | **0.66** |
-| cross b=1 ctx=256 | 5.3 / 8.2 / 6.4 | **0.83** | 5.5 / 11.2 / 7.3 | **0.75** | 7.2 / 10.5 / 7.5 | **0.96** |
-| self b=8 ctx=256 | 17.1 / 22.1 / 32.0 | **0.78** | 29.9 / 51.2 / 75.2 | **0.58** | 59.5 / 86.1 / 104 | **0.69** |
-| cross b=8 ctx=256 | 17.2 / 22.3 / 26.9 | **0.77** | 28.7 / 50.3 / 71.0 | **0.57** | 57.2 / 82.5 / 92.9 | **0.69** |
-| self b=8 ctx=1024 | 356 / 381 / 427 | **0.93** | 254 / 290 / 300 | **0.87** | 311 / 368 / 385 | **0.85** |
-| cross b=8 ctx=1024 | 355 / 378 / 414 | **0.94** | 269 / 315 / 307 | **0.88** | 306 / 357 / 368 | **0.86** |
-| self b=32 ctx=1024 | 2,856 / 2,472 / 2,859 | 1.16 | 1,163 / 1,508 / 1,535 | **0.77** | 2,837 / 4,076 / 3,095 | **0.92** |
-| cross b=32 ctx=1024 | 2,371 / 2,366 / 2,750 | 1.00 | 1,249 / 1,590 / 1,606 | **0.79** | 2,676 / 4,005 / 2,947 | **0.91** |
-| self b=1 ctx=4096 | 37.8 / 77.0 / 82.9 | **0.49** | 83.5 / 112 / 119 | **0.74** | 164 / 185 / 187 | **0.89** |
-| cross b=1 ctx=4096 | 38.9 / 76.1 / 81.1 | **0.51** | 82.1 / 109 / 114 | **0.75** | 163 / 185 / 183 | **0.89** |
+| row | C4D ours | C4D vLLM | C4D ratio | Axion ours | Axion vLLM | Axion ratio | Xeon ours | Xeon vLLM | Xeon ratio |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| `engine_out self b=1 ctx=256 bf16` | 3.6 | 7.4 | 0.49 | 5.3 | 10.0 | 0.53 | 5.6 | 14.5 | 0.39 |
+| `engine_out self b=1 ctx=256 fp32` | 6.7 | 9.0 | 0.74 | 9.2 | 16.3 | 0.57 | 9.4 | 27.2 | 0.35 |
+| `engine_out cross b=1 ctx=256 bf16` | 3.5 | 5.9 | 0.60 | 5.6 | 7.2 | 0.77 | 4.9 | 7.2 | 0.68 |
+| `engine_out cross b=1 ctx=256 fp32` | 6.7 | 7.7 | 0.87 | 8.6 | 12.6 | 0.68 | 10.0 | 15.1 | 0.66 |
+| `engine_out self b=8 ctx=256 bf16` | 46.3 | 68.4 | 0.68 | 34.7 | 83.1 | 0.42 | 89.8 | 116.5 | 0.77 |
+| `engine_out self b=8 ctx=256 fp32` | 311.6ᶜ | 324.0 | 0.96 | 84.5 | 141.3 | 0.60 | 165.6 | 180.3 | 0.92 |
+| `engine_out cross b=8 ctx=256 bf16` | 43.5 | 73.3 | 0.59 | 34.5 | 80.3 | 0.43 | 87.8 | 107.1 | 0.82 |
+| `engine_out cross b=8 ctx=256 fp32` | 311.2ᶜ | 307.7 | 1.01 | 87.3 | 137.7 | 0.63 | 165.5 | 164.1 | 1.01 |
+| `engine_out self b=8 ctx=1024 bf16` | 631.1ᶜ | 731.7 | 0.86 | 373.6ᶜ | 404.9 | 0.92 | 398.3 | 422.7 | 0.94 |
+| `engine_out self b=8 ctx=1024 fp32` | 1233.9ᶜ | 1262.9 | 0.98 | 694.9ᶜ | 795.2 | 0.87 | 924.2 | 972.8 | 0.95 |
+| `engine_out cross b=8 ctx=1024 bf16` | 631.1ᶜ | 735.5 | 0.86 | 366.7ᶜ | 407.8 | 0.90 | 431.5 | 427.0 | 1.01 |
+| `engine_out cross b=8 ctx=1024 fp32` | 1235.9ᶜ | 1252.0 | 0.99 | 713.1ᶜ | 761.7 | 0.94 | 883.1 | 973.3 | 0.91 |
+| `engine_out self b=32 ctx=1024 bf16` | 2522.9ᶜ | 3016.1 | 0.84 | 1545.4ᶜ | 1774.8 | 0.87 | 2903.3ᶜ | 2794.8 | 1.04 ▲ |
+| `engine_out self b=32 ctx=1024 fp32` | 4953.5ᶜ | 5115.2 | 0.97 | 2926.1ᶜ | 3259.5 | 0.90 | 5234.9ᶜ | 5099.4 | 1.03 |
+| `engine_out cross b=32 ctx=1024 bf16` | 2519.1ᶜ | 2977.7 | 0.85 | 1471.3ᶜ | 1784.8 | 0.82 | 2938.2ᶜ | 2750.2 | 1.07 ▲ |
+| `engine_out cross b=32 ctx=1024 fp32` | 4944.6ᶜ | 5088.1 | 0.97 | 2816.6ᶜ | 3208.0 | 0.88 | 5103.5ᶜ | 4942.3 | 1.03 ▲ |
+| `engine_out self b=1 ctx=4096 bf16` | 316.6ᶜ | 373.3 | 0.85 | 138.6 | 156.6 | 0.88 | 219.8 | 241.0 | 0.91 |
+| `engine_out self b=1 ctx=4096 fp32` | 630.1ᶜ | 629.4 | 1.00 | 336.9ᶜ | 334.4 | 1.01 | 381.7 | 375.5 | 1.02 |
+| `engine_out cross b=1 ctx=4096 bf16` | 316.2ᶜ | 370.0 | 0.85 | 137.5 | 152.6 | 0.90 | 218.2 | 238.5 | 0.91 |
+| `engine_out cross b=1 ctx=4096 fp32` | 629.8ᶜ | 624.5 | 1.01 | 336.6ᶜ | 341.0 | 0.99 | 382.2 | 373.7 | 1.02 |
 
-### Paged, fp32
+</details>
 
-| case | Ryzen C++ / Mojo / vLLM µs | c/best | Axion C++ / Mojo / vLLM µs | c/best | Xeon C++ / Mojo / vLLM µs | c/best |
-|---|---|---:|---|---:|---|---:|
-| self b=1 ctx=256 | 4.6 / 6.9 / 7.2 | **0.66** | 9.5 / 15.2 / 15.9 | **0.63** | 8.7 / 12.0 / 16.1 | **0.73** |
-| cross b=1 ctx=256 | 4.5 / 6.4 / 5.6 | **0.80** | 8.2 / 13.5 / 12.1 | **0.68** | 8.4 / 10.8 / 12.9 | **0.78** |
-| self b=8 ctx=256 | 32.9 / 51.2 / 53.9 | **0.64** | 64.5 / 96.2 / 123 | **0.67** | 144 / 153 / 159 | **0.94** |
-| cross b=8 ctx=256 | 31.8 / 49.4 / 49.1 | **0.65** | 63.1 / 92.1 / 121 | **0.69** | 142 / 146 / 145 | 0.98 |
-| self b=8 ctx=1024 | 1,070 / 1,132 / 1,163 | **0.95** | 440 / 626 / 606 | **0.73** | 594 / 837 / 915 | **0.71** |
-| cross b=8 ctx=1024 | 1,037 / 1,088 / 1,167 | **0.95** | 490 / 627 / 633 | **0.78** | 592 / 822 / 918 | **0.72** |
-| self b=32 ctx=1024 | 4,788 / 5,226 / 5,082 | **0.94** | 2,667 / 2,775 / 2,930 | **0.96** | 4,340 / 4,898 / 4,760 | **0.91** |
-| cross b=32 ctx=1024 | 4,637 / 4,788 / 4,922 | **0.97** | 2,670 / 2,791 / 2,997 | **0.96** | 4,419 / 4,900 / 4,685 | **0.94** |
-| self b=1 ctx=4096 | 285 / 322 / 337 | **0.89** | 222 / 251 / 256 | **0.89** | 311 / 334 / 318 | 0.98 |
-| cross b=1 ctx=4096 | 284 / 323 / 334 | **0.88** | 224 / 248 / 262 | **0.90** | 310 / 333 / 314 | 0.99 |
+<details><summary>public `flash_attn_with_kvcache` decode: µs per call, ours / vLLM (8 rows)</summary>
 
-¹ Re-run in isolation (median of 3 runs). The matrix process read 1.33 for this
-row because it ran straight after the test suites; see `docs/CPP.md` §7.
+| row | C4D ours | C4D vLLM | C4D ratio | Axion ours | Axion vLLM | Axion ratio | Xeon ours | Xeon vLLM | Xeon ratio |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| `api self b=1 ctx=256 bf16` | 4.9 | 7.5 | 0.65 | 10.0 | 12.6 | 0.79 | 7.2 | 12.5 | 0.57 |
+| `api self b=1 ctx=256 fp32` | 8.0 | 9.0 | 0.89 | 14.2 | 19.0 | 0.74 | 11.4 | 26.9 | 0.42 |
+| `api cross b=1 ctx=256 bf16` | 4.8 | 6.0 | 0.81 | 9.4 | 8.5 | 1.10 ▲ | 6.7 | 7.5 | 0.89 |
+| `api cross b=1 ctx=256 fp32` | 8.1 | 7.6 | 1.06 ▲ | 13.1 | 13.1 | 1.00 | 11.8 | 15.2 | 0.78 |
+| `api self b=8 ctx=1024 bf16` | 639.9ᶜ | 747.3 | 0.86 | 361.3ᶜ | 399.6 | 0.90 | 446.8 | 420.6 | 1.06 ▲ |
+| `api self b=8 ctx=1024 fp32` | 1245.7ᶜ | 1263.5 | 0.99 | 711.2ᶜ | 762.6 | 0.93 | 891.5 | 1009.7 | 0.88 |
+| `api cross b=8 ctx=1024 bf16` | 645.5ᶜ | 734.8 | 0.88 | 371.2ᶜ | 406.6 | 0.91 | 396.1 | 417.0 | 0.95 |
+| `api cross b=8 ctx=1024 fp32` | 1240.5ᶜ | 1250.9 | 0.99 | 723.2ᶜ | 763.9 | 0.95 | 854.1 | 895.0 | 0.95 |
+
+</details>
+
+<details><summary>store-only (`reshape_and_cache`): µs per call, ours / vLLM (4 rows)</summary>
+
+| row | C4D ours | C4D vLLM | C4D ratio | Axion ours | Axion vLLM | Axion ratio | Xeon ours | Xeon vLLM | Xeon ratio |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| `store store b=32 ctx=1 bf16` | 3.5 | 5.4 | 0.64 | 5.0 | 5.1 | 1.00 | 9.3 | 11.0 | 0.84 |
+| `store store b=32 ctx=1 fp32` | 11.9 | 10.2 | 1.17 ▲ | 6.9 | 7.4 | 0.93 | 24.3 | 34.7 | 0.70 |
+| `store store b=1 ctx=1024 bf16` | 32.2 | 115.9 | 0.28 | 56.1 | 63.1 | 0.89 | 85.9 | 222.8 | 0.39 |
+| `store store b=1 ctx=1024 fp32` | 124.1 | 226.3 | 0.55 | 75.6 | 126.3 | 0.60 | 188.8 | 406.1 | 0.47 |
+
+</details>
+
+**Where we do not win.**
+* **GQA/MQA decode** (`h=16/4`, `h=16/1`, bf16) on the Axion and the Xeon: vLLM is
+  up to 2.1x faster on MQA (`cross b=8 ctx=1024 h=16/1` bf16: 66.5 vs 37.7 us on the
+  Axion, 75.0 vs 35.4 us on the Xeon). On the C4D these rows win or tie.
+* **Xeon `b=32 ctx=1024`** decode: 1.03-1.08. This VM reports its socket's 260 MB L3,
+  so only 8 Xeon decode rows cross the cold threshold; the rest are timed warm, and
+  their control spreads reach 11%.
+* **Single small calls**: the public API at `b=1 ctx=256` (Axion bf16 9.4 vs 8.5 us,
+  C4D fp32 8.1 vs 7.6) and C4D store-only `b=32 ctx=1` fp32 (11.9 vs 10.2 us).
+* **No reference**: vLLM on x86 takes only page sizes that are a multiple of 32, so
+  the four `page=16` / `page=48` decode rows have no vLLM time on the C4D and the Xeon.
+
+**Mixed context lengths** (`ctx=het`: 8 sequences of 17 ... 2047 tokens) were the
+largest loss until `453760b` (Axion 1.55-2.74x slower than vLLM): decode tasks were
+split across workers by count, so on 8 threads each worker took one whole sequence
+and the one holding 2047 keys did 3.3x the mean. Split by context length, they now
+win (11 of 12 rows; Xeon `cross` bf16 0.96, unresolved; Axion fp32 `self` 1221 -> 430
+us, vLLM 490). vLLM's bf16 output on
+these rows is 1.8-2.3e-3 above the bf16 rounding, outside our 1e-3 gate but inside the
+reference sanity gate (3e-2), so they are scored.
+
+### 16-vCPU boxes
+
+Twice the cores, each box in one process as above (win / unresolved / loss):
+
+| rows | reference | C4D-16 | Axion-16 | Xeon-16 |
+|---|---|---|---|---|
+| `flash_attn_func` (78) | SDPA | 78 / 0 / 0 | 77 / 1 / 0 | 78 / 0 / 0 |
+| decode, allocating the output (60) | vLLM | 18 / 38 / 0 (4 no ref.) | 56 / 3 / 1 | 33 / 11 / 12 (4 no ref.) |
+| decode with `out=` (20) | vLLM | 8 / 12 / 0 | 20 / 0 / 0 | 10 / 7 / 3 |
+| public `flash_attn_with_kvcache` decode (8) | vLLM | 3 / 5 / 0 | 6 / 0 / 2 | 4 / 3 / 1 |
+| store-only (`reshape_and_cache`) (4) | vLLM | 3 / 0 / 1 | 1 / 2 / 1 | 2 / 2 / 0 |
+| **all (170)** | | **110 / 55 / 1 (4 no ref.)** | **160 / 6 / 4** | **127 / 23 / 16 (4 no ref.)** |
+
+Median ours / reference (bf16, fp32):
+
+| rows | C4D-16 | Axion-16 | Xeon-16 |
+|---|---|---|---|
+| `flash_attn_func` | 0.17, 0.30 | 0.39, 0.41 | 0.39, 0.31 |
+| decode, allocating the output | 0.97, 0.99 | 0.83, 0.90 | 0.92, 0.97 |
+| decode with `out=` | 0.95, 0.99 | 0.81, 0.90 | 0.94, 0.98 |
+| public `flash_attn_with_kvcache` decode | 0.98, 0.99 | 0.85, 0.93 | 1.00, 0.86 |
+| store-only (`reshape_and_cache`) | 0.55, 1.00 | 1.15, 0.80 | 0.65, 0.73 |
+
+<details><summary>`flash_attn_func`: µs per call, ours / SDPA (78 rows)</summary>
+
+| row | C4D-16 ours | C4D-16 SDPA | C4D-16 ratio | Axion-16 ours | Axion-16 SDPA | Axion-16 ratio | Xeon-16 ours | Xeon-16 SDPA | Xeon-16 ratio |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| `128:8:64 bf16` | 9.7 | 67.8 | 0.14 | 19.6 | 42.6 | 0.46 | 13.7 | 39.0 | 0.35 |
+| `128:8:64 fp32` | 14.0 | 65.6 | 0.21 | 36.2 | 95.6 | 0.38 | 21.2 | 71.6 | 0.30 |
+| `512:8:64 bf16` | 103.9 | 813.5 | 0.13 | 128.0 | 323.6 | 0.40 | 81.2 | 233.1 | 0.35 |
+| `512:8:64 fp32` | 169.8 | 771.7 | 0.22 | 331.9 | 1006.2 | 0.33 | 165.1 | 773.3 | 0.21 |
+| `1024:8:64 bf16` | 392.4 | 2265.8 | 0.17 | 444.3 | 1131.1 | 0.39 | 273.6 | 706.7 | 0.39 |
+| `1024:8:64 fp32` | 665.9 | 2189.4 | 0.30 | 1224.2 | 2964.5 | 0.41 | 536.2 | 1797.9 | 0.30 |
+| `2048:8:64 bf16` | 1537.7 | 7532.7 | 0.20 | 1651.7 | 3714.1 | 0.44 | 915.4 | 2066.1 | 0.44 |
+| `2048:8:64 fp32` | 2837.0 | 7311.0 | 0.39 | 4597.5 | 9644.6 | 0.48 | 1945.5 | 5797.2 | 0.34 |
+| `4096:8:64 bf16` | 6195.0 | 27273.6 | 0.23 | 6296.4 | 13584.6 | 0.46 | 3342.0 | 7022.0 | 0.48 |
+| `4096:8:64 fp32` | 11379.7 | 26198.6 | 0.43 | 17765.7 | 34111.3 | 0.52 | 7464.4 | 20619.6 | 0.36 |
+| `256:16:128 bf16` | 108.7 | 771.2 | 0.14 | 99.0 | 280.6 | 0.35 | 95.1 | 226.6 | 0.42 |
+| `256:16:128 fp32` | 186.9 | 767.6 | 0.24 | 272.8 | 673.0 | 0.41 | 206.7 | 702.7 | 0.29 |
+| `1024:16:128 bf16` | 1600.6 | 8755.5 | 0.18 | 1332.1 | 2653.9 | 0.50 | 821.5 | 1914.7 | 0.43 |
+| `1024:16:128 fp32` | 2954.9 | 8478.9 | 0.35 | 4017.0 | 6839.1 | 0.59 | 1889.6 | 6148.8 | 0.31 |
+| `2048:16:128 bf16` | 6250.3 | 28712.4 | 0.22 | 5271.8 | 8736.8 | 0.60 | 2764.5 | 5853.3 | 0.47 |
+| `2048:16:128 fp32` | 11561.3 | 27769.8 | 0.42 | 15890.7 | 21782.0 | 0.73 | 7534.5 | 20473.6 | 0.37 |
+| `4096:16:128 bf16` | 24061.2 | 104612.7 | 0.23 | 21030.9 | 31364.3 | 0.67 | 10820.7 | 20811.2 | 0.52 |
+| `4096:16:128 fp32` | 45821.1 | 103797.3 | 0.44 | 63953.4 | 75236.5 | 0.85 | 41422.7 | 84449.9 | 0.49 |
+| `512:32:128 bf16` | 816.0 | 6124.3 | 0.13 | 695.3 | 2058.9 | 0.34 | 525.0 | 1239.7 | 0.42 |
+| `512:32:128 fp32` | 1511.8 | 6112.8 | 0.25 | 2082.0 | 5170.5 | 0.40 | 1244.5 | 5870.3 | 0.21 |
+| `1024:8:32 bf16` | 218.5 | 1329.2 | 0.16 | 300.0 | 801.4 | 0.37 | 203.3 | 550.9 | 0.37 |
+| `1024:8:32 fp32` | 362.4 | 1244.5 | 0.29 | 724.8 | 1741.7 | 0.42 | 365.9 | 1142.9 | 0.32 |
+| `17:8:64 bf16` | 2.1 | 8.2 | 0.26 | 11.2 | 159.2 | 0.07 | 4.7 | 11.4 | 0.41 |
+| `17:8:64 fp32` | 2.4 | 8.4 | 0.28 | 11.8 | 174.3 | 0.07 | 5.1 | 11.7 | 0.44 |
+| `65:8:64 bf16` | 4.6 | 31.0 | 0.15 | 12.0 | 30.8 | 0.39 | 9.5 | 28.6 | 0.33 |
+| `65:8:64 fp32` | 5.8 | 25.3 | 0.23 | 19.1 | 47.0 | 0.41 | 9.7 | 23.7 | 0.41 |
+| `129:8:64 bf16` | 10.1 | 84.8 | 0.12 | 20.9 | 54.3 | 0.39 | 11.4 | 39.3 | 0.29 |
+| `129:8:64 fp32` | 14.9 | 70.2 | 0.21 | 38.7 | 104.5 | 0.37 | 25.9 | 81.0 | 0.32 |
+| `257:8:64 bf16` | 29.9 | 248.1 | 0.12 | 46.8 | 151.8 | 0.31 | 29.3 | 98.8 | 0.30 |
+| `257:8:64 fp32` | 47.5 | 215.1 | 0.22 | 103.7 | 352.3 | 0.29 | 66.7 | 217.0 | 0.31 |
+| `513:8:64 bf16` | 104.4 | 871.4 | 0.12 | 131.5 | 409.1 | 0.32 | 86.5 | 239.6 | 0.36 |
+| `513:8:64 fp32` | 172.6 | 790.2 | 0.22 | 338.3 | 1105.3 | 0.31 | 173.4 | 742.9 | 0.23 |
+| `1025:8:64 bf16` | 395.6 | 2375.4 | 0.17 | 451.1 | 1406.0 | 0.32 | 286.7 | 699.2 | 0.41 |
+| `1025:8:64 fp32` | 664.1 | 2202.7 | 0.30 | 1231.9 | 3278.7 | 0.38 | 556.8 | 1864.4 | 0.30 |
+| `2049:8:64 bf16` | 1544.2 | 7733.4 | 0.20 | 1665.4 | 4224.1 | 0.39 | 946.1 | 2079.7 | 0.45 |
+| `2049:8:64 fp32` | 2657.7 | 7383.9 | 0.36 | 4619.7 | 9610.8 | 0.48 | 2010.2 | 5913.9 | 0.34 |
+| `4097:8:64 bf16` | 6200.0 | 27504.1 | 0.23 | 6305.4 | 14822.3 | 0.43 | 3367.1 | 7038.6 | 0.48 |
+| `4097:8:64 fp32` | 10626.5 | 26153.4 | 0.41 | 17769.8 | 32302.2 | 0.55 | 7635.3 | 20656.0 | 0.37 |
+| `129:16:128 bf16` | 36.1 | 323.3 | 0.11 | 35.3 | 106.4 | 0.33 | 44.3 | 112.2 | 0.39 |
+| `129:16:128 fp32` | 58.7 | 239.3 | 0.25 | 82.0 | 210.7 | 0.39 | 97.4 | 260.5 | 0.37 |
+| `257:16:128 bf16` | 112.1 | 961.5 | 0.12 | 103.3 | 294.7 | 0.35 | 128.5 | 383.1 | 0.34 |
+| `257:16:128 fp32` | 195.1 | 792.5 | 0.25 | 282.6 | 694.6 | 0.41 | 232.0 | 805.5 | 0.29 |
+| `1025:16:128 bf16` | 1615.9 | 9387.2 | 0.17 | 1340.7 | 2690.9 | 0.50 | 871.4 | 1951.7 | 0.45 |
+| `1025:16:128 fp32` | 2978.0 | 8531.6 | 0.35 | 4053.9 | 6890.3 | 0.59 | 1978.6 | 6270.9 | 0.32 |
+| `2049:16:128 bf16` | 6222.6 | 30322.2 | 0.21 | 5190.5 | 8841.6 | 0.59 | 2890.4 | 6074.5 | 0.48 |
+| `2049:16:128 fp32` | 11046.3 | 27960.7 | 0.40 | 15956.2 | 21940.0 | 0.73 | 7216.0 | 20474.5 | 0.35 |
+| `1025:8:32 bf16` | 219.3 | 1369.9 | 0.16 | 303.7 | 1008.9 | 0.30 | 206.6 | 574.6 | 0.36 |
+| `1025:8:32 fp32` | 359.7 | 1256.6 | 0.29 | 736.8 | 2177.2 | 0.34 | 372.1 | 1161.7 | 0.32 |
+| `1x129:8:64 bf16` | 2.6 | 20.8 | 0.13 | 5.2 | 173.9 | 0.03 | 5.1 | 12.5 | 0.41 |
+| `1x129:8:64 fp32` | 2.8 | 8.4 | 0.33 | 7.5 | 176.8 | 0.04 | 5.0 | 11.7 | 0.42 |
+| `17x301:8:64 bf16` | 7.9 | 34.1 | 0.23 | 14.3 | 205.1 | 0.07 | 9.8 | 28.3 | 0.35 |
+| `17x301:8:64 fp32` | 10.5 | 33.2 | 0.32 | 32.1 | 230.7 | 0.14 | 19.8 | 39.7 | 0.50 |
+| `127x129:8:64 bf16` | 10.1 | 84.8 | 0.12 | 19.6 | 65.5 | 0.30 | 15.0 | 67.4 | 0.22 |
+| `127x129:8:64 fp32` | 14.9 | 83.2 | 0.18 | 37.5 | 101.2 | 0.37 | 21.9 | 87.5 | 0.25 |
+| `129x127:8:64 bf16` | 10.3 | 107.0 | 0.10 | 19.6 | 76.0 | 0.26 | 11.3 | 63.1 | 0.18 |
+| `129x127:8:64 fp32` | 14.5 | 93.2 | 0.16 | 37.3 | 128.4 | 0.29 | 20.2 | 93.7 | 0.22 |
+| `257x513:8:64 bf16` | 77.0 | 521.0 | 0.15 | 104.9 | 308.2 | 0.34 | 58.7 | 191.1 | 0.31 |
+| `257x513:8:64 fp32` | 128.1 | 439.6 | 0.29 | 265.6 | 629.6 | 0.42 | 120.2 | 453.2 | 0.27 |
+| `513x257:8:64 bf16` | 30.8 | 473.7 | 0.07 | 47.9 | 258.4 | 0.19 | 55.7 | 396.1 | 0.14 |
+| `513x257:8:64 fp32` | 48.3 | 447.9 | 0.11 | 111.1 | 536.5 | 0.21 | 72.0 | 442.5 | 0.16 |
+| `1025x2049:8:64 bf16` | 1153.9 | 6720.4 | 0.17 | 1270.9 | 3707.5 | 0.34 | 675.6 | 2213.1 | 0.31 |
+| `1025x2049:8:64 fp32` | 2070.6 | 6395.3 | 0.32 | 3514.0 | 8524.7 | 0.41 | 1490.1 | 5421.4 | 0.27 |
+| `2049x1025:8:64 bf16` | 401.0 | 6390.3 | 0.06 | 445.4 | 3021.0 | 0.15 | 299.0 | 1834.2 | 0.16 |
+| `2049x1025:8:64 fp32` | 712.8 | 6140.3 | 0.12 | 1213.6 | 7352.5 | 0.17 | 620.1 | 5072.9 | 0.12 |
+| `1024:8:64 noncausal bf16` | 755.2 | 3002.7 | 0.25 | 800.6 | 1108.6 | 0.72 | 458.1 | 881.4 | 0.52 |
+| `1024:8:64 noncausal fp32` | 1289.4 | 2882.6 | 0.45 | 2245.1 | 2258.4 | 0.99 | 933.0 | 2307.8 | 0.40 |
+| `1025:8:64 noncausal bf16` | 776.0 | 3218.6 | 0.24 | 819.2 | 1661.7 | 0.49 | 498.6 | 947.0 | 0.53 |
+| `1025:8:64 noncausal fp32` | 1315.9 | 2929.2 | 0.45 | 2281.8 | 3380.8 | 0.67 | 996.7 | 2430.7 | 0.41 |
+| `1024:16:128 noncausal bf16` | 2992.0 | 11548.9 | 0.26 | 2535.4 | 3496.6 | 0.73 | 1349.1 | 2416.9 | 0.56 |
+| `1024:16:128 noncausal fp32` | 5660.7 | 11190.3 | 0.51 | 7795.0 | 8127.9 | 0.96 | 3159.0 | 8047.4 | 0.39 |
+| `1024:32/8:128 bf16` | 3089.6 | 17081.8 | 0.18 | 2672.6 | 5205.3 | 0.51 | 1594.2 | 3443.3 | 0.46 |
+| `1024:32/8:128 fp32` | 5630.9 | 16564.9 | 0.34 | 8147.4 | 13662.7 | 0.60 | 3708.9 | 12175.2 | 0.30 |
+| `1024:16/1:64 bf16` | 800.7 | 4501.3 | 0.18 | 821.7 | 1635.8 | 0.50 | 502.6 | 1300.9 | 0.39 |
+| `1024:16/1:64 fp32` | 1341.5 | 4320.8 | 0.31 | 2255.3 | 4044.3 | 0.56 | 1021.0 | 3472.9 | 0.29 |
+| `1024:8:64 fused bf16` | 393.9 | 2287.4 | 0.17 | 445.4 | 1135.3 | 0.39 | 288.6 | 684.2 | 0.42 |
+| `1024:8:64 fused fp32` | 668.3 | 2192.9 | 0.30 | 1225.5 | 2624.2 | 0.47 | 547.3 | 1805.2 | 0.30 |
+| `257:16:128 fused bf16` | 113.1 | 969.7 | 0.12 | 103.1 | 294.9 | 0.35 | 116.2 | 336.2 | 0.35 |
+| `257:16:128 fused fp32` | 201.5 | 810.5 | 0.25 | 281.0 | 690.6 | 0.41 | 227.1 | 827.1 | 0.27 |
+
+</details>
+
+<details><summary>decode, allocating the output: µs per call, ours / vLLM (60 rows)</summary>
+
+| row | C4D-16 ours | C4D-16 vLLM | C4D-16 ratio | Axion-16 ours | Axion-16 vLLM | Axion-16 ratio | Xeon-16 ours | Xeon-16 vLLM | Xeon-16 ratio |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| `engine self b=1 ctx=256 bf16` | 2.6 | 5.1 | 0.50 | 5.4 | 9.3 | 0.58 | 4.9 | 9.4 | 0.52 |
+| `engine self b=1 ctx=256 fp32` | 3.7 | 6.3 | 0.59 | 6.5 | 11.6 | 0.56 | 5.4 | 11.6 | 0.47 |
+| `engine cross b=1 ctx=256 bf16` | 2.6 | 3.6 | 0.71 | 5.0 | 5.4 | 0.94 | 4.6 | 5.6 | 0.81 |
+| `engine cross b=1 ctx=256 fp32` | 3.6 | 4.5 | 0.79 | 6.7 | 7.2 | 0.92 | 5.1 | 7.3 | 0.70 |
+| `engine self b=8 ctx=256 bf16` | 19.1 | 28.2 | 0.68 | 17.9 | 39.4 | 0.45 | 29.6 | 64.3 | 0.46 |
+| `engine self b=8 ctx=256 fp32` | 300.7ᶜ | 305.0 | 0.99 | 39.8 | 77.0 | 0.52 | 108.6 | 109.0 | 1.00 |
+| `engine cross b=8 ctx=256 bf16` | 17.3 | 22.9 | 0.76 | 17.4 | 43.2 | 0.40 | 27.9 | 48.3 | 0.58 |
+| `engine cross b=8 ctx=256 fp32` | 301.0ᶜ | 297.0 | 1.01 | 36.6 | 69.7 | 0.52 | 110.2 | 98.6 | 1.12 ▲ |
+| `engine self b=8 ctx=1024 bf16` | 596.3ᶜ | 610.1 | 0.98 | 180.3ᶜ | 205.8 | 0.88 | 231.4 | 228.3 | 1.01 |
+| `engine self b=8 ctx=1024 fp32` | 1200.5ᶜ | 1210.4 | 0.99 | 367.3ᶜ | 411.5 | 0.89 | 437.9 | 504.8 | 0.87 |
+| `engine cross b=8 ctx=1024 bf16` | 599.7ᶜ | 599.0 | 1.00 | 176.4ᶜ | 204.6 | 0.86 | 228.2 | 216.5 | 1.05 |
+| `engine cross b=8 ctx=1024 fp32` | 1196.9ᶜ | 1201.3 | 1.00 | 365.5ᶜ | 397.9 | 0.92 | 430.2 | 510.0 | 0.84 |
+| `engine self b=32 ctx=1024 bf16` | 2420.8ᶜ | 2582.5 | 0.94 | 749.1ᶜ | 906.2 | 0.83 | 1713.7ᶜ | 1659.0 | 1.03 ▲ |
+| `engine self b=32 ctx=1024 fp32` | 4795.0ᶜ | 4868.2 | 0.98 | 1584.9ᶜ | 1737.1 | 0.91 | 3013.5ᶜ | 2968.6 | 1.02 |
+| `engine cross b=32 ctx=1024 bf16` | 2419.9ᶜ | 2489.6 | 0.97 | 744.3ᶜ | 890.8 | 0.84 | 1639.0ᶜ | 1656.0 | 0.99 |
+| `engine cross b=32 ctx=1024 fp32` | 4782.5ᶜ | 4815.0 | 0.99 | 1529.5ᶜ | 1641.6 | 0.93 | 2910.3ᶜ | 2757.3 | 1.06 ▲ |
+| `engine self b=1 ctx=4096 bf16` | 298.8ᶜ | 299.9 | 1.00 | 57.6 | 68.3 | 0.84 | 119.0 | 124.8 | 0.95 |
+| `engine self b=1 ctx=4096 fp32` | 599.1ᶜ | 593.7 | 1.01 | 160.5ᶜ | 174.3 | 0.92 | 241.3 | 231.0 | 1.04 ▲ |
+| `engine cross b=1 ctx=4096 bf16` | 298.6ᶜ | 292.1 | 1.02 | 56.1 | 63.4 | 0.88 | 114.7 | 127.8 | 0.90 |
+| `engine cross b=1 ctx=4096 fp32` | 597.4ᶜ | 591.1 | 1.01 | 159.0ᶜ | 169.8 | 0.94 | 247.6 | 230.7 | 1.07 ▲ |
+| `engine self b=8 ctx=255 bf16` | 17.4 | 25.4 | 0.69 | 17.6 | 41.7 | 0.42 | 29.9 | 61.6 | 0.48 |
+| `engine self b=8 ctx=255 fp32` | 300.2ᶜ | 302.5 | 0.99 | 38.0 | 74.6 | 0.51 | 110.0 | 109.0 | 1.01 |
+| `engine cross b=8 ctx=255 bf16` | 16.7 | 22.4 | 0.74 | 17.4 | 41.7 | 0.42 | 29.3 | 54.3 | 0.54 |
+| `engine cross b=8 ctx=255 fp32` | 300.0ᶜ | 301.1 | 1.00 | 37.9 | 67.7 | 0.56 | 104.2 | 97.3 | 1.07 ▲ |
+| `engine self b=8 ctx=257 bf16` | 159.2ᶜ | 172.6 | 0.92 | 20.0 | 44.1 | 0.45 | 33.2 | 68.5 | 0.48 |
+| `engine self b=8 ctx=257 fp32` | 310.5ᶜ | 339.4 | 0.91 | 39.6 | 79.4 | 0.50 | 120.9 | 127.5 | 0.95 |
+| `engine cross b=8 ctx=257 bf16` | 160.1ᶜ | 168.7 | 0.95 | 17.9 | 44.3 | 0.40 | 31.0 | 62.1 | 0.50 |
+| `engine cross b=8 ctx=257 fp32` | 310.2ᶜ | 329.1 | 0.94 | 38.4 | 72.5 | 0.53 | 108.9 | 111.2 | 0.98 |
+| `engine self b=8 ctx=1023 bf16` | 597.2ᶜ | 600.0 | 1.00 | 172.2ᶜ | 214.8 | 0.80 | 207.6 | 224.4 | 0.93 |
+| `engine self b=8 ctx=1023 fp32` | 1187.0ᶜ | 1210.0 | 0.98 | 367.7ᶜ | 390.9 | 0.94 | 441.6 | 470.8 | 0.94 |
+| `engine cross b=8 ctx=1023 bf16` | 597.4ᶜ | 593.4 | 1.01 | 181.3ᶜ | 209.8 | 0.86 | 202.9 | 216.3 | 0.94 |
+| `engine cross b=8 ctx=1023 fp32` | 1198.1ᶜ | 1202.6 | 1.00 | 349.8ᶜ | 390.9 | 0.89 | 429.3 | 473.3 | 0.91 |
+| `engine self b=8 ctx=1025 bf16` | 604.8ᶜ | 618.4 | 0.98 | 177.8ᶜ | 213.6 | 0.83 | 215.3 | 230.8 | 0.93 |
+| `engine self b=8 ctx=1025 fp32` | 1211.9ᶜ | 1248.7 | 0.97 | 357.3ᶜ | 391.1 | 0.91 | 433.3 | 515.9 | 0.84 |
+| `engine cross b=8 ctx=1025 bf16` | 603.2ᶜ | 612.9 | 0.98 | 181.6ᶜ | 213.2 | 0.85 | 216.5 | 218.6 | 0.99 |
+| `engine cross b=8 ctx=1025 fp32` | 1208.2ᶜ | 1237.2 | 0.98 | 355.5ᶜ | 392.8 | 0.90 | 435.1 | 508.4 | 0.86 |
+| `engine self b=1 ctx=4097 bf16` | 298.3ᶜ | 301.9 | 0.99 | 55.2 | 69.6 | 0.79 | 123.6 | 128.7 | 0.96 |
+| `engine self b=1 ctx=4097 fp32` | 601.3ᶜ | 601.6 | 1.00 | 162.1ᶜ | 176.3 | 0.92 | 252.8 | 237.1 | 1.07 ▲ |
+| `engine cross b=1 ctx=4097 bf16` | 297.2ᶜ | 293.7 | 1.01 | 61.5 | 74.1 | 0.83 | 118.4 | 124.7 | 0.95 |
+| `engine cross b=1 ctx=4097 fp32` | 601.4ᶜ | 594.2 | 1.01 | 161.0ᶜ | 172.1 | 0.94 | 252.4 | 230.4 | 1.10 ▲ |
+| `engine self b=8 ctx=1024 page=16 bf16` | 574.6ᶜ | - | - | 171.9ᶜ | 219.3 | 0.78 | 239.1 | - | - |
+| `engine self b=8 ctx=1024 page=16 fp32` | 1159.8ᶜ | - | - | 371.8ᶜ | 394.4 | 0.94 | 468.5 | - | - |
+| `engine self b=8 ctx=1024 page=48 bf16` | 579.5ᶜ | - | - | 147.4ᶜ | 176.7 | 0.83 | 220.4 | - | - |
+| `engine self b=8 ctx=1024 page=48 fp32` | 1179.2ᶜ | - | - | 287.0ᶜ | 364.9 | 0.79 | 452.6 | - | - |
+| `engine self b=8 ctx=1024 page=64 bf16` | 599.0ᶜ | 604.2 | 0.99 | 142.2ᶜ | 172.5 | 0.82 | 211.2 | 210.0 | 1.01 |
+| `engine self b=8 ctx=1024 page=64 fp32` | 1201.6ᶜ | 1210.7 | 0.99 | 299.9ᶜ | 353.2 | 0.85 | 435.6 | 539.4 | 0.81 |
+| `engine self b=8 ctx=1024 h=16/4 bf16` | 22.6 | 36.0 | 0.63 | 39.2 | 40.1 | 0.98 | 53.7 | 59.8 | 0.90 |
+| `engine self b=8 ctx=1024 h=16/4 fp32` | 300.9ᶜ | 305.3 | 0.99 | 55.9 | 73.1 | 0.76 | 106.9 | 116.1 | 0.92 |
+| `engine cross b=8 ctx=1024 h=16/4 bf16` | 22.2 | 33.7 | 0.66 | 38.6 | 36.5 | 1.06 ▲ | 50.3 | 55.5 | 0.91 |
+| `engine cross b=8 ctx=1024 h=16/4 fp32` | 301.1ᶜ | 305.9 | 0.98 | 55.0 | 69.5 | 0.79 | 108.6 | 113.4 | 0.96 |
+| `engine cross b=8 ctx=1024 h=16/1 bf16` | 17.7 | 56.2 | 0.31 | 35.5 | 36.9 | 0.96 | 38.7 | 20.4 | 1.89 ▲ |
+| `engine cross b=8 ctx=1024 h=16/1 fp32` | 22.7 | 73.8 | 0.31 | 44.7 | 80.5 | 0.55 | 35.3 | 183.4 | 0.19 |
+| `engine self b=8 ctx=het bf16` | 366.5ᶜ | 384.8 | 0.95 | 78.7 | 110.9 | 0.71 | 124.8 | 155.8 | 0.80 |
+| `engine self b=8 ctx=het fp32` | 733.1ᶜ | 750.8 | 0.98 | 248.1ᶜ | 266.9 | 0.93 | 287.8 | 267.4 | 1.08 ▲ |
+| `engine cross b=8 ctx=het bf16` | 369.5ᶜ | 380.5 | 0.97 | 72.1 | 102.2 | 0.71 | 125.6 | 149.0 | 0.84 |
+| `engine cross b=8 ctx=het fp32` | 732.8ᶜ | 745.3 | 0.98 | 257.1ᶜ | 258.2 | 1.00 | 279.2 | 267.8 | 1.04 ▲ |
+| `engine cross b=8 ctx=1024 d=32 bf16` | 298.3ᶜ | 296.0 | 1.01 | 43.5 | 59.9 | 0.73 | 101.1 | 122.0 | 0.83 |
+| `engine cross b=8 ctx=1024 d=32 fp32` | 598.0ᶜ | 594.9 | 1.01 | 186.7ᶜ | 206.6 | 0.90 | 230.5 | 205.1 | 1.12 ▲ |
+| `engine cross b=8 ctx=1024 d=128 bf16` | 594.9ᶜ | 593.8 | 1.00 | 153.8ᶜ | 183.9 | 0.84 | 204.4 | 204.0 | 1.00 |
+| `engine cross b=8 ctx=1024 d=128 fp32` | 1194.9ᶜ | 1191.1 | 1.00 | 312.5ᶜ | 312.8 | 1.00 | 419.5 | 463.4 | 0.91 |
+
+</details>
+
+<details><summary>decode with `out=`: µs per call, ours / vLLM (20 rows)</summary>
+
+| row | C4D-16 ours | C4D-16 vLLM | C4D-16 ratio | Axion-16 ours | Axion-16 vLLM | Axion-16 ratio | Xeon-16 ours | Xeon-16 vLLM | Xeon-16 ratio |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| `engine_out self b=1 ctx=256 bf16` | 2.3 | 5.2 | 0.44 | 4.8 | 9.1 | 0.52 | 4.1 | 8.9 | 0.46 |
+| `engine_out self b=1 ctx=256 fp32` | 3.3 | 6.2 | 0.53 | 6.3 | 11.2 | 0.57 | 4.9 | 11.3 | 0.44 |
+| `engine_out cross b=1 ctx=256 bf16` | 2.3 | 3.7 | 0.62 | 4.6 | 5.5 | 0.82 | 4.0 | 5.3 | 0.76 |
+| `engine_out cross b=1 ctx=256 fp32` | 3.3 | 4.3 | 0.75 | 6.1 | 7.9 | 0.77 | 4.7 | 7.1 | 0.66 |
+| `engine_out self b=8 ctx=256 bf16` | 17.4 | 27.3 | 0.64 | 16.7 | 40.9 | 0.41 | 27.6 | 61.8 | 0.45 |
+| `engine_out self b=8 ctx=256 fp32` | 297.9ᶜ | 305.1 | 0.98 | 36.6 | 73.4 | 0.50 | 109.3 | 112.5 | 0.97 |
+| `engine_out cross b=8 ctx=256 bf16` | 16.4 | 22.8 | 0.72 | 16.6 | 44.5 | 0.37 | 27.0 | 54.1 | 0.50 |
+| `engine_out cross b=8 ctx=256 fp32` | 298.7ᶜ | 298.4 | 1.00 | 36.5 | 67.3 | 0.54 | 105.5 | 100.3 | 1.05 ▲ |
+| `engine_out self b=8 ctx=1024 bf16` | 595.5ᶜ | 599.6 | 0.99 | 167.5ᶜ | 220.6 | 0.76 | 207.2 | 220.7 | 0.94 |
+| `engine_out self b=8 ctx=1024 fp32` | 1197.0ᶜ | 1206.7 | 0.99 | 353.5ᶜ | 393.8 | 0.90 | 429.9 | 463.1 | 0.93 |
+| `engine_out cross b=8 ctx=1024 bf16` | 595.0ᶜ | 600.3 | 0.99 | 165.5ᶜ | 205.9 | 0.80 | 209.7 | 210.5 | 1.00 |
+| `engine_out cross b=8 ctx=1024 fp32` | 1195.4ᶜ | 1201.5 | 0.99 | 348.8ᶜ | 384.6 | 0.91 | 423.8 | 454.9 | 0.93 |
+| `engine_out self b=32 ctx=1024 bf16` | 2415.2ᶜ | 2563.3 | 0.94 | 795.9ᶜ | 911.8 | 0.87 | 1617.7ᶜ | 1659.8 | 0.97 |
+| `engine_out self b=32 ctx=1024 fp32` | 4795.4ᶜ | 4875.6 | 0.98 | 1576.7ᶜ | 1650.2 | 0.96 | 2982.1ᶜ | 2995.1 | 1.00 |
+| `engine_out cross b=32 ctx=1024 bf16` | 2415.5ᶜ | 2497.1 | 0.97 | 735.8ᶜ | 882.3 | 0.83 | 1632.0ᶜ | 1615.4 | 1.01 |
+| `engine_out cross b=32 ctx=1024 fp32` | 4786.1ᶜ | 4816.5 | 0.99 | 1586.0ᶜ | 1643.8 | 0.96 | 2930.1ᶜ | 2928.8 | 1.00 |
+| `engine_out self b=1 ctx=4096 bf16` | 293.3ᶜ | 299.7 | 0.98 | 63.1 | 75.0 | 0.84 | 116.4 | 124.0 | 0.94 |
+| `engine_out self b=1 ctx=4096 fp32` | 598.1ᶜ | 594.8 | 1.01 | 157.5ᶜ | 175.5 | 0.90 | 246.8 | 228.6 | 1.08 ▲ |
+| `engine_out cross b=1 ctx=4096 bf16` | 296.6ᶜ | 290.0 | 1.02 | 54.8 | 64.6 | 0.85 | 111.2 | 115.1 | 0.97 |
+| `engine_out cross b=1 ctx=4096 fp32` | 598.9ᶜ | 594.5 | 1.01 | 157.5ᶜ | 168.7 | 0.93 | 233.4 | 226.5 | 1.03 ▲ |
+
+</details>
+
+<details><summary>public `flash_attn_with_kvcache` decode: µs per call, ours / vLLM (8 rows)</summary>
+
+| row | C4D-16 ours | C4D-16 vLLM | C4D-16 ratio | Axion-16 ours | Axion-16 vLLM | Axion-16 ratio | Xeon-16 ours | Xeon-16 vLLM | Xeon-16 ratio |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| `api self b=1 ctx=256 bf16` | 3.6 | 5.0 | 0.71 | 8.8 | 10.6 | 0.83 | 5.9 | 9.0 | 0.66 |
+| `api self b=1 ctx=256 fp32` | 4.5 | 5.7 | 0.78 | 9.9 | 12.4 | 0.80 | 6.5 | 11.0 | 0.59 |
+| `api cross b=1 ctx=256 bf16` | 3.5 | 3.7 | 0.96 | 8.6 | 6.3 | 1.37 ▲ | 5.5 | 5.4 | 1.02 |
+| `api cross b=1 ctx=256 fp32` | 4.5 | 4.6 | 0.99 | 9.5 | 8.5 | 1.11 ▲ | 6.4 | 6.5 | 0.99 |
+| `api self b=8 ctx=1024 bf16` | 606.0ᶜ | 605.5 | 1.00 | 172.9ᶜ | 210.0 | 0.82 | 210.0 | 215.9 | 0.97 |
+| `api self b=8 ctx=1024 fp32` | 1206.4ᶜ | 1209.5 | 1.00 | 361.9ᶜ | 398.7 | 0.91 | 439.6 | 513.3 | 0.86 |
+| `api cross b=8 ctx=1024 bf16` | 603.8ᶜ | 592.0 | 1.02 | 175.9ᶜ | 204.4 | 0.86 | 231.8 | 221.4 | 1.05 ▲ |
+| `api cross b=8 ctx=1024 fp32` | 1203.3ᶜ | 1203.1 | 1.00 | 361.9ᶜ | 378.8 | 0.96 | 432.2 | 505.5 | 0.85 |
+
+</details>
+
+<details><summary>store-only (`reshape_and_cache`): µs per call, ours / vLLM (4 rows)</summary>
+
+| row | C4D-16 ours | C4D-16 vLLM | C4D-16 ratio | Axion-16 ours | Axion-16 vLLM | Axion-16 ratio | Xeon-16 ours | Xeon-16 vLLM | Xeon-16 ratio |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| `store store b=32 ctx=1 bf16` | 2.3 | 2.8 | 0.81 | 4.1 | 4.2 | 0.97 | 5.4 | 5.5 | 0.97 |
+| `store store b=32 ctx=1 fp32` | 5.1 | 3.8 | 1.35 ▲ | 5.0 | 5.1 | 0.98 | 8.6 | 8.7 | 0.99 |
+| `store store b=1 ctx=1024 bf16` | 16.1 | 56.2 | 0.29 | 38.9 | 29.2 | 1.33 ▲ | 38.3 | 114.6 | 0.33 |
+| `store store b=1 ctx=1024 fp32` | 69.2 | 107.6 | 0.64 | 35.8 | 57.0 | 0.63 | 102.4 | 215.4 | 0.48 |
+
+</details>
+
+* **C4D-16**: one loss, store-only `b=32 ctx=1` fp32 (5.1 vs 3.8 us). 66 decode rows
+  are timed cold and sit at the shared DRAM roof with vLLM (median 0.97-0.99), so most
+  decode rows are unresolved rather than won.
+* **Axion-16**: 160 wins. The four losses are single small calls: the public API at
+  `b=1 ctx=256` (bf16 8.6 vs 6.3 us), store-only `b=1 ctx=1024` bf16 (38.9 vs 29.2 us),
+  and GQA `h=16/4` bf16 at 1.06; MQA, a 1.8x loss on 8 cores, is not one here.
+* **Xeon-16**: 16 losses, MQA `h=16/1` bf16 (38.7 vs 20.4 us) and 15 fp32 decode rows
+  at 1.03-1.12 (batch 1 at context 4096/4097, `b=8 ctx~256`, `d=32`, and the
+  mixed-length `self`/`cross` rows at 1.08 / 1.04, whose work is balanced: about five
+  of the long sequence's 16 tasks per worker). fp32 decode on this box sits a few
+  percent behind vLLM's VEC path generally; the cause is not investigated.
+* `flash_attn_func` against vLLM's prefill path: 0.44-1.15 (C4D-16), 0.68-1.10
+  (Axion-16), 0.36-0.88 (Xeon-16).
+
+**Caveats.**
+* `flash_attn_func` against vLLM's prefill path is in the JSON (`new/vllm`, 62
+  batch-1 equal-length rows): 0.44-1.09 on the C4D, 0.59-0.93 on the Axion, and
+  0.38-0.90 on the Xeon.
+* Rows bound by memory placement swing 20-30% with allocation order, and
+  single-run verdict counts move by several rows. Read a row's verdict from
+  repeated `--load-seed` runs, not from one table.
+* Measurements against the former C++ backend (16-vCPU boxes) are in this file's
+  history (`ad1f78c` and before).
 
 ## Benchmark it yourself
 
 ```bash
 scripts/build_vllm_ref.sh             # vLLM reference -> ~/vllm_cpu_build/*.so (pinned commit)
-python benchmarks/bench.py --vllm ~/vllm_cpu_build/vllm_cpu_attn_bench.so --isa vec \
-    --rounds 41 --json out.json        # add --block-calls 40 on a laptop
+uv run python benchmarks/bench.py --manifest full \
+    --vllm-bf16 ~/vllm_cpu_build/vllm_cpu_attn_bench.so --vllm-fp32 ~/vllm_cpu_build/vllm_cpu_attn_bench.so \
+    --rounds 61 --paged-rounds 121 --json /path/outside/the/repo/run.json
 ```
 
-* Pass the AMX reference (`vllm_cpu_attn_bench_amx.so --isa amx --dtype bf16`)
-  for bf16 on an AMX box, and `--isa neon` on aarch64.
-* Judge on the minimum, and only against the duplicate arm's spread. Never
-  compare two separate runs: these machines drift 5-15% between processes.
+On a fresh VM, `scripts/box_provision.sh` installs what the image lacks (a toolchain,
+`python3-dev`, `uv`) and the repository venv; then `scripts/build_vllm_ref.sh`, and
+`scripts/box_verify.sh BRANCH BASE "ISAS" <vLLM args>` runs every gate on BRANCH and the
+full-manifest run against SDPA, vLLM and BASE as a previous build at threads = physical
+cores (`scripts/ab_summary.py` summarizes the JSON). The tables above came from those
+scripts.
+
+* On an AMX box pass `--vllm-bf16 ~/vllm_cpu_build/vllm_cpu_attn_bench_amx.so
+  --vllm-isa-bf16 amx`; on aarch64 pass `--vllm-isa-bf16 neon --vllm-isa-fp32
+  neon`; always `--threads <physical cores>`. `--block-calls 40` is only for a desktop or laptop with
+  frequency scaling; the GCP VMs above use one call per sample.
+* `--only "<label substring>"` runs a subset, `--resume` continues a `--json`
+  after an interruption, `--previous <saved package>` A/Bs two of your builds
+  against an independent control, and `--load-seed N` changes the module-load and
+  cache-allocation order (repeat memory-bound rows with several).
+* Judge on the minimum and only inside one process; never compare two runs
+  (these machines drift 5-15% between processes).
 
 ## Getting the best performance
 
 1. **Set torch threads to the physical core count.** The kernels run on torch's
    OpenMP pool and cap themselves at physical cores; SMT threads only
    oversubscribe it.
-2. **Use bf16.** It is up to 3x faster than fp32 on both dense and paged rows.
-   The shortest Ryzen dense row (128:8:64) is the only case where fp32 is
-   faster (24.9 vs 28.2 µs).
+2. **Use bf16** where the model allows: on the Xeon, for sequences of 129 or
+   more tokens, the AMX policy is 2.7-8.1x faster than the vector policy in
+   bf16 and 1.1-3.4x in fp32 (fp32 runs as bf16 hi/lo products).
 3. **Pass `out=`** to `self_attention` / `cross_attention` on the decode path.
    It saves the allocation, which is a sizeable share of a batch-1 call.
-4. **Page size.** Use 32 on x86 and 16 on ARM (the engine defaults); measure
-   before changing it.
-5. **Leave AMX on** (the default on AMX CPUs). It is worth 2.8-9.8x over
-   AVX-512 for dense bf16.
+4. **Page size.** Use 32 on x86 and 16 on ARM (the engine defaults); 16, 32, 48
+   and 64 are specialized at compile time.
+5. **Leave AMX on** (the default on AMX CPUs). Few-query calls (fp32 up to ~65
+   rows at head_dim 64, bf16 1-2 rows) automatically use the vector policy,
+   which is faster there; `CPU_ATTENTION_AMX=0` forces it everywhere.
 
 ## Tests
 
 ```bash
-CPU_ATTENTION_BACKEND=cpp uv run python tests/test_dense.py        # dense vs a naive fp32 reference (89 checks)
-CPU_ATTENTION_BACKEND=cpp uv run python tests/test_flash_api.py    # flash-shaped API and its rejections
-CPU_ATTENTION_BACKEND=cpp uv run python tests/fuzz_dense.py --cases 80 --max-seq 900
-CPU_ATTENTION_BACKEND=cpp uv run python tests/test_paged_sweep.py  # 504 paged cases, both dtypes
-uv run python tests/test_amx.py                                    # Mojo AMX entries (AMX boxes)
+uv run python tests/test_dense.py          # flash_attn_func vs a naive fp32 reference (82 checks)
+uv run python tests/test_flash_api.py      # flash-shaped API and its rejections
+uv run python tests/fuzz_dense.py --cases 80 --max-seq 900
+uv run python tests/test_paged_sweep.py    # 504 paged cases, both dtypes
+uv run python tests/test_regressions.py    # 457 checks: odd/unequal lengths, masked rows, poisoned caches, strides, scale, workers, concurrency
+uv run python tests/test_amx.py --dtype both   # AMX policy (AMX CPUs; fails if AMX is present but unusable)
 ```
 
-Drop `CPU_ATTENTION_BACKEND=cpp` to test the Mojo backend.
+Prefix `CPU_ATTENTION_ISA=<tier>` to test a lower tier. The engine-level test
+lives in fast-encdec: `PYTHONPATH=. .venv/bin/python tests/test_cpu_attention.py`
+(it passes strided chunks of a fused projection; 45 checks).
 
-The engine-level test lives in fast-encdec:
-`CPU_ATTENTION_BACKEND=cpp PYTHONPATH=. .venv/bin/python tests/test_cpu_attention.py`.
-
-Accuracy gates:
+Accuracy gates (all pass on all three boxes):
 
 | case | limit |
 |---|---|
-| dense fp32 | <= 2e-4 vs the naive reference |
-| dense bf16 | <= 3e-2 |
-| paged fp32 | <= 1e-6 |
-| paged bf16, x86 | 0-2 ulp between backends |
-| paged bf16, ARM | <= 1e-3 |
+| `flash_attn_func` fp32 | <= 2e-4 vs the naive fp32 reference |
+| `flash_attn_func` bf16 | <= 3e-2 |
+| paged fp32 | <= 1e-6 (fp64 arbitrates an fp32 reference that is itself out of the gate) |
+| paged bf16 | <= 1e-3 *above the bf16 output-rounding floor* |
+
+The paged bf16 "<= 1e-3" is not met literally: rounding the exact result to bf16 alone
+exceeds 1e-3 on 77 of 252 sweep cases, so no bf16 output can satisfy an absolute
+1e-3. The tests check the excess over that floor (`tests/reference.py`); see
+`docs/Mojo.md` §5.
 
 ## Documentation
 
-* [`docs/CPP.md`](docs/CPP.md): the C++ backend's design, per-ISA techniques,
-  numerics, measurement rules, falsification ledger and open problems.
-* [`docs/Mojo.md`](docs/Mojo.md): the Mojo backend's kernels, ISA paths,
-  language notes, failure modes, and the levers already exhausted.
+* [`docs/Mojo.md`](docs/Mojo.md): the kernel's design, ISA tiers,
+  numerics, call path, defects found, falsification ledger and Mojo 1.2.0
+  notes.
 * [`AGENTS.md`](AGENTS.md): working rules for anyone changing a kernel.
 
 ## License
 
-Apache-2.0. Both backends follow vLLM's `csrc/cpu` attention (Apache-2.0); the
+Apache-2.0. The kernel follows vLLM's `csrc/cpu` attention (Apache-2.0); the
 Python API mirrors [flash-attention](https://github.com/Dao-AILab/flash-attention)
 (BSD-3).

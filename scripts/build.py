@@ -30,20 +30,63 @@ def _run(*args: str) -> None:
     subprocess.run(args, check=True)
 
 
-def _libgomp_flags() -> list[str] | None:
-    """Linker flags for libgomp, or None when only torch's runtime copy exists."""
+def _libgomp_flags(with_torch: bool = False) -> list[str] | None:
+    """Linker flags for libgomp (and torch libs for the shared object)."""
     try:
         import torch
 
         lib = os.path.join(os.path.dirname(torch.__file__), "lib")
+        flags: list[str] = []
         if os.path.exists(os.path.join(lib, "libgomp.so.1")):
-            return ["-Xlinker", "-l:libgomp.so.1", "-Xlinker", f"-L{lib}"]
+            flags += ["-Xlinker", "-l:libgomp.so.1", "-Xlinker", f"-L{lib}"]
+        elif any(
+            os.path.exists(os.path.join(d, "libgomp.so"))
+            for d in ("/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu", "/usr/lib64")
+        ):
+            flags += ["-Xlinker", "-lgomp"]
+        else:
+            return None
+        if with_torch:
+            flags += [
+                "-Xlinker", f"-L{lib}",
+                "-Xlinker", f"-rpath={lib}",
+                "-Xlinker", "-ltorch_python",
+                "-Xlinker", "-ltorch_cpu",
+                "-Xlinker", "-lc10",
+            ]
+        return flags
     except ImportError:
         pass
     dirs = ("/usr/lib/x86_64-linux-gnu", "/usr/lib/aarch64-linux-gnu", "/usr/lib64")
     if any(os.path.exists(os.path.join(d, "libgomp.so")) for d in dirs):
         return ["-Xlinker", "-lgomp"]
     return None
+
+
+# One shared object per ISA tier, each compiled for an explicit target (never
+# the build host's CPU): `cpu_attention._kernel` loads the highest tier this CPU
+# supports, and `CPU_ATTENTION_ISA` can force a lower one. The AVX-512-BF16 tier
+# also carries the AMX kernels; they run only after the OS grants tile state.
+TIERS = {
+    "x86_64": [
+        ("x86-avx512bf16", ["--target-cpu", "x86-64-v4",
+                            "--target-features", "+avx512bf16,+avx512vnni"]),
+        ("x86-avx2", ["--target-cpu", "x86-64-v3"]),
+        ("x86-64", ["--target-cpu", "x86-64"]),
+    ],
+    "aarch64": [
+        ("aarch64-bf16", ["--target-cpu", "neoverse-n1",
+                          "--target-features", "+bf16,+i8mm"]),
+        ("aarch64-neon", ["--target-cpu", "generic"]),
+    ],
+}
+
+
+def _arch() -> str:
+    import platform
+
+    m = platform.machine()
+    return "aarch64" if m in ("aarch64", "arm64") else "x86_64"
 
 
 def main() -> None:
@@ -58,24 +101,43 @@ def main() -> None:
     # bundled libgomp.so.1 is RTLD_LOCAL, so `import` fails with "undefined
     # symbol: omp_get_thread_num". Same soname either way, so the loader reuses
     # torch's copy when it is already in the process.
-    flags = _libgomp_flags()
+    flags = _libgomp_flags(with_torch=True)
+    test_flags = _libgomp_flags(with_torch=False) or []
     if flags is None:
         print("warning: no libgomp found; the extension may not import")
         flags = []
-    _run(
-        mojo,
-        "build",
-        os.path.join(SRC, "_C.mojo"),
-        "--emit",
-        "shared-lib",
-        "-o",
-        LIB,
-        *flags,
-    )
-    print(f"built {LIB}")
+    tiers = TIERS[_arch()]
+    only = [a.split("=", 1)[1] for a in sys.argv if a.startswith("--tier=")]
+    if only:
+        tiers = [t for t in tiers if t[0] in only]
+    procs = []
+    for name, target in tiers:
+        out = os.path.join(ROOT, "cpu_attention", f"_C_{name}.so")
+        cmd = [mojo, "build", os.path.join(SRC, "_C.mojo"), "--emit",
+               "shared-lib", *target, "-o", out, *flags]
+        print("+", " ".join(cmd))
+        procs.append((name, out, subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                                  stderr=subprocess.STDOUT,
+                                                  text=True)))
+    failed = False
+    for name, out, proc in procs:
+        log = proc.communicate()[0]
+        if proc.returncode != 0:
+            failed = True
+            print(f"tier {name} FAILED:\n" + "\n".join(
+                ln for ln in log.splitlines() if "error" in ln)[:4000])
+        else:
+            print(f"built {out}")
+    if failed:
+        raise SystemExit(1)
+    # `_C.so` stays the best tier for this host (what older callers load).
+    best = os.path.join(ROOT, "cpu_attention", f"_C_{tiers[0][0]}.so")
+    if not only or tiers[0][0] == TIERS[_arch()][0][0]:
+        shutil.copyfile(best, LIB)
+        print(f"{LIB} = {os.path.basename(best)}")
     if "--tests" not in sys.argv:
         return
-    if not flags:
+    if not test_flags:
         print("skip the standalone test: no libgomp to link against")
         return
     os.makedirs(BUILD, exist_ok=True)
@@ -83,12 +145,13 @@ def main() -> None:
     _run(
         mojo,
         "build",
+        *TIERS[_arch()][0][1],
         "-I",
         SRC,
         os.path.join(TESTS, "test_attention.mojo"),
         "-o",
         out,
-        *flags,
+        *test_flags,
     )
     _run(out)
 

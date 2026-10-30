@@ -8,6 +8,7 @@ name so ``from cpu_attention.flash_attn_interface import flash_attn_func`` works
 
 import torch
 
+from . import _kernel
 from ._kernel import _DTYPE_CODES, _HEAD_DIMS, _dense, _paged, supported
 
 _SCALES = {}
@@ -26,13 +27,6 @@ def _lens_tensor(cache_seqlens, batch: int, device):
             "cpu_attention: `cache_seqlens` must be an int or an int32 [batch] tensor"
         )
     return cache_seqlens
-
-
-def _append_slots(page_table, lengths, block_size: int):
-    """Slots writing one token at position ``lengths`` (flash's pre-append index)."""
-    block = torch.div(lengths, block_size, rounding_mode="floor")
-    page = page_table.gather(1, block.long().unsqueeze(1)).squeeze(1)
-    return (page * block_size + lengths % block_size).long()
 
 
 def flash_attn_with_kvcache(
@@ -101,6 +95,43 @@ def flash_attn_with_kvcache(
       cost a few microseconds per call, which at 24 calls per decode step is
       measurable end to end.
     """
+    if (
+        qv is None
+        and rotary_cos is None
+        and rotary_sin is None
+        and cache_leftpad is None
+        and cu_seqlens_q is None
+        and cu_seqlens_k_new is None
+        and max_seqlen_q is None
+        and rotary_seqlens is None
+        and q_descale is None
+        and k_descale is None
+        and v_descale is None
+        and cache_batch_idx is None
+        and window_size == (-1, -1)
+        and not softcap
+        and not attention_chunk
+        and not return_softmax_lse
+        and (page_table is None) != (block_table is None)
+    ):
+        table = getattr(_kernel._KV_TABLE, "t", None)
+        if table is not None and _kernel._KV_TABLE.gen == _kernel._KV_GEN[0]:
+            pt = page_table if page_table is not None else block_table
+            res = _kernel._KV_TABLE.fn(
+                _kernel._KV_TABLE.addr,
+                q,
+                k,
+                v,
+                k_cache,
+                v_cache,
+                slot_mapping,
+                pt,
+                cache_seqlens,
+                softmax_scale,
+                None,
+            )
+            if res is not None:
+                return res
     if check_inputs:
         if (
             qv is not None
@@ -206,8 +237,8 @@ def flash_attn_with_kvcache(
     if k is not None:
         if slot_mapping is None:
             before = _lens_tensor(cache_seqlens, batch, q.device)
-            slots = _append_slots(page_table, before, block_size)
-            lens = before + 1
+            slots = None
+            lens = before
         else:
             slots = slot_mapping
             lens = _lens_tensor(cache_seqlens, batch, q.device)
@@ -254,6 +285,16 @@ def flash_attn_func(q, k, v, softmax_scale=None, causal=False):
     ``deterministic`` and ``return_attn_probs`` (inference-only forward pass, no
     local attention, no bias terms).
     """
+    # Mojo fast path: a layout a validated call already registered runs with
+    # the tensors read in the extension (no Python checks or plan lookup).
+    table = _kernel._FLASH.__dict__.get("t")
+    if (table is not None and _kernel._FLASH.gen == _kernel._flash_gen() and
+            type(q) is torch.Tensor):
+        res = _kernel._FLASH.fn(_kernel._FLASH.addr, q, k, v,
+                                softmax_scale, causal)
+        if res is not None:
+            return res
+    q0, k0, v0 = q, k, v
     if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
         raise ValueError(
             "cpu_attention: q/k/v must be [batch, seqlen, nheads, headdim]"
@@ -303,7 +344,10 @@ def flash_attn_func(q, k, v, softmax_scale=None, causal=False):
     if stv[3] != 1:
         v = v.contiguous()
         stv = v.stride()
-    return _dense(q, k, v, scale, causal, (qs, stq, stk, stv, q.dtype))
+    out = _dense(q, k, v, scale, causal, (qs, stq, stk, stv, q.dtype))
+    if q is q0 and k is k0 and v is v0:
+        _kernel._flash_register(q, k, v, softmax_scale, causal)
+    return out
 
 
 def flash_attn_varlen_func(

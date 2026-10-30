@@ -1,225 +1,137 @@
-"""Standalone parity test for the Mojo paged-attention kernel.
+"""Standalone parity test of the KV-cache kernel against a scalar fp32 reference.
 
-Builds a tiny paged cache, scatters K/V through the kernel, then checks the
-attention output against a scalar reference computed from the same cache.
-
-    pixi run mojo run -I src tests/test_attention.mojo
+Stages every token through the store path (`do_attend=False`), then attends,
+for fp32 and bf16, page sizes 16/32/48/64 (multi-tile pages), GQA, and contexts
+that end mid-tile. Built and run by `scripts/build.py --tests`.
 """
 
-from std.memory import MutPointer, stack_allocation
 from std.math import exp
-from std.origin import MutUntrackedOrigin
-from attention import BF16_DOT, LANES, NEON_DOT, Job, run
+from std.memory import stack_allocation
 
-comptime HEAD_DIM = 64
-comptime HEADS = 2
-comptime MAX_PAGES = 6
-comptime BLOCKS = 16
-comptime NUM_SEQS = 2
-comptime MAX_LEN = 200
+from isa import ptr
+from paged_attn import PagedJob, paged_run
 
 
-@inline(.always)
-def _ptr[T: AnyType](address: Int) -> MutPointer[T, MutUntrackedOrigin]:
-    return MutPointer[T, MutUntrackedOrigin](unsafe_from_address=address)
-
-
-def _fill[
-    dtype: DType, n: Int
-](p: MutPointer[Scalar[dtype], MutUntrackedOrigin], seed: Int) -> Int:
-    """Deterministic pseudo-random fill in [-1, 1); returns the next seed."""
+def _fill[dtype: DType](p: Int, n: Int, seed: Int) -> Int:
     var s = seed
+    var d = ptr[Scalar[dtype]](p)
     for i in range(n):
-        s = (s * 1103515245 + 12345) & 0x7FFFFFFF
-        p.unsafe_store(i, Scalar[dtype]((Float64(s) / 1073741824.0) - 1.0))
+        s = (s * 1103515245 + 12345) % 2147483648
+        d.unsafe_store(i, Scalar[dtype](Float32(s % 2001 - 1000) / 1000.0))
     return s
 
 
-def _reference[
-    dtype: DType, BLOCK: Int
-](
-    q: Int,
-    k_cache: Int,
-    v_cache: Int,
-    dst: Int,
-    block_table: Int,
-    lens: Int,
-    num_seqs: Int,
-    scale: Float64,
-):
-    """Scalar fp32 reference over the (already populated) paged cache."""
-    comptime paired = BF16_DOT and dtype == DType.bfloat16 and BLOCK % LANES == 0
-    var qp = _ptr[Scalar[dtype]](q)
-    var kp = _ptr[Scalar[dtype]](k_cache)
-    var vp = _ptr[Scalar[dtype]](v_cache)
-    var op = _ptr[Scalar[dtype]](dst)
-    var bt = _ptr[Int32](block_table)
-    var lp = _ptr[Int32](lens)
-    var logits = stack_allocation[MAX_LEN, DType.float32]()
-    for seq in range(num_seqs):
-        var len = Int(lp.unsafe_load(seq))
-        for head in range(HEADS):
-            var qrow = (seq * HEADS + head) * HEAD_DIM
-            var row_max = Scalar[DType.float32](-3.4e38)
-            for j in range(len):
-                var block = Int(bt.unsafe_load(seq * MAX_PAGES + j // BLOCK))
-                var off = j % BLOCK
-                var kpage = (block * HEADS + head) * (BLOCK * HEAD_DIM)
-                var sum = Scalar[DType.float32](0.0)
-                for d in range(HEAD_DIM):
-                    comptime if paired:
-                        var k_idx = (
-                            kpage + (d // 2) * BLOCK * 2 + off * 2 + d % 2
-                        )
-                        sum += Scalar[DType.float32](
-                            qp.unsafe_load(qrow + d)
-                        ) * Scalar[DType.float32](kp.unsafe_load(k_idx))
-                    else:
-                        sum += Scalar[DType.float32](
-                            qp.unsafe_load(qrow + d)
-                        ) * Scalar[DType.float32](
-                            kp.unsafe_load(kpage + d * BLOCK + off)
-                        )
-                logits.unsafe_store(j, sum * Scalar[DType.float32](scale))
-                row_max = max(row_max, logits.unsafe_load(j))
-            var total = Scalar[DType.float32](0.0)
-            for j in range(len):
-                var e = exp(logits.unsafe_load(j) - row_max)
-                logits.unsafe_store(j, e)
-                total += e
-            for d in range(HEAD_DIM):
-                var acc = Scalar[DType.float32](0.0)
-                for j in range(len):
-                    var block = Int(
-                        bt.unsafe_load(seq * MAX_PAGES + j // BLOCK)
-                    )
-                    var off = j % BLOCK
-                    var vpage = (block * HEADS + head) * (BLOCK * HEAD_DIM)
-                    comptime if NEON_DOT and dtype == DType.bfloat16:
-                        # position-paired V page (see _store_head)
-                        acc += logits.unsafe_load(j) * Scalar[DType.float32](
-                            vp.unsafe_load(
-                                vpage
-                                + (off // 2) * HEAD_DIM * 2
-                                + d * 2
-                                + off % 2
-                            )
-                        )
-                    else:
-                        acc += logits.unsafe_load(j) * Scalar[DType.float32](
-                            vp.unsafe_load(vpage + off * HEAD_DIM + d)
-                        )
-                op.unsafe_store(qrow + d, Scalar[dtype](acc / total))
-
-
-def _run[dtype: DType, BLOCK: Int, len0: Int, len1: Int]() raises -> Bool:
-    comptime N = NUM_SEQS * HEADS * HEAD_DIM
-    comptime CACHE = BLOCKS * HEADS * BLOCK * HEAD_DIM
-    var q = stack_allocation[N, dtype]()
-    var k = stack_allocation[N, dtype]()
-    var v = stack_allocation[N, dtype]()
-    var k_cache = stack_allocation[CACHE, dtype]()
-    var v_cache = stack_allocation[CACHE, dtype]()
-    var out = stack_allocation[N, dtype]()
-    var ref_out = stack_allocation[N, dtype]()
-    var lens = stack_allocation[NUM_SEQS, DType.int32]()
-    var slots = stack_allocation[NUM_SEQS, DType.int64]()
-    var table = stack_allocation[NUM_SEQS * MAX_PAGES, DType.int32]()
-
-    var seed = 1
-    seed = _fill[dtype, N](q, seed)
-    seed = _fill[dtype, N](k, seed)
-    seed = _fill[dtype, N](v, seed)
-    seed = _fill[dtype, CACHE](k_cache, seed)
-    seed = _fill[dtype, CACHE](v_cache, seed)
-    lens.unsafe_store(0, Int32(len0))
-    lens.unsafe_store(1, Int32(len1))
-    slots.unsafe_store(0, Int64(len0 - 1))
-    slots.unsafe_store(1, Int64(len1 - 1))
-    var next_page = 0
-    for seq in range(NUM_SEQS):
-        var len = len0 if seq == 0 else len1
-        var pages = (len + BLOCK - 1) // BLOCK
-        for p in range(MAX_PAGES):
-            if p < pages:
-                table.unsafe_store(seq * MAX_PAGES + p, Int32(next_page))
-                next_page += 1
-            else:
-                table.unsafe_store(seq * MAX_PAGES + p, Int32(0))
-
-    var scale = 1.0 / Float64(HEAD_DIM) ** 0.5
-    var job = Job()
-    job.q = q.__int__()
-    job.k = k.__int__()
-    job.v = v.__int__()
-    job.k_cache = k_cache.__int__()
-    job.v_cache = v_cache.__int__()
-    job.dst = out.__int__()
-    job.slots = slots.__int__()
-    job.block_table = table.__int__()
-    job.lens = lens.__int__()
-    job.num_seqs = NUM_SEQS
-    job.num_heads = HEADS
-    job.num_kv_heads = HEADS
-    job.head_dim = HEAD_DIM
-    job.block_size = BLOCK
-    job.bt_stride = MAX_PAGES
-    job.q_stride = HEADS * HEAD_DIM
-    job.kv_stride = HEADS * HEAD_DIM
-    job.dst_stride = HEADS * HEAD_DIM
-    job.scale = Float32(scale)
-    run(
-        job,
-        0 if dtype == DType.float32 else 1,
-        num_workers=1,
-        do_store=True,
-        do_attend=True,
-    )
-    _reference[dtype, BLOCK](
-        q.__int__(),
-        k_cache.__int__(),
-        v_cache.__int__(),
-        ref_out.__int__(),
-        table.__int__(),
-        lens.__int__(),
-        NUM_SEQS,
-        scale,
-    )
-    var worst = Float64(0)
-    for i in range(N):
-        var d = abs(
-            Float64(out.unsafe_load(i)) - Float64(ref_out.unsafe_load(i))
-        )
-        worst = max(worst, d)
-    var ok = worst < 2e-3
-    print(
-        "dtype",
-        dtype,
-        "block",
-        BLOCK,
-        "lens",
-        len0,
-        len1,
-        "max|diff|",
-        worst,
-        "OK" if ok else "MISMATCH",
-    )
+def _case[dtype: DType](page: Int, len0: Int, len1: Int, heads: Int = 4, kvh: Int = 4) raises -> Bool:
+    comptime HD = 64
+    var seqs = 2
+    var lens = [len0, len1]
+    var pages_per = (max(len0, len1) + page - 1) // page
+    var nblocks = seqs * pages_per
+    var cache_n = nblocks * kvh * page * HD
+    var kc = stack_allocation[1 << 17, Scalar[dtype]]()
+    var vc = stack_allocation[1 << 17, Scalar[dtype]]()
+    var tokens = len0 + len1
+    var kn = stack_allocation[1 << 17, Scalar[dtype]]()
+    var vn = stack_allocation[1 << 17, Scalar[dtype]]()
+    var q = stack_allocation[1024, Scalar[dtype]]()
+    var out = stack_allocation[1024, Scalar[dtype]]()
+    var slots = stack_allocation[4096, Int64]()
+    var bt = stack_allocation[256, Int32]()
+    var ln = stack_allocation[2, Int32]()
+    if cache_n > (1 << 17) or tokens * kvh * HD > (1 << 17):
+        raise Error("test case too large")
+    var seed = _fill[dtype](Int(kn), tokens * kvh * HD, 7)
+    seed = _fill[dtype](Int(vn), tokens * kvh * HD, seed)
+    seed = _fill[dtype](Int(q), seqs * heads * HD, seed)
+    # Block table: sequence s owns pages s*pages_per .. (in reverse order, so the
+    # cache order differs from the sequence order).
+    for s in range(seqs):
+        for p in range(pages_per):
+            bt[s * pages_per + p] = Int32(s * pages_per + (pages_per - 1 - p))
+    var t = 0
+    for s in range(seqs):
+        ln[s] = Int32(lens[s])
+        for i in range(lens[s]):
+            slots[t] = Int64(Int(bt[s * pages_per + i // page]) * page + i % page)
+            t += 1
+    var job = PagedJob()
+    job.k = Int(kn)
+    job.v = Int(vn)
+    job.k_cache = Int(kc)
+    job.v_cache = Int(vc)
+    job.slots = Int(slots)
+    job.num_seqs = tokens
+    job.num_heads = kvh
+    job.kv_heads = kvh
+    job.head_dim = HD
+    job.page = page
+    job.kv_stride = kvh * HD
+    job.dtype = 0 if dtype == DType.float32 else 1
+    job.workers = 2
+    job.do_store = True
+    job.do_attend = False
+    paged_run(job)
+    var a = PagedJob()
+    a.q = Int(q)
+    a.k_cache = Int(kc)
+    a.v_cache = Int(vc)
+    a.out = Int(out)
+    a.block_table = Int(bt)
+    a.lens = Int(ln)
+    a.num_seqs = seqs
+    a.num_heads = heads
+    a.kv_heads = kvh
+    a.head_dim = HD
+    a.page = page
+    a.bt_stride = pages_per
+    a.q_stride = heads * HD
+    a.out_stride = heads * HD
+    a.scale = 0.125
+    a.dtype = job.dtype
+    a.workers = 2
+    a.do_attend = True
+    a.chunks = 1
+    paged_run(a)
+    var worst = Float32(0)
+    var base = 0
+    for s in range(seqs):
+        for h in range(heads):
+            var g = h // (heads // kvh)
+            var sc = List[Float32]()
+            var mx = Float32(-1e30)
+            for i in range(lens[s]):
+                var dot = Float32(0)
+                for d in range(HD):
+                    dot += Float32(q[(s * heads + h) * HD + d]) * Float32(kn[((base + i) * kvh + g) * HD + d])
+                sc.append(dot * 0.125)
+                mx = max(mx, dot * 0.125)
+            var sum = Float32(0)
+            for i in range(lens[s]):
+                sc[i] = exp(sc[i] - mx)
+                sum += sc[i]
+            for d in range(HD):
+                var acc = Float32(0)
+                for i in range(lens[s]):
+                    acc += sc[i] * Float32(vn[((base + i) * kvh + g) * HD + d])
+                var got = Float32(out[(s * heads + h) * HD + d])
+                worst = max(worst, abs(got - acc / sum))
+        base += lens[s]
+    var tol = Float32(1e-5) if dtype == DType.float32 else Float32(2e-2)
+    var ok = worst <= tol
+    print("dtype", dtype, "page", page, "lens", len0, len1, "heads", heads, "/", kvh,
+          "max|diff|", worst, "OK" if ok else "FAIL")
     return ok
 
 
 def main() raises:
     var ok = True
-    ok = _run[DType.float32, 32, 1, 37]() and ok
-    ok = _run[DType.float32, 32, 32, 96]() and ok
-    ok = _run[DType.bfloat16, 32, 1, 37]() and ok
-    ok = _run[DType.bfloat16, 32, 32, 96]() and ok
-    ok = _run[DType.float32, 16, 1, 37]() and ok
-    ok = _run[DType.float32, 16, 48, 96]() and ok
-    ok = _run[DType.bfloat16, 16, 33, 79]() and ok
-    # tile < block_size: several tiles per page, groups straddle pages
-    ok = _run[DType.float32, 64, 1, 37]() and ok
-    ok = _run[DType.float32, 64, 96, 200]() and ok
-    ok = _run[DType.bfloat16, 64, 33, 200]() and ok
-    ok = _run[DType.bfloat16, 48, 79, 190]() and ok
+    for page in [16, 32, 48, 64]:
+        ok = _case[DType.float32](page, 1, 37) and ok
+        ok = _case[DType.float32](page, page * 2 + 1, 95) and ok
+        ok = _case[DType.bfloat16](page, 33, page * 3 - 1) and ok
+        ok = _case[DType.bfloat16](page, 79, 190) and ok
+    ok = _case[DType.float32](32, 70, 129, 8, 2) and ok
+    ok = _case[DType.bfloat16](16, 70, 129, 8, 1) and ok
     if not ok:
-        raise Error("parity mismatch")
+        raise Error("parity failures")
+    print("all parity cases passed")

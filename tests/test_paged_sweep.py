@@ -5,8 +5,11 @@ head_dim 32/64/128, page 16/32/48/64, context 1..2049, GQA ratios 1/2/4,
 a block table whose pages are not in cache order, and a query / new-K/V that
 are strided chunks of a fused projection (what the engine actually passes).
 
-    CPU_ATTENTION_BACKEND=cpp python tests/test_paged_sweep.py
-    CPU_ATTENTION_BACKEND=mojo python tests/test_paged_sweep.py
+    python tests/test_paged_sweep.py
+
+fp32 must be within 1e-6 of the naive fp32 reference (fp64 arbitrates a reference
+that is itself out of tolerance); bf16 within 1e-3 of the reference beyond the
+unavoidable bf16 output rounding (`reference.bf16_excess`).
 """
 
 import itertools
@@ -37,8 +40,8 @@ def strided_chunk(t, proj_width):
 
 def run_case(batch, ctx, heads, kvh, hd, page, dtype, strided, seed,
              reference_dtype=torch.float32):
-    # Both backends must see the same tensors, so the data comes from a seed
-    # rather than from the global generator.
+    # The data comes from a seed rather than from the global generator, so a
+    # failing case reproduces in a fresh process.
     torch.manual_seed(seed)
     group = heads // kvh
     pages = (ctx + page - 1) // page
@@ -94,16 +97,11 @@ def main():
     # No options: the sweep is the point.
     torch.manual_seed(0)
     torch.set_num_threads(8)
-    print(f"backend {_kernel.backend()}", flush=True)
+    print(f"tier {_kernel.module().tier()}", flush=True)
     cases = bad = 0
     reference_checks = 0
     worst = {torch.float32: 0.0, torch.bfloat16: 0.0}
     worst_at = {}
-    # bf16 is judged against the other backend in bf16 ulps (the shipped x86
-    # kernel uses a degree-2 exponential that is inside a bf16 store, so an
-    # fp32-accurate reference legitimately disagrees by ~4e-3); fp32 against the
-    # naive fp32 reference in absolute terms.
-    other = "mojo" if _kernel.backend() == "cpp" else "cpp"
     shapes = [(1, 1, False), (17, 1, True), (33, 3, False), (256, 2, True),
               (257, 1, False), (1024, 1, True), (2049, 2, False)]
     for hd, page, (heads, kvh) in itertools.product(
@@ -117,11 +115,6 @@ def main():
                         hd * 13 + page * 17 + int(dtype == torch.bfloat16))
                 got, got_x, ref = run_case(batch, ctx, heads, kvh, hd, page,
                                            dtype, strided, seed)
-                # Same case and the same tensors through the other backend.
-                _kernel.set_backend(other)
-                got_o, got_xo, _ = run_case(batch, ctx, heads, kvh, hd, page,
-                                            dtype, strided, seed)
-                _kernel.set_backend("cpp" if other == "mojo" else "mojo")
                 if dtype == torch.float32:
                     err = max((got.float() - ref).abs().max().item(),
                               (got_x.float() - ref).abs().max().item())
@@ -145,16 +138,8 @@ def main():
                                   f"fp32/fp64={ref_err:.3e}, "
                                   f"kernel/fp64={err:.3e}", flush=True)
                 else:
-                    # bfs ulps at the row's peak output: one ulp of a bf16 value
-                    # near `peak` is `peak * 2^-8`, which is the scale the
-                    # scorecard quotes ("0-2 ulp at max outputs"). An
-                    # element-wise ulp would count a cancellation-level value of
-                    # 1e-4 as hundreds of ulps for the same 1e-3 error.
-                    peak = ref.abs().max().clamp_min(1e-30) * 2 ** -8
-                    err = max((got.float() - got_o.float()).abs().max().item(),
-                              (got_x.float() - got_xo.float()).abs().max().item())
-                    err /= peak.item()
-                    tol = 2.0
+                    err = max(C.bf16_excess(got, ref), C.bf16_excess(got_x, ref))
+                    tol = 1e-3
                 if err > worst[dtype]:
                     worst[dtype] = err
                     worst_at[dtype] = (hd, page, heads, kvh, ctx, batch, strided)
@@ -164,12 +149,12 @@ def main():
                     print(f"FAIL hd={hd} page={page} h={heads}/{kvh} ctx={ctx} "
                           f"b={batch} strided={strided} "
                           f"{'fp32' if dtype == torch.float32 else 'bf16'}: "
-                           f"{err:.3e} > {'1e-6' if dtype == torch.float32 else '2 ulp'}",
+                           f"{err:.3e} > {tol:.0e}",
                           flush=True)
     print(f"paged sweep: {cases - bad}/{cases} within tolerance")
     print(f"  fp64-resolved reference precision cases: {reference_checks}")
     print(f"  worst fp32 {worst[torch.float32]:.2e} at {worst_at.get(torch.float32)}")
-    print(f"  worst bf16 {worst[torch.bfloat16]:.2f} ulp at "
+    print(f"  worst bf16 excess {worst[torch.bfloat16]:.2e} at "
           f"{worst_at.get(torch.bfloat16)}")
     return 1 if bad else 0
 

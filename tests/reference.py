@@ -22,16 +22,30 @@ def load_so(path):
     return mod
 
 
-def ref_attention(q, k, v, causal, block=128, dtype=torch.float32):
+def _expand_kv(x, heads):
+    """Repeat KV heads for GQA/MQA: [..., kv_heads, D] -> [..., heads, D]."""
+    kv_heads = x.shape[-2]
+    if kv_heads == heads:
+        return x
+    assert heads % kv_heads == 0, (heads, kv_heads)
+    return x.repeat_interleave(heads // kv_heads, dim=-2)
+
+
+def ref_attention(q, k, v, causal, block=128, dtype=torch.float32, scale=None):
     """Ground-truth attention from first principles, blockwise over queries.
 
-    q/k/v are [1, S, H, D]. Computed in fp32 with an explicit mask; never calls
-    torch SDPA or any fused kernel.
+    q is [B, S_q, H, D] and k/v are [B, S_k, H_kv, D] with H % H_kv == 0
+    (GQA/MQA). The causal mask is bottom-right aligned: query i keeps keys
+    j <= i + (S_k - S_q). A row with no key left is defined as 0, as the API
+    returns. Computed in ``dtype`` (fp32, or fp64 to arbitrate) with an
+    explicit mask; never calls torch SDPA or any fused kernel.
     """
-    qf, kf, vf = q.to(dtype), k.to(dtype), v.to(dtype)
+    qf = q.to(dtype)
+    kf = _expand_kv(k.to(dtype), q.shape[2])
+    vf = _expand_kv(v.to(dtype), q.shape[2])
     s_q, s_k = qf.shape[1], kf.shape[1]
-    scale = qf.shape[-1] ** -0.5
-    out = torch.empty_like(qf)
+    scale = qf.shape[-1] ** -0.5 if scale is None else scale
+    out = torch.zeros_like(qf)
     for i0 in range(0, s_q, block):
         i1 = min(i0 + block, s_q)
         scores = torch.einsum("bqhd,bkhd->bhqk", qf[:, i0:i1], kf) * scale
@@ -41,16 +55,45 @@ def ref_attention(q, k, v, causal, block=128, dtype=torch.float32):
             keep = ki <= qi + (s_k - s_q)
             scores = scores.masked_fill(~keep, float("-inf"))
         p = torch.softmax(scores, dim=-1)
+        # softmax over an all -inf row is NaN; such a row attends nothing.
+        p = torch.nan_to_num(p, nan=0.0)
         out[:, i0:i1] = torch.einsum("bhqk,bkhd->bqhd", p, vf)
     return out
 
 
-def ref_decode(q, k, v, dtype=torch.float32):
-    """One query token per sequence: q [B,H,D], k/v [B,H,S,D] -> [B,H,D]."""
-    scale = q.shape[-1] ** -0.5
-    scores = torch.einsum("bhd,bhsd->bhs", q.to(dtype), k.to(dtype)) * scale
-    p = torch.softmax(scores, dim=-1)
-    return torch.einsum("bhs,bhsd->bhd", p, v.to(dtype))
+def ref_decode(q, k, v, dtype=torch.float32, scale=None, lens=None):
+    """One query token per sequence: q [B,H,D], k/v [B,H_kv,S,D] -> [B,H,D].
+
+    ``lens`` [B] limits sequence b to its first lens[b] keys (heterogeneous
+    contexts); ``scale`` defaults to D**-0.5.
+    """
+    scale = q.shape[-1] ** -0.5 if scale is None else scale
+    heads = q.shape[1]
+    kf = k.to(dtype).transpose(1, 2)
+    vf = v.to(dtype).transpose(1, 2)
+    kf = _expand_kv(kf, heads).transpose(1, 2)
+    vf = _expand_kv(vf, heads).transpose(1, 2)
+    scores = torch.einsum("bhd,bhsd->bhs", q.to(dtype), kf) * scale
+    if lens is not None:
+        pos = torch.arange(kf.shape[2]).unsqueeze(0)
+        keep = pos < torch.as_tensor(lens).long().unsqueeze(1)
+        scores = scores.masked_fill(~keep.unsqueeze(1), float("-inf"))
+    p = torch.nan_to_num(torch.softmax(scores, dim=-1), nan=0.0)
+    return torch.einsum("bhs,bhsd->bhd", p, vf)
+
+
+def bf16_excess(got, ref):
+    """Largest error of `got` against the fp32 `ref` beyond the unavoidable
+    bf16 output rounding: max(|got - ref| - |ref - bf16(ref)|).
+
+    The ARM paged bf16 gate reads "<= 1e-3 against the reference". Taken as an
+    absolute error to the real-valued result it cannot be met by any bf16
+    output: rounding the exact output to bf16 alone exceeds 1e-3 on 77/252 of
+    the Axion sweep cases (worst 6.6e-3, docs/Mojo.md). This measures the error
+    the kernel adds on top of that floor; the raw |got - ref| is reported too.
+    """
+    floor = (ref - ref.bfloat16().float()).abs()
+    return ((got.float() - ref).abs() - floor).max().item()
 
 
 def stats(samples):

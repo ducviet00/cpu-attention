@@ -13,7 +13,7 @@ license = { file = "LICENSE" }
 
 [project.optional-dependencies]
 # The Mojo compiler, from the PyPI wheel: uv is the only tool needed.
-build = ["mojo>=1.1"]
+build = ["mojo==1.2.0"]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cpu" }
@@ -28,4 +28,4 @@ include = ["cpu_attention*"]
 namespaces = false
 
 [tool.setuptools.package-data]
-cpu_attention = ["_C.so"]
+cpu_attention = ["_C.so", "_C_*.so"]

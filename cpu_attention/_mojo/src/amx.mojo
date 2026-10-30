@@ -37,6 +37,7 @@ from std.memory import MutPointer, stack_allocation
 from std.origin import MutUntrackedOrigin
 from std.os import abort
 from std.sys import inlined_assembly
+from std.sys.info import CompilationTarget
 
 
 @always_inline
@@ -71,6 +72,8 @@ def amx_init() -> Bool:
     Required before any tile instruction (`#XF` state is off by default), and
     it is per thread, so each worker calls this once.
     """
+    comptime if not CompilationTarget.is_x86():
+        return False
     comptime ARCH_REQ_XCOMP_PERM = 0x1023
     comptime XFEATURE_XTILEDATA = 18
     return (
@@ -108,47 +111,51 @@ def tile_config_bf16(
 @always_inline
 def tile_cfg_load(cfg: Int) -> None:
     """`ldtilecfg` from a 64-byte, 64-byte-aligned config."""
-    inlined_assembly[
-        "ldtilecfg ($0)",
-        NoneType,
-        constraints="r,~{memory}",
-        has_side_effect=True,
-    ](cfg)
+    comptime if CompilationTarget.is_x86():
+        inlined_assembly[
+            "ldtilecfg ($0)",
+            NoneType,
+            constraints="r,~{memory}",
+            has_side_effect=True,
+        ](cfg)
 
 
 @always_inline
 def tile_release() -> None:
     """`tilerelease`: drop the config (must be re-established afterwards)."""
-    inlined_assembly[
-        "tilerelease",
-        NoneType,
-        constraints="~{memory}",
-        has_side_effect=True,
-    ]()
+    comptime if CompilationTarget.is_x86():
+        inlined_assembly[
+            "tilerelease",
+            NoneType,
+            constraints="~{memory}",
+            has_side_effect=True,
+        ]()
 
 
 @always_inline
 def tile_load[tile: Int](base: Int, stride: Int) -> None:
     """`tileloadd`: 16 rows of the tile, `stride` bytes apart, from `base`."""
     comptime asm = "tileloadd ($0,$1,1), " + _tmm[tile]()
-    inlined_assembly[
-        asm,
-        NoneType,
-        constraints="r,r,~{memory}",
-        has_side_effect=True,
-    ](base, stride)
+    comptime if CompilationTarget.is_x86():
+        inlined_assembly[
+            asm,
+            NoneType,
+            constraints="r,r,~{memory}",
+            has_side_effect=True,
+        ](base, stride)
 
 
 @always_inline
 def tile_store[tile: Int](base: Int, stride: Int) -> None:
     """`tilestored`: write the tile back, 16 rows `stride` bytes apart."""
     comptime asm = "tilestored " + _tmm[tile]() + ", ($0,$1,1)"
-    inlined_assembly[
-        asm,
-        NoneType,
-        constraints="r,r,~{memory}",
-        has_side_effect=True,
-    ](base, stride)
+    comptime if CompilationTarget.is_x86():
+        inlined_assembly[
+            asm,
+            NoneType,
+            constraints="r,r,~{memory}",
+            has_side_effect=True,
+        ](base, stride)
 
 
 @always_inline
@@ -156,12 +163,13 @@ def tile_zero[tile: Int]() -> None:
     """`tilezero`: register-only, no memory operand."""
     comptime asm = "tilezero " + _tmm[tile]()
     # Register-only, so no memory clobber (see `tile_dpbf16ps`).
-    inlined_assembly[
-        asm,
-        NoneType,
-        constraints="",
-        has_side_effect=True,
-    ]()
+    comptime if CompilationTarget.is_x86():
+        inlined_assembly[
+            asm,
+            NoneType,
+            constraints="",
+            has_side_effect=True,
+        ]()
 
 
 @always_inline
@@ -181,9 +189,10 @@ def tile_dpbf16ps[dst: Int, a: Int, b: Int]() -> None:
     # still safe because `has_side_effect=True` keeps side-effecting asm in
     # program order, and the tile loads/stores around it keep their own clobber.
     # Measured, alternating processes, against the gcc-built C kernel.
-    inlined_assembly[
-        asm,
-        NoneType,
-        constraints="",
-        has_side_effect=True,
-    ]()
+    comptime if CompilationTarget.is_x86():
+        inlined_assembly[
+            asm,
+            NoneType,
+            constraints="",
+            has_side_effect=True,
+        ]()
