@@ -66,8 +66,8 @@ Notes on the API:
 * **`causal` on the paged path** is accepted and has no effect, because one
   query at the last position sees every key.
 * **Engines.** [`examples/ops.py`](examples/ops.py) shows an inference engine's
-  per-layer calls (fast-encdec's): precomputed slot mappings, no per-call
-  argument checks, a preallocated `out=`.
+  per-layer calls (fast-encdec's): its own slot mapping and a preallocated
+  `out=`, through the same native entry.
 
 ## Performance
 
