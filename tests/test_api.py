@@ -15,6 +15,7 @@ def paged():
 @pytest.mark.parametrize("kwargs", [
     dict(window_size=(8, 0)), dict(softcap=30.0), dict(return_softmax_lse=True),
     dict(attention_chunk=64), dict(rotary_cos=torch.ones(1)), dict(qv=torch.ones(1)),
+    dict(alibi_slopes=torch.ones(4)),
 ])
 def test_kvcache_unsupported_options(kwargs):
     q, kc, vc, bt = paged()
@@ -29,7 +30,7 @@ def test_kvcache_one_query_token_only():
                                   page_table=bt)
 
 
-@pytest.mark.parametrize("bad", ["dtype", "head_dim", "page", "heads", "no_table"])
+@pytest.mark.parametrize("bad", ["dtype", "head_dim", "page", "heads", "no_table", "both_tables"])
 def test_kvcache_bad_arguments(bad):
     q, kc, vc, bt = paged()
     if bad == "dtype":
@@ -42,8 +43,9 @@ def test_kvcache_bad_arguments(bad):
         q = q[:, :, :3]
     elif bad == "no_table":
         bt = None
+    extra = dict(block_table=bt) if bad == "both_tables" else {}
     with pytest.raises(ValueError):
-        C.flash_attn_with_kvcache(q, kc, vc, cache_seqlens=4, page_table=bt)
+        C.flash_attn_with_kvcache(q, kc, vc, cache_seqlens=4, page_table=bt, **extra)
 
 
 @pytest.mark.parametrize("kv_heads", [2, 1])

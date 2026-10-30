@@ -77,7 +77,8 @@ def test_append_one_token(dtype):
     ref = reference(q, *appended(ks, vs, kn, vn), d ** -0.5)
     err, tol = check(out, ref, dtype, paged=True)
     assert err <= tol
-    again = flash_attn_with_kvcache(q, kc, vc, cache_seqlens=seqlens + 1, page_table=bt)
+    # flash-attn 2's name for the page table
+    again = flash_attn_with_kvcache(q, kc, vc, cache_seqlens=seqlens + 1, block_table=bt)
     err, tol = check(again, ref, dtype, paged=True)
     assert err <= tol
 

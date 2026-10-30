@@ -65,6 +65,8 @@ def flash_attn_with_kvcache(
     pack_gqa=None,
     sm_margin=0,
     return_softmax_lse=False,
+    block_table=None,
+    alibi_slopes=None,
 ):
     """Paged decode: one query token per sequence against its cached K/V.
 
@@ -79,16 +81,23 @@ def flash_attn_with_kvcache(
       this library: ``reshape_and_cache``, or ``k``/``v`` here -- any number of
       new tokens, appended at ``cache_seqlens`` (the length before the write).
     * ``causal`` has no effect: the query sits at the last cached position.
+    * ``block_table`` (flash-attn 2's name for ``page_table``) is accepted;
+      ``alibi_slopes`` (flash-attn 2) raises ``NotImplementedError``.
     """
     if (qv is not None or rotary_cos is not None or rotary_sin is not None
             or cache_leftpad is not None or cu_seqlens_q is not None
             or cu_seqlens_k_new is not None or max_seqlen_q is not None
             or rotary_seqlens is not None or q_descale is not None
             or k_descale is not None or v_descale is not None
-            or window_size != (-1, -1) or softcap or attention_chunk or return_softmax_lse):
+            or window_size != (-1, -1) or softcap or attention_chunk or return_softmax_lse
+            or alibi_slopes is not None):
         raise NotImplementedError(
             "cpu_attention: qv, rotary, cache_leftpad, varlen, descale, sliding "
-            "windows, softcap, attention_chunk and return_softmax_lse are not supported")
+            "windows, softcap, attention_chunk, alibi and return_softmax_lse are not supported")
+    if block_table is not None:
+        if page_table is not None:
+            raise ValueError("cpu_attention: pass `page_table` or `block_table`, not both")
+        page_table = block_table
     if page_table is None:
         raise ValueError("cpu_attention: pass `page_table`")
     if cache_batch_idx is not None:

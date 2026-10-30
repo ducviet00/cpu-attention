@@ -90,6 +90,8 @@ Notes on the API:
   (vLLM's included) is not readable.
 * **Strides.** q/k/v may be strided chunks of a fused projection: any token
   stride, with heads and dims contiguous.
+* **flash-attn 2 callers.** `block_table=` is accepted as flash-attn 2's name
+  for `page_table=`; `alibi_slopes` raises `NotImplementedError`.
 * **`causal` on the paged path** is accepted and has no effect, because one
   query at the last position sees every key.
 * **Engines.** [`examples/ops.py`](examples/ops.py) shows an inference engine's
