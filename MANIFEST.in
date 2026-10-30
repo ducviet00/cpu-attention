@@ -1,0 +1,2 @@
+include scripts/build.py
+recursive-include cpu_attention/_mojo *.mojo

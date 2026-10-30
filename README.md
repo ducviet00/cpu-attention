@@ -24,8 +24,35 @@ and works as a standalone library.
 
 ## Install and build
 
+**From another project.** Installing the package builds the kernel (one
+`_C_<tier>.so` per ISA tier, about a minute) against the project's own torch, and
+bundles the three small Mojo runtime libraries it loads, so the project needs no
+Mojo afterwards. The build needs Linux and a C toolchain (`build-essential`);
+the Mojo compiler is fetched for the build only. With uv:
+
+```toml
+[project]
+dependencies = ["torch", "cpu-attention"]
+
+[tool.uv.sources]
+cpu-attention = { git = "https://github.com/ducviet00/cpu-attention.git" }
+
+# Build against the torch the project runs with: the extension links it.
+[tool.uv.extra-build-dependencies]
+cpu-attention = [{ requirement = "torch", match-runtime = true }]
+```
+
+With pip, in an environment that already has torch:
+
 ```bash
-uv sync --extra build --extra test                       # torch, the mojo wheel, pytest + numpy
+pip install mojo==1.2.0
+pip install --no-build-isolation git+https://github.com/ducviet00/cpu-attention.git
+```
+
+**For development** (this repository):
+
+```bash
+uv sync --extra build --extra test                       # torch, the mojo wheel, pytest
 uv run --extra build python scripts/build.py --tests     # one _C_<tier>.so per ISA tier
 ```
 
