@@ -1,12 +1,14 @@
-"""Low-level paged-attention entry points (the engine's per-layer calls).
+"""Example: an inference engine's per-layer paged-attention calls.
 
-These take three-dimensional q/k/v and precomputed slot mappings, so they skip
-the argument validation ``flash_attn_with_kvcache`` does: the caller is expected
-to have built the tensors (fast-encdec's runner does, once per step).
+An engine that already holds validated tensors and its own slot mapping (as
+fast-encdec's runner does, once per decode step) can skip
+``flash_attn_with_kvcache``'s argument checks and call the kernel plumbing
+directly. These take three-dimensional q/k/v; they use ``cpu_attention._kernel``,
+which is internal and may change between releases.
 """
 
-from . import _kernel
-from ._kernel import _paged
+from cpu_attention import _kernel
+from cpu_attention._kernel import _paged
 
 
 def self_attention(

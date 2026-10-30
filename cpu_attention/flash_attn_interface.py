@@ -60,9 +60,6 @@ def flash_attn_with_kvcache(
     pack_gqa=None,
     sm_margin=0,
     return_softmax_lse=False,
-    block_table=None,
-    slot_mapping=None,
-    check_inputs=True,
 ):
     """``flash_attn_with_kvcache`` over this backend's paged cache.
 
@@ -72,28 +69,21 @@ def flash_attn_with_kvcache(
     ``*_descale``, ``window_size``, ``softcap``, ``attention_chunk``,
     ``return_softmax_lse``).  The tuning hints ``num_splits``, ``pack_gqa``,
     ``sm_margin``, ``scheduler_metadata`` and ``rotary_interleaved`` are
-    accepted and ignored.  ``block_table`` is this repo's name for flash's
-    ``page_table``.
+    accepted and ignored.
 
     Deliberate differences:
 
     * ``q`` must be ``[batch, 1, nheads, headdim]``: the kernel decodes one
       query token per sequence, so ``seqlen`` may only be 1.
     * The cache is head-major ``[num_blocks, nheads_k, page_block_size,
-      headdim]`` (``attention.self_cache_shape``), not flash's page-major
-      layout, because K is stored transposed inside the page.  Must be
-      contiguous.
+      headdim]``, not flash's page-major layout, because K is stored
+      transposed inside the page.  Must be contiguous, and is written only
+      through this function: ``k``/``v`` of ``seqlen_new >= 1`` tokens are
+      appended at ``cache_seqlens`` (the length *before* the write, flash's
+      convention), so a prompt's K/V is staged by one call with
+      ``cache_seqlens=0``.
     * ``causal`` is accepted and has no effect: the one query sits at the last
       cached position, where the bottom-right-aligned mask keeps every key.
-    * With ``k``/``v``, they are written at ``cache_seqlens`` (the length
-      *before* the write, flash's convention).  Passing ``slot_mapping``
-      instead writes them at those slots and reads ``cache_seqlens`` as the
-      length *after* the write -- the engine's Context convention, and it skips
-      computing the slots per call.
-    * ``check_inputs=False`` skips the argument validation for callers whose
-      tensors are already known-good (the engine's per-layer path): the checks
-      cost a few microseconds per call, which at 24 calls per decode step is
-      measurable end to end.
     """
     if (
         qv is None
@@ -112,11 +102,10 @@ def flash_attn_with_kvcache(
         and not softcap
         and not attention_chunk
         and not return_softmax_lse
-        and (page_table is None) != (block_table is None)
+        and page_table is not None
     ):
         table = getattr(_kernel._KV_TABLE, "t", None)
         if table is not None and _kernel._KV_TABLE.gen == _kernel._KV_GEN[0]:
-            pt = page_table if page_table is not None else block_table
             res = _kernel._KV_TABLE.fn(
                 _kernel._KV_TABLE.addr,
                 q,
@@ -124,149 +113,106 @@ def flash_attn_with_kvcache(
                 v,
                 k_cache,
                 v_cache,
-                slot_mapping,
-                pt,
+                None,
+                page_table,
                 cache_seqlens,
                 softmax_scale,
                 None,
             )
             if res is not None:
                 return res
-    if check_inputs:
-        if (
-            qv is not None
-            or rotary_cos is not None
-            or rotary_sin is not None
-            or cache_leftpad is not None
-            or cu_seqlens_q is not None
-            or cu_seqlens_k_new is not None
-            or max_seqlen_q is not None
-            or rotary_seqlens is not None
-            or q_descale is not None
-            or k_descale is not None
-            or v_descale is not None
-        ):
-            raise NotImplementedError(
-                "cpu_attention: qv/rotary_*/cache_leftpad/cu_seqlens_*/"
-                "max_seqlen_q/*_descale are not supported"
-            )
-        if window_size != (-1, -1):
-            raise NotImplementedError(
-                "cpu_attention: sliding windows are not supported"
-            )
-        if softcap:
-            raise NotImplementedError("cpu_attention: softcapping is not supported")
-        if attention_chunk:
-            raise NotImplementedError(
-                "cpu_attention: `attention_chunk` is not supported"
-            )
-        if return_softmax_lse:
-            raise NotImplementedError(
-                "cpu_attention: `return_softmax_lse` is not supported"
-            )
-        if q.dim() != 4:
-            raise ValueError(
-                "cpu_attention: q must be [batch, seqlen, nheads, headdim]"
-            )
-        batch, q_len, num_heads, head_dim = q.shape
-        if q_len != 1:
-            raise NotImplementedError(
-                "cpu_attention decodes one query token per sequence; "
-                f"got seqlen={q_len}"
-            )
-        if page_table is not None and block_table is not None:
-            raise ValueError("cpu_attention: pass page_table or block_table, not both")
-        page_table = page_table if page_table is not None else block_table
-        if page_table is None:
-            raise ValueError("cpu_attention: pass `page_table` (or `block_table`)")
-        if cache_batch_idx is not None:
-            page_table = page_table.index_select(0, cache_batch_idx.long())
-        if page_table.dtype != torch.int32 or page_table.dim() != 2:
-            raise ValueError(
-                "cpu_attention: page_table must be int32 [batch, max_blocks]"
-            )
-        if page_table.shape[0] != batch:
-            raise ValueError("cpu_attention: page_table has the wrong batch size")
-        page_table = page_table.contiguous()
-        if k_cache.dim() != 4 or v_cache.shape != k_cache.shape:
-            raise ValueError(
-                "cpu_attention: k_cache/v_cache must be "
-                "[num_blocks, nheads_k, page_block_size, headdim] and match"
-            )
-        num_kv_heads, block_size, cache_dim = k_cache.shape[1:]
-        if cache_dim != head_dim:
-            raise ValueError(
-                "cpu_attention: head_dim mismatch between q and the caches"
-            )
-        if num_heads % num_kv_heads:
-            raise ValueError("cpu_attention: nheads must be divisible by nheads_k")
-        if not (k_cache.is_contiguous() and v_cache.is_contiguous()):
-            raise ValueError(
-                "cpu_attention: the paged caches must be contiguous "
-                "(head-major layout, see `attention.self_cache_shape`)"
-            )
-        if q.dtype != k_cache.dtype or v_cache.dtype != q.dtype:
-            raise ValueError("cpu_attention: q and the caches must share a dtype")
-        if not supported(q.dtype, block_size, head_dim):
-            raise ValueError(
-                f"cpu_attention cannot run dtype={q.dtype}, page={block_size}, "
-                f"head_dim={head_dim}"
-            )
-        if k is not None and (
-            k.dim() != 4
-            or k.shape[:2] != (batch, 1)
-            or k.shape[2] != num_kv_heads
-            or v.shape != k.shape
-            or k.dtype != q.dtype
-            or v.dtype != q.dtype
-        ):
-            raise ValueError(
-                "cpu_attention: k/v must be [batch, 1, nheads_k, headdim] and "
-                "match the cache"
-            )
-        if slot_mapping is not None and (
-            k is None or slot_mapping.dtype != torch.int64
-        ):
-            raise ValueError("cpu_attention: slot_mapping needs k/v and must be int64")
-    else:
-        batch, _, num_heads, head_dim = q.shape
-        page_table = page_table if page_table is not None else block_table
-        num_kv_heads, block_size = k_cache.shape[1], k_cache.shape[2]
+    if (
+        qv is not None
+        or rotary_cos is not None
+        or rotary_sin is not None
+        or cache_leftpad is not None
+        or cu_seqlens_q is not None
+        or cu_seqlens_k_new is not None
+        or max_seqlen_q is not None
+        or rotary_seqlens is not None
+        or q_descale is not None
+        or k_descale is not None
+        or v_descale is not None
+    ):
+        raise NotImplementedError(
+            "cpu_attention: qv/rotary_*/cache_leftpad/cu_seqlens_*/"
+            "max_seqlen_q/*_descale are not supported"
+        )
+    if window_size != (-1, -1):
+        raise NotImplementedError("cpu_attention: sliding windows are not supported")
+    if softcap:
+        raise NotImplementedError("cpu_attention: softcapping is not supported")
+    if attention_chunk:
+        raise NotImplementedError("cpu_attention: `attention_chunk` is not supported")
+    if return_softmax_lse:
+        raise NotImplementedError("cpu_attention: `return_softmax_lse` is not supported")
+    if q.dim() != 4:
+        raise ValueError("cpu_attention: q must be [batch, seqlen, nheads, headdim]")
+    batch, q_len, num_heads, head_dim = q.shape
+    if q_len != 1:
+        raise NotImplementedError(
+            f"cpu_attention decodes one query token per sequence; got seqlen={q_len}"
+        )
+    if page_table is None:
+        raise ValueError("cpu_attention: pass `page_table`")
+    if cache_batch_idx is not None:
+        page_table = page_table.index_select(0, cache_batch_idx.long())
+    if page_table.dtype != torch.int32 or page_table.dim() != 2:
+        raise ValueError("cpu_attention: page_table must be int32 [batch, max_blocks]")
+    if page_table.shape[0] != batch:
+        raise ValueError("cpu_attention: page_table has the wrong batch size")
+    page_table = page_table.contiguous()
+    if k_cache.dim() != 4 or v_cache.shape != k_cache.shape:
+        raise ValueError(
+            "cpu_attention: k_cache/v_cache must be "
+            "[num_blocks, nheads_k, page_block_size, headdim] and match"
+        )
+    num_kv_heads, block_size, cache_dim = k_cache.shape[1:]
+    if cache_dim != head_dim:
+        raise ValueError("cpu_attention: head_dim mismatch between q and the caches")
+    if num_heads % num_kv_heads:
+        raise ValueError("cpu_attention: nheads must be divisible by nheads_k")
+    if not (k_cache.is_contiguous() and v_cache.is_contiguous()):
+        raise ValueError("cpu_attention: the paged caches must be contiguous")
+    if q.dtype != k_cache.dtype or v_cache.dtype != q.dtype:
+        raise ValueError("cpu_attention: q and the caches must share a dtype")
+    if not supported(q.dtype, block_size, head_dim):
+        raise ValueError(
+            f"cpu_attention cannot run dtype={q.dtype}, page={block_size}, "
+            f"head_dim={head_dim}"
+        )
+    if (k is None) != (v is None) or k is not None and (
+        k.dim() != 4
+        or k.shape[0] != batch
+        or k.shape[1] < 1
+        or k.shape[2:] != (num_kv_heads, head_dim)
+        or v.shape != k.shape
+        or k.dtype != q.dtype
+        or v.dtype != q.dtype
+    ):
+        raise ValueError(
+            "cpu_attention: k/v must both be [batch, seqlen_new, nheads_k, headdim] "
+            "and match the cache"
+        )
     scale = head_dim**-0.5 if softmax_scale is None else softmax_scale
     query = q.squeeze(1)
+    lens = _lens_tensor(cache_seqlens, batch, q.device)
+    if k is not None and k.shape[1] > 1:
+        # Several new tokens: scatter them at cache_seqlens + j, then decode the
+        # one query over the grown cache (staging a prompt is one such call).
+        pos = lens.long()[:, None] + torch.arange(k.shape[1])[None]
+        slots = page_table.long().gather(1, pos // block_size) * block_size + pos % block_size
+        _kernel._kv_store(k.reshape(-1, num_kv_heads, head_dim),
+                          v.reshape(-1, num_kv_heads, head_dim),
+                          k_cache, v_cache, slots.flatten())
+        lens = lens + k.shape[1]
+        k = v = None
     if k is not None:
-        if slot_mapping is None:
-            before = _lens_tensor(cache_seqlens, batch, q.device)
-            slots = None
-            lens = before
-        else:
-            slots = slot_mapping
-            lens = _lens_tensor(cache_seqlens, batch, q.device)
-        out = _paged(
-            query,
-            k.squeeze(1),
-            v.squeeze(1),
-            k_cache,
-            v_cache,
-            slots,
-            page_table,
-            lens,
-            scale,
-            do_store=True,
-        )
+        out = _paged(query, k.squeeze(1), v.squeeze(1), k_cache, v_cache, None,
+                     page_table, lens, scale, do_store=True)
     else:
-        out = _paged(
-            query,
-            None,
-            None,
-            k_cache,
-            v_cache,
-            None,
-            page_table,
-            _lens_tensor(cache_seqlens, batch, q.device),
-            scale,
-            do_store=False,
-        )
+        out = _paged(query, None, None, k_cache, v_cache, None, page_table, lens,
+                     scale, do_store=False)
     return out.unsqueeze(1)
 
 
