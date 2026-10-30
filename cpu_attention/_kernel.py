@@ -1,9 +1,10 @@
-"""Loads the Mojo kernel and builds its launch plans.
+"""Loads the Mojo kernel and its runtime config.
 
 `scripts/build.py` builds one shared object per ISA tier; the best tier this CPU
 supports is loaded (`CPU_ATTENTION_ISA` forces a lower one, `CPU_ATTENTION_LIB`
-another build). A plan is the int64 geometry buffer a kernel entry reads; the
-callers build one per geometry, after validating it, and cache it.
+another build). The kernel's entries read torch tensors in place
+(`_mojo/src/torch_tensor.mojo`), at TensorImpl field offsets that `runtime()`
+finds once by matching what torch reports and verifies on probe tensors.
 """
 
 import importlib.util
@@ -116,125 +117,104 @@ def llc_bytes():
     return 32 << 20
 
 
-def workers(tasks, pages=1):
-    """Threads for one call. The kernel forks on torch's OpenMP pool (~2.4 us),
-    which beats running inline from about 32 KV positions per call (batch 1, ctx
-    64: 24.5 us inline vs 31.0 pooled; ctx 128: the pool 1.3x faster). Capped at
-    physical cores: SMT threads only oversubscribe (8 on a 4-core Xeon: 1.5x
-    slower at ctx 1024)."""
-    n = min(torch.get_num_threads(), physical_cores(), tasks)
-    return 1 if n > 1 and tasks * pages <= 32 else max(n, 1)
-
-
-# ---------------------------------------------------------------------------
-# paged decode / reshape_and_cache
-# ---------------------------------------------------------------------------
-def paged_plan(q, k, k_cache, npages, store, attend):
-    """The plan of a `kv_attention` call, for q `[seqs, ..., heads, dim]` and
-    the new tokens' k `[tokens, ..., heads, dim]` (heads and dims contiguous; a
-    token stride is fine: q/k/v may be chunks of one fused projection)."""
-    rows = q if q is not None else k
-    nseq, heads, hd = rows.shape[0], rows.shape[-2], rows.shape[-1]
-    buf = torch.tensor([
-        nseq, heads, hd, k_cache.shape[2], npages, heads * hd,
-        DTYPES[rows.dtype], workers(nseq * heads, max(npages, 1)), int(store),
-        int(attend), q.stride(0) if q is not None else 0,
-        k.stride(0) if k is not None else 0], dtype=torch.int64)
-    return buf, buf.data_ptr()
-
-
-def run_paged(plan, q, k, v, k_cache, v_cache, out, slots, page_table, lens, scale):
-    module().kv_attention(
-        plan[1], q.data_ptr() if q is not None else 0,
-        k.data_ptr() if k is not None else 0, v.data_ptr() if v is not None else 0,
-        k_cache.data_ptr(), v_cache.data_ptr(), out.data_ptr() if out is not None else 0,
-        slots.data_ptr() if slots is not None else 0,
-        page_table.data_ptr() if page_table is not None else 0,
-        lens.data_ptr() if lens is not None else 0, scale)
-
-
-# ---------------------------------------------------------------------------
-# flash_attn_func
-# ---------------------------------------------------------------------------
 _AMX_ENV = (os.environ.get("CPU_ATTENTION_AMX", "1") != "0"
             and os.environ.get("CPU_ATTENTION_ISA", "amx") == "amx")
 # fp32 runs on AMX as bf16 hi/lo products (error 3-8e-5 against the 2e-4 gate);
 # CPU_ATTENTION_AMX_FP32=0 keeps fp32 on the exact vector policy.
 _AMX_FP32 = os.environ.get("CPU_ATTENTION_AMX_FP32", "1") != "0"
+_DTYPES = (torch.float32, torch.bfloat16, torch.int32, torch.int64, torch.float16)
 
 
-@_cached
-def amx_available():
-    """The CPU reports AMX and the OS grants tile data (`arch_prctl`, asked by
-    the module: the first tile instruction is SIGILL without it)."""
-    return {"amx_tile", "amx_bf16"} <= _cpu_flags() and bool(module().amx_available())
+def _calibrate():
+    """Byte offsets of the fields the kernel reads, found by matching values torch
+    reports: the TensorImpl in the Python object (`tensor._cdata`), its storage and
+    the storage's data pointer, storage offset, dim count, inline sizes and
+    strides, and the dtype index. Returns (offsets, dtype codes) or None."""
+    import ctypes
+
+    def words(addr, n):
+        return [ctypes.c_int64.from_address(addr + 8 * i).value for i in range(n)]
+
+    def u16(addr):
+        return ctypes.c_uint16.from_address(addr).value
+
+    t = torch.empty(3, 5, 7)
+    w = words(t._cdata, 48)
+    storage = t.untyped_storage()
+    impl = [8 * i for i, x in enumerate(words(id(t), 8)) if x == t._cdata]
+    st = [8 * i for i, x in enumerate(w) if x == storage._cdata]
+    data = [8 * i for i, x in enumerate(words(storage._cdata, 16)) if x == storage.data_ptr()]
+    sizes = [8 * i for i in range(45) if w[i:i + 3] == [3, 5, 7]]
+    strides = [8 * i for i in range(45) if w[i:i + 3] == [35, 7, 1]]
+    view = words(torch.empty(100)[13:].view(29, 3)._cdata, 48)
+    offset = [8 * i for i, x in enumerate(view) if x == 13 and w[i] == 0]
+    w2, w1 = words(torch.empty(2, 2)._cdata, 48), words(torch.empty(4)._cdata, 48)
+    dim = [8 * i for i in range(48) if (w[i], w2[i], w1[i]) == (3, 2, 1)]
+    pairs = [(torch.empty(3, 5, dtype=d), torch.empty(7, dtype=d)) for d in _DTYPES]
+    dtype = [b for b in range(0, 384, 2)
+             if all(u16(a._cdata + b) == u16(c._cdata + b) for a, c in pairs)
+             and len({u16(a._cdata + b) for a, _ in pairs}) == len(_DTYPES)]
+    found = (impl, st, data, offset, dim, sizes, strides, dtype)
+    if not all(found):
+        return None
+    offsets = [x[0] for x in found]
+    return offsets, {d: u16(a._cdata + offsets[7]) for d, (a, _) in zip(_DTYPES, pairs)}
 
 
-def _vector_beats_amx(dt, hd, seq_q, seq_k, scale):
-    """Few query rows leave AMX's 16-row tiles mostly empty (and fp32 pays three
-    products per phase), so the vector policy is faster there. Crossovers on the
-    Xeon 8581C, 4 threads (vector / AMX time): fp32 hd=64 up to 65 rows 0.39-0.94,
-    fp32 hd=128 up to 17 rows 0.80-0.97 (or a 33-key sequence: 0.59), bf16 1-2
-    rows 0.76-0.89 (hd=128 only while seq_k <= 256: AMX packs a long K/V faster)."""
-    if dt == 0:
-        # A logit std above ~6 (scale * sqrt(hd) for unit inputs) peaks the
-        # probabilities enough for the hi/lo split to reach 2.03e-4 against the
-        # 2e-4 gate (scale 1.7 at hd=64): exact fp32 on the vector policy.
-        if scale * hd ** 0.5 > 6.0:
-            return True
-        return seq_q <= (65 if hd <= 64 else 24) or seq_k <= 64
-    return seq_q <= 2 and (hd <= 64 or seq_k <= 256)
+_RUNTIME = []
 
 
-def flash_plan(q, k, v, scale, causal):
-    """The plan of a `flash_forward` call: (geometry buffer, its address,
-    workspace bytes). q/k/v are `[batch, seq, heads, dim]` with dims contiguous."""
-    batch, seq_q, heads, hd = q.shape
-    seq_k = k.shape[1]
-    dt = DTYPES[q.dtype]
-    # Policy: 0 vector, 1 AMX (fp32 as bf16 hi/lo), 2 aarch64 bfmmla / lane FMA.
-    isa = (2 if module().tier() == "aarch64-bf16" else
-           1 if _AMX_ENV and amx_available() and (dt == 1 or _AMX_FP32) else 0)
-    if isa == 1 and _vector_beats_amx(dt, hd, seq_q, seq_k, scale):
-        isa = 0
-    if isa == 1:
-        rq = 64  # two 32-row AMX register tiles: K/V tiles load once per 64 rows
-    elif isa == 2 and dt == 0 and hd == 128 and causal and seq_q == seq_k >= 2048:
-        rq = 128  # Axion: amortize the K/V scan on long fp32 D=128 (6-9%; short rows lost 9.5%)
-    else:
-        rq = max(16, min(128, 16384 // (hd * 4)))  # a ~16 KB accumulator stays in L1
-    # At least ~8 work items per worker: causal blocks differ in cost, and at 4
-    # per worker the tail cost 1024:8:32 10-11% at 16 threads (Axion). Halve rq,
-    # down to one register-tile pair.
-    rq = min(rq, max(seq_q, 1))
-    floor, cap = (64 if isa == 1 else 16), workers(1 << 30)
-    while rq // 2 >= floor and batch * heads * -(-seq_q // rq) < 8 * cap:
-        rq //= 2
-    n = workers(batch * heads * -(-seq_q // rq), 8)
-    slab, aux = module().flash_sizes(seq_k, rq, hd, dt, isa)
-    llc = llc_bytes()
-    # Fused (a thread packs a head and attends it, no barrier) while the workers'
-    # slabs fit 0.6 of the LLC and the heads divide evenly.
-    fuse = batch * heads >= n and batch * heads % n == 0 and slab * n <= llc * 3 // 5
-    # fp32 V is read in place while it all fits half the LLC: a copy only buys a
-    # unit stride.
-    v_direct = dt == 0 and not isa and batch * heads * seq_k * hd * 4 <= llc // 2
-    qs, ks, vs = q.stride(), k.stride(), v.stride()
-    buf = torch.tensor([
-        batch, seq_q, seq_k, heads, hd, qs[0], qs[1], qs[2], ks[0], ks[1], ks[2],
-        vs[0], vs[1], vs[2], seq_q * heads * hd, heads * hd, hd, dt, int(causal),
-        n, int(fuse), rq, 0, slab, aux, int(v_direct), isa], dtype=torch.int64)
-    return buf, buf.data_ptr(), (n if fuse else batch * heads) * slab + n * aux + 64
+def runtime():
+    """The address of the kernel's runtime config (slots in `torch_tensor.mojo`).
+    Built once: calibrates the tensor field offsets and verifies them, and the
+    module's output allocation, on probe tensors (RuntimeError on any mismatch:
+    a torch whose tensor layout this build cannot read)."""
+    if _RUNTIME:
+        return _RUNTIME[1]
+    mod = module()
+    found = None
+    try:
+        found = _calibrate()
+    except Exception:  # noqa: BLE001
+        pass
+    if found is None:
+        raise RuntimeError(f"cpu_attention: cannot read torch {torch.__version__}'s tensor layout")
+    offsets, codes = found
+    amx = 0
+    if _AMX_ENV and {"amx_tile", "amx_bf16"} <= _cpu_flags() and mod.amx_available():
+        amx = 2 if _AMX_FP32 else 1
+    cfg = torch.tensor(offsets + [
+        id(torch.Tensor), id(torch.nn.Parameter), id(None), id(True), id(False),
+        codes[torch.float32], codes[torch.bfloat16], codes[torch.int32], codes[torch.int64],
+        physical_cores(), llc_bytes(), amx], dtype=torch.int64)
+    addr = cfg.data_ptr()
+    base = torch.randn(64, 3 * 16 * 8)
+    probes = [torch.randn(5), torch.randn(4, 6), torch.randn(2, 3, 4).bfloat16(),
+              torch.randn(9, 7)[2:].t(), torch.arange(50, dtype=torch.int32)[7:],
+              torch.arange(9)[1::2], base[:, 16 * 8:32 * 8].view(64, 16, 8),
+              torch.nn.Parameter(torch.randn(6, 2)), torch.empty(3, 16, 32, 64, dtype=torch.bfloat16)[1:]]
+    for t in probes:
+        got = mod.probe(addr, t)
+        n = t.dim()
+        want = [True, t.untyped_storage().data_ptr(), t.storage_offset(), n, *t.shape,
+                *t.stride(), codes[t.dtype]]
+        new = got[len(want):]
+        if got[:len(want)] != want or (t.dtype in (torch.float32, torch.bfloat16) and not (
+                new and new[0].shape == t.shape and new[0].dtype == t.dtype
+                and new[0].is_contiguous())):
+            raise RuntimeError(f"cpu_attention: cannot read torch {torch.__version__}'s tensor layout")
+    _RUNTIME[:] = [cfg, addr]
+    return addr
 
 
 _WS = threading.local()
 
 
-def workspace(nbytes):
-    """This thread's flash workspace (64-byte aligned), grown on demand and never
-    shrunk: a large `torch.empty` is an mmap whose pages fault in again after a
-    free (16.8% of an S=1024 H=16 D=128 fp32 call was the kernel zeroing them)."""
+def workspace(nbytes=0):
+    """This thread's flash workspace as (address, bytes), grown to `nbytes` and
+    never shrunk: a large `torch.empty` is an mmap whose pages fault in again after
+    a free (16.8% of an S=1024 H=16 D=128 fp32 call was the kernel zeroing them)."""
     ws = getattr(_WS, "t", None)
-    if ws is None or ws.numel() < nbytes + 64:
-        _WS.t = ws = torch.empty(nbytes + 4096, dtype=torch.uint8)
-    return (ws.data_ptr() + 63) & ~63
+    if ws is None or ws.numel() < nbytes:
+        _WS.t = ws = torch.empty(max(nbytes, 1 << 20), dtype=torch.uint8)
+    return ws.data_ptr(), ws.numel()

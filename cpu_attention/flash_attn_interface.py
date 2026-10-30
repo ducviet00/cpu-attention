@@ -1,9 +1,10 @@
 """flash-attn's interface over the Mojo kernel.
 
 Same names and arguments as flash-attn; what the kernel cannot do raises
-``NotImplementedError`` instead of being silently ignored. A call is validated and
-planned once per geometry (shapes, strides, dtypes, thread count); later calls
-with that geometry look the plan up and launch.
+``NotImplementedError`` instead of being silently ignored. Each call goes straight
+to the kernel's native entry, which validates the tensors itself; only when it
+declines (``None``) does Python look again, to raise the precise error or to copy a
+layout the kernel cannot read in place.
 """
 
 import torch
@@ -12,19 +13,25 @@ from . import _kernel as K
 from .cache import reshape_and_cache
 
 _MHA_ONLY = "cpu_attention supports MHA only (nheads == nheads_k); GQA/MQA are not supported yet"
-_PLANS = {}  # geometry key -> plan; plans are read-only, so threads share them
+_NATIVE = []  # (runtime address, decode, flash), bound on the first call
 
 
-def _remember(key, plan):
-    if len(_PLANS) > 1024:
-        _PLANS.clear()
-    _PLANS[key] = plan
-    return plan
+def _native():
+    if not _NATIVE:
+        mod = K.module()
+        _NATIVE[:] = [K.runtime(), mod.decode, mod.flash]
+    return _NATIVE
 
 
-def _layout_ok(x):
-    """Heads and dims contiguous (any token stride): the kernel reads it in place."""
-    return x.stride(-1) == 1 and x.stride(-2) == x.shape[-1]
+def _plain(x):
+    """A tensor subclass as a plain tensor (the kernel reads only plain ones)."""
+    plain = type(x) in (torch.Tensor, torch.nn.Parameter) or not isinstance(x, torch.Tensor)
+    return x if plain else x.as_subclass(torch.Tensor)
+
+
+def _rows(x):
+    """``x`` with heads and dims contiguous (any token stride is read in place)."""
+    return x if x.stride(-1) == 1 and x.stride(-2) == x.shape[-1] else x.contiguous()
 
 
 def flash_attn_with_kvcache(
@@ -93,36 +100,32 @@ def flash_attn_with_kvcache(
     if k is not None and k.shape[1] != 1:
         # Several new tokens (a prompt): store them at cache_seqlens + j, then
         # decode over the grown cache.
-        n = k.shape[1]
-        page = k_cache.shape[2]
+        n, page = k.shape[1], k_cache.shape[2]
         pos = cache_seqlens.long()[:, None] + torch.arange(n)[None]
         slots = page_table.long().gather(1, pos // page) * page + pos % page
         reshape_and_cache(k.reshape(-1, *k.shape[2:]), v.reshape(-1, *v.shape[2:]),
                           k_cache, v_cache, slots.flatten())
         cache_seqlens, k, v = cache_seqlens + n, None, None
-    new = None if k is None else (k.shape, k.stride(), k.dtype, v.shape, v.stride(), v.dtype)
-    key = (q.shape, q.stride(), q.dtype, k_cache.shape, k_cache.stride(), k_cache.dtype,
-           v_cache.shape, v_cache.stride(), v_cache.dtype, page_table.shape,
-           page_table.stride(), page_table.dtype, cache_seqlens.shape,
-           cache_seqlens.stride(), cache_seqlens.dtype, new, torch.get_num_threads())
-    plan = _PLANS.get(key) or _remember(key, _kvcache_plan(q, k_cache, v_cache, k, v,
-                                                           page_table, cache_seqlens))
-    buf, addr, copy, scale = plan
-    if copy:
-        q = q.contiguous()
-        k, v = (None, None) if k is None else (k.contiguous(), v.contiguous())
-    out = torch.empty_like(q)
-    K.run_paged(plan, q, k, v, k_cache, v_cache, out, None, page_table, cache_seqlens,
-                scale if softmax_scale is None else softmax_scale)
+    rt, decode, _ = _NATIVE or _native()
+    out = decode(rt, q, k_cache, v_cache, k, v, None, cache_seqlens, page_table, softmax_scale, None)
+    if out is None:
+        q, k_cache, v_cache, k, v, page_table, cache_seqlens = _check_kvcache(
+            q, k_cache, v_cache, k, v, page_table, cache_seqlens)
+        out = decode(rt, q, k_cache, v_cache, k, v, None, cache_seqlens, page_table,
+                     softmax_scale, None)
+        if out is None:
+            raise RuntimeError("cpu_attention: the kernel declined arguments that passed validation")
     return out
 
 
-def _kvcache_plan(q, k_cache, v_cache, k, v, page_table, lens):
-    """Validate one geometry and plan it: (buffer, address, copy, default scale)."""
-    if q.dim() != 4 or q.shape[1] != 1:
-        if q.dim() == 4:
-            raise NotImplementedError("cpu_attention decodes one query token per sequence")
+def _check_kvcache(q, k_cache, v_cache, k, v, page_table, lens):
+    """Raise the precise error for a call the kernel declined, or return its
+    tensors with the layouts it reads in place."""
+    q, k_cache, v_cache, k, v, page_table, lens = map(_plain, (q, k_cache, v_cache, k, v, page_table, lens))
+    if q.dim() != 4:
         raise ValueError("cpu_attention: q must be [batch, 1, nheads, headdim]")
+    if q.shape[1] != 1:
+        raise NotImplementedError("cpu_attention decodes one query token per sequence")
     batch, _, heads, hd = q.shape
     if k_cache.dim() != 4 or v_cache.shape != k_cache.shape:
         raise ValueError("cpu_attention: k_cache/v_cache must be "
@@ -138,21 +141,19 @@ def _kvcache_plan(q, k_cache, v_cache, k, v, page_table, lens):
     if hd not in K.HEAD_DIMS or k_cache.shape[2] % 16:
         raise ValueError(f"cpu_attention: head_dim must be 32/64/128 (got {hd}) and the "
                          f"page a multiple of 16 (got {k_cache.shape[2]})")
-    if (page_table.dtype != torch.int32 or page_table.dim() != 2
-            or page_table.shape[0] != batch or not page_table.is_contiguous()):
-        raise ValueError("cpu_attention: page_table must be a contiguous int32 [batch, max_blocks]")
-    if lens.dtype != torch.int32 or lens.shape != (batch,) or not lens.is_contiguous():
+    if page_table.dtype != torch.int32 or page_table.dim() != 2 or page_table.shape[0] != batch:
+        raise ValueError("cpu_attention: page_table must be int32 [batch, max_blocks]")
+    if lens.dtype != torch.int32 or lens.shape != (batch,):
         raise ValueError("cpu_attention: cache_seqlens must be an int or an int32 [batch] tensor")
     if (k is None) != (v is None) or k is not None and (
             k.shape != (batch, 1, heads, hd) or v.shape != k.shape
             or k.dtype != q.dtype or v.dtype != q.dtype):
         raise ValueError("cpu_attention: k/v must both be [batch, seqlen_new, nheads, headdim]")
-    copy = not _layout_ok(q) or k is not None and not (_layout_ok(k) and v.stride() == k.stride())
-    if copy:
-        q = q.contiguous()
-        k = None if k is None else k.contiguous()
-    buf, addr = K.paged_plan(q, k, k_cache, page_table.shape[1], k is not None, True)
-    return buf, addr, copy, hd ** -0.5
+    if int(lens.max()) + (k is not None) > page_table.shape[1] * k_cache.shape[2]:
+        raise ValueError("cpu_attention: cache_seqlens exceed the page table's capacity")
+    if k is not None:
+        k, v = (k, v) if _rows(k) is k and v.stride() == k.stride() else (k.contiguous(), v.contiguous())
+    return _rows(q), k_cache, v_cache, k, v, page_table.contiguous(), lens.contiguous()
 
 
 def flash_attn_func(q, k, v, softmax_scale=None, causal=False):
@@ -164,20 +165,29 @@ def flash_attn_func(q, k, v, softmax_scale=None, causal=False):
     ``softmax_scale`` defaults to ``1 / sqrt(headdim)``. Inference only: flash-attn's
     dropout, window, softcap, alibi and ``return_attn_probs`` are not offered.
     """
-    key = (q.shape, q.stride(), q.dtype, k.shape, k.stride(), k.dtype, v.shape,
-           v.stride(), v.dtype, softmax_scale, causal, torch.get_num_threads())
-    plan = _PLANS.get(key) or _remember(key, _flash_plan(q, k, v, softmax_scale, causal))
-    buf, addr, ws, copy, scale = plan
-    if copy:
-        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-    out = torch.empty_like(q, memory_format=torch.contiguous_format)
-    K.module().flash_forward(addr, q.data_ptr(), k.data_ptr(), v.data_ptr(),
-                             out.data_ptr(), K.workspace(ws), scale)
+    out = _flash(q, k, v, softmax_scale, causal)
+    if out is None:
+        q, k, v = _check_flash(q, k, v)
+        out = _flash(q, k, v, softmax_scale, bool(causal))
+        if out is None:
+            raise RuntimeError("cpu_attention: the kernel declined arguments that passed validation")
     return out
 
 
-def _flash_plan(q, k, v, softmax_scale, causal):
-    """Validate one geometry and plan it: (buffer, address, workspace bytes, copy, scale)."""
+def _flash(q, k, v, softmax_scale, causal):
+    rt, _, flash = _NATIVE or _native()
+    ws, nbytes = K.workspace()
+    out = flash(rt, q, k, v, softmax_scale, causal, ws, nbytes)
+    if type(out) is int:  # the workspace was short: grow it once
+        ws, nbytes = K.workspace(out)
+        out = flash(rt, q, k, v, softmax_scale, causal, ws, nbytes)
+    return out
+
+
+def _check_flash(q, k, v):
+    """Raise the precise error for a call the kernel declined, or return q/k/v
+    with the head dim contiguous."""
+    q, k, v = map(_plain, (q, k, v))
     if q.dim() != 4 or k.dim() != 4 or v.shape != k.shape:
         raise ValueError("cpu_attention: q/k/v must be [batch, seqlen, nheads, headdim]")
     batch, seq_q, heads, hd = q.shape
@@ -190,12 +200,7 @@ def _flash_plan(q, k, v, softmax_scale, causal):
         raise ValueError("cpu_attention: q/k/v must share a dtype (fp32 or bf16)")
     if hd not in K.HEAD_DIMS:
         raise ValueError(f"cpu_attention: head_dim must be 32, 64 or 128 (got {hd})")
-    # The kernel takes every stride explicitly except the head dim's.
-    copy = q.stride(3) != 1 or k.stride(3) != 1 or v.stride(3) != 1
-    if copy:
-        q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-    scale = hd ** -0.5 if softmax_scale is None else float(softmax_scale)
-    return (*K.flash_plan(q, k, v, scale, bool(causal)), copy, scale)
+    return (x if x.stride(3) == 1 else x.contiguous() for x in (q, k, v))
 
 
 def flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q,
