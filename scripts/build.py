@@ -86,6 +86,21 @@ def _arch() -> str:
     return "aarch64" if m in ("aarch64", "arm64") else "x86_64"
 
 
+MOJO_RUNTIME = ("libKGENCompilerRTShared.so", "libAsyncRTRuntimeGlobals.so", "libMSupportGlobals.so")
+
+
+def _vendor_mojo_runtime() -> None:
+    """Copy the Mojo runtime libraries the extension loads into the package."""
+    src = next((os.path.join(p, "modular", "lib") for p in sys.path
+                if os.path.exists(os.path.join(p, "modular", "lib", MOJO_RUNTIME[0]))), None)
+    if src is None:
+        raise SystemExit("cannot find the Mojo runtime libraries (modular/lib) of the mojo wheel")
+    dst = os.path.join(ROOT, "cpu_attention", "_mojo_rt")
+    os.makedirs(dst, exist_ok=True)
+    for name in MOJO_RUNTIME:
+        shutil.copy2(os.path.join(src, name), dst)
+
+
 def main() -> None:
     # In a package build (setup.py) the `mojo` wheel's binary sits next to the
     # build environment's Python rather than on PATH.
@@ -114,6 +129,12 @@ def main() -> None:
     if flags is None:
         print("warning: no libgomp found; the extension may not import")
         flags = []
+    # The extension needs three small Mojo runtime libraries (~2 MB, from the
+    # `mojo` wheel's modular/lib); they ship inside the package so a project
+    # installing it needs no Mojo. Torch's libraries are found beside it in
+    # site-packages (and are already loaded by `import torch`).
+    _vendor_mojo_runtime()
+    flags += ["-Xlinker", "-rpath=$ORIGIN/_mojo_rt", "-Xlinker", "-rpath=$ORIGIN/../torch/lib"]
     tiers = TIERS[_arch()]
     only = [a.split("=", 1)[1] for a in sys.argv if a.startswith("--tier=")]
     if only:

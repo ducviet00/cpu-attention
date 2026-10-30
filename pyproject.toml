@@ -31,7 +31,7 @@ include = ["cpu_attention*"]
 namespaces = false
 
 [tool.setuptools.package-data]
-cpu_attention = ["_C.so", "_C_*.so"]
+cpu_attention = ["_C.so", "_C_*.so", "_mojo_rt/*.so"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
