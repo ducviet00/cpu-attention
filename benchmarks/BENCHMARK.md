@@ -76,7 +76,10 @@ pin the CPU governor to `performance` first (`scripts/pin_governor.sh`).
 Measured at `f074b2e`. The later removal of the GQA/MQA kernel paths was timed
 against it in one process on c4-, c4a- and c4d-standard-8 (median new/old
 0.985-1.013, every row within the sample spread; `docs/Mojo.md` §9), so the
-tables below still describe the current kernel.
+tables below still describe the current kernel. So does the later call-route
+rewrite (one native entry per op, `7026f86`): against the old route, median
+new/old 0.99-1.03 on all three machines, with only the smallest call, `b1 short`
+decode, 5-16% slower on c4a- and c4-standard-8.
 
 ### c4-standard-8
 

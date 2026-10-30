@@ -54,41 +54,19 @@ def _case[dtype: DType](page: Int, len0: Int, len1: Int, heads: Int = 4) raises 
         for i in range(lens[s]):
             slots[t] = Int64(Int(bt[s * pages_per + i // page]) * page + i % page)
             t += 1
-    var job = PagedJob()
-    job.k = Int(kn)
-    job.v = Int(vn)
-    job.k_cache = Int(kc)
-    job.v_cache = Int(vc)
-    job.slots = Int(slots)
-    job.num_seqs = tokens
-    job.heads = heads
-    job.head_dim = HD
-    job.page = page
-    job.kv_stride = heads * HD
-    job.dtype = 0 if dtype == DType.float32 else 1
-    job.workers = 2
-    job.do_store = True
-    job.do_attend = False
-    paged_run(job)
-    var a = PagedJob()
-    a.q = Int(q)
-    a.k_cache = Int(kc)
-    a.v_cache = Int(vc)
-    a.out = Int(out)
-    a.block_table = Int(bt)
-    a.lens = Int(ln)
-    a.num_seqs = seqs
-    a.heads = heads
-    a.head_dim = HD
-    a.page = page
-    a.bt_stride = pages_per
-    a.q_stride = heads * HD
-    a.out_stride = heads * HD
-    a.scale = 0.125
-    a.dtype = job.dtype
-    a.workers = 2
-    a.do_attend = True
-    paged_run(a)
+    var dt = 0 if dtype == DType.float32 else 1
+    paged_run(PagedJob(  # stage every token through the store path
+        q=0, k=Int(kn), v=Int(vn), k_cache=Int(kc), v_cache=Int(vc), out=0, slots=Int(slots),
+        block_table=0, lens=0, num_seqs=tokens, heads=heads, head_dim=HD, page=page,
+        bt_stride=0, q_stride=0, kv_stride=heads * HD, out_stride=0, scale=1.0, dtype=dt,
+        workers=2, do_store=True, do_attend=False,
+    ))
+    paged_run(PagedJob(
+        q=Int(q), k=0, v=0, k_cache=Int(kc), v_cache=Int(vc), out=Int(out), slots=0,
+        block_table=Int(bt), lens=Int(ln), num_seqs=seqs, heads=heads, head_dim=HD, page=page,
+        bt_stride=pages_per, q_stride=heads * HD, kv_stride=0, out_stride=heads * HD,
+        scale=0.125, dtype=dt, workers=2, do_store=False, do_attend=True,
+    ))
     var worst = Float32(0)
     var base = 0
     for s in range(seqs):

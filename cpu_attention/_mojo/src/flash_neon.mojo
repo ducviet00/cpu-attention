@@ -26,11 +26,8 @@ from flash_attn import FlashJob, FlashPolicy, NEG
 from isa import exp2, online_max, ptr, vmax
 
 comptime F4 = SIMD[DType.float32, 4]
-comptime F2 = SIMD[DType.float32, 2]
 comptime B8 = SIMD[DType.bfloat16, 8]
 comptime B4 = SIMD[DType.bfloat16, 4]
-comptime U4 = SIMD[DType.uint32, 4]
-comptime U2 = SIMD[DType.uint32, 2]
 
 comptime KT = 512  # keys per softmax tile
 comptime RQT = 8  # query rows per register tile (4 row pairs)

@@ -223,21 +223,21 @@ def main():
     ap.add_argument("--vllm-isa-bf16", default="vec", help="amx on AMX CPUs, neon on aarch64")
     ap.add_argument("--vllm-isa-fp32", default="vec", help="neon on aarch64")
     args = ap.parse_args()
-    torch.set_num_threads(args.threads or _kernel._physical_cores())
+    torch.set_num_threads(args.threads or _kernel.physical_cores())
     pkgs = {"ours": cpu_attention}
     if args.compare:
         pkgs["compare"] = load_package(args.compare, "ca_compare")
     vllm = {t: (load_extension(getattr(args, f"vllm_{t}")),
                 getattr(args, f"vllm_isa_{t}"))
             for t in DT if getattr(args, f"vllm_{t}")}
-    flush_buf = torch.zeros(2 * _kernel._llc_bytes() // 4, dtype=torch.int32)
+    flush_buf = torch.zeros(2 * _kernel.llc_bytes() // 4, dtype=torch.int32)
     env = dict(machine=machine_type(),
                cpu=sh("lscpu").split("Model name:")[-1].split("\n")[0].strip(),
                threads=torch.get_num_threads(),
                git=sh("git", "-C", ROOT, "rev-parse", "--short", "HEAD"),
                torch=torch.__version__,
                mojo=sh(os.path.join(os.path.dirname(sys.executable), "mojo"), "--version"),
-               llc_bytes=_kernel._llc_bytes(),
+               llc_bytes=_kernel.llc_bytes(),
                vllm={t: [getattr(args, f"vllm_{t}"), v[1]] for t, v in vllm.items()})
     print(json.dumps(env), flush=True)
     rows = []

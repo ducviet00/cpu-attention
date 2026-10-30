@@ -1,53 +1,32 @@
-"""Python extension module for the cpu_attention paged-attention kernel.
+"""The Python extension: one native entry per op.
 
-Everything crossing the boundary is a raw address / integer, so a call costs a
-handful of `PyLong` conversions and no tensor bookkeeping. The Python side
-(``cpu_attention``) owns the tensors and passes ``tensor.data_ptr()``.
-
-Build with:  pixi run build        (from ``cpu_attention/_mojo``)
+Each entry reads its tensor arguments in place (`torch_tensor`), validates them,
+computes the launch parameters, allocates the output and runs the kernel; there
+is no plan cache. It returns None for anything it does not take (a wrong shape
+or dtype, a tensor subclass, a layout that needs a copy): the Python caller then
+raises the precise error, or copies and calls again.
 """
 
+from std.ffi import external_call
 from std.os import abort
-from std.memory import bitcast
 from std.python import Python, PythonObject
 from std.python.bindings import PythonModuleBuilder
-from paged_attn import PagedJob, paged_run
+
+from dispatch import flash_run, flash_sizes
 from flash_attn import FlashJob
-from dispatch import flash_run, flash_sizes as _flash_sizes
-from isa import amx_permitted, ptr, tier_name
-from std.ffi import external_call
-from pyview import (
-    alloc_out_3d,
-    alloc_out_4d,
-    data_ptr,
-    dims,
-    dtype_code,
-    hdr_at,
-    impl,
-    is_tensor,
-    size,
-    stride,
-    word,
-)
-
-
-def amx_available() -> PythonObject:
-    """True when the OS grants AMX tile-data permission (`arch_prctl`); False on
-    every tier that carries no AMX policy. Called once per process from
-    `cpu_attention._kernel.amx_available()`, which also checks the CPU flags."""
-    return PythonObject(amx_permitted())
+from isa import NEON_BF16, amx_permitted, ptr, tier_name
+from paged_attn import PagedJob, paged_run
+from torch_tensor import AMX, BF16, CORES, F32, FALSE, I32, I64, LLC, NONE, TRUE, Tensor, cfg, dims4, empty
 
 
 @export
 def PyInit__C() abi("C") -> PythonObject:
     try:
         var m = PythonModuleBuilder("_C")
-        m.def_function[kv_attention]("kv_attention")
-        m.def_function[kv_fast]("kv_fast")
-        m.def_function[flash_fast]("flash_fast")
-        m.def_function[tensor_probe]("tensor_probe")
-        m.def_function[flash_forward]("flash_forward")
-        m.def_function[flash_sizes]("flash_sizes")
+        m.def_function[decode]("decode")
+        m.def_function[store]("store")
+        m.def_function[flash]("flash")
+        m.def_function[probe]("probe")
         m.def_function[tier]("tier")
         m.def_function[amx_available]("amx_available")
         return m.finalize()
@@ -55,517 +34,322 @@ def PyInit__C() abi("C") -> PythonObject:
         abort(String("error creating cpu_attention._C: ", e))
 
 
-
-def tier() raises -> PythonObject:
-    """The build tier of this shared object (see `scripts/build.py`)."""
-    return PythonObject(tier_name())
-
-
-
-def flash_sizes(
-    seq_k: PythonObject, rq: PythonObject, hd: PythonObject, dtype: PythonObject, isa: PythonObject
-) raises -> PythonObject:
-    """(slab bytes per (batch, head), scratch bytes per thread)."""
-    var s = _flash_sizes(Int(py=seq_k), Int(py=rq), Int(py=hd), Int(py=dtype), Int(py=isa))
-    return Python.tuple(s[0], s[1])
+def _workers(rt: Int, tasks: Int, pages: Int) -> Int:
+    """Threads for one call. The kernel forks on torch's OpenMP pool (~2.4 us),
+    which beats running inline from about 32 KV positions per call (batch 1, ctx
+    64: 24.5 us inline vs 31.0 pooled; ctx 128: the pool 1.3x faster). Capped at
+    physical cores: SMT threads only oversubscribe (8 on a 4-core Xeon: 1.5x
+    slower at ctx 1024)."""
+    var threads = Int(external_call["omp_get_max_threads", Int32]())
+    var n = min(threads, cfg(rt, CORES), tasks)
+    return 1 if n > 1 and tasks * pages <= 32 else max(n, 1)
 
 
-def flash_forward(
-    plan: PythonObject,
+def _dtype(rt: Int, t: Tensor) -> Int:
+    """0 fp32, 1 bf16, -1 anything else."""
+    var code = t.dtype()
+    return 0 if code == cfg(rt, F32) else (1 if code == cfg(rt, BF16) else -1)
+
+
+def _rows_ok(t: Tensor, hd: Int) -> Bool:
+    """Heads and dims contiguous (any token stride: chunks of a fused projection)."""
+    var n = t.dim()
+    return t.stride(n - 1) == 1 and t.stride(n - 2) == hd
+
+
+def _caches_ok(kc: Tensor, vc: Tensor, code: Int, heads: Int, hd: Int) -> Bool:
+    """`[blocks, heads, page, dim]`, contiguous, matching, page a multiple of 16."""
+    if not (kc.ok() and vc.ok()) or kc.dim() != 4 or vc.dim() != 4:
+        return False
+    for i in range(4):
+        if vc.size(i) != kc.size(i):
+            return False
+    return (kc.dtype() == code and vc.dtype() == code and kc.size(1) == heads
+            and kc.size(3) == hd and kc.size(2) > 0 and kc.size(2) % 16 == 0
+            and kc.contiguous() and vc.contiguous())
+
+
+def _int_vector(rt: Int, t: Tensor, code: Int, n: Int) -> Bool:
+    return t.ok() and t.dim() == 1 and t.dtype() == cfg(rt, code) and t.size(0) == n and t.contiguous()
+
+
+def decode(
+    rt: PythonObject,
     q: PythonObject,
+    k_cache: PythonObject,
+    v_cache: PythonObject,
     k: PythonObject,
     v: PythonObject,
-    dst: PythonObject,
-    ws: PythonObject,
+    slots: PythonObject,
+    lens: PythonObject,
+    page_table: PythonObject,
     scale: PythonObject,
-) raises:
-    """flash_attn_func from a plan buffer (see `_kernel._flash_plan`)."""
-    var job = FlashJob(
-        Int(py=plan), Int(py=q), Int(py=k), Int(py=v), Int(py=dst),
-        Float32(Float64(py=scale)),
-    )
-    job.ws = Int(py=ws)
-    var p = ptr[Int64](Int(py=plan))
-    flash_run(job, Int(p.unsafe_load(17)), Int(p.unsafe_load(4)), Int(p.unsafe_load(26)))
-
-
-comptime KV_ENTRY0 = 24  # first plan entry slot (after the pyview header)
-comptime KV_ENTRY_W = 32  # slots per entry
-
-
-def tensor_probe(table: PythonObject, t: PythonObject) raises -> PythonObject:
-    """(storage base, dim, sizes..., strides..., dtype code, storage offset,
-    accepted type) as this module reads
-    them; the Python calibration compares it with torch before enabling
-    `kv_fast`."""
-    var hdr = Int(py=table)
-    var im = impl(Int(t._obj_ptr))
-    var n = dims(hdr, im)
-    var out = Python.list()
-    out.append(word(word(im + hdr_at(hdr, 1)) + hdr_at(hdr, 2)))  # storage base
-    out.append(n)
-    for i in range(min(n, 5)):
-        out.append(size(hdr, im, i))
-    for i in range(min(n, 5)):
-        out.append(stride(hdr, im, i))
-    out.append(dtype_code(hdr, im))
-    out.append(word(im + hdr_at(hdr, 3)))
-    out.append(is_tensor(hdr, Int(t._obj_ptr)))
+    dst: PythonObject,
+) raises -> PythonObject:
+    """Paged decode of q `[seqs, (1,) heads, dim]` (MHA). With k/v, each sequence's
+    new token is stored first: at `slots` (then `lens` is the length after the
+    store), or appended at `lens` (the length before). Writes `dst` when given,
+    else a new tensor; returns it, or None (see the module docstring)."""
+    var r = Int(py=rt)
+    var none = cfg(r, NONE)
+    var qt = Tensor.of(r, Int(q._obj_ptr))
+    var kc = Tensor.of(r, Int(k_cache._obj_ptr))
+    var vc = Tensor.of(r, Int(v_cache._obj_ptr))
+    var bt = Tensor.of(r, Int(page_table._obj_ptr))
+    var ln = Tensor.of(r, Int(lens._obj_ptr))
+    if not (qt.ok() and bt.ok()):
+        return PythonObject(None)
+    var nd = qt.dim()
+    if (nd != 3 and nd != 4) or (nd == 4 and qt.size(1) != 1):
+        return PythonObject(None)
+    var b = qt.size(0)
+    var heads = qt.size(nd - 2)
+    var hd = qt.size(nd - 1)
+    var dt = _dtype(r, qt)
+    if dt < 0 or (hd != 32 and hd != 64 and hd != 128) or not _rows_ok(qt, hd):
+        return PythonObject(None)
+    if not _caches_ok(kc, vc, qt.dtype(), heads, hd):
+        return PythonObject(None)
+    var page = kc.size(2)
+    if bt.dim() != 2 or bt.dtype() != cfg(r, I32) or bt.size(0) != b or not bt.contiguous():
+        return PythonObject(None)
+    var width = bt.size(1)
+    if not _int_vector(r, ln, I32, b):
+        return PythonObject(None)
+    var do_store = Int(k._obj_ptr) != none
+    var kt = Tensor.of(r, Int(k._obj_ptr))
+    var vt = Tensor.of(r, Int(v._obj_ptr))
+    if do_store:
+        if not (kt.ok() and vt.ok()) or kt.dim() != nd or vt.dim() != nd or kt.dtype() != qt.dtype():
+            return PythonObject(None)
+        for i in range(nd):
+            if kt.size(i) != qt.size(i) or vt.size(i) != qt.size(i) or vt.stride(i) != kt.stride(i):
+                return PythonObject(None)
+        if vt.dtype() != qt.dtype() or not _rows_ok(kt, hd):
+            return PythonObject(None)
+    elif Int(v._obj_ptr) != none:
+        return PythonObject(None)
+    var sl = 0
+    if Int(slots._obj_ptr) != none:
+        var st = Tensor.of(r, Int(slots._obj_ptr))
+        if not do_store or not _int_vector(r, st, I64, b):
+            return PythonObject(None)
+        sl = st.data(8)
+        for i in range(b):
+            if Int(ptr[Int64](sl)[i]) >= kc.size(0) * page:
+                return PythonObject(None)
+    # Every length must fit the page table (the kernel reads it without checks).
+    var extra = 1 if do_store and sl == 0 else 0
+    var lp = ptr[Int32](ln.data(4))
+    for i in range(b):
+        if Int(lp[i]) + extra > width * page:
+            return PythonObject(None)
+    var out = dst
+    if Int(dst._obj_ptr) == none:
+        var sizes = dims4(b, 1, heads, hd) if nd == 4 else dims4(b, heads, hd)
+        out = PythonObject(from_owned=empty(nd, sizes, dt == 1))
+    var ot = Tensor.of(r, Int(out._obj_ptr))
+    if not ot.ok() or ot.dim() != nd or ot.dtype() != qt.dtype() or not ot.contiguous():
+        return PythonObject(None)
+    for i in range(nd):
+        if ot.size(i) != qt.size(i):
+            return PythonObject(None)
+    var e = 2 if dt == 1 else 4
+    paged_run(PagedJob(
+        q=qt.data(e), k=kt.data(e) if do_store else 0, v=vt.data(e) if do_store else 0,
+        k_cache=kc.data(e), v_cache=vc.data(e), out=ot.data(e), slots=sl,
+        block_table=bt.data(4), lens=ln.data(4), num_seqs=b, heads=heads, head_dim=hd,
+        page=page, bt_stride=width, q_stride=qt.stride(0),
+        kv_stride=kt.stride(0) if do_store else 0, out_stride=heads * hd,
+        scale=Float32(Float64(hd) ** -0.5) if Int(scale._obj_ptr) == none else Float32(Float64(py=scale)),
+        dtype=dt, workers=_workers(r, b * heads, max(width, 1)), do_store=do_store, do_attend=True,
+    ))
     return out
 
 
-@always_inline
-def _match3(e: Int, at: Int, hdr: Int, im: Int, strides: Bool) -> Bool:
-    comptime for i in range(3):
-        var x = stride(hdr, im, i) if strides else size(hdr, im, i)
-        if x != word(e + 8 * (at + i)):
-            return False
-    return True
-
-
-@always_inline
-def _match3_d(e: Int, at: Int, hdr: Int, im: Int, strides: Bool, d4: Bool) -> Bool:
-    var i0 = 0
-    var i1 = 2 if d4 else 1
-    var i2 = 3 if d4 else 2
-    var x0 = stride(hdr, im, i0) if strides else size(hdr, im, i0)
-    var x1 = stride(hdr, im, i1) if strides else size(hdr, im, i1)
-    var x2 = stride(hdr, im, i2) if strides else size(hdr, im, i2)
-    return (
-        x0 == word(e + 8 * at)
-        and x1 == word(e + 8 * (at + 1))
-        and x2 == word(e + 8 * (at + 2))
-    )
-
-
-def kv_fast(
-    table: PythonObject,
-    q: PythonObject,
-    k: PythonObject,
-    v: PythonObject,
+def store(
+    rt: PythonObject,
+    key: PythonObject,
+    value: PythonObject,
     k_cache: PythonObject,
     v_cache: PythonObject,
     slots: PythonObject,
-    block_table: PythonObject,
-    lens: PythonObject,
-    scale: PythonObject,
-    dst: PythonObject,
 ) raises -> PythonObject:
-    """KV-cache attention / store with the tensors read here (see pyview.mojo):
-    True if a plan in `table` matched this call's layout and it ran, False for
-    the caller's checked path (which then registers a plan)."""
-    var hdr = Int(py=table)
-    var none = hdr_at(hdr, 10)
-    var qo = Int(q._obj_ptr)
-    var kco = Int(k_cache._obj_ptr)
-    var vco = Int(v_cache._obj_ptr)
-    var oo = Int(dst._obj_ptr)
-    var ko = Int(k._obj_ptr)
-    var vo = Int(v._obj_ptr)
-    var so = Int(slots._obj_ptr)
-    var bto = Int(block_table._obj_ptr)
-    var threads = Int(external_call["omp_get_max_threads", Int32]())
-    var n = hdr_at(hdr, 11)
-
-    if qo == none:
-        if bto != none:
+    """`reshape_and_cache`: token i of key/value `[tokens, heads, dim]` goes to
+    slot `slots[i]` (int64; negative skips it). True, or None."""
+    var r = Int(py=rt)
+    var kt = Tensor.of(r, Int(key._obj_ptr))
+    var vt = Tensor.of(r, Int(value._obj_ptr))
+    var kc = Tensor.of(r, Int(k_cache._obj_ptr))
+    var vc = Tensor.of(r, Int(v_cache._obj_ptr))
+    var st = Tensor.of(r, Int(slots._obj_ptr))
+    if not (kt.ok() and vt.ok()) or kt.dim() != 3 or vt.dim() != 3:
+        return PythonObject(None)
+    var n = kt.size(0)
+    var heads = kt.size(1)
+    var hd = kt.size(2)
+    var dt = _dtype(r, kt)
+    if dt < 0 or (hd != 32 and hd != 64 and hd != 128) or vt.dtype() != kt.dtype() or not _rows_ok(kt, hd):
+        return PythonObject(None)
+    for i in range(3):
+        if vt.size(i) != kt.size(i) or vt.stride(i) != kt.stride(i):
             return PythonObject(None)
-        # Store-only fast path (`reshape_and_cache`).
-        if not (
-            is_tensor(hdr, ko)
-            and is_tensor(hdr, vo)
-            and is_tensor(hdr, kco)
-            and is_tensor(hdr, vco)
-            and is_tensor(hdr, so)
-        ):
-            return False
-        var ki = impl(ko)
-        var vi = impl(vo)
-        var kci = impl(kco)
-        var vci = impl(vco)
-        var si = impl(so)
-        if (
-            dims(hdr, ki) != 3
-            or dims(hdr, vi) != 3
-            or dims(hdr, kci) != 4
-            or dims(hdr, vci) != 4
-            or dims(hdr, si) != 1
-        ):
-            return False
-        var code = dtype_code(hdr, ki)
-        if (
-            dtype_code(hdr, vi) != code
-            or dtype_code(hdr, kci) != code
-            or dtype_code(hdr, vci) != code
-            or dtype_code(hdr, si) != hdr_at(hdr, 13)
-        ):
-            return False
-        if stride(hdr, si, 0) != 1 or size(hdr, si, 0) < size(hdr, ki, 0):
-            return False
-        comptime for i in range(3):
-            if size(hdr, vi, i) != size(hdr, ki, i):
-                return False
-        comptime for i in range(4):
-            if size(hdr, vci, i) != size(hdr, kci, i) or stride(
-                hdr, vci, i
-            ) != stride(hdr, kci, i):
-                return False
-        for e_i in range(n - 1, -1, -1):
-            var e = hdr + 8 * (KV_ENTRY0 + KV_ENTRY_W * e_i)
-            if (
-                word(e) != code
-                or word(e + 8) != 3
-                or word(e + 16) != threads
-            ):
-                continue
-            if not (
-                _match3(e, 3, hdr, ki, False)
-                and _match3(e, 15, hdr, ki, True)
-                and _match3(e, 18, hdr, vi, True)
-            ):
-                continue
-            var ok = True
-            comptime for i in range(4):
-                if size(hdr, kci, i) != word(e + 8 * (9 + i)):
-                    ok = False
-            if not ok:
-                continue
-            var item = word(e + 8 * 24)
-            var p = ptr[Int64](word(e + 8 * 21))
-            var job = PagedJob()
-            job.num_seqs = Int(p[0])
-            job.heads = Int(p[1])
-            job.head_dim = Int(p[2])
-            job.page = Int(p[3])
-            job.dtype = Int(p[6])
-            job.workers = Int(p[7])
-            job.do_store = True
-            job.do_attend = False
-            job.k = data_ptr(hdr, ki, item)
-            job.v = data_ptr(hdr, vi, item)
-            job.k_cache = data_ptr(hdr, kci, item)
-            job.v_cache = data_ptr(hdr, vci, item)
-            job.slots = data_ptr(hdr, si, 8)
-            job.kv_stride = word(e + 8 * 23)
-            paged_run(job)
+    if not _caches_ok(kc, vc, kt.dtype(), heads, hd) or not _int_vector(r, st, I64, n):
+        return PythonObject(None)
+    var sp = ptr[Int64](st.data(8))
+    for i in range(n):
+        if Int(sp[i]) >= kc.size(0) * kc.size(2):
+            return PythonObject(None)
+    var e = 2 if dt == 1 else 4
+    paged_run(PagedJob(
+        q=0, k=kt.data(e), v=vt.data(e), k_cache=kc.data(e), v_cache=vc.data(e), out=0,
+        slots=Int(sp), block_table=0, lens=0, num_seqs=n, heads=heads, head_dim=hd,
+        page=kc.size(2), bt_stride=0, q_stride=0, kv_stride=kt.stride(0), out_stride=0,
+        scale=1.0, dtype=dt, workers=_workers(r, n * heads, 1), do_store=True, do_attend=False,
+    ))
+    return PythonObject(True)
+
+
+def _vector_beats_amx(dt: Int, hd: Int, seq_q: Int, seq_k: Int, scale: Float64) -> Bool:
+    """Few query rows leave AMX's 16-row tiles mostly empty (and fp32 pays three
+    products per phase), so the vector policy is faster there. Crossovers on the
+    Xeon 8581C, 4 threads (vector / AMX time): fp32 hd=64 up to 65 rows 0.39-0.94,
+    fp32 hd=128 up to 17 rows 0.80-0.97 (or a 33-key sequence: 0.59), bf16 1-2
+    rows 0.76-0.89 (hd=128 only while seq_k <= 256: AMX packs a long K/V faster)."""
+    if dt == 0:
+        # A logit std above ~6 (scale * sqrt(hd) for unit inputs) peaks the
+        # probabilities enough for the hi/lo split to reach 2.03e-4 against the
+        # 2e-4 gate (scale 1.7 at hd=64): exact fp32 on the vector policy.
+        if scale * Float64(hd) ** 0.5 > 6.0:
             return True
-        return False
-
-    var lo = Int(lens._obj_ptr)
-    var store = ko != none
-    var has_dst = oo != none
-    if not (
-        is_tensor(hdr, qo)
-        and is_tensor(hdr, kco)
-        and is_tensor(hdr, vco)
-        and is_tensor(hdr, bto)
-        and is_tensor(hdr, lo)
-        and (not has_dst or is_tensor(hdr, oo))
-    ):
-        return PythonObject(None)
-    var qi = impl(qo)
-    var kci = impl(kco)
-    var vci = impl(vco)
-    var bti = impl(bto)
-    var li = impl(lo)
-    var oi = impl(oo) if has_dst else 0
-    var qd = dims(hdr, qi)
-    var d4 = qd == 4
-    if (
-        (qd != 3 and qd != 4)
-        or dims(hdr, kci) != 4
-        or dims(hdr, vci) != 4
-        or dims(hdr, bti) != 2
-        or dims(hdr, li) != 1
-    ):
-        return PythonObject(None)
-    if d4 and size(hdr, qi, 1) != 1:
-        return PythonObject(None)
-    if stride(hdr, bti, 1) != 1 or stride(hdr, li, 0) != 1:
-        return PythonObject(None)
-    var nseq = size(hdr, qi, 0)
-    if size(hdr, li, 0) < nseq:
-        return PythonObject(None)
-    var code = dtype_code(hdr, qi)
-    var i32 = hdr_at(hdr, 12)
-    if dtype_code(hdr, kci) != code or dtype_code(hdr, vci) != code:
-        return PythonObject(None)
-    if dtype_code(hdr, bti) != i32 or dtype_code(hdr, li) != i32:
-        return PythonObject(None)
-    # The kernel writes a contiguous [seqs, (1,) heads, hd] output and reads V
-    # with the K cache's geometry.
-    var nh = size(hdr, qi, 2 if d4 else 1)
-    var hd = size(hdr, qi, 3 if d4 else 2)
-    if has_dst:
-        if (
-            dims(hdr, oi) != qd
-            or dtype_code(hdr, oi) != code
-            or (d4 and size(hdr, oi, 1) != 1)
-            or size(hdr, oi, 0) != nseq
-            or size(hdr, oi, 2 if d4 else 1) != nh
-            or size(hdr, oi, 3 if d4 else 2) != hd
-            or stride(hdr, oi, 0) != nh * hd
-            or stride(hdr, oi, 2 if d4 else 1) != hd
-            or stride(hdr, oi, 3 if d4 else 2) != 1
-        ):
-            return PythonObject(None)
-    comptime for i in range(4):
-        if size(hdr, vci, i) != size(hdr, kci, i) or stride(
-            hdr, vci, i
-        ) != stride(hdr, kci, i):
-            return PythonObject(None)
-    var ki = 0
-    var vi = 0
-    var si = 0
-    var mode = 0
-    if store:
-        if not (is_tensor(hdr, ko) and is_tensor(hdr, vo)):
-            return PythonObject(None)
-        ki = impl(ko)
-        vi = impl(vo)
-        if (
-            dims(hdr, ki) != qd
-            or dims(hdr, vi) != qd
-            or dtype_code(hdr, ki) != code
-            or dtype_code(hdr, vi) != code
-        ):
-            return PythonObject(None)
-        if d4 and (size(hdr, ki, 1) != 1 or size(hdr, vi, 1) != 1):
-            return PythonObject(None)
-        var kvh = size(hdr, kci, 1)
-        if (
-            size(hdr, ki, 0) != nseq
-            or size(hdr, ki, 2 if d4 else 1) != kvh
-            or size(hdr, ki, 3 if d4 else 2) != hd
-            or size(hdr, vi, 0) != nseq
-            or size(hdr, vi, 2 if d4 else 1) != kvh
-            or size(hdr, vi, 3 if d4 else 2) != hd
-        ):
-            return PythonObject(None)
-        if so != none:
-            if not is_tensor(hdr, so):
-                return PythonObject(None)
-            si = impl(so)
-            if (
-                dtype_code(hdr, si) != hdr_at(hdr, 13)
-                or dims(hdr, si) != 1
-                or stride(hdr, si, 0) != 1
-                or size(hdr, si, 0) < nseq
-            ):
-                return PythonObject(None)
-            mode = 1
-        else:
-            if size(hdr, li, 0) != nseq:
-                return PythonObject(None)
-            mode = 2
-    else:
-        if vo != none or so != none:
-            return PythonObject(None)
-        if d4 and size(hdr, li, 0) != nseq:
-            return PythonObject(None)
-    var sc_obj = Int(scale._obj_ptr)
-    var default_scale = sc_obj == none
-    var sval = Float32(0)
-    if not default_scale:
-        if word(sc_obj + 8) != hdr_at(hdr, 16):
-            return PythonObject(None)
-        sval = Float32(Float64(py=scale))
-    for e_i in range(n - 1, -1, -1):
-        var e = hdr + 8 * (KV_ENTRY0 + KV_ENTRY_W * e_i)
-        if word(e) != code or word(e + 8) != mode or word(e + 16) != threads:
-            continue
-        if not (
-            _match3_d(e, 3, hdr, qi, False, d4)
-            and _match3_d(e, 6, hdr, qi, True, d4)
-        ):
-            continue
-        var ok = True
-        comptime for i in range(4):
-            if size(hdr, kci, i) != word(e + 8 * (9 + i)):
-                ok = False
-        if (
-            not ok
-            or size(hdr, bti, 0) != word(e + 8 * 13)
-            or size(hdr, bti, 1) != word(e + 8 * 14)
-        ):
-            continue
-        if store and not (
-            _match3_d(e, 15, hdr, ki, True, d4)
-            and _match3_d(e, 18, hdr, vi, True, d4)
-        ):
-            continue
-        var item = word(e + 8 * 24)
-        var p = ptr[Int64](word(e + 8 * 21))
-        var job = PagedJob()
-        job.num_seqs = Int(p[0])
-        job.heads = Int(p[1])
-        job.head_dim = Int(p[2])
-        job.page = Int(p[3])
-        job.bt_stride = Int(p[4])
-        job.out_stride = Int(p[5])
-        job.dtype = Int(p[6])
-        job.workers = Int(p[7])
-        job.do_store = p[8] != 0
-        job.do_attend = p[9] != 0
-        job.q = data_ptr(hdr, qi, item)
-        job.k_cache = data_ptr(hdr, kci, item)
-        job.v_cache = data_ptr(hdr, vci, item)
-        job.block_table = data_ptr(hdr, bti, 4)
-        job.lens = data_ptr(hdr, li, 4)
-        job.q_stride = word(e + 8 * 22)
-        job.kv_stride = word(e + 8 * 23)
-        if store:
-            job.k = data_ptr(hdr, ki, item)
-            job.v = data_ptr(hdr, vi, item)
-            job.slots = data_ptr(hdr, si, 8) if mode == 1 else 0
-        job.scale = (
-            ptr[Float32](e + 8 * 25).unsafe_load(0)
-            if default_scale
-            else sval
-        )
-        if has_dst:
-            job.out = data_ptr(hdr, oi, item)
-            paged_run(job)
-            return dst
-        var py_out = (
-            alloc_out_4d(nseq, 1, nh, hd, job.dtype)
-            if d4
-            else alloc_out_3d(nseq, nh, hd, job.dtype)
-        )
-        job.out = data_ptr(hdr, impl(Int(py_out)), item)
-        paged_run(job)
-        return PythonObject(from_owned=py_out)
-    return PythonObject(None)
+        return seq_q <= (65 if hd <= 64 else 24) or seq_k <= 64
+    return seq_q <= 2 and (hd <= 64 or seq_k <= 256)
 
 
-comptime FL_ENTRY0 = 24  # first plan entry slot (after the pyview header)
-comptime FL_ENTRY_W = 32
-
-
-@always_inline
-def _match4(e: Int, at: Int, hdr: Int, im: Int, strides: Bool) -> Bool:
-    comptime for i in range(4):
-        var x = stride(hdr, im, i) if strides else size(hdr, im, i)
-        if x != word(e + 8 * (at + i)):
-            return False
-    return True
-
-
-def flash_fast(
-    table: PythonObject,
+def flash(
+    rt: PythonObject,
     q: PythonObject,
     k: PythonObject,
     v: PythonObject,
     scale: PythonObject,
     causal: PythonObject,
+    ws: PythonObject,
+    ws_bytes: PythonObject,
 ) raises -> PythonObject:
-    """flash_attn_func with the tensors read here: returns the output tensor if
-    a plan registered by a validated call matches this call exactly (layout,
-    dtype, causal, scale, threads); None for the caller's checked path."""
-    var hdr = Int(py=table)
-    var qo = Int(q._obj_ptr)
-    var ko = Int(k._obj_ptr)
-    var vo = Int(v._obj_ptr)
-    if not (is_tensor(hdr, qo) and is_tensor(hdr, ko) and is_tensor(hdr, vo)):
+    """flash_attn_func over q/k/v `[batch, seq, heads, dim]` (MHA, dims
+    contiguous) with the workspace at `ws`. Returns the output, the workspace bytes
+    it needs when `ws_bytes` is short (an int), or None."""
+    var r = Int(py=rt)
+    var qt = Tensor.of(r, Int(q._obj_ptr))
+    var kt = Tensor.of(r, Int(k._obj_ptr))
+    var vt = Tensor.of(r, Int(v._obj_ptr))
+    if not (qt.ok() and kt.ok() and vt.ok()) or qt.dim() != 4 or kt.dim() != 4 or vt.dim() != 4:
         return PythonObject(None)
-    var qi = impl(qo)
-    var ki = impl(ko)
-    var vi = impl(vo)
-    if dims(hdr, qi) != 4 or dims(hdr, ki) != 4 or dims(hdr, vi) != 4:
+    var b = qt.size(0)
+    var sq = qt.size(1)
+    var sk = kt.size(1)
+    var heads = qt.size(2)
+    var hd = qt.size(3)
+    var dt = _dtype(r, qt)
+    if dt < 0 or (hd != 32 and hd != 64 and hd != 128) or sq < 1 or sk < 1:
         return PythonObject(None)
-    var code = dtype_code(hdr, qi)
-    if dtype_code(hdr, ki) != code or dtype_code(hdr, vi) != code:
+    if kt.size(0) != b or kt.size(2) != heads or kt.size(3) != hd or kt.dtype() != qt.dtype() or vt.dtype() != qt.dtype():
         return PythonObject(None)
-    comptime for i in range(4):
-        if size(hdr, vi, i) != size(hdr, ki, i):
+    for i in range(4):
+        if vt.size(i) != kt.size(i):
             return PythonObject(None)
-    var co = Int(causal._obj_ptr)
-    var cflag = 1 if co == hdr_at(hdr, 14) else (0 if co == hdr_at(hdr, 15) else -1)
-    if cflag < 0:
+    if qt.stride(3) != 1 or kt.stride(3) != 1 or vt.stride(3) != 1:
         return PythonObject(None)
-    var so = Int(scale._obj_ptr)
-    var default_scale = so == hdr_at(hdr, 10)
-    var sval = Float64(0)
-    if not default_scale:
-        if word(so + 8) != hdr_at(hdr, 16):  # exactly a Python float
-            return PythonObject(None)
-        sval = Float64(py=scale)
-    var threads = Int(external_call["omp_get_max_threads", Int32]())
-    var n = hdr_at(hdr, 11)
-    for e_i in range(n - 1, -1, -1):
-        var e = hdr + 8 * (FL_ENTRY0 + FL_ENTRY_W * e_i)
-        if word(e) != code or word(e + 8) != cflag or word(e + 16) != threads:
-            continue
-        if default_scale:
-            if word(e + 24) != 1:
-                continue
-        elif word(e + 24) != 0 or ptr[Float64](e + 32).unsafe_load(0) != sval:
-            continue
-        if not (_match4(e, 5, hdr, qi, False) and _match4(e, 9, hdr, qi, True)
-                and _match4(e, 13, hdr, ki, False) and _match4(e, 17, hdr, ki, True)
-                and _match4(e, 21, hdr, vi, True)):
-            continue
-        var item = word(e + 8 * 27)
-        var plan = word(e + 8 * 25)
-        var p = ptr[Int64](plan)
-        var dt = Int(p.unsafe_load(17))
-        var py_out = alloc_out_4d(
-            size(hdr, qi, 0),
-            size(hdr, qi, 1),
-            size(hdr, qi, 2),
-            size(hdr, qi, 3),
-            dt,
-        )
-        var job = FlashJob(
-            plan, data_ptr(hdr, qi, item), data_ptr(hdr, ki, item),
-            data_ptr(hdr, vi, item), data_ptr(hdr, impl(Int(py_out)), item),
-            ptr[Float32](e + 8 * 28).unsafe_load(0),
-        )
-        job.ws = word(e + 8 * 26)
-        flash_run(job, dt, Int(p.unsafe_load(4)), Int(p.unsafe_load(26)))
-        return PythonObject(from_owned=py_out)
-    return PythonObject(None)
+    var cp = Int(causal._obj_ptr)
+    if cp != cfg(r, TRUE) and cp != cfg(r, FALSE):
+        return PythonObject(None)
+    var is_causal = cp == cfg(r, TRUE)
+    var sc = Float64(hd) ** -0.5 if Int(scale._obj_ptr) == cfg(r, NONE) else Float64(py=scale)
+    # Policy: 0 vector, 1 AMX (fp32 as bf16 hi/lo), 2 aarch64 bfmmla (fp32 on the vector policy).
+    var isa = 0
+    comptime if NEON_BF16:
+        isa = 2
+    else:
+        var amx = cfg(r, AMX)
+        if (amx == 2 or (amx == 1 and dt == 1)) and not _vector_beats_amx(dt, hd, sq, sk, sc):
+            isa = 1
+    var rq: Int
+    if isa == 1:
+        rq = 64  # two 32-row AMX register tiles: K/V tiles load once per 64 rows
+    elif isa == 2 and dt == 0 and hd == 128 and is_causal and sq == sk and sq >= 2048:
+        rq = 128  # Axion: amortize the K/V scan on long fp32 D=128 (6-9%; short rows lost 9.5%)
+    else:
+        rq = max(16, min(128, 16384 // (hd * 4)))  # a ~16 KB accumulator stays in L1
+    # At least ~8 work items per worker: causal blocks differ in cost, and at 4
+    # per worker the tail cost 1024:8:32 10-11% at 16 threads (Axion). Halve rq,
+    # down to one register-tile pair.
+    rq = min(rq, sq)
+    var floor = 64 if isa == 1 else 16
+    var cap = _workers(r, 1 << 30, 1)
+    while rq // 2 >= floor and b * heads * ((sq + rq - 1) // rq) < 8 * cap:
+        rq //= 2
+    var n = _workers(r, b * heads * ((sq + rq - 1) // rq), 8)
+    var sizes = flash_sizes(sk, rq, hd, dt, isa)
+    var slab = sizes[0]
+    var aux = sizes[1]
+    var llc = cfg(r, LLC)
+    # Fused (a thread packs a head and attends it, no barrier) while the workers'
+    # slabs fit 0.6 of the LLC and the heads divide evenly.
+    var fuse = b * heads >= n and b * heads % n == 0 and slab * n <= llc * 3 // 5
+    var need = (n if fuse else b * heads) * slab + n * aux + 128
+    if need > Int(py=ws_bytes):
+        return PythonObject(need)
+    var out = PythonObject(from_owned=empty(4, dims4(b, sq, heads, hd), dt == 1))
+    var e = 2 if dt == 1 else 4
+    var job = FlashJob(
+        q=qt.data(e), k=kt.data(e), v=vt.data(e), out=Tensor.of(r, Int(out._obj_ptr)).data(e),
+        batch=b, seq_q=sq, seq_k=sk, heads=heads,
+        qb=qt.stride(0), qt=qt.stride(1), qh=qt.stride(2), kb=kt.stride(0), kt=kt.stride(1),
+        kh=kt.stride(2), vb=vt.stride(0), vt=vt.stride(1), vh=vt.stride(2),
+        ob=sq * heads * hd, ot=heads * hd, oh=hd, causal=is_causal, workers=n, fuse=fuse, rq=rq,
+        ws=(Int(py=ws) + 63) & ~63, slab=slab, aux=aux,
+        # fp32 V is read in place while it all fits half the LLC: a copy only
+        # buys a unit stride.
+        v_direct=dt == 0 and isa == 0 and b * heads * sk * hd * 4 <= llc // 2,
+        scale=Float32(sc),
+    )
+    flash_run(job, dt, hd, isa)
+    return out
 
-def kv_attention(
-    plan: PythonObject,
-    q: PythonObject,
-    k: PythonObject,
-    v: PythonObject,
-    k_cache: PythonObject,
-    v_cache: PythonObject,
-    dst: PythonObject,
-    slots: PythonObject,
-    block_table: PythonObject,
-    lens: PythonObject,
-    q_stride: PythonObject,
-    kv_stride: PythonObject,
-    scale: PythonObject,
-) raises:
-    """KV-cache attention / store. `plan` addresses int64 geometry slots:
-    num_seqs, heads, head_dim, page, bt_stride, out_stride, dtype, workers,
-    do_store, do_attend."""
-    var p = ptr[Int64](Int(py=plan))
-    var job = PagedJob()
-    job.num_seqs = Int(p[0])
-    job.heads = Int(p[1])
-    job.head_dim = Int(p[2])
-    job.page = Int(p[3])
-    job.bt_stride = Int(p[4])
-    job.out_stride = Int(p[5])
-    job.dtype = Int(p[6])
-    job.workers = Int(p[7])
-    job.do_store = p[8] != 0
-    job.do_attend = p[9] != 0
-    job.q = Int(py=q)
-    job.k = Int(py=k)
-    job.v = Int(py=v)
-    job.k_cache = Int(py=k_cache)
-    job.v_cache = Int(py=v_cache)
-    job.out = Int(py=dst)
-    job.slots = Int(py=slots)
-    job.block_table = Int(py=block_table)
-    job.lens = Int(py=lens)
-    job.q_stride = Int(py=q_stride)
-    job.kv_stride = Int(py=kv_stride)
-    job.scale = Float32(Float64(py=scale))
-    paged_run(job)
+
+def probe(rt: PythonObject, t: PythonObject) raises -> PythonObject:
+    """What this module reads from `t` -- [plain, storage address, storage
+    offset, dims, sizes..., strides..., dtype code] -- plus a new tensor of its
+    shape and dtype, for the import-time check in `_kernel.runtime`."""
+    var r = Int(py=rt)
+    var x = Tensor.of(r, Int(t._obj_ptr))
+    var res = Python.list()
+    res.append(x.ok())
+    if not x.ok():
+        return res
+    var n = x.dim()
+    res.append(x.base())
+    res.append(x.offset())
+    res.append(n)
+    for i in range(n):
+        res.append(x.size(i))
+    for i in range(n):
+        res.append(x.stride(i))
+    res.append(x.dtype())
+    var dt = _dtype(r, x)
+    if 1 <= n <= 4 and dt >= 0:
+        var sizes = Array[Int, 4](fill=0)
+        for i in range(n):
+            sizes[i] = x.size(i)
+        res.append(PythonObject(from_owned=empty(n, sizes, dt == 1)))
+    return res
+
+
+def tier() raises -> PythonObject:
+    """The build tier of this shared object (`scripts/build.py`)."""
+    return PythonObject(tier_name())
+
+
+def amx_available() -> PythonObject:
+    """The OS grants AMX tile data (`arch_prctl`); False on tiers without AMX."""
+    return PythonObject(amx_permitted())

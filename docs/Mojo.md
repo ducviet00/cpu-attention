@@ -50,9 +50,9 @@ _mojo/src/flash_vec.mojo  the vector policy (AVX-512 / AVX2 / NEON fp32, LANES-g
 _mojo/src/flash_amx.mojo  the AMX policy (bf16, fp32 as bf16 hi/lo), x86 only
 _mojo/src/flash_neon.mojo the aarch64 bfmmla policy (bf16; fp32 is the vector policy)
 _mojo/src/dispatch.mojo   runtime dtype x head_dim x ISA-policy selection
-_mojo/src/pyview.mojo     reads torch tensors natively (the fast call paths, §6)
 _mojo/src/amx.mojo        AMX tile primitives (inline asm, x86 only)
-_mojo/src/_C.mojo         the Python extension
+_mojo/src/_C.mojo         the Python extension: one native entry per op (decode, store, flash)
+_mojo/src/torch_tensor.mojo  torch tensors read in place, outputs allocated (libtorch C shim)
 _mojo/tests/test_attention.mojo   standalone decode parity test vs a scalar fp32 reference
 ```
 
@@ -166,20 +166,18 @@ scale 0.9 even an fp32 reference is 6.4e-6 from fp64.
 - **Torch's OpenMP pool.** One `GOMP_parallel` region per call (~2.4 us warm);
   MAX's `parallelize` and private pools were slower. Slices
   use `omp_get_num_threads()`; workers are capped at physical cores.
-- **Native tensor reads (`pyview.mojo`).** `data_ptr()`/`.shape` cost ~50 ns each
-  from Python, and a decode call needs a dozen. At import, `_kernel._calibrate_layout`
-  finds the TensorImpl/StorageImpl field offsets by matching what torch reports
-  (`tensor._cdata` is the TensorImpl, `untyped_storage()._cdata` the StorageImpl),
-  verifies them on probe tensors (views with offsets, transposes, 1-4 dims, five
-  dtypes, `nn.Parameter`) through ctypes and again through the module's reader,
-  and disables the path on any disagreement (`CPU_ATTENTION_KV_FAST=0` turns it
-  off). `kv_fast` / `flash_fast` accept only exact `torch.Tensor`/`Parameter`
-  objects whose dtype, dims, sizes, strides, causal flag, scale and thread count
-  match a per-thread plan registered after a fully validated call; anything else
-  returns to the checked Python path. A grown workspace, a changed worker count
-  and `_drop_workspace` invalidate every table.
-  - b=1 ctx=256 decode with `out=`: 4.4 -> 2.75 us.
-  - flash_attn_func 17:8:64 bf16: 5.26 -> 3.05 us.
+- **One native call route.** Each public function checks its unsupported options
+  in Python and passes the tensor objects to one Mojo entry per op (`_C.decode`,
+  `_C.store`, `_C.flash`). The entry reads each tensor's TensorImpl fields in
+  place (`torch_tensor.mojo`, at offsets `_kernel.runtime()` finds at import by
+  matching what torch reports and verifies on probe tensors), validates them,
+  computes the launch parameters, allocates the output through libtorch's C shim
+  and runs the kernel. Nothing is cached per geometry. It returns None for
+  anything it does not take; Python then raises the precise error, or copies a
+  layout it cannot read in place and calls once more. A torch whose tensor layout
+  the calibration cannot match fails on the first call (no silent fallback).
+  Laptop, decode b=1 ctx=256 bf16: warm 3.5 us, cold 43.1 us against a 39.9 us
+  bare kernel (§9 for the routes it replaced).
 - **Workspace** is per thread, grown on demand, never shrunk (a freed large
   tensor is an mmap that faults in again).
 
@@ -301,4 +299,7 @@ Goal: one implementation across CPUs, then latency (AGENTS.md).
 | C++ backend removed; x86 paged bf16 judged like aarch64 (<= 1e-3 above the bf16 output rounding vs the fp32 reference) instead of <= 2 ulp vs C++; `exp2` degree 5 for bf16 decode on every CPU (x86 was 2) | degree 2 failed the reference gate on 91/252 sweep cases (worst 3.9e-3); degree 5 worst 7.0e-7 on every x86 tier; +1.2% instructions on the Ryzen, cycles within noise | kept: one numerics rule and one `DEG` for every CPU |
 | decode tasks split across workers by cost (context + 16 keys per task, contiguous ranges) instead of by count (`_share`) | equal counts gave each Axion thread one whole sequence of `ctx=het` (17-2047 keys x 16 heads on 8 threads): the 2047-key thread did 3.3x the mean. Against an independent previous build: Axion `ctx=het` 0.34-0.41 (fp32 1221 -> 430 us, bf16 305 -> 154; vs vLLM 2.7x slower -> 0.71-0.89), C4D (4 threads) 0.90-0.97, Xeon (4 threads) 0.63-0.80; the rest of the manifest median 0.995-1.016 | kept |
 | GQA/MQA paths removed from both kernels (decode: no `R`-row register tile, `_rows_tile`, group chunks or store barrier; prefill: no `kv_heads`/group mapping), `157f6c6` vs `56bd38c` in one process, 3 warmup + 10 cold samples | median new/old: c4-standard-8 prefill 0.985, decode 0.999; c4d-standard-8 0.992, 0.999; c4a-standard-8 1.001, 1.013 (every row within the sample spread, both directions); 535 lines -> 384 | kept |
+| the native call route removed (`pyview.mojo`, `kv_fast`/`flash_fast`, the import-time TensorImpl calibration and the per-thread geometry tables, ~750 lines); the remaining route validates and plans once per geometry | warm calls on the Ryzen laptop, decode b=1 ctx=256 bf16/fp32: old checked route 10.7/11.9 us, native route 4.1/3.7, now 5.5/6.4; prefill 17:8:64: 5.4/5.8, 3.2/2.5, now 4.0/4.4 | kept: one route |
+| the cold-cache cost of that removal, and a supported native route (vLLM's: a dispatcher custom op reading tensors through the official API; the stable C ABI `aoti_torch_library_impl` + `aoti_torch_get_*` would give Mojo the same), prototyped as a C++ dispatcher op with the decode signature that reads every tensor's metadata and runs no kernel | Ryzen laptop, decode b=1 ctx=256 bf16, median, caches flushed before each call (warm in brackets): bare kernel 39.9 (2.5) us; removed native route +3.1 (+0.6); single Python route +12.2 (+3.1: key + lookup 6.7, output allocation 4.0, launch 2.4); dispatcher op alone, no kernel, 9.9 (2.7). On the VMs the single route was 15-35 us slower than the native route on short calls (c4-standard-8 `b1 short` 63 -> 96 us); larger rows unchanged | dispatcher route rejected: `torch.ops` runs as much cold Python as our route; only reading tensors in Mojo skips it |
+| the native route rebuilt as the only route: one Mojo entry per op validating and planning every call from TensorImpl fields (no geometry tables, no registration, Python only for options and error messages) | laptop, decode b=1 ctx=256 bf16 cold / warm: 43.1 / 3.5 us (old native route 42.4 / 3.0, single Python route 52.1 / 5.5); prefill 17:8:64 15.4 / 2.7 (14.5 / 2.5); Florence-2-large decode simulation, attention per step at b=1: 772-792 us (old 770, Python route 1046); +338 lines over the Python route. In-process A/B against the old native route on c4-, c4a-, c4d-standard-8 (`7026f86` vs `efc28ee`): median new/old 0.99-1.03 everywhere; `b1 short` decode 1.08-1.16 on c4a/c4 (~5 us; ranges overlap), parity on c4d (the single Python route had read 1.41-1.70) | kept |
 | the first version of that removal: an `R = 1` epilogue with only compile-time offsets into the decode accumulator buffer | LLVM promoted the buffer to vector registers live across the key loop and spilled the Q@K^T accumulators: aarch64 bf16 d=128 hot loop 155 stack accesses against 57 (the old runtime row loop had blocked the promotion), c4a-standard-8 decode 4-14% slower (confirmed with the arms swapped). Fixed by runtime loops in the epilogue (50). An out-of-line epilogue also fixed the spills but returned wrong results: the caller's stores into the stack buffer were dead-eliminated, as with the PV helpers above | fixed |

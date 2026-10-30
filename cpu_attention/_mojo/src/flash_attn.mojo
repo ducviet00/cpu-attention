@@ -27,7 +27,11 @@ comptime NEG = -Float32.MAX
 comptime V = SIMD[DType.float32, LANES]
 
 
+@fieldwise_init
 struct FlashJob(ImplicitlyCopyable, Movable):
+    """One call: addresses, the geometry with every stride (b/t/h: batch, token,
+    head; in elements), and the launch parameters `_C.flash` computed."""
+
     var q: Int
     var k: Int
     var v: Int
@@ -57,38 +61,6 @@ struct FlashJob(ImplicitlyCopyable, Movable):
     var aux: Int  # bytes per thread
     var v_direct: Bool
     var scale: Float32
-
-    def __init__(out self, plan: Int, q: Int, k: Int, v: Int, out_: Int, scale: Float32):
-        var p = ptr[Int64](plan)
-        self.q = q
-        self.k = k
-        self.v = v
-        self.out = out_
-        self.batch = Int(p[0])
-        self.seq_q = Int(p[1])
-        self.seq_k = Int(p[2])
-        self.heads = Int(p[3])
-        self.qb = Int(p[5])
-        self.qt = Int(p[6])
-        self.qh = Int(p[7])
-        self.kb = Int(p[8])
-        self.kt = Int(p[9])
-        self.kh = Int(p[10])
-        self.vb = Int(p[11])
-        self.vt = Int(p[12])
-        self.vh = Int(p[13])
-        self.ob = Int(p[14])
-        self.ot = Int(p[15])
-        self.oh = Int(p[16])
-        self.causal = p[18] != 0
-        self.workers = Int(p[19])
-        self.fuse = p[20] != 0
-        self.rq = Int(p[21])
-        self.ws = Int(p[22])
-        self.slab = Int(p[23])
-        self.aux = Int(p[24])
-        self.v_direct = p[25] != 0
-        self.scale = scale
 
 
 trait FlashPolicy:

@@ -1,110 +1,36 @@
 """Example: an inference engine's per-layer paged-attention calls.
 
-An engine that already holds validated tensors and its own slot mapping (as
-fast-encdec's runner does, once per decode step) can skip
-``flash_attn_with_kvcache``'s argument checks and call the kernel plumbing
-directly. These take three-dimensional q/k/v; they use ``cpu_attention._kernel``,
-which is internal and may change between releases.
+An engine that keeps its own slot mapping and a scratch output per layer (as
+fast-encdec's runner does) can call the kernel's decode entry directly: q/k/v are
+``[seqs, heads, head_dim]`` (heads and dims contiguous; a token stride is fine).
+The entry validates its arguments and returns None for anything it does not take.
+``cpu_attention._kernel`` is internal and may change between releases.
 """
 
-from cpu_attention import _kernel
-from cpu_attention._kernel import _paged
+from cpu_attention import _kernel as K
 
 
-def self_attention(
-    query,
-    key,
-    value,
-    k_cache,
-    v_cache,
-    slot_mapping,
-    block_table,
-    context_lens,
-    scale,
-    out=None,
-):
-    """Write new K/V into the paged cache and attend over the cached keys.
-
-    ``query``/``key``/``value`` are ``[num_seqs, num_heads, head_dim]`` with the
-    token stride taken from the tensors (a fused q/k/v projection hands out
-    chunks of one buffer).  ``context_lens`` is the cached length *after* the
-    store, and ``slot_mapping[b]`` is where sequence ``b``'s new token goes.
-
-    ``out`` writes into a caller-owned ``[num_seqs, num_heads, head_dim]``
-    tensor instead of allocating one. At batch 1 the allocation is 1.3 us of a
-    6.8 us call, so an engine that keeps a scratch buffer per layer step should
-    pass it.
-    """
-    table = getattr(_kernel._KV_TABLE, "t", None)
-    if table is not None and _kernel._KV_TABLE.gen == _kernel._KV_GEN[0]:
-        res = _kernel._KV_TABLE.fn(
-            _kernel._KV_TABLE.addr,
-            query,
-            key,
-            value,
-            k_cache,
-            v_cache,
-            slot_mapping,
-            block_table,
-            context_lens,
-            scale,
-            out,
-        )
-        if res is not None:
-            return res
-    return _paged(
-        query,
-        key,
-        value,
-        k_cache,
-        v_cache,
-        slot_mapping,
-        block_table,
-        context_lens,
-        scale,
-        do_store=True,
-        out=out,
-    )
+def _checked(result):
+    if result is None:
+        raise ValueError("cpu_attention: the kernel declined these arguments")
+    return result
 
 
-def cross_attention(query, k_cache, v_cache, block_table, cache_seqlens, scale,
-                    out=None):
-    """Attend over a paged, pre-staged encoder K/V cache (no store).
-
-    ``out`` as in :func:`self_attention`.
-    """
-    table = getattr(_kernel._KV_TABLE, "t", None)
-    if table is not None and _kernel._KV_TABLE.gen == _kernel._KV_GEN[0]:
-        res = _kernel._KV_TABLE.fn(
-            _kernel._KV_TABLE.addr,
-            query,
-            None,
-            None,
-            k_cache,
-            v_cache,
-            None,
-            block_table,
-            cache_seqlens,
-            scale,
-            out,
-        )
-        if res is not None:
-            return res
-    return _paged(
-        query,
-        None,
-        None,
-        k_cache,
-        v_cache,
-        None,
-        block_table,
-        cache_seqlens,
-        scale,
-        do_store=False,
-        out=out,
-    )
+def self_attention(query, key, value, k_cache, v_cache, slot_mapping, block_table,
+                   context_lens, scale, out=None):
+    """Store each sequence's new K/V at ``slot_mapping`` and attend over its cache;
+    ``context_lens`` is the length after the store. ``out``, when given, is a
+    caller-owned ``[seqs, heads, head_dim]`` output (it saves the allocation)."""
+    return _checked(K.module().decode(K.runtime(), query, k_cache, v_cache, key, value,
+                                      slot_mapping, context_lens, block_table, scale, out))
 
 
-def reshape_and_cache(key, value, k_cache, v_cache, slot_mapping) -> None:
-    """``cpu_attention.reshape_and_cache`` without its argument checks."""
-    _kernel._kv_store(key, value, k_cache, v_cache, slot_mapping)
+def cross_attention(query, k_cache, v_cache, block_table, cache_seqlens, scale, out=None):
+    """Attend over a pre-staged (encoder) K/V cache; no store."""
+    return _checked(K.module().decode(K.runtime(), query, k_cache, v_cache, None, None, None,
+                                      cache_seqlens, block_table, scale, out))
+
+
+def reshape_and_cache(key, value, k_cache, v_cache, slot_mapping):
+    """``cpu_attention.reshape_and_cache`` without the error explanations."""
+    _checked(K.module().store(K.runtime(), key, value, k_cache, v_cache, slot_mapping))

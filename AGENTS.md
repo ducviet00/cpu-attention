@@ -12,7 +12,7 @@ with a falsification ledger: do not re-run a dead idea without a new mechanism.
 ## Layout
 
 ```
-cpu_attention/              the Python API (flash-attn's functions + reshape_and_cache), loader, worker policy
+cpu_attention/              the Python API (flash-attn's functions + reshape_and_cache), loader, runtime config
 cpu_attention/_mojo/        the Mojo kernel -> _C_<tier>.so (scripts/build.py)
 examples/ops.py             an engine's per-layer calls over the internal plumbing (fast-encdec's)
 tests/                      pytest against tests/reference.py (eager attention, PyTorch float64):
