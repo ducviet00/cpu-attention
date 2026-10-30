@@ -107,7 +107,9 @@ concurrent callers, a 30-case fuzz), plus the rejected arguments. Limits:
 | paged decode bf16 | 1e-3 beyond the rounding of the exact result to bf16 |
 
 Rounding the exact result to bf16 alone exceeds an absolute 1e-3 on many cases,
-so the paged bf16 limit is taken above that floor (`docs/Mojo.md` §5).
+so the paged bf16 limit is taken above that floor (`docs/Mojo.md` §5). The fp32
+limits hold at `softmax_scale` up to `1/sqrt(head_dim)` (the model scale); larger
+scales grow the logits, and fp32 softmax error with them.
 
 ## Documentation
 

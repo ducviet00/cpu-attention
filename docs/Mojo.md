@@ -147,9 +147,11 @@ output-rounding floor*, `max(|out - ref| - |ref - bf16(ref)|) <= 1e-3`
 (`tests/reference.check`), on every CPU. This is a stated interpretation
 of an unattainable literal gate, not a passed literal gate. (Until the C++
 backend was removed, x86 bf16 was judged instead as <= 2 bf16 ulp against it,
-which its degree-2 `exp2` met; the reference gate needs degree 5, §9.) Test
-scales stay where the 1e-6 fp32 gate is defined (<= 0.2): at scale 0.9 even an
-fp32 reference is 6.4e-6 from fp64.
+which its degree-2 `exp2` met; the reference gate needs degree 5, §9.) The fp32
+limits hold at `softmax_scale <= 1/sqrt(head_dim)`, and the tests stay there: fp32
+softmax error grows with the logits (c4a-standard-8, d=128, MQA, ctx 708: scale 0.2,
+2.3x the model scale, up to 2.2e-6 from fp64; at the model scale 1.4-2.2e-7), and at
+scale 0.9 even an fp32 reference is 6.4e-6 from fp64.
 
 ## 6. Call path and threading
 

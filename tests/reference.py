@@ -37,7 +37,10 @@ def check(got, ref, dtype, paged=False):
 
     flash_attn_func: fp32 2e-4, bf16 3e-2. Paged decode: fp32 1e-6; bf16 1e-3 beyond
     the unavoidable rounding of the exact result to bf16 (rounding alone exceeds an
-    absolute 1e-3 on many cases, so the literal gate is unattainable).
+    absolute 1e-3 on many cases, so the literal gate is unattainable). The fp32 limits
+    hold at softmax_scale <= 1/sqrt(head_dim): fp32 softmax error grows with the
+    logits (c4a-standard-8, d=128, scale 0.2 = 2.3x that: up to 2.2e-6; at the model
+    scale 1.4-2.2e-7).
     """
     err = np.abs(f64(got) - ref)
     if dtype == torch.float32:

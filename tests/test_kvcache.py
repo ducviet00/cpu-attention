@@ -119,8 +119,9 @@ def test_fuzz(seed):
     r = random.Random(seed)
     h, hk = r.choice(HEADS)
     lens = [r.randint(0, 1100) for _ in range(r.randint(1, 6))]
-    err, tol = decode(lens, h, hk, r.choice([32, 64, 128]), r.choice([16, 32, 48, 64]),
-                      r.choice(DTYPES), seed, scale=r.choice([None, 0.05, 0.2]))
+    d = r.choice([32, 64, 128])
+    err, tol = decode(lens, h, hk, d, r.choice([16, 32, 48, 64]), r.choice(DTYPES), seed,
+                      scale=r.choice([1.0, 0.5]) * d ** -0.5)
     assert err <= tol
 
 
