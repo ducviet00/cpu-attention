@@ -48,12 +48,12 @@ def _k_off[dtype: DType, hd: Int](j: Int, d: Int) -> Int:
 # ---------------------------------------------------------------------------
 # pack
 # ---------------------------------------------------------------------------
-def _pack[dtype: DType, hd: Int](job: FlashJob, b: Int, kvh: Int, slab: Int):
+def _pack[dtype: DType, hd: Int](job: FlashJob, b: Int, h: Int, slab: Int):
     comptime E = 2 if dtype == DType.bfloat16 else 4
     comptime BF = dtype == DType.bfloat16
     var pad = _pad(job.seq_k)
-    var ks = ptr[Scalar[dtype]](job.k + (b * job.kb + kvh * job.kh) * E)
-    var vs = ptr[Scalar[dtype]](job.v + (b * job.vb + kvh * job.vh) * E)
+    var ks = ptr[Scalar[dtype]](job.k + (b * job.kb + h * job.kh) * E)
+    var vs = ptr[Scalar[dtype]](job.v + (b * job.vb + h * job.vh) * E)
     var kd = ptr[Scalar[dtype]](slab)
     var vd = ptr[Scalar[dtype]](slab + pad * hd * E)
     var t0 = 0
@@ -418,15 +418,15 @@ struct VecPolicy[dtype: DType, hd: Int](FlashPolicy):
         return RQT * KT * 4 + (RQT * KT * 2 if BF else (RQT * Self.hd * 4 if QPANEL else 0))
 
     @staticmethod
-    def pack(job: FlashJob, b: Int, kvh: Int, slab: Int):
-        _pack[Self.dtype, Self.hd](job, b, kvh, slab)
+    def pack(job: FlashJob, b: Int, h: Int, slab: Int):
+        _pack[Self.dtype, Self.hd](job, b, h, slab)
 
     @staticmethod
     def tile(
         job: FlashJob,
         slab: Int,
         b: Int,
-        kvh: Int,
+        h: Int,
         q0: Int,
         sub: Int,
         k0: Int,
@@ -443,7 +443,7 @@ struct VecPolicy[dtype: DType, hd: Int](FlashPolicy):
         var vsrc = slab + _pad(job.seq_k) * Self.hd * E
         var vstride = Self.hd
         if job.v_direct:
-            vsrc = job.v + (b * job.vb + kvh * job.vh) * E
+            vsrc = job.v + (b * job.vb + h * job.vh) * E
             vstride = job.vt
         # A partial register tile dispatches a smaller instantiation instead of
         # repeating the last query row.

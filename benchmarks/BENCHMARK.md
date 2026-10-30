@@ -73,6 +73,11 @@ pin the CPU governor to `performance` first (`scripts/pin_governor.sh`).
 
 ## Results
 
+Measured at `f074b2e`. The later removal of the GQA/MQA kernel paths was timed
+against it in one process on c4-, c4a- and c4d-standard-8 (median new/old
+0.985-1.013, every row within the sample spread; `docs/Mojo.md` §9), so the
+tables below still describe the current kernel.
+
 ### c4-standard-8
 
 INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.30GHz, 4 threads, `f074b2e`, torch 2.14.1+cpu, Mojo 1.2.0 (2016d0cd); vLLM ISA bf16 `amx`, fp32 `vec`.

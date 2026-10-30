@@ -3,6 +3,7 @@
 # each lower tier in ISAS (e.g. "vec avx2 scalar" or "neon scalar"), then the benchmark.
 #   REPO     git URL or bundle to clone from (default: ~/cpu-attention's origin)
 #   NOBENCH  1 = tests only
+#   COMPARE_REF  a branch to build too and time in the same process (bench.py --compare)
 # Results go to ~/verify-BRANCH.out/{tests-*.log,bench.json,bench.log}.
 # Launch it outside the ssh session (`sudo systemd-run --uid=$USER --setenv=HOME=$HOME
 # --working-directory=$HOME bash ...`): when the last session logs out, systemd stops the
@@ -24,4 +25,12 @@ done
 unset CPU_ATTENTION_ISA
 echo TESTS_DONE
 [ "${NOBENCH:-}" = 1 ] && exit 0
-uv run python benchmarks/bench.py --json "$O/bench.json" "$@" > "$O/bench.log" 2>&1 && echo BENCH_DONE || { echo BENCH_FAIL; tail -20 "$O/bench.log"; }
+CMP=()
+if [ -n "${COMPARE_REF:-}" ]; then
+  B=$HOME/verify-base; rm -rf "$B"
+  git clone -q -b "$COMPARE_REF" "$REPO" "$B" && ln -s "$D/.venv" "$B/.venv" &&
+    (cd "$B" && PATH="$D/.venv/bin:$PATH" python scripts/build.py > "$O/compare-build.log" 2>&1) &&
+    echo "COMPARE $COMPARE_REF $(git -C "$B" rev-parse --short HEAD)" && CMP=(--compare "$B/cpu_attention") ||
+    { echo COMPARE_BUILD_FAIL; exit 1; }
+fi
+uv run python benchmarks/bench.py --json "$O/bench.json" "${CMP[@]}" "$@" > "$O/bench.log" 2>&1 && echo BENCH_DONE || { echo BENCH_FAIL; tail -20 "$O/bench.log"; }

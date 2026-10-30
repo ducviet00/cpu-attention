@@ -150,9 +150,9 @@ def _pack_k_block[
 
 
 @always_inline
-def _pack_k[dtype: DType, hd: Int](job: FlashJob, b: Int, kvh: Int, slab: Int):
+def _pack_k[dtype: DType, hd: Int](job: FlashJob, b: Int, h: Int, slab: Int):
     comptime E = 2 if dtype == DType.bfloat16 else 4
-    var ks = job.k + (b * job.kb + kvh * job.kh) * E
+    var ks = job.k + (b * job.kb + h * job.kh) * E
     for kb in range(_pad(job.seq_k) // 16):
         var t0 = kb * 16
         if t0 + 16 <= job.seq_k:
@@ -207,9 +207,9 @@ def _pack_v_block[
 
 
 @always_inline
-def _pack_v[dtype: DType, hd: Int](job: FlashJob, b: Int, kvh: Int, slab: Int):
+def _pack_v[dtype: DType, hd: Int](job: FlashJob, b: Int, h: Int, slab: Int):
     comptime E = 2 if dtype == DType.bfloat16 else 4
-    var vs = job.v + (b * job.vb + kvh * job.vh) * E
+    var vs = job.v + (b * job.vb + h * job.vh) * E
     var vbase = slab + _k_bytes[dtype, hd](job.seq_k)
     for kb in range(_pad(job.seq_k) // 32):
         var t0 = kb * 32
@@ -626,16 +626,16 @@ struct AmxPolicy[dtype: DType, hd: Int](FlashPolicy):
         return RQT * (Self.KT * 4 + PAD) + RQT * (Self.KT * 2 + PAD) * NLO + RQT * Self.hd * 2 * NLO + 64
 
     @staticmethod
-    def pack(job: FlashJob, b: Int, kvh: Int, slab: Int):
-        _pack_k[Self.dtype, Self.hd](job, b, kvh, slab)
-        _pack_v[Self.dtype, Self.hd](job, b, kvh, slab)
+    def pack(job: FlashJob, b: Int, h: Int, slab: Int):
+        _pack_k[Self.dtype, Self.hd](job, b, h, slab)
+        _pack_v[Self.dtype, Self.hd](job, b, h, slab)
 
     @staticmethod
     def tile(
         job: FlashJob,
         slab: Int,
         b: Int,
-        kvh: Int,
+        h: Int,
         q0: Int,
         sub: Int,
         k0: Int,

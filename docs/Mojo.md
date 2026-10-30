@@ -29,8 +29,9 @@ over SDPA and vLLM on all three machines. Where rows tie, the limit is:
   faster on c4-standard-* (its AMX path) and 1.06-1.26x on c4a-standard-*
   (README); fp32 and c4d-standard-* tie or win.
 - **GQA/MQA are out of scope for now**: the API raises `NotImplementedError`
-  for `nheads_k < nheads`, though the kernel keeps its group paths (a group's
-  query heads as rows of one register tile, §3). When last measured (`0081f7c`),
+  for `nheads_k < nheads`, and the group paths are removed from both kernels
+  (in git history before the removal: a group's query heads as rows of one
+  decode register tile, `R` up to 8). When last measured (`0081f7c`),
   GQA decode at head_dim 128 (32 query heads over 8 or 4 KV heads) ran 1.34-1.86x
   behind vLLM in bf16 on c4-standard-*, where vLLM uses AMX tiles for the group,
   and 1.1-1.6x behind on c4a-standard-*; an AMX (and a `bfmmla`) `PVKernel` for
@@ -57,14 +58,14 @@ _mojo/tests/test_attention.mojo   standalone decode parity test vs a scalar fp32
 
 ## 3. One design for both APIs
 
-**The page layout is shared.** flash_attn_func packs each (batch, kv head) into a
+**The page layout is shared.** flash_attn_func packs each (batch, head) into a
 private slab whose K^T is blocked every 64 keys -- exactly a KV-cache page of 64
 tokens: `[tile][hd][64]` fp32, `[tile][hd/2][64][2]` bf16 (the dim pair a dot
 instruction contracts). The decode cache uses the same dim-pair K layout per
-page. So Q@K^T, the online softmax and P@V are the same register-tile
-algorithm over pages of keys:
-- decode: rows = the query heads of one kv group;
-- flash_attn_func: rows = consecutive query positions.
+page. So Q@K^T, the online softmax and P@V are the same algorithm over pages of
+keys: decode scores one query row per (sequence, head), flash_attn_func a
+register tile of consecutive query positions. MHA only (GQA/MQA raise in the API;
+the group paths were removed from both kernels, §9).
 
 **flash_attn_func driver / policy split.** `flash_attn.mojo` owns scheduling,
 the bottom-right causal bound (row i sees keys `j <= i + seq_k - seq_q`, exact
@@ -89,21 +90,18 @@ a broadcast does not fold into the FMA, `isa.BCAST_FOLD` false, query dims and
 probabilities as vectors used by lane, 4 keys per P@V step, and a contiguous Q
 panel). The bf16 matrix engines (AMX, `bfmmla`) keep their own policies.
 
-**Decode.** Work item = (sequence, kv head, chunk of that head's query heads):
-every query head of a GQA/MQA group is a row of one register tile, so the group
-shares one scan of the cache (0.52-0.73 of C++ on the GQA/MQA rows, where C++
-rescans per query head). Groups are split into chunks only when there are fewer
-(sequence, kv head) pairs than workers; stores then precede a barrier. P@V never
-reads past `lens`, a negative slot skips its store, a zero-length context returns
-0. The page size is a compile-time constant for 16/32/48/64.
+**Decode.** Work item = (sequence, head), one query row; workers take contiguous
+ranges balanced on context length (`_share`). P@V never reads past `lens`, a
+negative slot skips its store, a zero-length context returns 0. The page size is
+a compile-time constant for 16/32/48/64.
 
-**One decode driver for every tier** (`paged_attn._attend_rows`). A softmax step of
+**One decode driver for every tier** (`paged_attn._attend`). A softmax step of
 `KT` keys is resolved into 16-key units (page % 16 == 0, so a unit never
 straddles a page): one key vector on AVX-512, two on AVX2, four on NEON. Q@K^T
 scores `G` key vectors per call (independent dot chains) with a masked tail that
 stays inside one unit, tracks the step maximum as a tree, and the softmax keeps
 `NS` partial sums. What differs per target is compile-time only:
-- `Decode[dtype, hd, R]` holds the shape as `comptime` members computed from
+- `Decode[dtype, hd]` holds the shape as `comptime` members computed from
   `simd_width_of` and `CompilationTarget` (`KT`, `G`, `G_TAIL`, `DEG`, `NS`, `NC`,
   `FULL`); `comptime assert` pins the tiling invariants.
 - `Decode.PV` is the one per-target kernel, a type conforming to the `PVKernel`
@@ -302,59 +300,5 @@ Goal: one implementation across CPUs, then latency (AGENTS.md).
 | store-only K through a LANES x LANES word transpose for prefill-style staging (consecutive slots); scattered appends keep token order | C4D store `b=1 ctx=1024` fp32 1.14 -> 0.97 of C++, bf16 42.6 -> 20.9 us (0.21 of C++); `b=32 ctx=1` unchanged (blocks for scattered tokens had cost it 0.4 us) | kept |
 | C++ backend removed; x86 paged bf16 judged like aarch64 (<= 1e-3 above the bf16 output rounding vs the fp32 reference) instead of <= 2 ulp vs C++; `exp2` degree 5 for bf16 decode on every CPU (x86 was 2) | degree 2 failed the reference gate on 91/252 sweep cases (worst 3.9e-3); degree 5 worst 7.0e-7 on every x86 tier; +1.2% instructions on the Ryzen, cycles within noise | kept: one numerics rule and one `DEG` for every CPU |
 | decode tasks split across workers by cost (context + 16 keys per task, contiguous ranges) instead of by count (`_share`) | equal counts gave each Axion thread one whole sequence of `ctx=het` (17-2047 keys x 16 heads on 8 threads): the 2047-key thread did 3.3x the mean. Against an independent previous build: Axion `ctx=het` 0.34-0.41 (fp32 1221 -> 430 us, bf16 305 -> 154; vs vLLM 2.7x slower -> 0.71-0.89), C4D (4 threads) 0.90-0.97, Xeon (4 threads) 0.63-0.80; the rest of the manifest median 0.995-1.016 | kept |
-
-Result: decode unification at no measured cost; Axion fp32 `flash_attn_func` was ~5% slower
-than the dedicated NEON policy (wins became ties, no losses), accepted for the unification
-(2026-10-29). The fused rescale and first-tile write (`ZEROES_ACC`), the mask constants and the
-per-pass K base since brought it to +2% cycles / +7% instructions at hd 64; hd 32 stays ~13%
-behind. Open: the Q@K^T loop holds 33 live vectors (16 accumulators, 8 K, 8 running max, the
-query) on a 32-register machine and spills a little more than the old policy did.
-
-**Axion decode ledger (c4a-standard-8, one process, independent control, vs `2fc4652`).**
-
-| idea | result | decision |
-|---|---|---|
-| NEON decode key tile `KT` 256 -> 64 (hd 64), 128 -> 64 (hd 128) | b=8 ctx=1024 bf16 0.986; d=128 cross 0.992 (within control) | reverted |
-| software prefetch of the next-but-one K and V page at each page crossing | b=8 ctx=1024 1.02, b=1 ctx=4096 bf16 1.06 / fp32 1.08 (slower) | reverted |
-| bf16 Q@K^T key groups per step G 8 -> 16 (ARM, R=1) | b=32 ctx=1024 1.001, b=8 ctx=256 1.047 | reverted |
-| recycle allocated decode outputs (ring checked by raw refcounts) | `engine` rows b=1 ctx=256 bf16 8.0 -> 6.5 us (C++ 8.1) | rejected: reads c10 refcounts from raw memory, unsafe |
-
-Findings. Plain `engine` rows lose to `engine_out` rows by the cost of `torch.empty_like`
-(0.7 us hot, 2-3 us in the interleaved harness; C++ allocates inside its extension, about
-1.4 us). Large-batch bf16 decode (b=8..32, ctx~1024, d=128, page 64, MQA h=16/1) streams
-16-67 MB per call at 60-150 GB/s and sits at 1.04-1.17 of C++ NEON; no loop-shape change
-tried moved it. Open: why C++'s 64-key K/V interleave streams better than the
-Mojo 256-key tile at b=32, and why MQA h=16/1 bf16 (92 us vs C++ 83, vLLM 39) is not
-compute-bound-efficient. Requests: none for the shared driver.
-
-**Axion campaign 2 (branch `axion-mojo`, vs `/tmp` copy of the previous build as control).**
-
-| idea | result | decision |
-|---|---|---|
-| allocate decode/flash outputs inside the extension (`aoti_torch_empty_strided` + `THPVariable_Wrap`, links libtorch_python) | removes the `empty_like` cost: engine rows 49 win / 35 unresolved / 8 loss on the 92 paged rows (was 23 losses) | kept |
-| ARM 16-key page unit (PT=16, PG=4, KT=64) paged decode, bfdot/ldp-shaped P@V, vectorized K/V store | b=8 ctx=1024 bf16 0.80 of the previous build | kept |
-| Q@K^T tail skip when a page group has <= 4 live keys | ctx 2^k+1 rows (257/1025/4097) turn into wins | kept |
-| `@no_inline` PV helpers taking `vbase` by pointer | `d=32` segfault: the pointer array's stores were dead-eliminated in the caller (tail call + stack slot), so the callee read garbage | rejected; helpers are `@always_inline` |
-| PV helpers `@no_inline` with `vbase: Array[Int, 4]` by value | 40/92 rows slower than the inline version (register pressure across Q@K^T/softmax) | rejected |
-
-Open: batch 8-32 context ~1024 and batch-1 context 4096 decode sit at 0.95-1.03 of C++ NEON
-(bandwidth-bound); fp32 `engine_out` rows at batch 8 still tie or lose by up to 9% in single
-runs.
-
-Earlier campaigns' ledgers (`docs/CPP.md` §8 in git history and the oracle's notes
-at `mojo-oracle-v1.1`) still apply; nothing on them was re-run without a new
-mechanism.
-
-## 10. Mojo 1.2.0 notes (the ones that cost time)
-
-- `--fp-mode contract=fast` is the default: `a + b*c` contracts into FMA across
-  statements.
-- `Int` has no `bit_length`; `Atomic[Int64].fetch_add(ptr, 1)`; there is no
-  `memset_zero`; positional pointer indexing is deprecated (`unsafe_load`).
-- A fully `comptime for`-unrolled head-dim loop lets LLVM hoist every query
-  broadcast out of the key loop and spill it: keep a runtime loop with a small
-  unroll.
-- `llvm_intrinsic[..., has_side_effect=False]` for dot instructions, or the calls
-  stay ordered (~4x slower).
-- `out` is a keyword (not an argument name); `PythonObject._obj_ptr` is the raw
-  object; stack arrays of megabytes overflow the 8 MB stack.
+| GQA/MQA paths removed from both kernels (decode: no `R`-row register tile, `_rows_tile`, group chunks or store barrier; prefill: no `kv_heads`/group mapping), `157f6c6` vs `56bd38c` in one process, 3 warmup + 10 cold samples | median new/old: c4-standard-8 prefill 0.985, decode 0.999; c4d-standard-8 0.992, 0.999; c4a-standard-8 1.001, 1.013 (every row within the sample spread, both directions); 535 lines -> 384 | kept |
+| the first version of that removal: an `R = 1` epilogue with only compile-time offsets into the decode accumulator buffer | LLVM promoted the buffer to vector registers live across the key loop and spilled the Q@K^T accumulators: aarch64 bf16 d=128 hot loop 155 stack accesses against 57 (the old runtime row loop had blocked the promotion), c4a-standard-8 decode 4-14% slower (confirmed with the arms swapped). Fixed by runtime loops in the epilogue (50). An out-of-line epilogue also fixed the spills but returned wrong results: the caller's stores into the stack buffer were dead-eliminated, as with the PV helpers above | fixed |
