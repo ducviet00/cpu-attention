@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import torch
 
-from cpu_attention import flash_attn_with_kvcache
+from cpu_attention import flash_attn_with_kvcache, reshape_and_cache
 from reference import attention, check, f64
 
 DTYPES = [torch.float32, torch.bfloat16]
@@ -144,3 +144,25 @@ def test_concurrent_callers():
     for t in pool:
         t.join()
     assert len(errors) == 80 and all(err <= tol for err, tol in errors)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("page", [16, 32])
+def test_reshape_and_cache(dtype, page):
+    """reshape_and_cache writes the same cache an append does; negative slots skip,
+    and k/v may be chunks of a fused projection."""
+    lens, h, hk, d = [70, 5], 8, 2, 64
+    q, kc, vc, bt, ks, vs = stage(lens, h, hk, d, page, dtype, seed=6)
+    kc2, vc2 = torch.full_like(kc, float("nan")), torch.full_like(vc, float("nan"))
+    kv = torch.cat([torch.cat([k[0], v[0]], -1) for k, v in zip(ks, vs)])  # [tokens, hk, 2d]
+    pos = torch.cat([torch.arange(n) for n in lens])
+    seq = torch.cat([torch.full((n,), i) for i, n in enumerate(lens)])
+    slots = bt[seq, pos // page].long() * page + pos % page
+    pad = torch.full((3,), -1, dtype=torch.int64)
+    junk = torch.randn(3, hk, 2 * d).to(dtype)
+    reshape_and_cache(torch.cat([kv, junk])[..., :d], torch.cat([kv, junk])[..., d:],
+                      kc2, vc2, torch.cat([slots, pad]))
+    seqlens = torch.tensor(lens, dtype=torch.int32)
+    out = flash_attn_with_kvcache(q, kc2, vc2, cache_seqlens=seqlens, page_table=bt)
+    err, tol = check(out, reference(q, ks, vs, d ** -0.5), dtype, paged=True)
+    assert err <= tol

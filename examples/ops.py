@@ -106,5 +106,5 @@ def cross_attention(query, k_cache, v_cache, block_table, cache_seqlens, scale,
 
 
 def reshape_and_cache(key, value, k_cache, v_cache, slot_mapping) -> None:
-    """Scatter ``[num_tokens, num_heads, head_dim]`` K/V into the paged cache."""
+    """``cpu_attention.reshape_and_cache`` without its argument checks."""
     _kernel._kv_store(key, value, k_cache, v_cache, slot_mapping)

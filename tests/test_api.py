@@ -46,6 +46,25 @@ def test_kvcache_bad_arguments(bad):
         C.flash_attn_with_kvcache(q, kc, vc, cache_seqlens=4, page_table=bt)
 
 
+@pytest.mark.parametrize("bad", ["dtype", "heads", "slots_dtype", "slots_len", "past_end"])
+def test_reshape_and_cache_bad_arguments(bad):
+    k = torch.randn(5, 2, 64)
+    kc = torch.zeros(2, 2, 16, 64)
+    slots = torch.arange(5)
+    if bad == "dtype":
+        k = k.bfloat16()
+    elif bad == "heads":
+        k = torch.randn(5, 3, 64)
+    elif bad == "slots_dtype":
+        slots = slots.int()
+    elif bad == "slots_len":
+        slots = slots[:4]
+    elif bad == "past_end":
+        slots = slots + 30
+    with pytest.raises(ValueError):
+        C.reshape_and_cache(k, k, kc, kc.clone(), slots)
+
+
 @pytest.mark.parametrize("bad", ["dtype", "head_dim", "heads", "batch"])
 def test_flash_bad_arguments(bad):
     q, k = torch.randn(2, 8, 4, 64), torch.randn(2, 8, 2, 64)

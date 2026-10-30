@@ -12,7 +12,7 @@ with a falsification ledger: do not re-run a dead idea without a new mechanism.
 ## Layout
 
 ```
-cpu_attention/              the Python API (exactly flash-attn's functions), loader, worker policy
+cpu_attention/              the Python API (flash-attn's functions + reshape_and_cache), loader, worker policy
 cpu_attention/_mojo/        the Mojo kernel -> _C_<tier>.so (scripts/build.py)
 examples/ops.py             an engine's per-layer calls over the internal plumbing (fast-encdec's)
 tests/                      pytest against tests/reference.py (numpy float64, explicit loops):
@@ -30,8 +30,9 @@ scripts/box_verify.sh       on a box: the tests at every tier on a branch, then 
 
 ## Rules
 
-- **The API is flash-attn's.** `cpu_attention` exports exactly flash-attn's
-  functions; engine conveniences belong in `examples/`, not in the package.
+- **The API is flash-attn's.** `cpu_attention` exports flash-attn's functions
+  plus `reshape_and_cache` (vLLM's signature: the cache layout is ours, so its
+  writer must be public); engine conveniences belong in `examples/`.
 - **The references are torch SDPA and vLLM.** Prefill is judged against
   `F.scaled_dot_product_attention`, paged decode against vLLM's CPU attention at
   the commit pinned in `scripts/build_vllm_ref.sh` (AMX for x86 bf16 on AMX

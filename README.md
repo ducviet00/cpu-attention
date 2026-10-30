@@ -11,8 +11,9 @@ and works as a standalone library.
   aligned) or not.
 * fp32 and bf16, MHA / MQA / GQA, head_dim 32/64/128, page size a multiple of
   16.
-* The API is flash-attn's: `cpu_attention` exports exactly flash-attn's functions
-  (the packed and varlen ones raise `NotImplementedError`).
+* The API is flash-attn's: `cpu_attention` exports flash-attn's functions (the
+  packed and varlen ones raise `NotImplementedError`), plus `reshape_and_cache`
+  with vLLM's signature to write the paged cache.
 * One kernel, written in Mojo (`cpu_attention/_mojo/`,
   [`docs/Mojo.md`](docs/Mojo.md)): one driver per op for every CPU, a target
   differing only by compile-time constants and a trait-plugged inner kernel.
@@ -37,14 +38,14 @@ and is refused if the CPU lacks it.
 ## Use
 
 ```python
-from cpu_attention import flash_attn_func, flash_attn_with_kvcache
+from cpu_attention import flash_attn_func, flash_attn_with_kvcache, reshape_and_cache
 
 # Prefill: q/k/v [batch, seq, heads, head_dim]
 out = flash_attn_func(q, k, v, causal=True)
 
-# Stage a prompt's K/V into the paged cache (k/v [B, prompt_len, kv_heads, D]) ...
-flash_attn_with_kvcache(q, k_cache, v_cache, k=k_prompt, v=v_prompt,
-                        cache_seqlens=0, page_table=pages)
+# Stage prompts' K/V into the paged cache: token i goes to slot_mapping[i]
+# (page slot // page_size, position slot % page_size; negative = skip)
+reshape_and_cache(k_tokens, v_tokens, k_cache, v_cache, slot_mapping)  # [tokens, kv_heads, D]
 # ... then decode, one query token per sequence
 out = flash_attn_with_kvcache(
     q, k_cache, v_cache,      # q [B, 1, H, D]; caches [blocks, kv_heads, page, D]
@@ -56,9 +57,10 @@ out = flash_attn_with_kvcache(
 
 Notes on the API:
 * **Cache layout.** Head-major `[num_blocks, nheads_k, page, head_dim]` with K
-  stored transposed inside the page, so it is written only through
-  `flash_attn_with_kvcache` (`k`/`v` of any number of new tokens); a cache in
-  another library's layout (vLLM's included) is not readable.
+  stored transposed inside the page, so it is written only by this library:
+  `reshape_and_cache`, or `flash_attn_with_kvcache` with `k`/`v` (any number of
+  new tokens, appended at `cache_seqlens`). A cache in another library's layout
+  (vLLM's included) is not readable.
 * **Strides.** q/k/v may be strided chunks of a fused projection: any token
   stride, with heads and dims contiguous.
 * **`causal` on the paged path** is accepted and has no effect, because one
@@ -169,7 +171,7 @@ arm's median, min and max.
 ## Tests
 
 ```bash
-uv run --extra test pytest            # ~480 cases, ~10 s
+uv run --extra test pytest            # ~490 cases, ~10 s
 CPU_ATTENTION_ISA=avx2 uv run --extra test pytest    # a lower tier
 ```
 
@@ -178,8 +180,9 @@ Every case is checked against a slow, obviously correct reference
 explicit masking and softmax. The tests cover prefill (tile-edge, single-row and
 unequal lengths, causal and not, MHA/GQA/MQA, head_dim 32/64/128, fused-projection
 strides, a 40-case fuzz) and paged decode (page sizes 16/32/48/64, empty and
-uneven contexts, poisoned caches, one- and multi-token appends, 1-8 threads,
-concurrent callers, a 30-case fuzz), plus the rejected arguments. Limits:
+uneven contexts, poisoned caches, `reshape_and_cache` and one- and multi-token
+appends, 1-8 threads, concurrent callers, a 30-case fuzz), plus the rejected
+arguments. Limits:
 
 | case | max error vs float64 |
 |---|---|
