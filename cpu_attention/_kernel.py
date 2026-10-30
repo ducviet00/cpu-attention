@@ -218,7 +218,7 @@ _PAGED_PLANS = threading.local()
 _get_num_threads = torch.get_num_threads
 """Per-thread geometry -> fast call, for the paged path.
 
-The engine calls `self_attention`/`cross_attention` 24 times a decode step with
+An engine calls the paged decode 24 times a decode step with
 the same geometry, and at batch 1 / ctx 256 the whole call is 7 us: reading a
 `.shape` and three `.stride()` tuples per call is a third of that. The plan holds
 the 14 constant arguments and patches only the data pointers, so a call is one

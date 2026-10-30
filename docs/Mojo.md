@@ -123,32 +123,33 @@ except for `amx`); a tier the CPU lacks is refused with an error. AMX code sits 
 the AVX-512-BF16 tier (inline asm assembles for any x86 target) and runs only
 when the CPU reports `amx_tile`/`amx_bf16` and `arch_prctl` grants tile state.
 `_C.so` is a copy of the host's best tier for older callers. Every tier the CPU
-supports passes the gates (C4D: avx512bf16, avx2, x86-64; Xeon: vec, avx2,
-scalar). bf16 K is dim pairs on every tier, so a cache written under one tier
+supports passes the tests (c4d-standard-*: avx512bf16, avx2, x86-64;
+c4-standard-*: vec, avx2, scalar; c4a-standard-*: bf16, neon). bf16 K is dim pairs on every tier, so a cache written under one tier
 is read correctly under another.
 
 ## 5. Numerics and gates
 
-| gate | limit | C4D result |
-|---|---|---|
-| flash_attn_func fp32 vs naive fp32 reference | 2e-4 | test_dense 82/82, fuzz 80/80 (worst 0.52x tol) |
-| flash_attn_func bf16 | 3e-2 | same |
-| paged fp32 | 1e-6 (fp64 arbitrates an arm over the gate) | sweep 504/504, worst 8.9e-7 |
-| paged bf16 | <= 1e-3 above the bf16 output-rounding floor | sweep worst 7.0e-7 |
-| regressions (`tests/test_regressions.py`) | as above | 412/412 |
-| fast-encdec `tests/test_cpu_attention.py` (strided fused q/k/v) | 45 checks | 45/45 (development laptop; fast-encdec is not on the VMs) |
+The tests (`tests/`, pytest) compare every case against `tests/reference.py`:
+numpy in float64, one (batch, head) at a time. Limits:
+
+| case | limit vs float64 |
+|---|---|
+| flash_attn_func fp32 | 2e-4 |
+| flash_attn_func bf16 | 3e-2 |
+| paged fp32 | 1e-6 |
+| paged bf16 | 1e-3 above the bf16 output-rounding floor |
 
 **Paged bf16 "<= 1e-3 against the reference".** Taken literally (absolute error
 to the real-valued result) no bf16 output can meet it: an earlier campaign
 measured 77/252 Axion sweep cases where rounding the exact result to bf16 alone
 exceeds 1e-3 (worst 6.6e-3). The tests therefore check the error *above the bf16
 output-rounding floor*, `max(|out - ref| - |ref - bf16(ref)|) <= 1e-3`
-(`tests/reference.bf16_excess`), on every CPU. This is a stated interpretation
+(`tests/reference.check`), on every CPU. This is a stated interpretation
 of an unattainable literal gate, not a passed literal gate. (Until the C++
 backend was removed, x86 bf16 was judged instead as <= 2 bf16 ulp against it,
-which its degree-2 `exp2` met; the reference gate needs degree 5, §9.) The scale used by the changed-scale regression
-stays where the 1e-6 fp32 gate is defined: at scale 0.9 the fp32 *reference* is
-6.4e-6 from fp64.
+which its degree-2 `exp2` met; the reference gate needs degree 5, §9.) Test
+scales stay where the 1e-6 fp32 gate is defined (<= 0.2): at scale 0.9 even an
+fp32 reference is 6.4e-6 from fp64.
 
 ## 6. Call path and threading
 
@@ -165,8 +166,8 @@ stays where the 1e-6 fp32 gate is defined: at scale 0.9 the fp32 *reference* is
   off). `kv_fast` / `flash_fast` accept only exact `torch.Tensor`/`Parameter`
   objects whose dtype, dims, sizes, strides, causal flag, scale and thread count
   match a per-thread plan registered after a fully validated call; anything else
-  returns to the checked Python path. A grown workspace, `set_num_workers` and
-  `_drop_workspace` invalidate every table.
+  returns to the checked Python path. A grown workspace, a changed worker count
+  and `_drop_workspace` invalidate every table.
   - b=1 ctx=256 decode with `out=`: 4.4 -> 2.75 us.
   - flash_attn_func 17:8:64 bf16: 5.26 -> 3.05 us.
 - **Workspace** is per thread, grown on demand, never shrunk (a freed large
@@ -174,30 +175,16 @@ stays where the 1e-6 fp32 gate is defined: at scale 0.9 the fp32 *reference* is
 
 ## 7. Measuring
 
-`benchmarks/bench.py` is the harness (its docstring holds the rules): every Mojo
-arm is an independently loaded copy of the package (`benchmarks/arms.py`) --
-`mojo_new` and `mojo_ctrl` (a second copy: the noise floor) -- plus torch SDPA
-(the flash reference) and the pinned vLLM build (the paged reference), interleaved
-with rotated order, minimum as the statistic, raw samples kept, every arm's
-output validated, the environment recorded in the JSON. Each arm stages its own
-cache through its own `reshape_and_cache`; repeated appends rewrite the same
-slot. `scripts/pin_governor.sh` pins `performance` and restores each CPU's
-original setting. Paged rows on a laptop or desktop can use 40-call blocks (`--block-calls 40`), which keep a
-single power state; the reported runs are on GCP VMs and use one call per sample.
-
-For an optimization A/B, save the previous package's Python files and shared
-libraries, then pass `--previous /path/to/saved/package`. This loads the previous
-build twice independently (`mojo_previous`, `mojo_ctrl`); their spread defines
-the control uncertainty, not the candidate's improvement. Reports fingerprint
-the Python files, shared libraries, kernel sources, manifest, lockfile and build
-scripts.
-Store-only rows start with poisoned caches, and self-attention rows stage a
-poisoned append slot, so missing writes cannot pass merely because setup already
-wrote the expected data.
-Store validation reads the logical K/V elements directly and requires exact
-copies; vLLM's store, whose layout is its own, is judged by decoding from it.
-Use `--load-seed` to repeat with different reproducible module-load and cache
-allocation orders.
+`benchmarks/BENCHMARK.md` describes the benchmark: the Python API of each
+library, cold L2/L3 before every call, 3 warmup + 10 samples interleaved across
+arms, the median with min and max. `--compare <package dir>` adds another build
+of the package to the same process for an A/B (a private copy, imported under its
+own name, so the two share no module state or `dlopen` handle).
+`scripts/pin_governor.sh` pins `performance` on a laptop or desktop and restores
+each CPU's original setting. Ledger entries below that cite "full manifest",
+`mojo_ctrl`, verdict counts or cold/warm rows were measured with the previous
+harness (170 rows, an independent control copy, the minimum of 41-121 samples);
+it is in git history before the restructure.
 
 ## 8. Defects found and fixed (each has a regression test)
 
