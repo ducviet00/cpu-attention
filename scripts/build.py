@@ -31,7 +31,9 @@ def _run(*args: str) -> None:
 
 
 def _libgomp_flags(with_torch: bool = False) -> list[str] | None:
-    """Linker flags for libgomp (and torch libs for the shared object)."""
+    """Linker flags for libgomp (torch's bundled copy, else the system one), and
+    for the extension the torch libraries its output allocation calls
+    (`aoti_torch_empty_strided`, `THPVariable_Wrap`)."""
     try:
         import torch
 
@@ -47,13 +49,8 @@ def _libgomp_flags(with_torch: bool = False) -> list[str] | None:
         else:
             return None
         if with_torch:
-            flags += [
-                "-Xlinker", f"-L{lib}",
-                "-Xlinker", f"-rpath={lib}",
-                "-Xlinker", "-ltorch_python",
-                "-Xlinker", "-ltorch_cpu",
-                "-Xlinker", "-lc10",
-            ]
+            flags += ["-Xlinker", f"-L{lib}", "-Xlinker", f"-rpath={lib}",
+                      "-Xlinker", "-ltorch_python", "-Xlinker", "-ltorch_cpu", "-Xlinker", "-lc10"]
         return flags
     except ImportError:
         pass
@@ -102,7 +99,7 @@ def main() -> None:
     # symbol: omp_get_thread_num". Same soname either way, so the loader reuses
     # torch's copy when it is already in the process.
     flags = _libgomp_flags(with_torch=True)
-    test_flags = _libgomp_flags(with_torch=False) or []
+    test_flags = _libgomp_flags() or []
     if flags is None:
         print("warning: no libgomp found; the extension may not import")
         flags = []

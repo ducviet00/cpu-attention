@@ -18,23 +18,13 @@ apple_amx_intrinsics.mojo` emits raw `.word` encodings through
 Tile numbers are compile-time parameters interpolated into the asm string, so
 one call site serves every tile — no 8^3 variants.
 
-**The one thing to be careful about** is that LLVM does not track tile registers,
-so it will happily hoist a `tileloadd` above a `tdpbf16ps` that still reads that
-tile (a WAR hazard, silently wrong results). Every memory-touching primitive
-here therefore carries a `~{memory}` clobber, and `tdpbf16ps` does too: correct
-but conservative, and the reason a Mojo AMX kernel must be A/B'd against the C
-one rather than assumed equal. Loads and dots are already ordered in this
-kernel, so the cost is software-pipelining opportunity, not correctness.
-
-Verified compile-time only here (`mojo build --emit asm --target-cpu
-sapphirerapids`): the emitted assembly contains the instructions above.
-`test_amx_mojo.mojo` runs a 16x16x32 bf16 GEMM against a scalar reference and
-needs an AMX CPU, i.e. run it on the Xeon box.
+LLVM does not track tile registers, so it would hoist a `tileloadd` above a
+`tdpbf16ps` that still reads that tile (a WAR hazard, silently wrong results).
+Every memory-touching primitive therefore carries a `~{memory}` clobber, and
+`tdpbf16ps` does too: correct but conservative (the cost is software-pipelining
+opportunity). `tests/test_flash.py` exercises the AMX policy on AMX CPUs.
 """
 
-from std.ffi import external_call
-from std.memory import MutPointer, stack_allocation
-from std.origin import MutUntrackedOrigin
 from std.os import abort
 from std.sys import inlined_assembly
 from std.sys.info import CompilationTarget
@@ -62,52 +52,6 @@ def _tmm[i: Int]() -> StaticString:
     abort("AMX tile index out of range")
 
 
-comptime PALETTE_BF16 = 1
-"""Tile palette: 1 = bf16 rows (64 bytes = 32 bf16 per tile row)."""
-
-
-def amx_init() -> Bool:
-    """Ask the kernel for tile-data permission; False means AMX is unusable.
-
-    Required before any tile instruction (`#XF` state is off by default), and
-    it is per thread, so each worker calls this once.
-    """
-    comptime if not CompilationTarget.is_x86():
-        return False
-    comptime ARCH_REQ_XCOMP_PERM = 0x1023
-    comptime XFEATURE_XTILEDATA = 18
-    return (
-        Int(
-            external_call["syscall", Int, Int64, Int64, Int64](
-                Int64(158),  # SYS_arch_prctl on x86_64 (157 is prctl)
-                Int64(ARCH_REQ_XCOMP_PERM),
-                Int64(XFEATURE_XTILEDATA),
-            )
-        )
-        == 0
-    )
-
-
-def tile_config_bf16(
-    rows: Int, colsb: Int, cfg: MutPointer[UInt8, MutUntrackedOrigin]
-) -> None:
-    """Fill a 64-byte tile config for `rows` tiles of `colsb` bytes each.
-
-    The layout that matters (and that cost the x86 agent an hour): palette at
-    byte 0, `colsb[8]` are **uint16** at offset 16, `rows[8]` are **uint8** at
-    offset 48. Writing colsb as bytes makes `ldtilecfg` fault.
-    """
-    for i in range(64):
-        cfg.unsafe_store(i, UInt8(0))
-    cfg.unsafe_store(0, UInt8(PALETTE_BF16))
-    for i in range(8):
-        var c16 = MutPointer[UInt16, MutUntrackedOrigin](
-            unsafe_from_address=Int(cfg) + 16
-        )
-        c16.unsafe_store(i, UInt16(colsb))
-        cfg.unsafe_store(48 + i, UInt8(rows))
-
-
 @always_inline
 def tile_cfg_load(cfg: Int) -> None:
     """`ldtilecfg` from a 64-byte, 64-byte-aligned config."""
@@ -118,18 +62,6 @@ def tile_cfg_load(cfg: Int) -> None:
             constraints="r,~{memory}",
             has_side_effect=True,
         ](cfg)
-
-
-@always_inline
-def tile_release() -> None:
-    """`tilerelease`: drop the config (must be re-established afterwards)."""
-    comptime if CompilationTarget.is_x86():
-        inlined_assembly[
-            "tilerelease",
-            NoneType,
-            constraints="~{memory}",
-            has_side_effect=True,
-        ]()
 
 
 @always_inline
