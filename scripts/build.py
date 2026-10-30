@@ -87,12 +87,23 @@ def _arch() -> str:
 
 
 def main() -> None:
-    mojo = shutil.which("mojo")
+    # In a package build (setup.py) the `mojo` wheel's binary sits next to the
+    # build environment's Python rather than on PATH.
+    beside = os.path.join(os.path.dirname(sys.executable), "mojo")
+    mojo = shutil.which("mojo") or (beside if os.path.exists(beside) else None)
     if mojo is None:
         raise SystemExit(
             "mojo not found: run `uv sync --extra build` first, or "
             "`uv run --extra build python scripts/build.py`"
         )
+    try:
+        import torch  # noqa: F401  (the extension links the torch it will run with)
+    except ImportError:
+        raise SystemExit(
+            "building cpu_attention needs torch in the build environment: the "
+            "extension links the torch it runs with. Install with "
+            "`--no-build-isolation`, or with uv's extra-build-dependencies "
+            "(`{ requirement = \"torch\", match-runtime = true }`)") from None
     # Link libgomp into the extension instead of leaving `omp_*` undefined for
     # load time: on x86 torch happens to bring a global copy, but on aarch64 its
     # bundled libgomp.so.1 is RTLD_LOCAL, so `import` fails with "undefined

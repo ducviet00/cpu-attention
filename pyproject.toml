@@ -1,5 +1,7 @@
 [build-system]
-requires = ["setuptools>=61"]
+# The Mojo compiler builds the kernel during the package build (setup.py); torch
+# must come from the installing environment (see README, "Install").
+requires = ["setuptools>=61", "mojo==1.2.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
