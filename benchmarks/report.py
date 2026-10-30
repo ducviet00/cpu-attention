@@ -8,6 +8,18 @@ import argparse
 import json
 
 
+def label(kind, shape):
+    """A row's shape in SDPA's legend: N batch, L query length, S key/value length,
+    H heads (MHA: query and key/value heads alike), E head dim. Prefill rows mark
+    `causal`; decode rows store the new token's K/V in the call unless marked
+    `no append`."""
+    n, s, h, e, flag = shape
+    if kind == "flash":
+        return f"N={n} L={s} S={s} H={h} E={e}" + (" causal" if flag else "")
+    s = f"{min(s)}..{max(s)}" if isinstance(s, list) else s
+    return f"N={n} L=1 S={s} H={h} E={e}" + ("" if flag else " no append")
+
+
 def us(t):
     return f"{t:,.0f}" if t >= 100 else f"{t:.1f}"
 
@@ -19,7 +31,8 @@ def spread(t):
 def summary(runs):
     """Per kind and dtype: one row per shape, one column per machine."""
     machines = [r["environment"]["machine"] for r in runs]
-    names = list(dict.fromkeys((x["kind"], x["name"]) for r in runs for x in r["rows"]))
+    names = list(dict.fromkeys((x["kind"], label(x["kind"], x["shape"])) for r in runs
+                               for x in r["rows"]))
     out = []
     for kind, ref in (("flash", "SDPA"), ("paged", "vLLM")):
         for dt in ("bf16", "fp32"):
@@ -33,7 +46,7 @@ def summary(runs):
                     continue
                 cells = []
                 for r in runs:
-                    row = next((x for x in r["rows"] if x["name"] == name and
+                    row = next((x for x in r["rows"] if label(x["kind"], x["shape"]) == name and
                                 x["dtype"] == dt), None)
                     if row is None or not row["ref"]:
                         cells.append("-")
@@ -64,7 +77,7 @@ def full(runs):
             for x in rows:
                 cells = [spread(x["timing"][a]) if a in x["timing"] else "-" for a in arms]
                 ratio = f"{x['ratio']:.2f}" if x.get("ratio") else "-"
-                out.append(f"| {x['name']} | {x['dtype']} | " + " | ".join(cells) +
+                out.append(f"| {label(x['kind'], x['shape'])} | {x['dtype']} | " + " | ".join(cells) +
                            f" | {ratio} |")
             out.append("")
     return "\n".join(out)
