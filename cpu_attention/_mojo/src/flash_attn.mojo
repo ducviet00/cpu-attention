@@ -18,12 +18,13 @@ threads share one head's slab through the LLC).
 """
 
 from std.atomic import Atomic
+from std.math import align_up, ceildiv
 from std.memory import stack_allocation
+from std.sys import size_of
 
-from isa import LANES, LOG2E, ptr
+from isa import LANES, LOG2E, NEG_INF, ptr
 from parallel import barrier, parallel
 
-comptime NEG = -Float32.MAX
 comptime V = SIMD[DType.float32, LANES]
 
 
@@ -117,11 +118,10 @@ trait FlashPolicy:
 
 def aux_bytes[P: FlashPolicy](rq: Int) -> Int:
     """Per-thread scratch: tile scratch | accumulator | m, l, alpha."""
-    var arows = (rq + P.RQT - 1) // P.RQT * P.RQT
-    var n = P.tile_bytes() + arows * P.HD * 4 + 3 * rq * 4
+    var n = P.tile_bytes() + align_up(rq, P.RQT) * P.HD * 4 + 3 * rq * 4
     # 64-byte multiples: the split order's work counter (an Int64 atomic) sits
     # after the per-thread scratch, and aarch64 atomics fault when misaligned.
-    return (n + 63) // 64 * 64
+    return align_up(n, 64)
 
 
 def _attend[
@@ -131,11 +131,11 @@ def _attend[
     comptime hd = P.HD
     comptime RQT = P.RQT
     comptime KT = P.KT
-    comptime E = 2 if dtype == DType.bfloat16 else 4
+    comptime E = size_of[dtype]()
     var q0 = qblk * job.rq
     var nrows = min(job.rq, job.seq_q - q0)
     var acc = aux + P.tile_bytes()
-    var arows = (job.rq + RQT - 1) // RQT * RQT
+    var arows = align_up(job.rq, RQT)
     var m = acc + arows * hd * 4
     var l = m + job.rq * 4
     var alpha = l + job.rq * 4
@@ -147,7 +147,7 @@ def _attend[
         for i in range(0, arows * hd, LANES):
             accp.unsafe_store[width=LANES](i, V(0))
     for r in range(nrows):
-        ptr[Float32](m).unsafe_store(r, NEG)
+        ptr[Float32](m).unsafe_store(r, NEG_INF)
         ptr[Float32](l).unsafe_store(r, 0)
     var qbase = job.q + (b * job.qb + q0 * job.qt + h * job.qh) * E
     var empty = job.causal and limit0 + nrows - 1 < 0
@@ -188,7 +188,7 @@ def _attend[
 # ---------------------------------------------------------------------------
 def _body[P: FlashPolicy](ctx: Int, tid: Int, threads: Int):
     var job = ptr[FlashJob](ctx)[]
-    var nqb = (job.seq_q + job.rq - 1) // job.rq
+    var nqb = ceildiv(job.seq_q, job.rq)
     var nbh = job.batch * job.heads
     var cells = threads if job.fuse else nbh
     var aux = job.ws + cells * job.slab + tid * job.aux

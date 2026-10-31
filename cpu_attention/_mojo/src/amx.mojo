@@ -25,7 +25,7 @@ Every memory-touching primitive therefore carries a `~{memory}` clobber, and
 opportunity). `tests/test_flash.py` exercises the AMX policy on AMX CPUs.
 """
 
-from std.os import abort
+from std.collections.string.string_span import get_static_string
 from std.sys import inlined_assembly
 from std.sys.info import CompilationTarget
 
@@ -33,23 +33,8 @@ from std.sys.info import CompilationTarget
 @always_inline
 def _tmm[i: Int]() -> StaticString:
     """``%tmm<i>`` for a compile-time tile index."""
-    comptime if i == 0:
-        return "%tmm0"
-    comptime if i == 1:
-        return "%tmm1"
-    comptime if i == 2:
-        return "%tmm2"
-    comptime if i == 3:
-        return "%tmm3"
-    comptime if i == 4:
-        return "%tmm4"
-    comptime if i == 5:
-        return "%tmm5"
-    comptime if i == 6:
-        return "%tmm6"
-    comptime if i == 7:
-        return "%tmm7"
-    abort("AMX tile index out of range")
+    comptime assert 0 <= i < 8, "AMX has tiles 0-7"
+    return get_static_string["%tmm", String(i)]()
 
 
 @always_inline
@@ -112,9 +97,7 @@ def tile_dpbf16ps[dst: Int, a: Int, b: Int]() -> None:
     # alternative. Writing the destination first assembles fine and silently
     # computes `b += a * dst_old`, which measured as "C is all zeros" in the
     # smoke test (tmm2 was the zeroed accumulator and also a source).
-    comptime asm = (
-        "tdpbf16ps " + _tmm[b]() + ", " + _tmm[a]() + ", " + _tmm[dst]()
-    )
+    comptime asm = "tdpbf16ps " + _tmm[b]() + ", " + _tmm[a]() + ", " + _tmm[dst]()
     # No `~{memory}` here: the dot touches no memory, and the clobber cost 10-28%
     # in the kernel (it forces the compiler to treat every dot as a full barrier,
     # so the surrounding loads/stores cannot be scheduled around it). Ordering is

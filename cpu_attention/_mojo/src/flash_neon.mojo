@@ -19,11 +19,12 @@ Packed slab (per batch, head; keys padded to 16):
      reads one linear stream, 64 B per 4 keys.
 """
 
+from std.math import align_up
 from std.memory import bitcast
 from std.sys import llvm_intrinsic
 
-from flash_attn import FlashJob, FlashPolicy, NEG
-from isa import exp2, online_max, ptr, vmax
+from flash_attn import FlashJob, FlashPolicy
+from isa import NEG_INF, exp2, online_max, ptr, vmax
 
 comptime F4 = SIMD[DType.float32, 4]
 comptime B8 = SIMD[DType.bfloat16, 8]
@@ -35,20 +36,10 @@ comptime PAD = 16  # slab keys are padded to a multiple of this
 
 
 @always_inline
-def _pad(n: Int) -> Int:
-    return (n + PAD - 1) // PAD * PAD
-
-
-@always_inline
 def _bfmmla(acc: F4, a: B8, b: B8) -> F4:
     return llvm_intrinsic[
         "llvm.aarch64.neon.bfmmla", F4, has_side_effect=False
     ](acc, a, b)
-
-
-@always_inline
-def _ninf() -> F4:
-    return F4(bitcast[DType.float32, 1](SIMD[DType.uint32, 1](0xFF800000))[0])
 
 
 @always_inline
@@ -71,7 +62,7 @@ def _bf16(e: F4) -> SIMD[DType.uint16, 4]:
 def _pack[hd: Int](job: FlashJob, b: Int, h: Int, slab: Int):
     comptime DG = hd // 4
     var n = job.seq_k
-    var pad = _pad(n)
+    var pad = align_up(n, PAD)
     var ks = ptr[BFloat16](job.k + (b * job.kb + h * job.kh) * 2)
     var vs = ptr[BFloat16](job.v + (b * job.vb + h * job.vh) * 2)
     var kd = ptr[BFloat16](slab)
@@ -83,34 +74,16 @@ def _pack[hd: Int](job: FlashJob, b: Int, h: Int, slab: Int):
     while t0 < pad:
         var blk = kd + ((t0 >> 3) * DG * 4 + ((t0 >> 1) & 3)) * 8
         comptime for dg2 in range(0, DG, 2):
-            var r0 = zero
-            var r1 = zero
-            var r2 = zero
-            var r3 = zero
-            if t0 < n:
-                r0 = (ks + t0 * job.kt).unsafe_load[width=8](dg2 * 4)
-            if t0 + 1 < n:
-                r1 = (ks + (t0 + 1) * job.kt).unsafe_load[width=8](dg2 * 4)
-            if t0 + 2 < n:
-                r2 = (ks + (t0 + 2) * job.kt).unsafe_load[width=8](dg2 * 4)
-            if t0 + 3 < n:
-                r3 = (ks + (t0 + 3) * job.kt).unsafe_load[width=8](dg2 * 4)
-            blk.unsafe_store[width=8](
-                dg2 * 32,
-                r0.slice[4, offset=0]().join(r1.slice[4, offset=0]()),
-            )
-            blk.unsafe_store[width=8](
-                dg2 * 32 + 8,
-                r2.slice[4, offset=0]().join(r3.slice[4, offset=0]()),
-            )
-            blk.unsafe_store[width=8](
-                (dg2 + 1) * 32,
-                r0.slice[4, offset=4]().join(r1.slice[4, offset=4]()),
-            )
-            blk.unsafe_store[width=8](
-                (dg2 + 1) * 32 + 8,
-                r2.slice[4, offset=4]().join(r3.slice[4, offset=4]()),
-            )
+            var r = Array[B8, 4](fill=zero)  # dims dg2*4 .. +7 of keys t0 .. t0+3
+            comptime for i in range(4):
+                if t0 + i < n:
+                    r[i] = (ks + (t0 + i) * job.kt).unsafe_load[width=8](dg2 * 4)
+            comptime for g in range(2):  # dim group dg2 + g
+                comptime for p in range(2):  # key pair (t0 + 2p, t0 + 2p + 1)
+                    blk.unsafe_store[width=8](
+                        (dg2 + g) * 32 + p * 8,
+                        r[2 * p].slice[4, offset = 4 * g]().join(r[2 * p + 1].slice[4, offset = 4 * g]()),
+                    )
         t0 += 4
     # V: [chunk of 8 dims][key group][4 dim pairs][8]; a dim pair holds, for
     # each of its two dims, the four keys of the group.
@@ -118,31 +91,19 @@ def _pack[hd: Int](job: FlashJob, b: Int, h: Int, slab: Int):
     for kg in range(kgn):
         var t = kg * 4
         comptime for dc in range(hd // 8):
-            var r0 = zero
-            var r1 = zero
-            var r2 = zero
-            var r3 = zero
-            if t < n:
-                r0 = (vs + t * job.vt).unsafe_load[width=8](dc * 8)
-            if t + 1 < n:
-                r1 = (vs + (t + 1) * job.vt).unsafe_load[width=8](dc * 8)
-            if t + 2 < n:
-                r2 = (vs + (t + 2) * job.vt).unsafe_load[width=8](dc * 8)
-            if t + 3 < n:
-                r3 = (vs + (t + 3) * job.vt).unsafe_load[width=8](dc * 8)
-            var z01 = r0.interleave(r1)  # (k0 k1) per dim, dims 0..7
-            var z23 = r2.interleave(r3)
-            var a = bitcast[DType.uint32, 4](z01.slice[8, offset=0]())  # dims 0-3
-            var bb = bitcast[DType.uint32, 4](z01.slice[8, offset=8]())  # dims 4-7
-            var c = bitcast[DType.uint32, 4](z23.slice[8, offset=0]())
-            var e = bitcast[DType.uint32, 4](z23.slice[8, offset=8]())
+            var r = Array[B8, 4](fill=zero)  # dims dc*8 .. +7 of keys t .. t+3
+            comptime for i in range(4):
+                if t + i < n:
+                    r[i] = (vs + (t + i) * job.vt).unsafe_load[width=8](dc * 8)
+            var z01 = r[0].interleave(r[1])  # (k0 k1) per dim, dims 0..7
+            var z23 = r[2].interleave(r[3])
             var dst = vd + (dc * kgn + kg) * 32
-            var p0 = a.interleave(c)  # (a0 c0 a1 c1 | a2 c2 a3 c3)
-            var p1 = bb.interleave(e)
-            dst.unsafe_store[width=8](0, bitcast[DType.bfloat16, 16](p0).slice[8, offset=0]())
-            dst.unsafe_store[width=8](8, bitcast[DType.bfloat16, 16](p0).slice[8, offset=8]())
-            dst.unsafe_store[width=8](16, bitcast[DType.bfloat16, 16](p1).slice[8, offset=0]())
-            dst.unsafe_store[width=8](24, bitcast[DType.bfloat16, 16](p1).slice[8, offset=8]())
+            comptime for g in range(2):  # dims 0-3, then 4-7
+                var a = bitcast[DType.uint32, 4](z01.slice[8, offset = 8 * g]())
+                var c = bitcast[DType.uint32, 4](z23.slice[8, offset = 8 * g]())
+                var p = bitcast[DType.bfloat16, 16](a.interleave(c))  # (a0 c0 a1 c1 | a2 c2 a3 c3)
+                dst.unsafe_store[width=8](16 * g, p.slice[8, offset=0]())
+                dst.unsafe_store[width=8](16 * g + 8, p.slice[8, offset=8]())
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +119,7 @@ def _qk[
     var kbase = ptr[BFloat16](kd)
     var qpp = ptr[BFloat16](qp)
     var lgp = ptr[Float32](lg)
-    var ninf = _ninf()
+    var ninf = F4(NEG_INF)
     var mx = Array[F4, RP](fill=ninf)
     var j = 0
     while j < nk:
@@ -253,32 +214,26 @@ def _softmax[
     var s = F4(0)
     var dead = SIMD[DType.bool, 4](fill=False)
     comptime if FIX:
-        dead = mt.eq(_ninf())
+        dead = mt.eq(NEG_INF)
     for blk in range(nblk):
-        var e0 = exp2[2, 4](lgp.unsafe_load[width=4](blk * 16).fma(c4, off))
-        var e1 = exp2[2, 4](lgp.unsafe_load[width=4](blk * 16 + 4).fma(c4, off))
-        var e2 = exp2[2, 4](lgp.unsafe_load[width=4](blk * 16 + 8).fma(c4, off))
-        var e3 = exp2[2, 4](lgp.unsafe_load[width=4](blk * 16 + 12).fma(c4, off))
+        # 8 keys of the row pair: four tiles (r0 k2i k2i+1, r1 k2i k2i+1).
+        var e = Array[F4, 4](uninitialized=True)
+        var q = Array[SIMD[DType.uint32, 2], 4](uninitialized=True)
+        comptime for i in range(4):
+            e[i] = exp2[2, 4](lgp.unsafe_load[width=4](blk * 16 + 4 * i).fma(c4, off))
         comptime if FIX:
             # A row that sees no key in this tile contributes exactly 0.
-            e0 = dead.select(F4(0), e0)
-            e1 = dead.select(F4(0), e1)
-            e2 = dead.select(F4(0), e2)
-            e3 = dead.select(F4(0), e3)
-        s += (e0 + e1) + (e2 + e3)
-        var q0 = bitcast[DType.uint32, 2](_bf16(e0))
-        var q1 = bitcast[DType.uint32, 2](_bf16(e1))
-        var q2 = bitcast[DType.uint32, 2](_bf16(e2))
-        var q3 = bitcast[DType.uint32, 2](_bf16(e3))
+            comptime for i in range(4):
+                e[i] = dead.select(F4(0), e[i])
+        s += (e[0] + e[1]) + (e[2] + e[3])
+        comptime for i in range(4):
+            q[i] = bitcast[DType.uint32, 2](_bf16(e[i]))
         # (r0 k0k1, r1 k0k1) and (r0 k2k3, r1 k2k3) -> r0 k0..k3 | r1 k0..k3
-        pp.unsafe_store[width=8](
-            ((2 * blk) * RP + rp) * 8,
-            bitcast[DType.bfloat16, 8](q0.interleave(q1)),
-        )
-        pp.unsafe_store[width=8](
-            ((2 * blk + 1) * RP + rp) * 8,
-            bitcast[DType.bfloat16, 8](q2.interleave(q3)),
-        )
+        comptime for h in range(2):
+            pp.unsafe_store[width=8](
+                ((2 * blk + h) * RP + rp) * 8,
+                bitcast[DType.bfloat16, 8](q[2 * h].interleave(q[2 * h + 1])),
+            )
     lp.unsafe_store(r0, lp.unsafe_load(r0) * a4[0] + (s[0] + s[1]))
     if live:
         lp.unsafe_store(r1, lp.unsafe_load(r1) * a4[2] + (s[2] + s[3]))
@@ -364,7 +319,7 @@ def _tile[
     alpha: Int,
 ):
     comptime DG = hd // 4
-    var pad = _pad(job.seq_k)
+    var pad = align_up(job.seq_k, PAD)
     var lg = scratch
     var pb = scratch + LG_BYTES
     var qp = pb + P_BYTES
@@ -389,7 +344,7 @@ def _tile[
         var mxv = mxp.unsafe_load[width=4](rp * 4)
         # A row is dead when it sees no key in this tile (both lanes -inf).
         var mt = vmax[4](mxv, _swap(mxv))
-        var any_dead = mt.eq(_ninf()).reduce_or()
+        var any_dead = mt.eq(NEG_INF).reduce_or()
         if any_dead:
             _softmax[RP, True](lg, pb, mxv, rp, nblk, c, sub, m, l, alpha)
         else:
@@ -406,7 +361,7 @@ struct NeonMmlaPolicy[hd: Int](FlashPolicy):
 
     @staticmethod
     def slab_bytes(seq_k: Int) -> Int:
-        return 2 * _pad(seq_k) * Self.hd * 2
+        return 2 * align_up(seq_k, PAD) * Self.hd * 2
 
     @staticmethod
     def tile_bytes() -> Int:
