@@ -11,24 +11,22 @@ from the request would leave work unexecuted.
 """
 
 from std.ffi import external_call
-from std.memory import MutPointer, stack_allocation
-from std.origin import MutUntrackedOrigin
+from std.memory import stack_allocation
+
+from isa import ptr
 
 comptime Body = def(Int, Int, Int) thin -> None
 
 
-struct _Region(ImplicitlyCopyable, Movable):
+@fieldwise_init
+struct _Region(TrivialRegisterPassable):
     var body: Body
     var ctx: Int
-
-    def __init__(out self, body: Body, ctx: Int):
-        self.body = body
-        self.ctx = ctx
 
 
 @export
 def _cpu_attention_region(data: Int) abi("C"):
-    var r = MutPointer[_Region, MutUntrackedOrigin](unsafe_from_address=data)[]
+    var r = ptr[_Region](data)[]
     var threads = Int(external_call["omp_get_num_threads", Int32]())
     var tid = Int(external_call["omp_get_thread_num", Int32]())
     r.body(r.ctx, tid, threads)
@@ -41,8 +39,7 @@ def parallel(body: Body, ctx: Int, workers: Int):
         return
     var st = stack_allocation[1, _Region]()
     st[] = _Region(body, ctx)
-    comptime entry = _cpu_attention_region
-    external_call["GOMP_parallel", NoneType](entry, Int(st), Int32(workers), Int32(0))
+    external_call["GOMP_parallel", NoneType](_cpu_attention_region, Int(st), Int32(workers), Int32(0))
 
 
 @always_inline

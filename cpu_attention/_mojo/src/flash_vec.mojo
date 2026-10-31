@@ -9,11 +9,12 @@ P@V. Q@K^T is an RQT-row x LANES-key register tile; P@V an RQT-row x 2*LANES-dim
 tile.
 """
 
-from std.math import iota
+from std.math import align_up, iota
 from std.memory import bitcast
+from std.sys import size_of
 
-from flash_attn import FlashJob, FlashPolicy, NEG, V
-from isa import BCAST_FOLD, LANES, dot_bf16, exp2, online_max, ptr, transpose, vmax
+from flash_attn import FlashJob, FlashPolicy, V
+from isa import BCAST_FOLD, LANES, NEG_INF, dot_bf16, exp2, online_max, ptr, transpose, vmax
 
 comptime KP = 64  # keys per K^T block
 comptime KT = 256  # keys per softmax tile
@@ -32,11 +33,6 @@ comptime QPANEL = not BCAST_FOLD
 
 
 @always_inline
-def _pad(n: Int) -> Int:
-    return (n + KP - 1) // KP * KP
-
-
-@always_inline
 def _k_off[dtype: DType, hd: Int](j: Int, d: Int) -> Int:
     """Element offset of key j, dim d in the K^T slab."""
     comptime if dtype == DType.bfloat16:
@@ -49,9 +45,9 @@ def _k_off[dtype: DType, hd: Int](j: Int, d: Int) -> Int:
 # pack
 # ---------------------------------------------------------------------------
 def _pack[dtype: DType, hd: Int](job: FlashJob, b: Int, h: Int, slab: Int):
-    comptime E = 2 if dtype == DType.bfloat16 else 4
+    comptime E = size_of[dtype]()
     comptime BF = dtype == DType.bfloat16
-    var pad = _pad(job.seq_k)
+    var pad = align_up(job.seq_k, KP)
     var ks = ptr[Scalar[dtype]](job.k + (b * job.kb + h * job.kh) * E)
     var vs = ptr[Scalar[dtype]](job.v + (b * job.vb + h * job.vh) * E)
     var kd = ptr[Scalar[dtype]](slab)
@@ -123,12 +119,11 @@ def _qk[
 ):
     """Query rows are `qs` elements apart. Also writes each row's tile maximum
     to `tmax` (the softmax then skips its max pass over the tile)."""
-    comptime BF = dtype == DType.bfloat16
     # bf16 K is stored as dim pairs on every tier, so bf16 always goes through
     # `dot_bf16` (one instruction with AVX-512-BF16/NEON-BF16, widened otherwise).
-    comptime DOT = BF
+    comptime DOT = dtype == DType.bfloat16
     var kend = k0 + nkeys
-    var mx = Array[V, ROWS](fill=V(NEG))
+    var mx = Array[V, ROWS](fill=V(NEG_INF))
     var lim = min(kend, limit0 + 1)
     var lg = ptr[Float32](logits)
     var j = 0
@@ -205,7 +200,7 @@ def _qk[
                 comptime for r in range(ROWS):
                     if r < nrows:
                         var bad = past | rel.gt(SIMD[DType.int32, LANES](Int32(r)))
-                        var x = bad.select(V(NEG), c[r * KV + i])
+                        var x = bad.select(V(NEG_INF), c[r * KV + i])
                         lg.unsafe_store[width=LANES](r * KT + j + i * LANES, x)
                         mx[r] = vmax[LANES](mx[r], x)
         j += KV * LANES
@@ -231,11 +226,10 @@ def _softmax[
         var row = lg + r * KT
         var tm = ap.unsafe_load(r)  # the tile max `_qk` left here
         var j = 0
-        if tm == NEG:
+        if tm == NEG_INF:
             # No visible key in this tile (a causal row inside a register tile
-            # whose last row does see keys): zero what P@V reads. Going through
-            # exp2 would compare two roundings of -MAX*c, whose difference is far
-            # outside exp2's range in either direction.
+            # whose last row does see keys): zero what P@V reads. Through exp2,
+            # a row whose running max is still -inf would get -inf - -inf = NaN.
             ap.unsafe_store(r, 1.0)
             while j < nkeys:
                 comptime if BF:
@@ -409,7 +403,7 @@ struct VecPolicy[dtype: DType, hd: Int](FlashPolicy):
 
     @staticmethod
     def slab_bytes(seq_k: Int) -> Int:
-        return 2 * _pad(seq_k) * Self.hd * (2 if Self.dtype == DType.bfloat16 else 4)
+        return 2 * align_up(seq_k, KP) * Self.hd * size_of[Self.dtype]()
 
     @staticmethod
     def tile_bytes() -> Int:
@@ -439,8 +433,8 @@ struct VecPolicy[dtype: DType, hd: Int](FlashPolicy):
         l: Int,
         alpha: Int,
     ):
-        comptime E = 2 if Self.dtype == DType.bfloat16 else 4
-        var vsrc = slab + _pad(job.seq_k) * Self.hd * E
+        comptime E = size_of[Self.dtype]()
+        var vsrc = slab + align_up(job.seq_k, KP) * Self.hd * E
         var vstride = Self.hd
         if job.v_direct:
             vsrc = job.v + (b * job.vb + h * job.vh) * E

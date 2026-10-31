@@ -8,6 +8,7 @@ raises the precise error, or copies and calls again.
 """
 
 from std.ffi import external_call
+from std.math import align_up, ceildiv
 from std.os import abort
 from std.python import Python, PythonObject
 from std.python.bindings import PythonModuleBuilder
@@ -45,10 +46,23 @@ def _workers(rt: Int, tasks: Int, pages: Int) -> Int:
     return 1 if n > 1 and tasks * pages <= 32 else max(n, 1)
 
 
+def _is(rt: Int, obj: PythonObject, slot: Int) -> Bool:
+    """`obj` is the Python object (None, True, False) the config slot holds."""
+    return Int(obj._obj_ptr) == cfg(rt, slot)
+
+
 def _dtype(rt: Int, t: Tensor) -> Int:
     """0 fp32, 1 bf16, -1 anything else."""
     var code = t.dtype()
     return 0 if code == cfg(rt, F32) else (1 if code == cfg(rt, BF16) else -1)
+
+
+def _itemsize(dt: Int) -> Int:
+    return 2 if dt == 1 else 4
+
+
+def _hd_ok(hd: Int) -> Bool:
+    return hd == 32 or hd == 64 or hd == 128
 
 
 def _rows_ok(t: Tensor, hd: Int) -> Bool:
@@ -59,11 +73,8 @@ def _rows_ok(t: Tensor, hd: Int) -> Bool:
 
 def _caches_ok(kc: Tensor, vc: Tensor, code: Int, heads: Int, hd: Int) -> Bool:
     """`[blocks, heads, page, dim]`, contiguous, matching, page a multiple of 16."""
-    if not (kc.ok() and vc.ok()) or kc.dim() != 4 or vc.dim() != 4:
+    if not (kc.ok() and vc.ok()) or kc.dim() != 4 or not vc.same_sizes(kc):
         return False
-    for i in range(4):
-        if vc.size(i) != kc.size(i):
-            return False
     return (kc.dtype() == code and vc.dtype() == code and kc.size(1) == heads
             and kc.size(3) == hd and kc.size(2) > 0 and kc.size(2) % 16 == 0
             and kc.contiguous() and vc.contiguous())
@@ -91,12 +102,11 @@ def decode(
     store), or appended at `lens` (the length before). Writes `dst` when given,
     else a new tensor; returns it, or None (see the module docstring)."""
     var r = Int(py=rt)
-    var none = cfg(r, NONE)
-    var qt = Tensor.of(r, Int(q._obj_ptr))
-    var kc = Tensor.of(r, Int(k_cache._obj_ptr))
-    var vc = Tensor.of(r, Int(v_cache._obj_ptr))
-    var bt = Tensor.of(r, Int(page_table._obj_ptr))
-    var ln = Tensor.of(r, Int(lens._obj_ptr))
+    var qt = Tensor.of(r, q)
+    var kc = Tensor.of(r, k_cache)
+    var vc = Tensor.of(r, v_cache)
+    var bt = Tensor.of(r, page_table)
+    var ln = Tensor.of(r, lens)
     if not (qt.ok() and bt.ok()):
         return PythonObject(None)
     var nd = qt.dim()
@@ -106,7 +116,7 @@ def decode(
     var heads = qt.size(nd - 2)
     var hd = qt.size(nd - 1)
     var dt = _dtype(r, qt)
-    if dt < 0 or (hd != 32 and hd != 64 and hd != 128) or not _rows_ok(qt, hd):
+    if dt < 0 or not _hd_ok(hd) or not _rows_ok(qt, hd):
         return PythonObject(None)
     if not _caches_ok(kc, vc, qt.dtype(), heads, hd):
         return PythonObject(None)
@@ -116,22 +126,19 @@ def decode(
     var width = bt.size(1)
     if not _int_vector(r, ln, I32, b):
         return PythonObject(None)
-    var do_store = Int(k._obj_ptr) != none
-    var kt = Tensor.of(r, Int(k._obj_ptr))
-    var vt = Tensor.of(r, Int(v._obj_ptr))
+    var do_store = not _is(r, k, NONE)
+    var kt = Tensor.of(r, k)
+    var vt = Tensor.of(r, v)
     if do_store:
-        if not (kt.ok() and vt.ok()) or kt.dim() != nd or vt.dim() != nd or kt.dtype() != qt.dtype():
+        if not (kt.ok() and vt.ok() and kt.same_sizes(qt) and vt.same_sizes(qt) and vt.same_strides(kt)):
             return PythonObject(None)
-        for i in range(nd):
-            if kt.size(i) != qt.size(i) or vt.size(i) != qt.size(i) or vt.stride(i) != kt.stride(i):
-                return PythonObject(None)
-        if vt.dtype() != qt.dtype() or not _rows_ok(kt, hd):
+        if kt.dtype() != qt.dtype() or vt.dtype() != qt.dtype() or not _rows_ok(kt, hd):
             return PythonObject(None)
-    elif Int(v._obj_ptr) != none:
+    elif not _is(r, v, NONE):
         return PythonObject(None)
     var sl = 0
-    if Int(slots._obj_ptr) != none:
-        var st = Tensor.of(r, Int(slots._obj_ptr))
+    if not _is(r, slots, NONE):
+        var st = Tensor.of(r, slots)
         if not do_store or not _int_vector(r, st, I64, b):
             return PythonObject(None)
         sl = st.data(8)
@@ -145,23 +152,20 @@ def decode(
         if Int(lp[i]) + extra > width * page:
             return PythonObject(None)
     var out = dst
-    if Int(dst._obj_ptr) == none:
+    if _is(r, dst, NONE):
         var sizes = dims4(b, 1, heads, hd) if nd == 4 else dims4(b, heads, hd)
         out = PythonObject(from_owned=empty(nd, sizes, dt == 1))
-    var ot = Tensor.of(r, Int(out._obj_ptr))
-    if not ot.ok() or ot.dim() != nd or ot.dtype() != qt.dtype() or not ot.contiguous():
+    var ot = Tensor.of(r, out)
+    if not (ot.ok() and ot.same_sizes(qt)) or ot.dtype() != qt.dtype() or not ot.contiguous():
         return PythonObject(None)
-    for i in range(nd):
-        if ot.size(i) != qt.size(i):
-            return PythonObject(None)
-    var e = 2 if dt == 1 else 4
+    var e = _itemsize(dt)
     paged_run(PagedJob(
         q=qt.data(e), k=kt.data(e) if do_store else 0, v=vt.data(e) if do_store else 0,
         k_cache=kc.data(e), v_cache=vc.data(e), out=ot.data(e), slots=sl,
         block_table=bt.data(4), lens=ln.data(4), num_seqs=b, heads=heads, head_dim=hd,
         page=page, bt_stride=width, q_stride=qt.stride(0),
         kv_stride=kt.stride(0) if do_store else 0, out_stride=heads * hd,
-        scale=Float32(Float64(hd) ** -0.5) if Int(scale._obj_ptr) == none else Float32(Float64(py=scale)),
+        scale=Float32(Float64(hd) ** -0.5) if _is(r, scale, NONE) else Float32(Float64(py=scale)),
         dtype=dt, workers=_workers(r, b * heads, max(width, 1)), do_store=do_store, do_attend=True,
     ))
     return out
@@ -178,29 +182,28 @@ def store(
     """`reshape_and_cache`: token i of key/value `[tokens, heads, dim]` goes to
     slot `slots[i]` (int64; negative skips it). True, or None."""
     var r = Int(py=rt)
-    var kt = Tensor.of(r, Int(key._obj_ptr))
-    var vt = Tensor.of(r, Int(value._obj_ptr))
-    var kc = Tensor.of(r, Int(k_cache._obj_ptr))
-    var vc = Tensor.of(r, Int(v_cache._obj_ptr))
-    var st = Tensor.of(r, Int(slots._obj_ptr))
+    var kt = Tensor.of(r, key)
+    var vt = Tensor.of(r, value)
+    var kc = Tensor.of(r, k_cache)
+    var vc = Tensor.of(r, v_cache)
+    var st = Tensor.of(r, slots)
     if not (kt.ok() and vt.ok()) or kt.dim() != 3 or vt.dim() != 3:
         return PythonObject(None)
     var n = kt.size(0)
     var heads = kt.size(1)
     var hd = kt.size(2)
     var dt = _dtype(r, kt)
-    if dt < 0 or (hd != 32 and hd != 64 and hd != 128) or vt.dtype() != kt.dtype() or not _rows_ok(kt, hd):
+    if dt < 0 or not _hd_ok(hd) or vt.dtype() != kt.dtype() or not _rows_ok(kt, hd):
         return PythonObject(None)
-    for i in range(3):
-        if vt.size(i) != kt.size(i) or vt.stride(i) != kt.stride(i):
-            return PythonObject(None)
+    if not (vt.same_sizes(kt) and vt.same_strides(kt)):
+        return PythonObject(None)
     if not _caches_ok(kc, vc, kt.dtype(), heads, hd) or not _int_vector(r, st, I64, n):
         return PythonObject(None)
     var sp = ptr[Int64](st.data(8))
     for i in range(n):
         if Int(sp[i]) >= kc.size(0) * kc.size(2):
             return PythonObject(None)
-    var e = 2 if dt == 1 else 4
+    var e = _itemsize(dt)
     paged_run(PagedJob(
         q=0, k=kt.data(e), v=vt.data(e), k_cache=kc.data(e), v_cache=vc.data(e), out=0,
         slots=Int(sp), block_table=0, lens=0, num_seqs=n, heads=heads, head_dim=hd,
@@ -240,9 +243,9 @@ def flash(
     contiguous) with the workspace at `ws`. Returns the output, the workspace bytes
     it needs when `ws_bytes` is short (an int), or None."""
     var r = Int(py=rt)
-    var qt = Tensor.of(r, Int(q._obj_ptr))
-    var kt = Tensor.of(r, Int(k._obj_ptr))
-    var vt = Tensor.of(r, Int(v._obj_ptr))
+    var qt = Tensor.of(r, q)
+    var kt = Tensor.of(r, k)
+    var vt = Tensor.of(r, v)
     if not (qt.ok() and kt.ok() and vt.ok()) or qt.dim() != 4 or kt.dim() != 4 or vt.dim() != 4:
         return PythonObject(None)
     var b = qt.size(0)
@@ -251,20 +254,18 @@ def flash(
     var heads = qt.size(2)
     var hd = qt.size(3)
     var dt = _dtype(r, qt)
-    if dt < 0 or (hd != 32 and hd != 64 and hd != 128) or sq < 1 or sk < 1:
+    if dt < 0 or not _hd_ok(hd) or sq < 1 or sk < 1:
         return PythonObject(None)
     if kt.size(0) != b or kt.size(2) != heads or kt.size(3) != hd or kt.dtype() != qt.dtype() or vt.dtype() != qt.dtype():
         return PythonObject(None)
-    for i in range(4):
-        if vt.size(i) != kt.size(i):
-            return PythonObject(None)
+    if not vt.same_sizes(kt):
+        return PythonObject(None)
     if qt.stride(3) != 1 or kt.stride(3) != 1 or vt.stride(3) != 1:
         return PythonObject(None)
-    var cp = Int(causal._obj_ptr)
-    if cp != cfg(r, TRUE) and cp != cfg(r, FALSE):
+    var is_causal = _is(r, causal, TRUE)
+    if not (is_causal or _is(r, causal, FALSE)):
         return PythonObject(None)
-    var is_causal = cp == cfg(r, TRUE)
-    var sc = Float64(hd) ** -0.5 if Int(scale._obj_ptr) == cfg(r, NONE) else Float64(py=scale)
+    var sc = Float64(hd) ** -0.5 if _is(r, scale, NONE) else Float64(py=scale)
     # Policy: 0 vector, 1 AMX (fp32 as bf16 hi/lo), 2 aarch64 bfmmla (fp32 on the vector policy).
     var isa = 0
     comptime if NEON_BF16:
@@ -286,12 +287,10 @@ def flash(
     rq = min(rq, sq)
     var floor = 64 if isa == 1 else 16
     var cap = _workers(r, 1 << 30, 1)
-    while rq // 2 >= floor and b * heads * ((sq + rq - 1) // rq) < 8 * cap:
+    while rq // 2 >= floor and b * heads * ceildiv(sq, rq) < 8 * cap:
         rq //= 2
-    var n = _workers(r, b * heads * ((sq + rq - 1) // rq), 8)
-    var sizes = flash_sizes(sk, rq, hd, dt, isa)
-    var slab = sizes[0]
-    var aux = sizes[1]
+    var n = _workers(r, b * heads * ceildiv(sq, rq), 8)
+    var slab, aux = flash_sizes(sk, rq, hd, dt, isa)
     var llc = cfg(r, LLC)
     # Fused (a thread packs a head and attends it, no barrier) while the workers'
     # slabs fit 0.6 of the LLC and the heads divide evenly.
@@ -300,14 +299,14 @@ def flash(
     if need > Int(py=ws_bytes):
         return PythonObject(need)
     var out = PythonObject(from_owned=empty(4, dims4(b, sq, heads, hd), dt == 1))
-    var e = 2 if dt == 1 else 4
+    var e = _itemsize(dt)
     var job = FlashJob(
-        q=qt.data(e), k=kt.data(e), v=vt.data(e), out=Tensor.of(r, Int(out._obj_ptr)).data(e),
+        q=qt.data(e), k=kt.data(e), v=vt.data(e), out=Tensor.of(r, out).data(e),
         batch=b, seq_q=sq, seq_k=sk, heads=heads,
         qb=qt.stride(0), qt=qt.stride(1), qh=qt.stride(2), kb=kt.stride(0), kt=kt.stride(1),
         kh=kt.stride(2), vb=vt.stride(0), vt=vt.stride(1), vh=vt.stride(2),
         ob=sq * heads * hd, ot=heads * hd, oh=hd, causal=is_causal, workers=n, fuse=fuse, rq=rq,
-        ws=(Int(py=ws) + 63) & ~63, slab=slab, aux=aux,
+        ws=align_up(Int(py=ws), 64), slab=slab, aux=aux,
         # fp32 V is read in place while it all fits half the LLC: a copy only
         # buys a unit stride.
         v_direct=dt == 0 and isa == 0 and b * heads * sk * hd * 4 <= llc // 2,
@@ -322,7 +321,7 @@ def probe(rt: PythonObject, t: PythonObject) raises -> PythonObject:
     offset, dims, sizes..., strides..., dtype code] -- plus a new tensor of its
     shape and dtype, for the import-time check in `_kernel.runtime`."""
     var r = Int(py=rt)
-    var x = Tensor.of(r, Int(t._obj_ptr))
+    var x = Tensor.of(r, t)
     var res = Python.list()
     res.append(x.ok())
     if not x.ok():

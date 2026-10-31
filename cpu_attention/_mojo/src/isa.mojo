@@ -7,6 +7,7 @@ features; nothing here probes the running CPU except `amx_permitted` (AMX needs
 OS permission, which only a syscall can ask for).
 """
 
+from std.bit import log2_floor
 from std.ffi import external_call
 from std.memory import MutPointer, bitcast
 from std.origin import MutUntrackedOrigin
@@ -55,6 +56,10 @@ def ptr[T: AnyType](address: Int) -> MutPointer[T, MutUntrackedOrigin]:
 
 
 comptime LOG2E = 1.4426950408889634
+
+comptime NEG_INF = Float32.MIN
+"""-inf (Mojo's `Float32.MAX` is +inf): a masked logit and the running max
+before any key."""
 
 
 @always_inline
@@ -154,8 +159,7 @@ def exp2[
 def transpose[dt: DType](mut r: Array[SIMD[dt, LANES], LANES]):
     """LANES x LANES in registers (any 32-bit lane type): log2(LANES) rounds of
     interleaving row i with row i + LANES/2."""
-    comptime ROUNDS = 4 if LANES == 16 else (3 if LANES == 8 else 2)
-    comptime for _s in range(ROUNDS):
+    comptime for _s in range(log2_floor(LANES)):
         var t = Array[SIMD[dt, LANES], LANES](uninitialized=True)
         comptime for i in range(LANES // 2):
             var w = r[i].interleave(r[i + LANES // 2])
@@ -228,13 +232,4 @@ def amx_permitted() -> Bool:
     comptime ARCH_REQ_XCOMP_PERM = 0x1023
     comptime XFEATURE_XTILEDATA = 18
     comptime SYS_ARCH_PRCTL = 158
-    return (
-        Int(
-            external_call["syscall", Int, Int64, Int64, Int64](
-                Int64(SYS_ARCH_PRCTL),
-                Int64(ARCH_REQ_XCOMP_PERM),
-                Int64(XFEATURE_XTILEDATA),
-            )
-        )
-        == 0
-    )
+    return external_call["syscall", Int](SYS_ARCH_PRCTL, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA) == 0

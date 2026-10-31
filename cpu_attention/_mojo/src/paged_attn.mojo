@@ -9,11 +9,13 @@ MHA: work item = (sequence, head), one query row against its own head's K/V.
 Workers take contiguous ranges of items balanced on context length (`_share`).
 """
 
-from std.math import iota
+from std.bit import log2_floor
+from std.math import ceildiv, iota
 from std.memory import bitcast, stack_allocation
+from std.sys import size_of
 from std.sys.info import CompilationTarget
 
-from isa import BCAST_FOLD, LANES, LOG2E, bf16_lo, dot_bf16, exp2, online_max, ptr, transpose, vmax
+from isa import BCAST_FOLD, LANES, LOG2E, NEG_INF, bf16_lo, dot_bf16, exp2, online_max, ptr, transpose, vmax
 from parallel import parallel
 
 comptime V_PAIRS_ARM = CompilationTarget.has_neon()
@@ -97,7 +99,6 @@ struct PageLayout[dtype: DType, hd: Int]:
     def store_v(v_page: Int, page: Int, t: Int, v_src: Int):
         """One token's V (one head) into its page."""
         var vs = ptr[Scalar[Self.dtype]](v_src)
-        var vd = ptr[Scalar[Self.dtype]](v_page)
         comptime if Self.V_PAIRS:
             var vdt = ptr[Scalar[Self.dtype]](
                 v_page + (((t >> 1) * Self.hd) * 2 + (t & 1)) * 2
@@ -107,7 +108,7 @@ struct PageLayout[dtype: DType, hd: Int]:
                 comptime for u in range(8):
                     vdt.unsafe_store((d0 + u) * 2, v8[u])
         else:
-            vd.unsafe_store[width=Self.hd](
+            ptr[Scalar[Self.dtype]](v_page).unsafe_store[width=Self.hd](
                 t * Self.hd, vs.unsafe_load[width=Self.hd]()
             )
 
@@ -118,7 +119,7 @@ struct PageLayout[dtype: DType, hd: Int]:
         a LANES x LANES transpose of 32-bit K words (an fp32 dim, or a bf16 dim
         pair): one vector store per word row, where per-token stores are LANES
         scalar stores each (store-bound: fp32 store-only ran 1.14x slower that way on the C4D)."""
-        comptime W = Self.hd * (2 if Self.BF else 4) // 4
+        comptime W = Self.hd * size_of[Self.dtype]() // 4
         comptime assert W % LANES == 0, "K words tile by LANES"
         comptime for w0 in range(0, W, LANES):
             var r = Array[SIMD[DType.int32, LANES], LANES](uninitialized=True)
@@ -133,13 +134,11 @@ struct PageLayout[dtype: DType, hd: Int]:
 # store
 # ---------------------------------------------------------------------------
 @always_inline
-def _div_page[PAGE: Int](x: Int, page: Int, out res: Tuple[Int, Int]):
-    comptime if PAGE == 16:
-        return (x >> 4, x & 15)
-    elif PAGE == 32:
-        return (x >> 5, x & 31)
-    elif PAGE == 64:
-        return (x >> 6, x & 63)
+def _div_page[PAGE: Int](x: Int, page: Int) -> Tuple[Int, Int]:
+    """(page, offset) of position x: a shift and a mask for a power-of-two PAGE,
+    a constant divisor for another, `page` at runtime when PAGE is 0."""
+    comptime if PAGE and PAGE & (PAGE - 1) == 0:
+        return (x >> log2_floor(PAGE), x & (PAGE - 1))
     elif PAGE:
         var q = x // PAGE  # a constant divisor: multiply and shift
         return (q, x - q * PAGE)
@@ -168,7 +167,7 @@ def _store_kv[dtype: DType, hd: Int, PAGE: Int](job: PagedJob, seq: Int, h: Int)
         pg = Int(ptr[Int32](job.block_table + seq * job.bt_stride * 4).unsafe_load(d[0]))
         off = d[1]
     comptime L = PageLayout[dtype, hd]
-    comptime E = 2 if dtype == DType.bfloat16 else 4
+    comptime E = size_of[dtype]()
     var base = ((pg * job.heads + h) * page * hd) * E
     var src = (seq * job.kv_stride + h * hd) * E
     L.store_token(
@@ -183,7 +182,7 @@ def _store_block[dtype: DType, hd: Int, PAGE: Int](job: PagedJob, h: Int, s0: In
     consecutive slots of one page take the transposed K store; anything else
     (padding, a page boundary, scattered slots) stores token by token."""
     comptime L = PageLayout[dtype, hd]
-    comptime E = 2 if dtype == DType.bfloat16 else 4
+    comptime E = size_of[dtype]()
     var page = PAGE if PAGE else job.page
     if n == LANES and job.slots != 0:
         var sl = ptr[Int64](job.slots)
@@ -244,7 +243,7 @@ struct Decode[dtype: DType, hd: Int]:
     """The decode kernel's compile-time shape on this tier."""
 
     comptime BF = Self.dtype == DType.bfloat16
-    comptime E = 2 if Self.BF else 4
+    comptime E = size_of[Self.dtype]()
     comptime UNIT = 16
     comptime GPU = Self.UNIT // LANES
     """Key vectors per unit."""
@@ -303,7 +302,7 @@ def _store_row[dtype: DType, hd: Int](job: PagedJob, seq: Int, h: Int, l: Float3
     spills the Q@K^T accumulators (aarch64 bf16 d=128: 155 stack accesses in that
     loop against 47, decode 4-14% slower)."""
     comptime L = PageLayout[dtype, hd]
-    comptime E = 2 if dtype == DType.bfloat16 else 4
+    comptime E = size_of[dtype]()
     var o = ptr[Scalar[dtype]](job.out + (seq * job.out_stride + h * hd) * E)
     if l <= 0:
         comptime for d in range(0, hd, LANES):
@@ -367,7 +366,7 @@ def _qk[
     mut mx: SIMD[DType.float32, LANES],
 ):
     """logits[j + g*LANES ..] for G key vectors from key j, and the running lane
-    max; with MASK, lanes at or past nk are -max and vectors past nk are neither
+    max; with MASK, lanes at or past nk are -inf and vectors past nk are neither
     scored into the max nor stored."""
     comptime V = SIMD[DType.float32, LANES]
     # A call of whole units (j is then a multiple of 16) addresses each unit's
@@ -440,7 +439,7 @@ def _qk[
         comptime if MASK:
             if key + LANES > nk:
                 var lane = iota[DType.int32, LANES]() + Int32(key)
-                v = lane.lt(SIMD[DType.int32, LANES](Int32(nk))).select(v, V(-Float32.MAX))
+                v = lane.lt(SIMD[DType.int32, LANES](Int32(nk))).select(v, V(NEG_INF))
             if key < nk:
                 logits.unsafe_store[width=LANES](key, v)
         else:
@@ -505,7 +504,7 @@ struct PVRows[dtype: DType, hd: Int](PVKernel):
         comptime V = SIMD[DType.float32, LANES]
         comptime NC = Self.NC
         comptime SPLIT = PageLayout[Self.dtype, Self.hd].SPLIT
-        var vp = ptr[Scalar[Self.dtype]](vb + dc * (2 if Self.dtype == DType.bfloat16 else 4))
+        var vp = ptr[Scalar[Self.dtype]](vb + dc * size_of[Self.dtype]())
         var pk = ptr[Float32](p) + kf
 
         @always_inline
@@ -577,7 +576,7 @@ struct PVPairs[hd: Int](PVKernel):
         var hi = e.cast[DType.bfloat16]()
         ptr[BFloat16](pbuf).unsafe_store[width=W](i, hi)
         comptime if LO:
-            ptr[BFloat16](pbuf_lo).unsafe_store[width=W](i, bf16_lo(e, hi))
+            ptr[BFloat16](pbuf_lo).unsafe_store[width=W](i, bf16_lo[W](e, hi))
         if odd:  # the unpaired last key is an fp32 FMA
             ptr[Float32](logits).unsafe_store[width=W](i, e)
 
@@ -734,7 +733,7 @@ def _attend[dtype: DType, hd: Int, PAGE: Int](job: PagedJob, seq: Int, h: Int):
     var pbuf = stack_allocation[KT if D.PV.P16 else 1, DType.bfloat16, alignment=64]()
     var pbuf_lo = stack_allocation[KT if D.PV.P16 else 1, DType.bfloat16, alignment=64]()
     var acc = stack_allocation[hd, DType.float32, alignment=64]()
-    var m = -Float32.MAX
+    var m = NEG_INF
     var l = Float32(0)
 
     var k0 = 0
@@ -748,7 +747,7 @@ def _attend[dtype: DType, hd: Int, PAGE: Int](job: PagedJob, seq: Int, h: Int):
 
         # ---- Q@K^T: G key vectors per call; the tail in masked calls of at
         # most one unit, and a single vector when that is all that is left.
-        var mx = V(-Float32.MAX)
+        var mx = V(NEG_INF)
         var j = 0
         while j + D.G * LANES <= nk:
             _qk[dtype, hd, D.G, PAGE, False](kpg, page, o0, q, j, nk, logits, mx)
@@ -832,7 +831,7 @@ def _body[dtype: DType, hd: Int, PAGE: Int](ctx: Int, tid: Int, threads: Int):
                 for i in range(1, LANES):
                     blocks = blocks and Int(sl.unsafe_load(i)) == Int(sl.unsafe_load(0)) + i
             if blocks:
-                var nblk = (job.num_seqs + LANES - 1) // LANES
+                var nblk = ceildiv(job.num_seqs, LANES)
                 var tasks = heads * nblk
                 for t in range(tid * tasks // threads, (tid + 1) * tasks // threads):
                     var h = t // nblk
@@ -865,26 +864,15 @@ def _body[dtype: DType, hd: Int, PAGE: Int](ctx: Int, tid: Int, threads: Int):
 
 
 def _run[dtype: DType, hd: Int](job: PagedJob):
-    var j = job
     var st = stack_allocation[1, PagedJob]()
-    st[] = j
-    # Compile-time page sizes (16, 32, 48, 64) give constant K strides and
-    # shift/mask page indexing; anything else falls back to runtime `job.page`.
-    if j.page == 32:
-        comptime body = _body[dtype, hd, 32]
-        parallel(body, Int(st), j.workers)
-    elif j.page == 16:
-        comptime body = _body[dtype, hd, 16]
-        parallel(body, Int(st), j.workers)
-    elif j.page == 64:
-        comptime body = _body[dtype, hd, 64]
-        parallel(body, Int(st), j.workers)
-    elif j.page == 48:
-        comptime body = _body[dtype, hd, 48]
-        parallel(body, Int(st), j.workers)
-    else:
-        comptime body = _body[dtype, hd, 0]
-        parallel(body, Int(st), j.workers)
+    st[] = job
+    # Compile-time page sizes give constant K strides and shift/mask page
+    # indexing; anything else falls back to the runtime `job.page` (PAGE 0).
+    comptime for PAGE in [32, 16, 64, 48]:
+        if job.page == PAGE:
+            parallel(_body[dtype, hd, PAGE], Int(st), job.workers)
+            return
+    parallel(_body[dtype, hd, 0], Int(st), job.workers)
 
 
 def paged_run(job: PagedJob) raises:
@@ -902,11 +890,8 @@ def paged_run(job: PagedJob) raises:
 def _dispatch_hd[dtype: DType](job: PagedJob) raises:
     if job.page % 16 != 0 or job.page <= 0:
         raise Error("cpu_attention: page size must be a positive multiple of 16")
-    if job.head_dim == 64:
-        _run[dtype, 64](job)
-    elif job.head_dim == 128:
-        _run[dtype, 128](job)
-    elif job.head_dim == 32:
-        _run[dtype, 32](job)
-    else:
-        raise Error("cpu_attention: head_dim must be 32, 64 or 128")
+    comptime for hd in [64, 128, 32]:
+        if job.head_dim == hd:
+            _run[dtype, hd](job)
+            return
+    raise Error("cpu_attention: head_dim must be 32, 64 or 128")

@@ -39,15 +39,14 @@ def _with_isa[dtype: DType, hd: Int, body: def[P: FlashPolicy]() raises capturin
 def _with_policy[body: def[P: FlashPolicy]() raises capturing -> None](dtype: Int, hd: Int, isa: Int) raises:
     if dtype != 0 and dtype != 1:
         raise Error("cpu_attention: unsupported dtype")
-    if hd != 32 and hd != 64 and hd != 128:
-        raise Error("cpu_attention: head_dim must be 32, 64 or 128")
     comptime for d in range(2):
         comptime dt = DType.float32 if d == 0 else DType.bfloat16
         if dtype == d:
-            comptime for h in range(3):
-                comptime hdc = 32 << h
+            comptime for hdc in [32, 64, 128]:
                 if hd == hdc:
                     _with_isa[dt, hdc, body](isa)
+                    return
+    raise Error("cpu_attention: head_dim must be 32, 64 or 128")
 
 
 def flash_run(job: FlashJob, dtype: Int, hd: Int, isa: Int) raises:

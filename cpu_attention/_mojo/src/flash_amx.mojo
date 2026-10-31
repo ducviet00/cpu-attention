@@ -24,13 +24,13 @@ A masked or padded logit is -1e30, so exp2 gives exactly +0, which P@V needs:
 rows at a time and reduced across rows by a shuffle network, not per row.
 """
 
-from std.math import iota
+from std.math import align_up, iota
 from std.memory import bitcast
-from std.sys import llvm_intrinsic
+from std.sys import llvm_intrinsic, size_of
 
 from amx import tile_cfg_load, tile_dpbf16ps, tile_load, tile_store, tile_zero
-from flash_attn import FlashJob, FlashPolicy, NEG
-from isa import X86_BF16, bf16_lo, exp2, online_max, ptr, vmax
+from flash_attn import FlashJob, FlashPolicy
+from isa import NEG_INF, X86_BF16, bf16_lo, exp2, online_max, ptr, vmax
 
 comptime RQT = 32  # query rows per register tile
 comptime KSTEP = 32  # keys per Q@K^T / P@V step
@@ -38,15 +38,94 @@ comptime SLACK = 8.0  # FA4's running-max slack (log2 units): rescale only past 
 comptime PAD = 64  # bytes added to the logits / P row strides: a power-of-two stride
 # aliases in L1 (measured 3-4% on the whole call)
 comptime MASKED = -1.0e30  # a masked logit; finite so the exponential needs no clamp
-comptime F = DType.float32
 comptime BF16 = DType.bfloat16
 comptime V16 = SIMD[DType.float32, 16]
 comptime I16 = SIMD[DType.int32, 16]
 
 
+# ---------------------------------------------------------------------------
+# AMX tile groups: C tiles 4-7 hold two 16-row groups (A tiles 0, 1) x two
+# 16-column blocks (B tiles 2, 3)
+# ---------------------------------------------------------------------------
 @always_inline
-def _pad(n: Int) -> Int:
-    return (n + KSTEP - 1) // KSTEP * KSTEP
+def _zero_c():
+    tile_zero[4]()
+    tile_zero[5]()
+    tile_zero[6]()
+    tile_zero[7]()
+
+
+@always_inline
+def _load_c(base: Int, stride: Int):
+    tile_load[4](base, stride)
+    tile_load[5](base + 64, stride)
+    tile_load[6](base + 16 * stride, stride)
+    tile_load[7](base + 16 * stride + 64, stride)
+
+
+@always_inline
+def _store_c(base: Int, stride: Int):
+    tile_store[4](base, stride)
+    tile_store[5](base + 64, stride)
+    tile_store[6](base + 16 * stride, stride)
+    tile_store[7](base + 16 * stride + 64, stride)
+
+
+@always_inline
+def _load_a(base: Int, stride: Int):
+    """Two 16-row groups, `stride` bytes per row."""
+    tile_load[0](base, stride)
+    tile_load[1](base + 16 * stride, stride)
+
+
+@always_inline
+def _load_b(b0: Int, b1: Int):
+    """Two packed 1 KB B tiles."""
+    tile_load[2](b0, 64)
+    tile_load[3](b1, 64)
+
+
+@always_inline
+def _dot_2x2():
+    tile_dpbf16ps[4, 0, 2]()
+    tile_dpbf16ps[5, 0, 3]()
+    tile_dpbf16ps[6, 1, 2]()
+    tile_dpbf16ps[7, 1, 3]()
+
+
+# ---------------------------------------------------------------------------
+# 16-lane shuffle stages of a 16x16 transpose (32-bit lanes): interleave 32-bit
+# then 64-bit units inside each 128-bit lane (`unpck{l,h}ps` / `pd`), then pick
+# 128-bit lanes (the even ones, or the odd ones, of a then b)
+# ---------------------------------------------------------------------------
+@always_inline
+def _lo32[dt: DType](a: SIMD[dt, 16], b: SIMD[dt, 16]) -> SIMD[dt, 16]:
+    return a.shuffle[0, 16, 1, 17, 4, 20, 5, 21, 8, 24, 9, 25, 12, 28, 13, 29](b)
+
+
+@always_inline
+def _hi32[dt: DType](a: SIMD[dt, 16], b: SIMD[dt, 16]) -> SIMD[dt, 16]:
+    return a.shuffle[2, 18, 3, 19, 6, 22, 7, 23, 10, 26, 11, 27, 14, 30, 15, 31](b)
+
+
+@always_inline
+def _lo64[dt: DType](a: SIMD[dt, 16], b: SIMD[dt, 16]) -> SIMD[dt, 16]:
+    return a.shuffle[0, 1, 16, 17, 4, 5, 20, 21, 8, 9, 24, 25, 12, 13, 28, 29](b)
+
+
+@always_inline
+def _hi64[dt: DType](a: SIMD[dt, 16], b: SIMD[dt, 16]) -> SIMD[dt, 16]:
+    return a.shuffle[2, 3, 18, 19, 6, 7, 22, 23, 10, 11, 26, 27, 14, 15, 30, 31](b)
+
+
+@always_inline
+def _even128[dt: DType](a: SIMD[dt, 16], b: SIMD[dt, 16]) -> SIMD[dt, 16]:
+    return a.shuffle[0, 1, 2, 3, 8, 9, 10, 11, 16, 17, 18, 19, 24, 25, 26, 27](b)
+
+
+@always_inline
+def _odd128[dt: DType](a: SIMD[dt, 16], b: SIMD[dt, 16]) -> SIMD[dt, 16]:
+    return a.shuffle[4, 5, 6, 7, 12, 13, 14, 15, 20, 21, 22, 23, 28, 29, 30, 31](b)
 
 
 # ---------------------------------------------------------------------------
@@ -59,44 +138,40 @@ def _row32(a: SIMD[BF16, 16], b: SIMD[BF16, 16]) -> I16:
 
 @always_inline
 def _tp16(m: Array[I16, 16]) -> Array[I16, 16]:
-    """16x16 transpose of 32-bit units in registers (64 shuffles): unpack ps,
-    unpack pd, then two stages of 128-bit-lane shuffles. The index-vector form (`vpermt2d/q`, 16 data + the
-    index registers) spilled and was 18% slower on the pack."""
+    """16x16 transpose of 32-bit units in registers (64 shuffles). The
+    index-vector form (`vpermt2d/q`, 16 data + the index registers) spilled and
+    was 18% slower on the pack."""
     var r = m.copy()
     comptime for i in range(0, 16, 2):
         var a = r[i]
         var b = r[i + 1]
-        r[i] = a.shuffle[0, 16, 1, 17, 4, 20, 5, 21, 8, 24, 9, 25, 12, 28, 13, 29](b)
-        r[i + 1] = a.shuffle[2, 18, 3, 19, 6, 22, 7, 23, 10, 26, 11, 27, 14, 30, 15, 31](b)
+        r[i] = _lo32(a, b)
+        r[i + 1] = _hi32(a, b)
     comptime for i in range(0, 16, 4):
         var a0 = r[i]
         var a1 = r[i + 1]
         var a2 = r[i + 2]
         var a3 = r[i + 3]
-        r[i] = a0.shuffle[0, 1, 16, 17, 4, 5, 20, 21, 8, 9, 24, 25, 12, 13, 28, 29](a2)
-        r[i + 1] = a0.shuffle[2, 3, 18, 19, 6, 7, 22, 23, 10, 11, 26, 27, 14, 15, 30, 31](a2)
-        r[i + 2] = a1.shuffle[0, 1, 16, 17, 4, 5, 20, 21, 8, 9, 24, 25, 12, 13, 28, 29](a3)
-        r[i + 3] = a1.shuffle[2, 3, 18, 19, 6, 7, 22, 23, 10, 11, 26, 27, 14, 15, 30, 31](a3)
+        r[i] = _lo64(a0, a2)
+        r[i + 1] = _hi64(a0, a2)
+        r[i + 2] = _lo64(a1, a3)
+        r[i + 3] = _hi64(a1, a3)
     comptime for j in range(4):
-        var a0 = r[j]
-        var a1 = r[j + 4]
-        var a2 = r[j + 8]
-        var a3 = r[j + 12]
-        var p0 = a0.shuffle[0, 1, 2, 3, 8, 9, 10, 11, 16, 17, 18, 19, 24, 25, 26, 27](a1)
-        var p1 = a0.shuffle[4, 5, 6, 7, 12, 13, 14, 15, 20, 21, 22, 23, 28, 29, 30, 31](a1)
-        var q0 = a2.shuffle[0, 1, 2, 3, 8, 9, 10, 11, 16, 17, 18, 19, 24, 25, 26, 27](a3)
-        var q1 = a2.shuffle[4, 5, 6, 7, 12, 13, 14, 15, 20, 21, 22, 23, 28, 29, 30, 31](a3)
-        r[j] = p0.shuffle[0, 1, 2, 3, 8, 9, 10, 11, 16, 17, 18, 19, 24, 25, 26, 27](q0)
-        r[j + 8] = p0.shuffle[4, 5, 6, 7, 12, 13, 14, 15, 20, 21, 22, 23, 28, 29, 30, 31](q0)
-        r[j + 4] = p1.shuffle[0, 1, 2, 3, 8, 9, 10, 11, 16, 17, 18, 19, 24, 25, 26, 27](q1)
-        r[j + 12] = p1.shuffle[4, 5, 6, 7, 12, 13, 14, 15, 20, 21, 22, 23, 28, 29, 30, 31](q1)
+        var p0 = _even128(r[j], r[j + 4])
+        var p1 = _odd128(r[j], r[j + 4])
+        var q0 = _even128(r[j + 8], r[j + 12])
+        var q1 = _odd128(r[j + 8], r[j + 12])
+        r[j] = _even128(p0, q0)
+        r[j + 8] = _odd128(p0, q0)
+        r[j + 4] = _even128(p1, q1)
+        r[j + 12] = _odd128(p1, q1)
     return r.copy()
 
 
 @always_inline
 def _k_bytes[dtype: DType, hd: Int](seq_k: Int) -> Int:
     comptime NLO = 1 if dtype == DType.bfloat16 else 2
-    return (_pad(seq_k) // 16) * (hd // 32) * 512 * NLO * 2
+    return (align_up(seq_k, KSTEP) // 16) * (hd // 32) * 512 * NLO * 2
 
 
 @always_inline
@@ -107,7 +182,7 @@ def _pack_k_block[
     Keys past seq_k are zero (a padded key must never inject a NaN); `full` is the
     common case with every key present and no per-row test."""
     comptime BF = dtype == DType.bfloat16
-    comptime E = 2 if BF else 4
+    comptime E = size_of[dtype]()
     comptime DC32 = hd // 32
     comptime SLOT = 512 * (1 if BF else 2)  # bf16 elements per (key block, dim chunk)
     var kts = job.kt * E
@@ -151,9 +226,8 @@ def _pack_k_block[
 
 @always_inline
 def _pack_k[dtype: DType, hd: Int](job: FlashJob, b: Int, h: Int, slab: Int):
-    comptime E = 2 if dtype == DType.bfloat16 else 4
-    var ks = job.k + (b * job.kb + h * job.kh) * E
-    for kb in range(_pad(job.seq_k) // 16):
+    var ks = job.k + (b * job.kb + h * job.kh) * size_of[dtype]()
+    for kb in range(align_up(job.seq_k, KSTEP) // 16):
         var t0 = kb * 16
         if t0 + 16 <= job.seq_k:
             comptime for dc in range(hd // 32):
@@ -170,7 +244,7 @@ def _pack_v_block[
     """One 1 KB tile: 32 keys x 16 dims, a tile row = two adjacent keys of 16
     dims interleaved."""
     comptime BF = dtype == DType.bfloat16
-    comptime E = 2 if BF else 4
+    comptime E = size_of[dtype]()
     comptime DC16 = hd // 16
     comptime SLOT = 512 * (1 if BF else 2)
     var vts = job.vt * E
@@ -208,10 +282,9 @@ def _pack_v_block[
 
 @always_inline
 def _pack_v[dtype: DType, hd: Int](job: FlashJob, b: Int, h: Int, slab: Int):
-    comptime E = 2 if dtype == DType.bfloat16 else 4
-    var vs = job.v + (b * job.vb + h * job.vh) * E
+    var vs = job.v + (b * job.vb + h * job.vh) * size_of[dtype]()
     var vbase = slab + _k_bytes[dtype, hd](job.seq_k)
-    for kb in range(_pad(job.seq_k) // 32):
+    for kb in range(align_up(job.seq_k, KSTEP) // 32):
         var t0 = kb * 32
         if t0 + 32 <= job.seq_k:
             comptime for dc in range(hd // 16):
@@ -221,9 +294,6 @@ def _pack_v[dtype: DType, hd: Int](job: FlashJob, b: Int, h: Int, slab: Int):
                 _pack_v_block[dtype, hd, False](job, vs, t0, kb, dc, vbase)
 
 
-# ---------------------------------------------------------------------------
-# exp2 and the bf16 probability store
-# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # Q@K^T
 # ---------------------------------------------------------------------------
@@ -243,7 +313,7 @@ def _q_operand[
     1024:16:128 -6%. Below that the copy is a net cost (129:16:128 +6%, 2048:8:64
     +2%)."""
     comptime BF = dtype == DType.bfloat16
-    comptime E = 2 if BF else 4
+    comptime E = size_of[dtype]()
     comptime DC32 = hd // 32
     if BF and nrows == RQT and not (job.qt * E >= 2048 and job.seq_k >= 256):
         return (qaddr, 0, job.qt * E)
@@ -252,16 +322,11 @@ def _q_operand[
     for r in range(RQT):
         comptime for dc in range(DC32):
             if r < nrows:
-                var s = qaddr + r * job.qt * E + dc * 32 * E
-                comptime if BF:
-                    ph.unsafe_store[width=32](r * hd + dc * 32, ptr[BFloat16](s).unsafe_load[width=32](0))
-                else:
-                    var f0 = ptr[Float32](s).unsafe_load[width=16](0)
-                    var f1 = ptr[Float32](s).unsafe_load[width=16](16)
-                    var h0 = f0.cast[BF16]()
-                    var h1 = f1.cast[BF16]()
-                    ph.unsafe_store[width=32](r * hd + dc * 32, h0.join(h1))
-                    pl.unsafe_store[width=32](r * hd + dc * 32, bf16_lo[16](f0, h0).join(bf16_lo[16](f1, h1)))
+                var x = ptr[Scalar[dtype]](qaddr + r * job.qt * E + dc * 32 * E).unsafe_load[width=32](0)
+                var hi = x.cast[BF16]()
+                ph.unsafe_store[width=32](r * hd + dc * 32, hi)
+                comptime if not BF:
+                    pl.unsafe_store[width=32](r * hd + dc * 32, bf16_lo[32](x.cast[DType.float32](), hi))
             else:
                 ph.unsafe_store[width=32](r * hd + dc * 32, SIMD[BF16, 32](0))
                 comptime if not BF:
@@ -297,42 +362,21 @@ def _qk[
     while j < nkeys:
         var jj = k0 + j
         var kb = jj >> 4
-        tile_zero[4]()
-        tile_zero[5]()
-        tile_zero[6]()
-        tile_zero[7]()
+        _zero_c()
         comptime for dc in range(DC32):
             var kp = kslab + ((kb * DC32 + dc) * SLOT) * 2
             var kp1 = kslab + (((kb + 1) * DC32 + dc) * SLOT) * 2
-            tile_load[0](a_hi + dc * 64, astride)
-            tile_load[1](a_hi + 16 * astride + dc * 64, astride)
-            tile_load[2](kp, 64)
-            tile_load[3](kp1, 64)
-            tile_dpbf16ps[4, 0, 2]()
-            tile_dpbf16ps[5, 0, 3]()
-            tile_dpbf16ps[6, 1, 2]()
-            tile_dpbf16ps[7, 1, 3]()
+            _load_a(a_hi + dc * 64, astride)
+            _load_b(kp, kp1)
+            _dot_2x2()
             comptime if not BF:
                 # q_hi @ k_lo, then q_lo @ k_hi (k_hi reloads from L1).
-                tile_load[2](kp + 1024, 64)
-                tile_load[3](kp1 + 1024, 64)
-                tile_dpbf16ps[4, 0, 2]()
-                tile_dpbf16ps[5, 0, 3]()
-                tile_dpbf16ps[6, 1, 2]()
-                tile_dpbf16ps[7, 1, 3]()
-                tile_load[0](a_lo + dc * 64, astride)
-                tile_load[1](a_lo + 16 * astride + dc * 64, astride)
-                tile_load[2](kp, 64)
-                tile_load[3](kp1, 64)
-                tile_dpbf16ps[4, 0, 2]()
-                tile_dpbf16ps[5, 0, 3]()
-                tile_dpbf16ps[6, 1, 2]()
-                tile_dpbf16ps[7, 1, 3]()
-        var lp = lg + j * 4
-        tile_store[4](lp, LS)
-        tile_store[5](lp + 64, LS)
-        tile_store[6](lp + 16 * LS, LS)
-        tile_store[7](lp + 16 * LS + 64, LS)
+                _load_b(kp + 1024, kp1 + 1024)
+                _dot_2x2()
+                _load_a(a_lo + dc * 64, astride)
+                _load_b(kp, kp1)
+                _dot_2x2()
+        _store_c(lg + j * 4, LS)
         if jj + KSTEP > lim:
             # Boundary step: the stores above already happened, so a NaN out of a
             # padded K tile is overwritten, not propagated.
@@ -364,32 +408,13 @@ def _hnet[is_max: Bool](v: Array[V16, 16]) -> V16:
     and pd halve the vector count in-lane, then two 128-bit-lane stages."""
     var u = Array[V16, 8](uninitialized=True)
     comptime for p in range(8):
-        var a = v[2 * p]
-        var b = v[2 * p + 1]
-        u[p] = _op[is_max](
-            a.shuffle[0, 16, 1, 17, 4, 20, 5, 21, 8, 24, 9, 25, 12, 28, 13, 29](b),
-            a.shuffle[2, 18, 3, 19, 6, 22, 7, 23, 10, 26, 11, 27, 14, 30, 15, 31](b),
-        )
+        u[p] = _op[is_max](_lo32(v[2 * p], v[2 * p + 1]), _hi32(v[2 * p], v[2 * p + 1]))
     var w = Array[V16, 4](uninitialized=True)
     comptime for q in range(4):
-        var a = u[2 * q]
-        var b = u[2 * q + 1]
-        w[q] = _op[is_max](
-            a.shuffle[0, 1, 16, 17, 4, 5, 20, 21, 8, 9, 24, 25, 12, 13, 28, 29](b),
-            a.shuffle[2, 3, 18, 19, 6, 7, 22, 23, 10, 11, 26, 27, 14, 15, 30, 31](b),
-        )
-    var z0 = _op[is_max](
-        w[0].shuffle[0, 1, 2, 3, 8, 9, 10, 11, 16, 17, 18, 19, 24, 25, 26, 27](w[1]),
-        w[0].shuffle[4, 5, 6, 7, 12, 13, 14, 15, 20, 21, 22, 23, 28, 29, 30, 31](w[1]),
-    )
-    var z1 = _op[is_max](
-        w[2].shuffle[0, 1, 2, 3, 8, 9, 10, 11, 16, 17, 18, 19, 24, 25, 26, 27](w[3]),
-        w[2].shuffle[4, 5, 6, 7, 12, 13, 14, 15, 20, 21, 22, 23, 28, 29, 30, 31](w[3]),
-    )
-    return _op[is_max](
-        z0.shuffle[0, 1, 2, 3, 8, 9, 10, 11, 16, 17, 18, 19, 24, 25, 26, 27](z1),
-        z0.shuffle[4, 5, 6, 7, 12, 13, 14, 15, 20, 21, 22, 23, 28, 29, 30, 31](z1),
-    )
+        w[q] = _op[is_max](_lo64(u[2 * q], u[2 * q + 1]), _hi64(u[2 * q], u[2 * q + 1]))
+    var z0 = _op[is_max](_even128(w[0], w[1]), _odd128(w[0], w[1]))
+    var z1 = _op[is_max](_even128(w[2], w[3]), _odd128(w[2], w[3]))
+    return _op[is_max](_even128(z0, z1), _odd128(z0, z1))
 
 
 @always_inline
@@ -438,9 +463,9 @@ def _stats[
                 rmax[r4 + rr] = mx[rr]
         var raw = _hnet[True](rmax)
         var mxv = raw * V16(c)
-        var mo = _ld16(m + rg * 4, valid, NEG)
+        var mo = _ld16(m + rg * 4, valid, NEG_INF)
         var visible = raw.gt(V16(MASKED * 0.1))
-        var first = mo.le(V16(NEG))
+        var first = mo.le(V16(NEG_INF))
         var need = mxv.gt(mo + V16(SLACK))
         var take = visible & (first | need)
         var rescale = visible & need & ~first
@@ -481,7 +506,7 @@ def _emit32[
     var hh = _cvt2(e0, e1)
     ptr[BFloat16](pp).unsafe_store[width=32](0, hh)
     comptime if not BF:
-        var hf = hh.cast[F]()
+        var hf = hh.cast[DType.float32]()
         var lo = _cvt2(e0 - hf.slice[16, offset=0](), e1 - hf.slice[16, offset=16]())
         ptr[BFloat16](pl).unsafe_store[width=32](0, lo)
     return e0 + e1
@@ -496,7 +521,7 @@ def _emit[
     zeros P@V needs past the key range."""
     comptime LS = KT * 4 + PAD
     comptime PS = KT * 2 + PAD
-    var ntail = _pad(n)
+    var ntail = align_up(n, KSTEP)
     var vc = V16(c)
     var mp = ptr[Float32](m)
     var rg = 0
@@ -510,7 +535,7 @@ def _emit[
             var sm = Array[V16, 4](fill=V16(0))
             comptime for rr in range(4):
                 var mr = mp.unsafe_load(min(rg + r4 + rr, nrows - 1))
-                nb[rr] = V16(-mr if mr > NEG else Float32(0))
+                nb[rr] = V16(-mr if mr > NEG_INF else Float32(0))
             var j = 0
             while j < ntail:
                 comptime for rr in range(4):
@@ -545,52 +570,27 @@ def _pv[
     var plo = pb + RQT * PS
     var dc = 0
     while dc < DC16:
-        var cc0 = acc + dc * 64
-        var cc1 = acc + 16 * hd * 4 + dc * 64
+        var cc = acc + dc * 64
         if first:
-            tile_zero[4]()
-            tile_zero[5]()
-            tile_zero[6]()
-            tile_zero[7]()
+            _zero_c()
         else:
-            tile_load[4](cc0, hd * 4)
-            tile_load[5](cc0 + 64, hd * 4)
-            tile_load[6](cc1, hd * 4)
-            tile_load[7](cc1 + 64, hd * 4)
+            _load_c(cc, hd * 4)
         var ks = 0
         while ks < nkeys:
             var kb = (k0 + ks) >> 5
             var vp = vslab + ((kb * DC16 + dc) * SLOT) * 2
-            var pp = pb + ks * 2
-            tile_load[0](pp, PS)
-            tile_load[1](pp + 16 * PS, PS)
-            tile_load[2](vp, 64)
-            tile_load[3](vp + SLOT * 2, 64)
-            tile_dpbf16ps[4, 0, 2]()
-            tile_dpbf16ps[5, 0, 3]()
-            tile_dpbf16ps[6, 1, 2]()
-            tile_dpbf16ps[7, 1, 3]()
+            _load_a(pb + ks * 2, PS)
+            _load_b(vp, vp + SLOT * 2)
+            _dot_2x2()
             comptime if not BF:
                 # p_hi @ v_lo, then p_lo @ v_hi
-                tile_load[2](vp + 1024, 64)
-                tile_load[3](vp + SLOT * 2 + 1024, 64)
-                tile_dpbf16ps[4, 0, 2]()
-                tile_dpbf16ps[5, 0, 3]()
-                tile_dpbf16ps[6, 1, 2]()
-                tile_dpbf16ps[7, 1, 3]()
-                tile_load[0](plo + ks * 2, PS)
-                tile_load[1](plo + ks * 2 + 16 * PS, PS)
-                tile_load[2](vp, 64)
-                tile_load[3](vp + SLOT * 2, 64)
-                tile_dpbf16ps[4, 0, 2]()
-                tile_dpbf16ps[5, 0, 3]()
-                tile_dpbf16ps[6, 1, 2]()
-                tile_dpbf16ps[7, 1, 3]()
+                _load_b(vp + 1024, vp + SLOT * 2 + 1024)
+                _dot_2x2()
+                _load_a(plo + ks * 2, PS)
+                _load_b(vp, vp + SLOT * 2)
+                _dot_2x2()
             ks += KSTEP
-        tile_store[4](cc0, hd * 4)
-        tile_store[5](cc0 + 64, hd * 4)
-        tile_store[6](cc1, hd * 4)
-        tile_store[7](cc1 + 64, hd * 4)
+        _store_c(cc, hd * 4)
         dc += 2
 
 
@@ -613,17 +613,16 @@ struct AmxPolicy[dtype: DType, hd: Int](FlashPolicy):
     # 256 keys for bf16, 512 for fp32 (whose P also carries a lo half).
     comptime KT = 256 if Self.dtype == DType.bfloat16 else 512
     comptime ZEROES_ACC = True  # P@V starts with tile_zero on a row's first key tile
+    comptime NLO = 1 if Self.dtype == DType.bfloat16 else 2  # bf16 halves per value (fp32: hi, lo)
 
     @staticmethod
     def slab_bytes(seq_k: Int) -> Int:
-        comptime NLO = 1 if Self.dtype == DType.bfloat16 else 2
-        return _k_bytes[Self.dtype, Self.hd](seq_k) + (_pad(seq_k) // 32) * (Self.hd // 16) * 512 * NLO * 2
+        return _k_bytes[Self.dtype, Self.hd](seq_k) + (align_up(seq_k, KSTEP) // 32) * (Self.hd // 16) * 512 * Self.NLO * 2
 
     @staticmethod
     def tile_bytes() -> Int:
         # logits | bf16 P (hi, then lo for fp32) | Q panel (hi, lo) | tile config
-        comptime NLO = 1 if Self.dtype == DType.bfloat16 else 2
-        return RQT * (Self.KT * 4 + PAD) + RQT * (Self.KT * 2 + PAD) * NLO + RQT * Self.hd * 2 * NLO + 64
+        return RQT * (Self.KT * 4 + PAD) + RQT * (Self.KT * 2 + PAD) * Self.NLO + RQT * Self.hd * 2 * Self.NLO + 64
 
     @staticmethod
     def pack(job: FlashJob, b: Int, h: Int, slab: Int):
@@ -648,18 +647,17 @@ struct AmxPolicy[dtype: DType, hd: Int](FlashPolicy):
         l: Int,
         alpha: Int,
     ):
-        comptime NLO = 1 if Self.dtype == DType.bfloat16 else 2
         comptime KT = Self.KT
         var lg = scratch
         var pb = lg + RQT * (KT * 4 + PAD)
-        var panel = pb + RQT * (KT * 2 + PAD) * NLO
+        var panel = pb + RQT * (KT * 2 + PAD) * Self.NLO
         if k0 == 0:
             # A query block's sweep always starts at key 0: load the tile config
             # once there instead of per call. The tile state can be dropped
             # between calls (another AMX user, a `tilerelease`, a migration) and
             # a tile instruction in INIT state is #UD, but nothing else runs on
             # this thread inside one sweep.
-            var cfg = panel + RQT * Self.hd * 2 * NLO
+            var cfg = panel + RQT * Self.hd * 2 * Self.NLO
             _cfg(cfg)
             tile_cfg_load(cfg)
         var qo = _q_operand[Self.dtype, Self.hd](job, q0, sub, panel)

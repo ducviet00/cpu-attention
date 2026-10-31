@@ -12,6 +12,7 @@ follow.
 
 from std.ffi import external_call
 from std.memory import stack_allocation
+from std.python import PythonObject
 from std.python._cpython import PyObjectPtr
 
 from isa import ptr
@@ -57,8 +58,9 @@ struct Tensor(ImplicitlyCopyable, Movable):
     var rt: Int
 
     @staticmethod
-    def of(rt: Int, obj: Int) -> Tensor:
-        var tp = _word(obj + 8)
+    def of(rt: Int, py: PythonObject) -> Tensor:
+        var obj = Int(py._obj_ptr)
+        var tp = _word(obj + 8)  # ob_type
         var plain = tp == cfg(rt, TENSOR_TYPE) or tp == cfg(rt, PARAM_TYPE)
         return Tensor(_word(obj + cfg(rt, IMPL)) if plain else 0, rt)
 
@@ -87,6 +89,21 @@ struct Tensor(ImplicitlyCopyable, Movable):
 
     def data(self, itemsize: Int) -> Int:
         return self.base() + self.offset() * itemsize
+
+    def same_sizes(self, other: Tensor) -> Bool:
+        if other.dim() != self.dim():
+            return False
+        for i in range(self.dim()):
+            if other.size(i) != self.size(i):
+                return False
+        return True
+
+    def same_strides(self, other: Tensor) -> Bool:
+        """Equal strides over this tensor's dims (check the sizes first)."""
+        for i in range(self.dim()):
+            if other.stride(i) != self.stride(i):
+                return False
+        return True
 
     def contiguous(self) -> Bool:
         var expect = 1
